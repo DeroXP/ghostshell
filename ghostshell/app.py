@@ -26,6 +26,7 @@ from core.system_info import get_dashboard
 from core import debloater, optimizer, privacy, dns_manager, network_tweaks, startup_manager
 from core.vault import Vault
 from core import benchmark
+from core import maintenance
 
 utils.ensure_app_dirs()
 logger = utils.get_logger(__name__)
@@ -573,6 +574,59 @@ def api_benchmark_clear() -> Response:
         current_app.logger.exception("Failed to clear benchmark history")
         return jsonify({"error": str(exc)}), 500
     return jsonify({"ok": True})
+
+
+# ===== Maintenance APIs =====
+
+def _get_task_name_from_request() -> str | None:
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict):
+        task_name = payload.get("task_name")
+        if isinstance(task_name, str):
+            return task_name
+    return None
+
+
+def _maintenance_response(success: bool, message: str, status_code: int = 200):
+    response = jsonify({"success": success, "message": message})
+    response.status_code = status_code
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _maintenance_error_response(exc: Exception):
+    utils.log_event("maintenance", "api", "error", str(exc))
+    return _maintenance_response(False, "An unexpected error occurred.", 500)
+
+
+@app.route("/api/maintenance/install", methods=["POST"])
+def api_maintenance_install():
+    task_name = _get_task_name_from_request()
+    try:
+        ok, message = maintenance.install_task(task_name)
+    except Exception as exc:
+        return _maintenance_error_response(exc)
+    return _maintenance_response(bool(ok), str(message))
+
+
+@app.route("/api/maintenance/remove", methods=["POST"])
+def api_maintenance_remove():
+    task_name = _get_task_name_from_request()
+    try:
+        ok, message = maintenance.remove_task(task_name)
+    except Exception as exc:
+        return _maintenance_error_response(exc)
+    return _maintenance_response(bool(ok), str(message))
+
+
+@app.route("/api/maintenance/run", methods=["POST"])
+def api_maintenance_run():
+    task_name = _get_task_name_from_request()
+    try:
+        ok, message = maintenance.run_now(task_name)
+    except Exception as exc:
+        return _maintenance_error_response(exc)
+    return _maintenance_response(bool(ok), str(message))
 
 
 # ===== Server + Window bootstrap =====
