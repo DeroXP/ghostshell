@@ -20,37 +20,200 @@
 
   <div id="app">
     <div class="sidebar">
-      <div class="nav-item active">Dashboard</div>
-      <div class="nav-item">Debloat</div>
-      <div class="nav-item">Optimize</div>
-      <div class="nav-item">Network</div>
-      <div class="nav-item">GPU</div>
-      <div class="nav-item">Privacy</div>
-      <div class="nav-item">HWID</div>
-      <div class="nav-item">Vault</div>
-      <div class="nav-item">Logs</div>
+      <div class="nav-item active" data-section="dashboard">Dashboard</div>
+      <div class="nav-item" data-section="debloat">Debloat</div>
+      <div class="nav-item" data-section="optimize">Optimize</div>
+      <div class="nav-item" data-section="network">Network</div>
+      <div class="nav-item" data-section="gpu">GPU</div>
+      <div class="nav-item" data-section="privacy">Privacy</div>
+      <div class="nav-item" data-section="hwid">HWID</div>
+      <div class="nav-item" data-section="vault">Vault</div>
+      <div class="nav-item" data-section="logs">Logs</div>
     </div>
+
     <div class="main">
-      <div class="hero">
-        <h1 class="glitch" data-text="GHOSTSHELL">GHOSTSHELL</h1>
-        <p class="subtitle">Covert Windows 11 privacy, debloat, and optimization suite.</p>
-      </div>
-
-      <div class="panel dashboard">
-        <div class="panel-title">System Overview</div>
-        <div class="grid">
-          <div>OS: <span id="os-version">—</span></div>
-          <div>CPU: <span id="cpu-model">—</span></div>
-          <div>GPU: <span id="gpu-models">—</span></div>
-          <div>RAM: <span id="ram-total">—</span></div>
-          <div>Storage: <span id="storage-primary">—</span></div>
+      <section id="dashboard" class="section">
+        <div class="hero">
+          <h1 class="glitch" data-text="GHOSTSHELL">GHOSTSHELL</h1>
+          <p class="subtitle">Covert Windows 11 privacy, debloat, and optimization suite.</p>
         </div>
-      </div>
 
-      <div class="panel">
-        <div class="panel-title">Live Log</div>
-        <pre id="log" class="terminal" data-log-target></pre>
-      </div>
+        <div class="panel dashboard">
+          <div class="panel-title">System Overview</div>
+          <div class="grid">
+            <div>OS: <span id="os-version">—</span></div>
+            <div>CPU: <span id="cpu-model">—</span></div>
+            <div>GPU: <span id="gpu-models">—</span></div>
+            <div>RAM: <span id="ram-total">—</span></div>
+            <div>Storage: <span id="storage-primary">—</span></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Quick Actions</div>
+          <div class="button-group">
+            <button type="button" id="qa-debloat">Execute Debloat</button>
+            <button type="button" id="qa-optimize">Apply All Tweaks</button>
+            <button type="button" id="qa-privacy">Harden Privacy</button>
+            <button type="button" id="qa-benchmark">Run Benchmark</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Profiles</div>
+          <form id="profile-form" class="form-inline">
+            <label for="profile-name">Name</label>
+            <input type="text" id="profile-name" placeholder="my-setup" />
+            <button type="button" id="profile-export">Export</button>
+            <button type="button" id="profile-import">Import</button>
+            <span id="profile-status" class="status"></span>
+          </form>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Live Log</div>
+          <pre id="log" class="terminal" data-log-target></pre>
+        </div>
+      </section>
+
+      <section id="debloat" class="section" hidden>
+        <div class="panel">
+          <div class="panel-title">Windows 11 Debloater</div>
+          <p>Remove preinstalled bloatware apps, disable unnecessary services and telemetry tasks. A system restore point is created before changes.</p>
+          <button type="button" id="debloat-run">Execute Debloat Now</button>
+        </div>
+      </section>
+
+      <section id="optimize" class="section" hidden>
+        <div class="panel">
+          <div class="panel-title">Optimizer</div>
+          <div class="two-col">
+            <div class="col">
+              <div id="optimize-list" class="checklist" aria-live="polite">Loading tweaks...</div>
+            </div>
+            <div class="col">
+              <div class="button-group">
+                <button type="button" id="opt-select-all">Select All</button>
+                <button type="button" id="opt-deselect-all">Deselect All</button>
+                <button type="button" id="opt-apply">Apply Selected</button>
+              </div>
+              <div id="opt-results" class="results"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="network" class="section" hidden>
+        <div class="panel">
+          <div class="panel-title">DNS Configuration</div>
+          <div id="dns-presets" class="radio-list">Loading presets...</div>
+          <div class="form-inline">
+            <label for="dns-primary">Primary</label>
+            <input id="dns-primary" type="text" placeholder="1.1.1.1" />
+            <label for="dns-secondary">Secondary</label>
+            <input id="dns-secondary" type="text" placeholder="1.0.0.1" />
+            <button type="button" id="dns-apply">Apply DNS</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Network Tweaks</div>
+          <div class="button-group">
+            <button type="button" id="net-load">Load Network Tweaks</button>
+          </div>
+          <div id="network-list" class="checklist" aria-live="polite"></div>
+          <div class="button-group">
+            <button type="button" id="net-apply">Apply Network Tweaks</button>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Latency Test</div>
+          <div class="form-inline">
+            <label for="ping-host">Host</label>
+            <input id="ping-host" type="text" value="1.1.1.1" />
+            <button type="button" id="ping-go">Ping</button>
+            <span id="ping-result" class="status"></span>
+          </div>
+        </div>
+      </section>
+
+      <section id="gpu" class="section" hidden>
+        <div class="panel">
+          <div class="panel-title">GPU Module</div>
+          <div class="grid">
+            <div>Model: <span id="gpu-model">—</span></div>
+            <div>Driver: <span id="gpu-driver">—</span></div>
+          </div>
+          <div class="button-group">
+            <button type="button" id="gpu-prepare">Prepare Clean Install</button>
+            <button type="button" id="gpu-tweaks">Apply GPU Tweaks</button>
+          </div>
+          <label for="gpu-readme" class="panel-title small">Notes / README</label>
+          <textarea id="gpu-readme" readonly rows="6" style="width:100%"></textarea>
+        </div>
+      </section>
+
+      <section id="privacy" class="section" hidden>
+        <div class="panel">
+          <div class="panel-title">Privacy Hardening</div>
+          <p>Apply telemetry disablement, hosts blocking, firewall rules, and privacy policies.</p>
+          <button type="button" id="privacy-harden">Harden All Privacy</button>
+        </div>
+      </section>
+
+      <section id="hwid" class="section" hidden>
+        <div class="panel">
+          <div class="panel-title">HWID Spoofer</div>
+          <div class="form-grid">
+            <label for="hwid-guid">Machine GUID</label>
+            <input type="text" id="hwid-guid" />
+            <label for="hwid-prodid">Product ID</label>
+            <input type="text" id="hwid-prodid" />
+            <label for="hwid-name">Computer Name</label>
+            <input type="text" id="hwid-name" />
+          </div>
+          <div class="button-group">
+            <button type="button" id="hwid-gen-guid">Generate GUID</button>
+            <button type="button" id="hwid-apply">Apply Changes</button>
+            <button type="button" id="hwid-restore">Restore Backup</button>
+          </div>
+          <div id="hwid-status" class="status-log" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section id="vault" class="section" hidden>
+        <div class="panel">
+          <div class="panel-title">Vault</div>
+          <div class="vault-lock" id="vault-locked-state">
+            <label for="vault-pin">PIN</label>
+            <input type="password" id="vault-pin" maxlength="6" />
+            <div class="button-group">
+              <button type="button" id="vault-unlock">Unlock</button>
+              <button type="button" id="vault-setup-pin">Setup PIN</button>
+            </div>
+          </div>
+
+          <div class="vault-unlocked" id="vault-unlocked-state" hidden>
+            <form id="vault-entry-form" class="form-grid">
+              <label for="vault-service">Service</label>
+              <input type="text" id="vault-service" required />
+              <label for="vault-username">Username</label>
+              <input type="text" id="vault-username" required />
+              <label for="vault-password">Password</label>
+              <input type="password" id="vault-password" required />
+              <button type="submit" id="vault-add-entry">Add Entry</button>
+            </form>
+            <div class="panel-title small">Stored Entries</div>
+            <div id="vault-list" class="vault-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="logs" class="section" hidden>
+        <div class="panel">
+          <div class="panel-title">Live Log</div>
+          <pre id="log" class="terminal" data-log-target></pre>
+        </div>
+      </section>
     </div>
   </div>
 
