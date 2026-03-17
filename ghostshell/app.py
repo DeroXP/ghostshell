@@ -629,6 +629,94 @@ def api_maintenance_run():
     return _maintenance_response(bool(ok), str(message))
 
 
+# ===== Profile APIs =====
+from typing import Any as _Any, Dict as _Dict
+from core.profile import delete_profile, export_profile, import_profile, list_profiles
+
+
+def _profile_response(payload: _Dict[str, _Any], status_code: int = 200):
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response, status_code
+
+
+@app.route("/api/profile/list", methods=["GET"])
+def api_profile_list() -> _Any:
+    try:
+        profiles = list_profiles()
+        return _profile_response({"profiles": profiles})
+    except Exception as exc:  # pylint: disable=broad-except
+        utils.log_event("profile", "api", "error", str(exc))
+        return _profile_response({"error": "Unable to list profiles"}, 500)
+
+
+@app.route("/api/profile/export", methods=["POST"])
+def api_profile_export() -> _Any:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _profile_response({"error": "Invalid JSON payload"}, 400)
+
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return _profile_response({"error": "Profile name is required"}, 400)
+
+    extras = data.get("extras")
+    if extras is not None and not isinstance(extras, dict):
+        return _profile_response({"error": "Extras must be an object"}, 400)
+
+    try:
+        success, message, path = export_profile(name.strip(), extras=extras)
+        status_code = 200 if success else 400
+        return _profile_response(
+            {"success": success, "message": message, "path": path}, status_code
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        utils.log_event("profile", "api", "error", str(exc))
+        return _profile_response({"error": "Unable to export profile"}, 500)
+
+
+@app.route("/api/profile/import", methods=["POST"])
+def api_profile_import() -> _Any:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _profile_response({"error": "Invalid JSON payload"}, 400)
+
+    name_or_path = data.get("name_or_path")
+    if not isinstance(name_or_path, str) or not name_or_path.strip():
+        return _profile_response({"error": "Profile name or path is required"}, 400)
+
+    apply_flag = data.get("apply", False)
+    if not isinstance(apply_flag, bool):
+        return _profile_response({"error": "Apply flag must be a boolean"}, 400)
+
+    try:
+        success, message = import_profile(name_or_path.strip(), apply=apply_flag)
+        status_code = 200 if success else 400
+        return _profile_response({"success": success, "message": message}, status_code)
+    except Exception as exc:  # pylint: disable=broad-except
+        utils.log_event("profile", "api", "error", str(exc))
+        return _profile_response({"error": "Unable to import profile"}, 500)
+
+
+@app.route("/api/profile", methods=["DELETE"])
+def api_profile_delete() -> _Any:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _profile_response({"error": "Invalid JSON payload"}, 400)
+
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return _profile_response({"error": "Profile name is required"}, 400)
+
+    try:
+        success, message = delete_profile(name.strip())
+        status_code = 200 if success else 400
+        return _profile_response({"success": success, "message": message}, status_code)
+    except Exception as exc:  # pylint: disable=broad-except
+        utils.log_event("profile", "api", "error", str(exc))
+        return _profile_response({"error": "Unable to delete profile"}, 500)
+
+
 # ===== Server + Window bootstrap =====
 
 def start_flask():
