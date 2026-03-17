@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GhostShell</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body class="theme-ghost">
+  <div id="titlebar" class="drag-region pywebview-drag-region">
+    <div class="title-left">
+      <span class="logo">◉</span>
+      <span class="title">GHOSTSHELL</span>
+    </div>
+    <div class="title-right">
+      <button id="btn-min" title="Minimize">─</button>
+      <button id="btn-close" title="Close">✕</button>
+    </div>
+  </div>
+
+  <div id="app">
+    <div class="sidebar">
+      <div class="nav-item active">Dashboard</div>
+      <div class="nav-item">Debloat</div>
+      <div class="nav-item">Optimize</div>
+      <div class="nav-item">Network</div>
+      <div class="nav-item">GPU</div>
+      <div class="nav-item">Privacy</div>
+      <div class="nav-item">HWID</div>
+      <div class="nav-item">Vault</div>
+      <div class="nav-item">Logs</div>
+    </div>
+    <div class="main">
+      <div class="hero">
+        <h1 class="glitch" data-text="GHOSTSHELL">GHOSTSHELL</h1>
+        <p class="subtitle">Covert Windows 11 privacy, debloat, and optimization suite.</p>
+      </div>
+
+      <div class="panel dashboard">
+        <div class="panel-title">System Overview</div>
+        <div class="grid">
+          <div>OS: <span id="os-version">—</span></div>
+          <div>CPU: <span id="cpu-model">—</span></div>
+          <div>GPU: <span id="gpu-models">—</span></div>
+          <div>RAM: <span id="ram-total">—</span></div>
+          <div>Storage: <span id="storage-primary">—</span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">Live Log</div>
+        <pre id="log" class="terminal" data-log-target></pre>
+      </div>
+    </div>
+  </div>
+
+  <canvas id="matrix"></canvas>
+  <div class="scanlines"></div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GhostShell - Elevation Required</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body class="theme-ghost">
+  <div id="titlebar" class="drag-region">
+    <div class="title-left">
+      <span class="logo">◉</span>
+      <span class="title">GHOSTSHELL</span>
+    </div>
+    <div class="title-right">
+      <button id="btn-min" title="Minimize">─</button>
+      <button id="btn-close" title="Close">✕</button>
+    </div>
+  </div>
+
+  <div class="elevate">
+    <h1>Administrator Access Required</h1>
+    <p>GhostShell needs administrator privileges to modify system settings.
+       Click the button below to relaunch with elevated permissions.</p>
+    <button id="btn-elevate" class="primary">Relaunch as Administrator</button>
+    <pre id="elevate-status" class="terminal"></pre>
+  </div>
+
+  <canvas id="matrix"></canvas>
+  <div class="scanlines"></div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
