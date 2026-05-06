@@ -18,8 +18,6 @@ GhostShell uses a matte-black UI with neon cyan accents, matrix-rain canvas back
 
 ## Requirements
 - Windows 11 (64-bit). Some features work on Windows 10, but the target is 11.
-- Python 3.11 or higher (download: https://www.python.org/downloads/)
-- Pip (bundled with Python 3.11+). For building the .exe: PyInstaller 6+.
 - Administrator privileges to apply system changes (UAC prompt will be shown).
 
 ## Setup — Step by Step
