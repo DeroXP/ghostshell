@@ -1,0 +1,25 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller build artifacts — release binaries are tracked in the
+# ghostshell-site repo (releases/<channel>/GhostShell.exe), not here.
+build/
+build_*/
+build-*/
+dist/
+dist_*/
+dist-*/
+
+# Logs + local scratch
+*.log
+*.tmp
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Local env / secrets — never commit credentials
+.env
+*.env

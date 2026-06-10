@@ -1,0 +1,429 @@
+/* GhostShell Updater — palette matched to the main app (style.css).
+   Frameless window with custom titlebar matching GhostShell's chrome. */
+
+:root {
+    /* Mirrors GhostShell's exact variables — keeping these in lockstep
+       means the updater feels like a smaller pane of the same app. */
+    --bg-base:        #020203;
+    --bg-elevated:    #0a0a0c;
+    --bg-overlay:     #131316;
+    --bg-input:       #050507;
+    --bg-hover:       #161618;
+    --border-faint:   rgba(255, 255, 255, 0.04);
+    --border:         rgba(255, 255, 255, 0.07);
+    --border-strong:  rgba(255, 255, 255, 0.12);
+    --text-bright:    #ffffff;
+    --text:           #f5f5f7;
+    --text-secondary: #a0a0a8;
+    --text-tertiary:  #5a5a64;
+    --accent:         #5edda2;
+    --accent-bright:  #7eecb8;
+    --accent-deep:    #2ea864;
+    --accent-soft:    rgba(94, 221, 162, 0.10);
+    --accent-mid:     rgba(94, 221, 162, 0.22);
+    --accent-glow:    rgba(94, 221, 162, 0.32);
+    --accent-fg:      #03130b;
+    --warning:        #f0b341;
+    --danger:         #f06464;
+
+    --radius-xs:  4px;
+    --radius-sm:  6px;
+    --radius:     8px;
+
+    --font-sans:  'Segoe UI Variable Display', 'Segoe UI Variable', 'Segoe UI', 'Inter', -apple-system, system-ui, sans-serif;
+    --font-mono:  'JetBrains Mono', 'SF Mono', Consolas, ui-monospace, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: var(--bg-base);
+    color: var(--text);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+/* ─── Frameless titlebar (matches GhostShell's chrome) ─── */
+.titlebar {
+    height: 38px;
+    background: rgba(2, 2, 3, 0.7);
+    border-bottom: 1px solid var(--border-faint);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 4px 0 14px;
+    -webkit-app-region: drag;
+    -webkit-user-select: none;
+    user-select: none;
+}
+.pywebview-drag-region {
+    -webkit-user-select: none;
+    user-select: none;
+    cursor: default;
+}
+.titlebar-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text-bright);
+}
+.titlebar-left svg {
+    width: 18px; height: 18px;
+    color: var(--accent);
+}
+.titlebar-version {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-tertiary);
+    font-weight: 400;
+}
+.titlebar-buttons {
+    display: flex;
+    -webkit-app-region: no-drag;
+}
+.titlebar-btn {
+    width: 38px;
+    height: 38px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background 150ms ease, color 150ms ease;
+}
+.titlebar-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-bright);
+}
+.titlebar-btn.close:hover {
+    background: var(--danger);
+    color: white;
+}
+.titlebar-btn svg {
+    width: 12px; height: 12px;
+}
+
+/* ─── Main content ─── */
+.content {
+    height: calc(100% - 38px);
+    padding: 18px 22px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    overflow-y: auto;
+}
+
+.header-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.header-row .title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-bright);
+    letter-spacing: -0.01em;
+}
+.header-row .channel-tag {
+    margin-left: auto;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill, 9999px);
+    background: var(--bg-elevated);
+}
+
+.versions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--text-bright);
+}
+.versions .from { color: var(--text-secondary); }
+.versions .arrow { color: var(--text-tertiary); }
+.versions .target {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+}
+.controls label {
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
+    font-weight: 600;
+}
+.controls select,
+.controls input[type="text"] {
+    flex: 1;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xs);
+    padding: 6px 10px;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    outline: none;
+    transition: border-color 150ms ease;
+}
+.controls select:hover,
+.controls input:hover { border-color: var(--border-strong); }
+.controls select:focus,
+.controls input:focus { border-color: var(--accent); }
+
+/* ─── Steps list ─── */
+ul.steps {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    flex: 1;
+    min-height: 0;
+}
+ul.steps li {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 7px 10px;
+    border-radius: var(--radius-xs);
+    margin-bottom: 2px;
+    font-size: 13px;
+    transition: background 200ms ease, color 200ms ease;
+}
+ul.steps li.pending {
+    color: var(--text-tertiary);
+}
+ul.steps li.active {
+    background: var(--accent-soft);
+    color: var(--text-bright);
+}
+ul.steps li.done {
+    color: var(--text);
+}
+ul.steps li.error {
+    background: rgba(240, 100, 100, 0.07);
+    color: var(--danger);
+}
+ul.steps li.skipped {
+    color: var(--text-tertiary);
+    opacity: 0.6;
+}
+ul.steps .icon {
+    flex-shrink: 0;
+    width: 14px; height: 14px;
+    margin-top: 2px;
+    color: currentColor;
+}
+ul.steps li.pending .icon { color: var(--text-tertiary); }
+ul.steps li.active .icon  { color: var(--accent); }
+ul.steps li.done .icon    { color: var(--accent); }
+ul.steps li.error .icon   { color: var(--danger); }
+ul.steps .body {
+    flex: 1;
+    min-width: 0;
+}
+ul.steps .label {
+    font-weight: 500;
+    font-size: 13px;
+    line-height: 1.3;
+}
+ul.steps .detail {
+    margin-top: 1px;
+    font-size: 11.5px;
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    word-break: break-word;
+    line-height: 1.4;
+}
+
+/* ─── Progress bar ─── */
+.progress {
+    height: 3px;
+    background: var(--bg-elevated);
+    border-radius: 2px;
+    overflow: hidden;
+}
+.progress-fill {
+    height: 100%;
+    background: var(--accent);
+    box-shadow: 0 0 12px var(--accent-glow);
+    transition: width 300ms ease;
+    width: 0%;
+}
+
+/* ─── Install-mode banner (no existing GhostShell found) ─── */
+.install-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 14px;
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-mid);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-size: 12.5px;
+    line-height: 1.5;
+}
+.install-banner > svg {
+    width: 22px; height: 22px;
+    color: var(--accent);
+    flex-shrink: 0;
+    margin-top: 1px;
+}
+.install-banner > div {
+    flex: 1;
+    min-width: 0;
+}
+.install-banner-title {
+    color: var(--text-bright);
+    font-weight: 600;
+    font-size: 13px;
+    margin-bottom: 2px;
+}
+.install-banner-detail {
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+.link-btn {
+    background: transparent;
+    border: none;
+    color: var(--accent);
+    padding: 2px 4px;
+    font-size: 12px;
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-color: var(--accent-mid);
+    font-family: var(--font-sans);
+}
+.link-btn:hover { color: var(--accent-bright); }
+
+/* Read-only path display in update mode */
+.readonly-path {
+    flex: 1;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-secondary);
+    padding: 6px 10px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-xs);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ─── Error box ─── */
+.error-box {
+    padding: 10px 12px;
+    background: rgba(240, 100, 100, 0.06);
+    border: 1px solid rgba(240, 100, 100, 0.25);
+    border-radius: var(--radius-sm);
+    color: var(--danger);
+    font-size: 12px;
+    line-height: 1.55;
+}
+/* v1.2.0 — when the install pipeline completes the box flips green and
+   hosts the "GhostShell is launching — closing in Ns" countdown. */
+.error-box.success {
+    background: rgba(74, 222, 128, 0.08);
+    border-color: rgba(74, 222, 128, 0.32);
+    color: #4ade80;
+}
+
+/* ─── Actions row ─── */
+.actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding-top: 4px;
+}
+button {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    padding: 7px 14px;
+    font-size: 12.5px;
+    font-family: var(--font-sans);
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 150ms ease;
+}
+button:hover:not(:disabled) {
+    background: var(--bg-hover);
+    border-color: var(--border-strong);
+    color: var(--text-bright);
+}
+button.primary {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
+    font-weight: 600;
+}
+button.primary:hover:not(:disabled) {
+    background: var(--accent-bright);
+    border-color: var(--accent-bright);
+    box-shadow: 0 0 18px var(--accent-mid);
+}
+button.danger {
+    color: var(--danger);
+}
+button.danger:hover:not(:disabled) {
+    background: rgba(240, 100, 100, 0.08);
+    border-color: var(--danger);
+    color: var(--danger);
+}
+button:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
+/* ─── Spinner ─── */
+.spinner {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 1.5px solid var(--accent-soft);
+    border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite;
+    display: inline-block;
+    flex-shrink: 0;
+    margin-top: 2px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Scrollbar */
+::-webkit-scrollbar         { width: 6px; }
+::-webkit-scrollbar-track   { background: transparent; }
+::-webkit-scrollbar-thumb   { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }

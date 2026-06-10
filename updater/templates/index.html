@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>GhostShell Updater</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- Frameless-window titlebar.  Drag region covers the whole bar
+     except the close button. -->
+<div class="titlebar pywebview-drag-region">
+    <div class="titlebar-left">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+            <path d="M2 17l10 5 10-5"/>
+            <path d="M2 12l10 5 10-5"/>
+        </svg>
+        <span id="app-title">GhostShell Updater</span>
+        <span class="titlebar-version" id="updater-version-tag">v{{ updater_version }}</span>
+    </div>
+    <div class="titlebar-buttons">
+        <button class="titlebar-btn close" onclick="onClose()" title="Close">
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5">
+                <line x1="2" y1="2" x2="10" y2="10"/>
+                <line x1="10" y1="2" x2="2" y2="10"/>
+            </svg>
+        </button>
+    </div>
+</div>
+
+<div class="content">
+    <!-- Header — text adapts to install vs update mode -->
+    <div class="header-row">
+        <span class="title" id="page-title">Updating GhostShell</span>
+        <span class="channel-tag" id="channel-tag">channel: ?</span>
+    </div>
+
+    <!-- Versions row — for update mode -->
+    <div class="versions" id="versions-row">
+        <span class="from" id="from-version">v?</span>
+        <span class="arrow">→</span>
+        <span class="target" id="to-version">checking…</span>
+    </div>
+
+    <!-- New-install splash — shown only in install mode.  Tells the
+         user the updater couldn't find an existing GhostShell and
+         it's switched into installer mode. -->
+    <div class="install-banner" id="install-banner" style="display:none">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        <div>
+            <div class="install-banner-title" id="install-banner-title">Fresh install</div>
+            <div class="install-banner-detail" id="install-banner-detail">
+                No existing GhostShell found on this PC.  Pick where to install it,
+                pick a channel, and click Install.
+            </div>
+        </div>
+        <button class="link-btn" onclick="rescan()" title="Re-scan PC for an existing install">Re-scan</button>
+    </div>
+
+    <!-- Channel selector — shown until a channel is set -->
+    <div class="controls" id="controls-channel">
+        <label for="channel-select">Channel</label>
+        <select id="channel-select">
+            <option value="">— pick one —</option>
+            <option value="stable">Stable</option>
+            <option value="beta">Beta</option>
+        </select>
+    </div>
+
+    <!-- Install-directory picker — shown when:
+           • mode = install (no existing GhostShell found), OR
+           • mode = update  but the user clicks "Change…" -->
+    <div id="controls-targetdir" class="controls" style="display:none">
+        <label for="target-dir-input">Install&nbsp;path</label>
+        <input type="text" id="target-dir-input"
+               placeholder="C:\Program Files\GhostShell">
+        <button onclick="browseFolder()" title="Pick a folder">Browse…</button>
+    </div>
+
+    <!-- Update-mode read-only path display.  Click "Change…" to switch
+         to the install-mode picker for moving the install. -->
+    <div id="controls-targetdir-readonly" class="controls" style="display:none">
+        <label>Install&nbsp;path</label>
+        <span class="readonly-path" id="readonly-path">—</span>
+        <button onclick="showDirPicker()" title="Move install to a different folder">Change…</button>
+    </div>
+
+    <div id="error-box" class="error-box" style="display:none"></div>
+
+    <ul class="steps" id="steps"></ul>
+
+    <div class="progress">
+        <div class="progress-fill" id="progress-fill"></div>
+    </div>
+
+    <div class="actions">
+        <button id="btn-cancel" onclick="onCancel()" class="danger">Cancel</button>
+        <button id="btn-start"  onclick="onStart()"  class="primary">Install Update</button>
+        <!-- v1.2.0 — the install pipeline auto-launches GhostShell at step 6,
+             so we don't surface a manual "Launch" button (clicking it would
+             just spawn a second instance).  After phase=done we briefly show
+             a success banner + countdown, then auto-close. -->
+        <button id="btn-close"  onclick="onClose()"  style="display:none">Close now</button>
+    </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

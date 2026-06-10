@@ -1,0 +1,9 @@
+flask>=3.0
+cryptography>=41.0
+pywebview>=5.0
+pyinstaller>=6.0
+pystray>=0.19
+Pillow>=10.0
+# v3.6 — recoil pattern capture (FFT-based screen tracking + fast capture)
+numpy>=1.26
+mss>=10.0
