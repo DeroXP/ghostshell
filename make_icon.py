@@ -1,107 +1,80 @@
-"""Generate assets/ghostshell.ico from the brand mark (Vispora / Nacre).
+"""Generate assets/ghostshell.ico — the Vispora "Velocity V" brand mark.
 
-Renders the same stacked-layers mark used in the titlebar + boot
-splash at every standard Windows icon size (16/24/32/48/64/128/256),
-then packs them into one multi-resolution .ico file.  (Filename stays
-ghostshell.ico for now — build.spec references it; the exe + icon file
-get renamed together in the Phase-2 exe rename.)
+Renders the iridescent (Nacre) Velocity V — two tapered blades forming a
+sharp V with a diagonal mint -> periwinkle -> lilac -> rose sweep — on a
+dark rounded tile, at every standard Windows icon size, packed into one
+multi-resolution .ico.
+
+(Filename stays ghostshell.ico for now — build.spec references it; the exe
++ icon file get renamed together in the Phase-2 exe rename.)
 
 Run:
     python make_icon.py
-
 Re-run any time the brand colours / geometry change.
 """
-import math
 import os
+import numpy as np
 from PIL import Image, ImageDraw
 
-# ─── Tokens (Vispora Nacre — match style.css iridescent accent) ───────────
-# The three stacked layers get three distinct Nacre hues (mint -> lilac ->
-# rose) to fake the iridescent shift in a flat-fill PIL icon.
-BG          = (10, 11, 13, 255)       # #0a0b0d
-BG_INNER    = (6,  7,  8,  255)       # slight gradient feel
-ACCENT      = (167, 240, 228, 255)    # #a7f0e4 mint  — top "lit" layer
-ACCENT_DEEP = (217, 184, 255, 255)    # #d9b8ff lilac — middle layer
-ACCENT_DIM  = (255, 196, 230, 140)    # #ffc4e6 rose  — bottom (translucent)
-SHADOW      = (0, 0, 0, 90)
+# ─── Tokens (Vispora Nacre) ───────────────────────────────────────────────
+BG     = (10, 11, 18, 255)            # near-black tile (#0a0b12)
+# Diagonal gradient stops (top-left -> bottom-right): mint, periwinkle, lilac, rose
+GRAD_STOPS = [
+    (0.00, (167, 240, 228)),   # #a7f0e4 mint
+    (0.40, (184, 200, 255)),   # #b8c8ff periwinkle
+    (0.70, (217, 184, 255)),   # #d9b8ff lilac
+    (1.00, (255, 196, 230)),   # #ffc4e6 rose
+]
+
+# Velocity V geometry in a 96x96 design space (two tapered blades).
+V_LEFT  = [(22, 28), (38, 28), (49, 57), (43, 70)]
+V_RIGHT = [(49, 57), (58, 28), (74, 28), (55, 70)]
 
 OUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "assets", "ghostshell.ico")
 SIZES = [256, 128, 64, 48, 32, 24, 16]
 
 
-def _stacked_layers_path(size: int):
-    """Return the three diamond-row polygons that make the mark.
-
-    The brand SVG is the Lucide 'layers' glyph — three stacked
-    parallelograms.  We translate that to pixel coords for a given size.
-    """
-    s = size
-    # Geometry from the SVG (24x24 viewBox), scaled to pixel size.
-    # Top diamond:    (12,2)-(2,7)-(12,12)-(22,7)
-    # Middle:         (2,12)-(12,17)-(22,12)
-    # Bottom:         (2,17)-(12,22)-(22,17)
-    def p(x, y):
-        return (x / 24 * s, y / 24 * s)
-
-    top    = [p(12, 2),  p(2, 7),   p(12, 12), p(22, 7)]
-    middle = [p(2, 12),  p(12, 17), p(22, 12)]
-    bottom = [p(2, 17),  p(12, 22), p(22, 17)]
-    return top, middle, bottom
+def _gradient_rgba(n: int) -> Image.Image:
+    """An n x n RGBA image holding the diagonal Nacre gradient."""
+    yy, xx = np.mgrid[0:n, 0:n].astype(np.float32)
+    t = (xx + yy) / (2 * (n - 1)) if n > 1 else np.zeros((n, n), np.float32)
+    r = np.zeros((n, n), np.float32)
+    g = np.zeros_like(r)
+    b = np.zeros_like(r)
+    for (t0, c0), (t1, c1) in zip(GRAD_STOPS, GRAD_STOPS[1:]):
+        m = (t >= t0) & (t <= t1)
+        f = (t[m] - t0) / (t1 - t0)
+        r[m] = c0[0] + (c1[0] - c0[0]) * f
+        g[m] = c0[1] + (c1[1] - c0[1]) * f
+        b[m] = c0[2] + (c1[2] - c0[2]) * f
+    a = np.full((n, n), 255, np.uint8)
+    arr = np.dstack([r.astype(np.uint8), g.astype(np.uint8), b.astype(np.uint8), a])
+    return Image.fromarray(arr)   # HxWx4 uint8 -> RGBA inferred
 
 
 def _render(size: int) -> Image.Image:
-    """Render a single icon at the requested edge size, with anti-alias.
-
-    Strategy: render at 4× then downsample to keep edges crisp at small
-    sizes (Windows uses the pre-rendered 16/24/32 directly without
-    further filtering).
-    """
+    """Render one icon at `size`, super-sampled 4x then downsampled."""
     SS = 4
-    canvas = Image.new("RGBA", (size * SS, size * SS), (0, 0, 0, 0))
+    n = size * SS
+    canvas = Image.new("RGBA", (n, n), (0, 0, 0, 0))
     d = ImageDraw.Draw(canvas)
 
-    # Rounded square background.  Win11 icon shape is squircle-ish, but
-    # we use a simple rounded-rect — Windows clips it to the taskbar
-    # shape automatically when displayed on the taskbar.
-    radius = int(size * SS * 0.22)
-    d.rounded_rectangle(
-        (0, 0, size * SS - 1, size * SS - 1),
-        radius=radius,
-        fill=BG,
-    )
+    radius = int(n * 0.22)
+    d.rounded_rectangle((0, 0, n - 1, n - 1), radius=radius, fill=BG)
+    if size >= 48:   # subtle Win11 mica rim, large sizes only
+        d.rounded_rectangle((1, 1, n - 2, n - 2), radius=radius - 1,
+                            outline=(255, 255, 255, 14), width=max(1, n // 64))
 
-    # Subtle inner highlight rim (Win11 mica feel) — only at large sizes
-    if size >= 48:
-        rim_color = (255, 255, 255, 14)
-        d.rounded_rectangle(
-            (1, 1, size * SS - 2, size * SS - 2),
-            radius=radius - 1,
-            outline=rim_color,
-            width=max(1, size * SS // 64),
-        )
+    # Velocity V — fill the two blades with the diagonal gradient via a mask.
+    sc = n / 96.0
+    scale = lambda pts: [(x * sc, y * sc) for x, y in pts]
+    mask = Image.new("L", (n, n), 0)
+    md = ImageDraw.Draw(mask)
+    md.polygon(scale(V_LEFT), fill=255)
+    md.polygon(scale(V_RIGHT), fill=255)
+    canvas.paste(_gradient_rgba(n), (0, 0), mask)
 
-    # Stacked layers — translate to a centered mini-canvas
-    inner = int(size * SS * 0.62)
-    pad = (size * SS - inner) // 2
-    top, middle, bottom = _stacked_layers_path(inner)
-    top    = [(x + pad, y + pad) for x, y in top]
-    middle = [(x + pad, y + pad) for x, y in middle]
-    bottom = [(x + pad, y + pad) for x, y in bottom]
-
-    # Bottom layer — most translucent
-    d.polygon(bottom, fill=ACCENT_DIM)
-    # Middle layer — medium accent
-    d.polygon(middle, fill=ACCENT_DEEP)
-    # Top layer — full accent (the "lit" surface)
-    d.polygon(top, fill=ACCENT)
-
-    # Tiny outline on the top layer to crisp it against the bg
-    line_w = max(1, size * SS // 96)
-    d.polygon(top, outline=(255, 255, 255, 25), width=line_w)
-
-    # Downsample with bicubic for smooth edges (except at tiny sizes
-    # where bicubic blurs too much — use bilinear for 16/24).
     if size <= 24:
         return canvas.resize((size, size), Image.Resampling.BILINEAR)
     return canvas.resize((size, size), Image.Resampling.LANCZOS)
@@ -110,11 +83,8 @@ def _render(size: int) -> Image.Image:
 def main() -> None:
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     images = [_render(s) for s in SIZES]
-    # Pillow's .ico writer takes the largest image first and an
-    # explicit `sizes` list of the resolutions to include.
     images[0].save(
-        OUT_PATH,
-        format="ICO",
+        OUT_PATH, format="ICO",
         sizes=[(s, s) for s in SIZES],
         append_images=images[1:],
     )

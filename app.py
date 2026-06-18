@@ -3622,20 +3622,20 @@ def _render_tray_image(state: str = "idle"):
                                 (95, 100, 108, 255),
                                 (140, 145, 152, 110))
 
-    # Stacked-layers geometry (24x24 viewbox scaled to inner area)
-    inner = int(size * SS * 0.78)   # bigger than the .exe icon — tray is small
+    # Velocity V geometry (96x96 design space scaled to inner area).  Two
+    # tapered blades, 2-toned per state so idle/armed/playing stay legible at
+    # tray size; matches the .exe icon mark (make_icon.py).
+    inner = int(size * SS * 0.82)
     pad = (size * SS - inner) // 2
 
     def p(x, y):
-        return (x / 24 * inner + pad, y / 24 * inner + pad)
+        return (x / 96 * inner + pad, y / 96 * inner + pad)
 
-    top    = [p(12, 2),  p(2, 7),   p(12, 12), p(22, 7)]
-    middle = [p(2, 12),  p(12, 17), p(22, 12)]
-    bottom = [p(2, 17),  p(12, 22), p(22, 17)]
+    v_left  = [p(22, 28), p(38, 28), p(49, 57), p(43, 70)]
+    v_right = [p(49, 57), p(58, 28), p(74, 28), p(55, 70)]
 
-    d.polygon(bottom, fill=c_bot)
-    d.polygon(middle, fill=c_mid)
-    d.polygon(top,    fill=c_top)
+    d.polygon(v_left,  fill=c_top)
+    d.polygon(v_right, fill=c_mid)
 
     # "Playing" state: small accent dot in the top-right (notification cue)
     if state == "playing":
