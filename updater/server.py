@@ -216,9 +216,10 @@ def api_set_target_dir():
     parent = os.path.dirname(d) or d
     if not os.path.isdir(parent):
         return jsonify({"ok": False, "err": f"parent directory not found: {parent}"})
+    from updater import installer
     with _state_lock:
         _state["target_dir"] = d
-        _state["target_exe"] = os.path.join(d, "GhostShell.exe")
+        _state["target_exe"] = installer.pick_app_exe(d)
     return jsonify({"ok": True, "target_dir": d})
 
 
@@ -271,8 +272,7 @@ def api_rescan():
             # Suggest a default install dir if the user hasn't picked one
             if not _state["target_dir"]:
                 _state["target_dir"] = installer.default_install_dir()
-                _state["target_exe"] = os.path.join(_state["target_dir"],
-                                                     "GhostShell.exe")
+                _state["target_exe"] = installer.pick_app_exe(_state["target_dir"])
     return jsonify({"ok": True, "mode": _state["mode"], "found": found})
 
 
@@ -294,10 +294,11 @@ def api_browse_folder():
         if not result:
             return jsonify({"ok": True, "cancelled": True, "path": ""})
         picked = result[0] if isinstance(result, (list, tuple)) else result
-        # Update the state with the new path
+        # Update the state with the new path (rename-aware)
+        from updater import installer
         with _state_lock:
             _state["target_dir"] = picked
-            _state["target_exe"] = os.path.join(picked, "GhostShell.exe")
+            _state["target_exe"] = installer.pick_app_exe(picked)
         return jsonify({"ok": True, "path": picked})
     except Exception as e:
         return jsonify({"ok": False, "err": str(e)})

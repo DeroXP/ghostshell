@@ -6,7 +6,7 @@ from core.utils import run_ps, get_logger
 
 log = get_logger("notifier")
 
-APP_ID = "GhostShell"
+APP_ID = "Vispora"
 _SETTINGS_FILE = None
 
 
@@ -113,21 +113,21 @@ try {{
 
 def notify_game_detected(game_name: str, exe: str) -> dict:
     return toast(
-        "GhostShell — Game Detected",
+        "Vispora — Game Detected",
         f"Applying gaming optimizations for {game_name}",
     )
 
 
 def notify_game_exited(game_name: str) -> dict:
     return toast(
-        "GhostShell — Game Closed",
+        "Vispora — Game Closed",
         f"{game_name} exited. Normal mode restored.",
     )
 
 
 def notify_boot_prep_done(duration_sec: float) -> dict:
     return toast(
-        "GhostShell — Ready",
+        "Vispora — Ready",
         f"System primed for gaming in {duration_sec:.1f}s",
     )
 
@@ -136,15 +136,15 @@ def notify_boot_prep_done(duration_sec: float) -> dict:
 # replaces the .exe and the new build re-launches.
 def notify_update_installed(new_version: str, previous_version: str) -> dict:
     return toast(
-        f"GhostShell updated to v{new_version}",
-        f"Successfully upgraded from v{previous_version}. Click the GhostShell window to see what's new.",
+        f"Vispora updated to v{new_version}",
+        f"Successfully upgraded from v{previous_version}. Click the Vispora window to see what's new.",
         force=True,   # don't let user-disabled notifications hide an update success
     )
 
 
 def notify_update_failed(reason: str) -> dict:
     return toast(
-        "GhostShell — Update install failed",
+        "Vispora — Update install failed",
         f"The update did not apply: {reason}. The current version is unchanged.",
         force=True,
     )

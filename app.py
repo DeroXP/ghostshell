@@ -1,4 +1,4 @@
-"""GhostShell — Main Flask application with pywebview launcher."""
+"""Vispora — Main Flask application with pywebview launcher."""
 import sys
 import os
 import json
@@ -1896,8 +1896,8 @@ def api_dependencies_start_rtss_gone():
         "ok": False,
         "removed": True,
         "err": ("RTSS is no longer auto-launched or auto-installed by "
-                "GhostShell.  If you want RTSS running, start it from "
-                "the Start menu — GhostShell will detect it for the "
+                "Vispora.  If you want RTSS running, start it from "
+                "the Start menu — Vispora will detect it for the "
                 "OC-tool conflict warning but won't touch it.")
     }), 410
 
@@ -3110,7 +3110,7 @@ def api_monitor_benchmark():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Full Ghost (run everything in sequence)
+# Full Spectrum (run everything in sequence) — internal route kept as /api/full-ghost
 # ═══════════════════════════════════════════════════════════════════════════
 @app.route("/api/full-ghost", methods=["POST"])
 def api_full_ghost():
@@ -3421,7 +3421,7 @@ def api_notifier_toggle():
 
 @app.route("/api/notifier/test", methods=["POST"])
 def api_notifier_test():
-    return jsonify(notifier.toast("GhostShell", "Notifications are working.", force=True))
+    return jsonify(notifier.toast("Vispora", "Notifications are working.", force=True))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3608,15 +3608,15 @@ def _render_tray_image(state: str = "idle"):
     canvas = Image.new("RGBA", (size * SS, size * SS), (0, 0, 0, 0))
     d = ImageDraw.Draw(canvas)
 
-    # Mark colours per state
+    # Mark colours per state — Nacre iridescent (mint / lilac / rose layers)
     if state == "playing":
-        c_top, c_mid, c_bot = ((126, 236, 184, 255),
-                                (94, 221, 162, 255),
-                                (94, 221, 162, 130))
+        c_top, c_mid, c_bot = ((167, 240, 228, 255),
+                                (217, 184, 255, 255),
+                                (255, 196, 230, 150))
     elif state == "armed":
-        c_top, c_mid, c_bot = ((94, 221, 162, 255),
-                                (46, 168, 100, 255),
-                                (94, 221, 162, 110))
+        c_top, c_mid, c_bot = ((184, 200, 255, 255),
+                                (159, 147, 230, 255),
+                                (196, 193, 255, 120))
     else:  # idle
         c_top, c_mid, c_bot = ((140, 145, 152, 255),
                                 (95, 100, 108, 255),
@@ -3765,7 +3765,7 @@ def _create_tray_icon(show_window_func, quit_func):
             status_line = "○  Game Mode: off"
 
         return Menu(
-            MenuItem("Open GhostShell", _action_show, default=True),
+            MenuItem("Open Vispora", _action_show, default=True),
             Menu.SEPARATOR,
             MenuItem(status_line, None, enabled=False),
             MenuItem(
@@ -3783,9 +3783,9 @@ def _create_tray_icon(show_window_func, quit_func):
         )
 
     icon = Icon(
-        "GhostShell",
+        "Vispora",
         images["idle"],
-        "GhostShell",
+        "Vispora",
         menu=_menu_factory(),
     )
 
@@ -3807,9 +3807,9 @@ def _create_tray_icon(show_window_func, quit_func):
                     log.info(f"Tray icon → {state}")
                 if game != last_game:
                     icon.title = (
-                        f"GhostShell — playing {game[:48]}" if game else
-                        "GhostShell — game mode armed"   if state == "armed" else
-                        "GhostShell"
+                        f"Vispora — playing {game[:48]}" if game else
+                        "Vispora — game mode armed"   if state == "armed" else
+                        "Vispora"
                     )
                     last_game = game
                 # Refresh menu so the status line + checkbox reflect live state.
@@ -3880,7 +3880,7 @@ def _acquire_single_instance_lock() -> bool:
         # scope to the current desktop session only (which is what we
         # want — autostart runs as the same user, so Local is enough
         # AND avoids needing SeCreateGlobalPrivilege).
-        MUTEX_NAME      = r"Local\GhostShell-SingleInstance-{8B7A1F23}"
+        MUTEX_NAME      = r"Local\Vispora-SingleInstance-{8B7A1F23}"
         ERROR_ALREADY_EXISTS = 183
 
         kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]

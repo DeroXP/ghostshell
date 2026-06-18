@@ -63,6 +63,25 @@ from updater import server
 
 _CREATE_NO_WINDOW = 0x08000000
 
+# Rename-awareness (Vispora).  The app exe is GhostShell.exe today and will
+# become Vispora.exe in a later release.  This updater (shipped FIRST, while
+# the app is still GhostShell.exe) must understand BOTH names so that, when the
+# app exe is renamed, the already-deployed updater can still find/close/install
+# it.  New name first so an on-disk Vispora.exe wins over a leftover GhostShell.exe.
+APP_EXE_NAMES = ("Vispora.exe", "GhostShell.exe")
+
+
+def pick_app_exe(target_dir: str) -> str:
+    """Return the app-exe path inside target_dir, rename-aware: prefer an
+    existing Vispora.exe, then an existing GhostShell.exe; if neither is on
+    disk yet (fresh install) fall back to GhostShell.exe (the current build's
+    name)."""
+    for name in APP_EXE_NAMES:
+        p = os.path.join(target_dir, name)
+        if os.path.isfile(p):
+            return p
+    return os.path.join(target_dir, "GhostShell.exe")
+
 
 # ─── GhostShell discovery (scan PC for existing install) ─────────────
 
@@ -111,18 +130,26 @@ def find_existing_ghostshell() -> dict:
             _log(f"install_info.json parse failed: {e}")
 
     # ── 2. Standard install paths ────────────────────────────────
-    standard = [
-        os.path.join(pf,           "GhostShell", "GhostShell.exe"),
-        os.path.join(pfx86,        "GhostShell", "GhostShell.exe"),
-        os.path.join(localappdata, "Programs", "GhostShell", "GhostShell.exe"),
-        os.path.join(localappdata, "GhostShell", "GhostShell.exe"),
-        os.path.join(profile,      "Desktop",   "GhostShell.exe"),
-        os.path.join(profile,      "Documents", "GhostShell", "GhostShell.exe"),
-        os.path.join(profile,      "Downloads", "GhostShell.exe"),
+    # Rename-aware: probe each location for EITHER Vispora.exe or the legacy
+    # GhostShell.exe (APP_EXE_NAMES), and include the Vispora install dirs too.
+    _dirs = [
+        os.path.join(pf,           "GhostShell"),
+        os.path.join(pfx86,        "GhostShell"),
+        os.path.join(localappdata, "Programs", "GhostShell"),
+        os.path.join(localappdata, "GhostShell"),
+        os.path.join(profile,      "Desktop"),
+        os.path.join(profile,      "Documents", "GhostShell"),
+        os.path.join(profile,      "Downloads"),
         # v3.2 user dev path
-        os.path.join(profile,      "Documents", "My Games", "ghostshell",
-                                                 "dist", "GhostShell.exe"),
+        os.path.join(profile,      "Documents", "My Games", "ghostshell", "dist"),
+        # Vispora install dirs (post-rename)
+        os.path.join(pf,           "Vispora"),
+        os.path.join(pfx86,        "Vispora"),
+        os.path.join(localappdata, "Programs", "Vispora"),
+        os.path.join(localappdata, "Vispora"),
+        os.path.join(profile,      "Documents", "Vispora"),
     ]
+    standard = [os.path.join(_d, _n) for _d in _dirs for _n in APP_EXE_NAMES]
     for p in standard:
         candidates.append(p)
         if os.path.isfile(p):
@@ -183,12 +210,20 @@ def _check_cancelled() -> bool:
 
 # ─── Step 1: Close running GhostShell ────────────────────────────────
 
-def _find_ghostshell_pids() -> list:
-    """Return PIDs of every running GhostShell.exe."""
+def _find_ghostshell_pids(image_name: str = "GhostShell.exe") -> list:
+    """Return PIDs of every running process named `image_name`.
+
+    Vispora rename-awareness — this was hardcoded to GhostShell.exe.  It now
+    takes the image name (the basename of --target-exe) so that once the app
+    exe is renamed to Vispora.exe, this updater can STILL find and close the
+    running process before the in-place swap.  Without it, an in-field updater
+    could not terminate a renamed, locked exe and the update would fail —
+    stranding the user on their current build.
+    """
     pids = []
     try:
         r = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq GhostShell.exe", "/FO", "CSV", "/NH"],
+            ["tasklist", "/FI", f"IMAGENAME eq {image_name}", "/FO", "CSV", "/NH"],
             capture_output=True, text=True, timeout=4,
             creationflags=_CREATE_NO_WINDOW,
         )
@@ -207,9 +242,12 @@ def _find_ghostshell_pids() -> list:
 
 
 def _close_ghostshell(target_exe: str, timeout_s: int = 30) -> dict:
-    """Politely ask GhostShell to close, fall back to taskkill /F.
+    """Politely ask the app to close, fall back to taskkill /F.
     Returns {ok, msg}."""
-    pids = _find_ghostshell_pids()
+    # Rename-aware: close the process by the basename of the REAL target exe
+    # (GhostShell.exe today, Vispora.exe after the rename), not a hardcoded name.
+    image = os.path.basename(target_exe) or "GhostShell.exe"
+    pids = _find_ghostshell_pids(image)
     if not pids:
         _log("no running GhostShell — skipping close step")
         return {"ok": True, "msg": "not running", "skipped": True}
@@ -234,7 +272,7 @@ def _close_ghostshell(target_exe: str, timeout_s: int = 30) -> dict:
     deadline = time.time() + (timeout_s / 2)
     while time.time() < deadline:
         if _check_cancelled(): return {"ok": False, "msg": "cancelled"}
-        remaining = _find_ghostshell_pids()
+        remaining = _find_ghostshell_pids(image)
         if not remaining:
             _log("GhostShell exited gracefully")
             return {"ok": True, "msg": f"closed {len(pids)} process(es) gracefully"}
@@ -243,7 +281,7 @@ def _close_ghostshell(target_exe: str, timeout_s: int = 30) -> dict:
     # Step B: Force-close
     _log("graceful close timed out — escalating to taskkill /F")
     server.update_step("close", "active", "Force-closing stuck process…")
-    for pid in _find_ghostshell_pids():
+    for pid in _find_ghostshell_pids(image):
         try:
             subprocess.run(
                 ["taskkill", "/F", "/PID", str(pid)],
@@ -257,11 +295,11 @@ def _close_ghostshell(target_exe: str, timeout_s: int = 30) -> dict:
     deadline = time.time() + (timeout_s / 2)
     while time.time() < deadline:
         if _check_cancelled(): return {"ok": False, "msg": "cancelled"}
-        if not _find_ghostshell_pids():
+        if not _find_ghostshell_pids(image):
             return {"ok": True, "msg": "force-closed"}
         time.sleep(0.5)
 
-    remaining = _find_ghostshell_pids()
+    remaining = _find_ghostshell_pids(image)
     return {"ok": False,
             "msg": f"could not close GhostShell (pids still alive: {remaining})"}
 

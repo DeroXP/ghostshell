@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GhostShell</title>
+<title>Vispora</title>
 <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
@@ -18,7 +18,7 @@
         <path d="M2 17l10 5 10-5"/>
         <path d="M2 12l10 5 10-5"/>
     </svg>
-    <div class="boot-splash-mark"><span>G</span><span>H</span><span>O</span><span>S</span><span>T</span><span>S</span><span>H</span><span>E</span><span>L</span><span>L</span></div>
+    <div class="boot-splash-mark"><span>V</span><span>I</span><span>S</span><span>P</span><span>O</span><span>R</span><span>A</span></div>
     <div class="boot-splash-status">Initializing&nbsp;system</div>
 </div>
 
@@ -28,7 +28,7 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="pywebview-drag-region">
             <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
         </svg>
-        <span class="pywebview-drag-region">GhostShell</span>
+        <span class="pywebview-drag-region">Vispora</span>
         <span class="pywebview-drag-region titlebar-version">v{{ version }}</span>
         <span id="update-badge" style="display:none;font-size:11px;font-weight:600;padding:2px 8px;background:var(--accent-soft);color:var(--accent);border-radius:9999px;margin-left:6px;cursor:pointer" onclick="switchPage('dashboard');showUpdateModal()">Update</span>
     </div>
@@ -150,7 +150,7 @@
                         <div class="section-subtitle">Your hardware, your modules, your control surface — all in one view.</div>
                     </div>
                     <div class="page-header-actions">
-                        <button class="btn btn-cta btn-primary" onclick="runFullGhost()">⚡ Full Ghost</button>
+                        <button class="btn btn-cta btn-primary" onclick="runFullGhost()">⚡ Full Spectrum</button>
                     </div>
                 </div>
             </div>
@@ -247,7 +247,7 @@
                     <div class="action-card-icon">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
                     </div>
-                    <div class="action-card-title">Full Ghost</div>
+                    <div class="action-card-title">Full Spectrum</div>
                     <div class="action-card-desc">Run debloat + optimize + harden + clean in sequence.</div>
                 </div>
             </div>
@@ -872,7 +872,7 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg></div>
                 <div class="card-title">Hard Temp Ceiling</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:640px">
-                    Background watchdog. If GPU temperature stays above the ceiling for the sustained period, GhostShell automatically reverts the OC to stock and notifies you. Runs even when no OC is applied — catches a failing fan or hot day before it cooks the card.
+                    Background watchdog. If GPU temperature stays above the ceiling for the sustained period, Vispora automatically reverts the OC to stock and notifies you. Runs even when no OC is applied — catches a failing fan or hot day before it cooks the card.
                 </p>
                 <div class="toggle-row">
                     <div class="toggle-info"><div class="toggle-name">Watchdog enabled</div><div class="toggle-desc">Monitor GPU temperature in the background.</div></div>
@@ -918,7 +918,7 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg></div>
                 <div class="card-title">Crash Recovery</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:640px">
-                    When a tracked game closes, GhostShell looks for TDR / driver-crash events in the Windows Event Log over the last 10 seconds. If a crash is detected with active OC, the failing offset goes on a permanent per-game blacklist and the saved profile auto-steps-down (–25 MHz core / –100 MHz mem) so the next launch runs safely. A toast fires within 5 s.
+                    When a tracked game closes, Vispora looks for TDR / driver-crash events in the Windows Event Log over the last 10 seconds. If a crash is detected with active OC, the failing offset goes on a permanent per-game blacklist and the saved profile auto-steps-down (–25 MHz core / –100 MHz mem) so the next launch runs safely. A toast fires within 5 s.
                 </p>
                 <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
                     <span style="font-size:12.5px;color:var(--text-secondary)">Total recorded crashes:</span>
@@ -1030,7 +1030,7 @@
                             <button class="btn btn-sm btn-danger" onclick="deleteOcProfile()">Delete</button>
                         </div>
                         <label style="display:flex;align-items:center;gap:8px;margin-top:14px;font-size:12.5px;color:var(--text-secondary)">
-                            <input type="checkbox" id="oc-apply-on-startup" checked style="width:auto;flex-shrink:0"> Apply on GhostShell startup
+                            <input type="checkbox" id="oc-apply-on-startup" checked style="width:auto;flex-shrink:0"> Apply on Vispora startup
                         </label>
                     </div>
                 </div>
@@ -1258,7 +1258,7 @@
                     </div>
                     <div id="device-status">
                         <div class="toggle-row">
-                            <div class="toggle-info"><div class="toggle-name">Webcam</div><div class="toggle-desc">Global camera access for all apps. Microphone is intentionally <b>not</b> here — managing it from GhostShell broke voice chat for users, so mic privacy is left to Windows Settings.</div></div>
+                            <div class="toggle-info"><div class="toggle-name">Webcam</div><div class="toggle-desc">Global camera access for all apps. Microphone is intentionally <b>not</b> here — managing it from Vispora broke voice chat for users, so mic privacy is left to Windows Settings.</div></div>
                             <div class="toggle-switch" id="toggle-webcam" onclick="toggleDevice('webcam', this)"></div>
                         </div>
                     </div>
@@ -1429,7 +1429,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01"/><path d="M10 8h.01"/><path d="M14 8h.01"/><path d="M18 8h.01"/><path d="M7 16h10"/></svg>
                         Input Device Priority
                     </div>
-                    <div class="card-section-desc">Boost interrupt priority for your input devices. <em>High</em> tells Windows to handle those interrupts before normal-priority ones — measurable reduction in input lag under heavy CPU load. <b>Reboot required.</b><br><br><span style="color:var(--text-tertiary);font-size:12px">Note: <code style="color:var(--accent);font-size:11px">HKLM\\Enum</code> is locked-down on Windows by default — GhostShell takes ownership + grants Admin write before applying. The result is read back from the registry to verify (see kernel log below). For USB-attached devices, also raise priority on the host controller via Auto-Optimize above.</span></div>
+                    <div class="card-section-desc">Boost interrupt priority for your input devices. <em>High</em> tells Windows to handle those interrupts before normal-priority ones — measurable reduction in input lag under heavy CPU load. <b>Reboot required.</b><br><br><span style="color:var(--text-tertiary);font-size:12px">Note: <code style="color:var(--accent);font-size:11px">HKLM\\Enum</code> is locked-down on Windows by default — Vispora takes ownership + grants Admin write before applying. The result is read back from the registry to verify (see kernel log below). For USB-attached devices, also raise priority on the host controller via Auto-Optimize above.</span></div>
 
                     <!-- Keyboards -->
                     <div style="margin-top:14px;padding:12px;border-radius:8px;background:var(--bg-overlay)">
@@ -1461,7 +1461,7 @@
                             <span id="ct-count" style="margin-left:auto;font-size:11px;color:var(--text-tertiary)">—</span>
                         </div>
                         <div style="font-size:12.5px;color:var(--text-secondary);margin-bottom:10px;line-height:1.55">
-                            Multiple paired controllers can show up here even when only one is in your hands. <b>Press any button on the controller you actually want to use</b> — GhostShell will identify it and boost only that one.
+                            Multiple paired controllers can show up here even when only one is in your hands. <b>Press any button on the controller you actually want to use</b> — Vispora will identify it and boost only that one.
                         </div>
                         <div id="ct-detect-zone" style="padding:14px;border-radius:6px;background:var(--bg-elevated);border:1px dashed var(--border-faint);text-align:center;font-size:13px;color:var(--text-secondary);margin-bottom:10px">
                             <div id="ct-detect-msg">Connect a controller and press any button…</div>
@@ -1520,7 +1520,7 @@
                     What happens when a game is detected
                 </summary>
                 <div style="font-size:13px;color:var(--text-secondary);line-height:1.7;margin-top:14px">
-                    When any game from the database launches, GhostShell automatically applies these tweaks and reverts them all when the game closes:
+                    When any game from the database launches, Vispora automatically applies these tweaks and reverts them all when the game closes:
                 </div>
                 <div style="font-size:13px;color:var(--text);margin-top:12px;line-height:1.8">
                     <span style="color:var(--accent);font-weight:600">1.</span> Process priority → High<br>
@@ -1546,7 +1546,7 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
                 <div class="card-title">Per-Game Auto-Tuning</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:680px">
-                    During real gameplay, GhostShell nudges your GPU OC offsets up while watching the live stability score (clock variance, temp, util consistency). When stable, it bumps. When the score drops or a crash happens, it steps down and remembers — that offset is permanently blacklisted for that game. Each game gets its own learned profile that improves over time.
+                    During real gameplay, Vispora nudges your GPU OC offsets up while watching the live stability score (clock variance, temp, util consistency). When stable, it bumps. When the score drops or a crash happens, it steps down and remembers — that offset is permanently blacklisted for that game. Each game gets its own learned profile that improves over time.
                 </p>
                 <div class="toggle-row">
                     <div class="toggle-info">
@@ -1599,7 +1599,7 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></div>
                 <div class="card-title">Installed Games</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:680px">
-                    Scans Steam, Epic, Riot, Battle.net, GOG, Ubisoft, EA and Microsoft Store and lists every game GhostShell can recognize.  One click enables Adaptive Tuning for an installed title — no need to launch it first.  Re-scan after installing a new game.
+                    Scans Steam, Epic, Riot, Battle.net, GOG, Ubisoft, EA and Microsoft Store and lists every game Vispora can recognize.  One click enables Adaptive Tuning for an installed title — no need to launch it first.  Re-scan after installing a new game.
                 </p>
                 <div id="library-summary" style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">Loading…</div>
                 <div class="filter-row" style="margin-bottom:10px">
@@ -1778,7 +1778,7 @@
                                 fill="#ef4444" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
                         <text x="488" y="160" text-anchor="middle" fill="#fff" font-size="13" font-weight="700" font-family="monospace" pointer-events="none">B</text>
                         <circle class="gpm-svg-btn" data-gpm-btn="A" id="gpm-svg-btn-A" cx="450" cy="190" r="18"
-                                fill="#22c55e" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
+                                fill="#c4c1ff" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
                         <text x="450" y="195" text-anchor="middle" fill="#000" font-size="13" font-weight="700" font-family="monospace" pointer-events="none">A</text>
 
                         <!-- D-pad -->
@@ -1856,7 +1856,7 @@
                                     <option value="ds4">DualShock 4</option>
                                 </select>
                             </label>
-                            <label style="font-size:12px;color:var(--text-secondary);display:flex;gap:6px;align-items:center" title="Internal sample rate — how fast GhostShell reads your physical controller and pushes updates to the virtual pad. Higher = lower latency between input and the virtual pad's state being current. Note: ViGEmBus's USB-side rate to the GAME is hardcoded by the kernel driver (~1 kHz for DS4, ~250 Hz for X360); higher internal rates make the data the game sees fresher, but don't increase how often the game polls.">
+                            <label style="font-size:12px;color:var(--text-secondary);display:flex;gap:6px;align-items:center" title="Internal sample rate — how fast Vispora reads your physical controller and pushes updates to the virtual pad. Higher = lower latency between input and the virtual pad's state being current. Note: ViGEmBus's USB-side rate to the GAME is hardcoded by the kernel driver (~1 kHz for DS4, ~250 Hz for X360); higher internal rates make the data the game sees fresher, but don't increase how often the game polls.">
                                 Sample:
                                 <select id="gpm-poll-hz" onchange="onGpmPollHzChange()" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">
                                     <option value="1000">1 kHz</option>
@@ -1865,7 +1865,7 @@
                                     <option value="8000">8 kHz (internal)</option>
                                 </select>
                             </label>
-                            <span id="gpm-hidhide-status" style="font-size:11px;color:var(--text-tertiary);display:flex;gap:6px;align-items:center" title="When virtual_controller mode is active, GhostShell auto-cloaks the physical controller from games so they see only the virtual pad."></span>
+                            <span id="gpm-hidhide-status" style="font-size:11px;color:var(--text-tertiary);display:flex;gap:6px;align-items:center" title="When virtual_controller mode is active, Vispora auto-cloaks the physical controller from games so they see only the virtual pad."></span>
                             <button class="btn btn-sm" onclick="testVirtualPad()" style="font-size:11px" title="Fires a brief test sequence (A press, R-stick down, B press) on the virtual controller so you can verify games are seeing it">Test virtual pad</button>
                         </div>
                     </div>
@@ -1924,7 +1924,7 @@
                             <!-- Latency probe -->
                             <div>
                                 <div style="font-weight:600;color:var(--text-bright);margin-bottom:6px">Latency probe</div>
-                                <div style="color:var(--text-tertiary);margin-bottom:6px;line-height:1.4">Measures the round-trip from injecting a synthetic input into GhostShell to the next snapshot reflecting it.  Doesn't include ViGEmBus/USB/game-poll delay (those are kernel-side).</div>
+                                <div style="color:var(--text-tertiary);margin-bottom:6px;line-height:1.4">Measures the round-trip from injecting a synthetic input into Vispora to the next snapshot reflecting it.  Doesn't include ViGEmBus/USB/game-poll delay (those are kernel-side).</div>
                                 <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
                                     <button class="btn btn-sm" onclick="runLatencyProbe()">Run probe (50 samples)</button>
                                     <span id="gpm-latency-result" style="font-family:var(--font-mono,monospace);color:var(--text-secondary);font-size:11px"></span>
@@ -1976,7 +1976,7 @@
                             <b style="color:#ef4444">Recording…</b>
                             <span id="gpm-macro-rec-timer" style="margin-left:auto;font-family:var(--font-mono,monospace);color:var(--text-bright)">0.0s · 0 events</span>
                         </div>
-                        <div style="font-size:12px;color:var(--text-secondary);line-height:1.5">Press your sequence — keyboard, mouse, controller — anywhere on screen. GhostShell timestamps each press/release. Mouse movement is filtered out. Hit Stop when done.</div>
+                        <div style="font-size:12px;color:var(--text-secondary);line-height:1.5">Press your sequence — keyboard, mouse, controller — anywhere on screen. Vispora timestamps each press/release. Mouse movement is filtered out. Hit Stop when done.</div>
                         <div class="btn-group" style="margin-top:10px">
                             <button class="btn btn-sm btn-primary" onclick="stopMacroRecording(false)">Stop &amp; replace</button>
                             <button class="btn btn-sm" onclick="stopMacroRecording(true)">Stop &amp; append</button>
@@ -2079,7 +2079,7 @@
                             <option value="once">Once (full mag spray)</option>
                             <option value="loop_while_held">Loop while held (rapid SMG)</option>
                         </select>
-                        <label title="Have GhostShell hold RT through the virtual pad while you focus on the counter-pull motion.  Requires Virtual controller mode + master switch on.">Auto-fire</label>
+                        <label title="Have Vispora hold RT through the virtual pad while you focus on the counter-pull motion.  Requires Virtual controller mode + master switch on.">Auto-fire</label>
                         <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="gpm-capture-cp-autofire" /> <span style="font-size:11px;color:var(--text-tertiary)">Push RT via virtual pad for me (controller users)</span></label>
                     </div>
 
@@ -2101,7 +2101,7 @@
                     <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55">
                         Aim at a flat wall in your game (<b>windowed or borderless</b>), click <b>Start</b>, fire your full magazine <b>without moving your aim</b> (don't touch the right stick / mouse).  We screenshot the foreground window at 120 Hz and use FFT-based phase correlation to extract the camera-drift pattern.  After firing, click Stop (or wait for the duration to elapse) and save as a preset.
                         <br/><br/>
-                        <b>Controller user?</b>  Enable <b>Auto-fire</b> below — GhostShell will push RT through your virtual pad so you don't have to hold the trigger yourself.  Requires virtual_controller mode + master switch on.
+                        <b>Controller user?</b>  Enable <b>Auto-fire</b> below — Vispora will push RT through your virtual pad so you don't have to hold the trigger yourself.  Requires virtual_controller mode + master switch on.
                     </div>
                     <div style="display:grid;grid-template-columns:max-content 1fr;gap:8px 12px;font-size:12px;margin-bottom:14px;align-items:center">
                         <label>Preset name</label>
@@ -2121,7 +2121,7 @@
                             <option value="once">Once (full mag spray)</option>
                             <option value="loop_while_held">Loop while held (rapid SMG)</option>
                         </select>
-                        <label title="Have GhostShell hold RT through your virtual pad during the capture window — you don't have to physically touch the trigger.  Requires the active profile in Virtual controller mode + master switch on.">Auto-fire</label>
+                        <label title="Have Vispora hold RT through your virtual pad during the capture window — you don't have to physically touch the trigger.  Requires the active profile in Virtual controller mode + master switch on.">Auto-fire</label>
                         <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="gpm-capture-screen-autofire" /> <span style="font-size:11px;color:var(--text-tertiary)">Push RT via virtual pad for me (controller users)</span></label>
                     </div>
 
@@ -2143,7 +2143,7 @@
                     <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55">
                         Aim at a clean flat wall in a training map (e.g. CS2's <code>aim_botz</code>, Apex firing range, R6's terrorist hunt).  Click <b>Capture before</b>, fire your full magazine <b>without moving your aim</b> (don't touch the right stick / mouse), then click <b>Capture after</b>.  We diff the two screenshots, detect bullet holes via connected components, and sort top-down (first-shot-highest convention).
                         <br/><br/>
-                        <b>Controller user?</b>  Click <b>Auto-fire mag</b> between Before and After — GhostShell will hold RT through your virtual pad for the right duration so you don't need to alt-tab.  Requires virtual_controller mode.
+                        <b>Controller user?</b>  Click <b>Auto-fire mag</b> between Before and After — Vispora will hold RT through your virtual pad for the right duration so you don't need to alt-tab.  Requires virtual_controller mode.
                     </div>
                     <div style="display:grid;grid-template-columns:max-content 1fr;gap:8px 12px;font-size:12px;margin-bottom:14px;align-items:center">
                         <label>Preset name</label>
@@ -2192,7 +2192,7 @@
                 <div class="page-header-row">
                     <div>
                         <div class="section-title">Capture</div>
-                        <div class="section-subtitle">Instant-replay clips and screenshots while you play. Hotkeys work even when GhostShell isn't focused.</div>
+                        <div class="section-subtitle">Instant-replay clips and screenshots while you play. Hotkeys work even when Vispora isn't focused.</div>
                     </div>
                 </div>
             </div>
@@ -2206,7 +2206,7 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg></div>
                 <div class="card-title">Auto stream helper (experimental)</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:720px">
-                    Turn this on and GhostShell takes over: it configures OBS automatically with Game Capture (hook-injected — handles fullscreen-exclusive games way better than display capture), then sets up three separate audio sources on independent tracks so you can mix them in OBS / your broadcast software:
+                    Turn this on and Vispora takes over: it configures OBS automatically with Game Capture (hook-injected — handles fullscreen-exclusive games way better than display capture), then sets up three separate audio sources on independent tracks so you can mix them in OBS / your broadcast software:
                 </p>
                 <ul style="font-size:12.5px;color:var(--text-secondary);margin-top:-4px;margin-bottom:14px;line-height:1.7;padding-left:22px">
                     <li><b>Game audio</b> — captures only the active game's process via per-app WASAPI</li>
@@ -2214,7 +2214,7 @@
                     <li><b>Microphone</b> — your default Windows recording device</li>
                 </ul>
                 <p style="font-size:12.5px;color:var(--text-tertiary);margin-bottom:14px;line-height:1.55;max-width:720px">
-                    The Game Capture + Game Audio sources auto-follow whichever game is in the foreground.  When the toggle is on, the manual Capture controls below are hidden — GhostShell does it all.
+                    The Game Capture + Game Audio sources auto-follow whichever game is in the foreground.  When the toggle is on, the manual Capture controls below are hidden — Vispora does it all.
                 </p>
                 <div class="toggle-row">
                     <div class="toggle-info">
@@ -2224,7 +2224,7 @@
                     <div class="toggle-switch" id="toggle-stream-helper-enabled" onclick="toggleStreamHelper(this)"></div>
                 </div>
                 <div id="stream-helper-status" style="font-size:11.5px;color:var(--text-tertiary);line-height:1.5;padding:8px 10px;background:var(--bg-overlay);border-radius:var(--radius-sm);margin-top:12px">
-                    Off — flip the toggle to let GhostShell take over OBS setup.
+                    Off — flip the toggle to let Vispora take over OBS setup.
                 </div>
                 <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
                     <button class="btn btn-sm" onclick="streamHelperSetup()">Setup scene now</button>
@@ -2236,7 +2236,7 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg></div>
                 <div class="card-title">Instant-replay buffer</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:680px">
-                    A rolling FFmpeg buffer captures the last <span id="clip-buffer-label">30 seconds</span> of your desktop in the background. Press your save-clip hotkey mid-game and GhostShell concats the last N seconds into a single mp4 — like NVIDIA ShadowPlay or Xbox Game Bar's instant replay, but vendor-agnostic. Uses NVENC if you have an NVIDIA GPU, AMF for AMD, QSV for Intel, else libx264.
+                    A rolling FFmpeg buffer captures the last <span id="clip-buffer-label">30 seconds</span> of your desktop in the background. Press your save-clip hotkey mid-game and Vispora concats the last N seconds into a single mp4 — like NVIDIA ShadowPlay or Xbox Game Bar's instant replay, but vendor-agnostic. Uses NVENC if you have an NVIDIA GPU, AMF for AMD, QSV for Intel, else libx264.
                 </p>
                 <div id="clipper-status" style="margin-bottom:14px;font-size:12.5px"></div>
                 <div class="toggle-row">
@@ -2259,7 +2259,7 @@
             <div class="card">
                 <div class="card-title">What to record</div>
                 <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;line-height:1.55">
-                    Pick which monitor GhostShell should capture.  The choice locks in when you turn the buffer on — if you want to switch displays, toggle the buffer off + on after selecting.
+                    Pick which monitor Vispora should capture.  The choice locks in when you turn the buffer on — if you want to switch displays, toggle the buffer off + on after selecting.
                 </p>
                 <div class="filter-row" style="flex-wrap:wrap;gap:14px;align-items:flex-end">
                     <label style="font-size:12.5px;color:var(--text-secondary);display:flex;flex-direction:column;gap:4px;min-width:220px">
@@ -2365,12 +2365,12 @@
             <div class="card">
                 <div class="card-title">OBS Studio backend (experimental)</div>
                 <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;line-height:1.55">
-                    Drives a running OBS Studio instance via the built-in WebSocket plugin instead of GhostShell's FFmpeg path.  OBS uses Windows Graphics Capture which handles fullscreen-exclusive games and high-refresh-rate captures better than FFmpeg's DXGI wrapper.  Requires OBS 28 or newer.
+                    Drives a running OBS Studio instance via the built-in WebSocket plugin instead of Vispora's FFmpeg path.  OBS uses Windows Graphics Capture which handles fullscreen-exclusive games and high-refresh-rate captures better than FFmpeg's DXGI wrapper.  Requires OBS 28 or newer.
                 </p>
                 <div class="toggle-row" style="padding-bottom:6px">
                     <div class="toggle-info">
                         <div class="toggle-name">Use OBS as recorder backend</div>
-                        <div class="toggle-desc">When on, GhostShell drives OBS for recording instead of the bundled FFmpeg pipeline.</div>
+                        <div class="toggle-desc">When on, Vispora drives OBS for recording instead of the bundled FFmpeg pipeline.</div>
                     </div>
                     <div class="toggle-switch" id="toggle-obs-enabled" onclick="toggleObsBackend(this)"></div>
                 </div>
@@ -2411,7 +2411,7 @@
             <div class="card">
                 <div class="card-title">Global hotkeys</div>
                 <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;line-height:1.55">
-                    Click a button below and press the key (or combo) you want.  Escape cancels.  Hotkeys fire from anywhere — even when GhostShell is minimized or you're focused on a game.
+                    Click a button below and press the key (or combo) you want.  Escape cancels.  Hotkeys fire from anywhere — even when Vispora is minimized or you're focused on a game.
                 </p>
                 <div class="filter-row" style="flex-wrap:wrap;gap:14px;align-items:flex-end">
                     <div style="display:flex;flex-direction:column;gap:4px;min-width:230px">
@@ -2577,7 +2577,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h4"/><path d="M14 12h.01"/><path d="M18 12h.01"/></svg>
                         Game Mode
                     </div>
-                    <div class="card-section-desc">When game mode is on, GhostShell watches for any game from the ~280-entry database and applies the gaming profile automatically (priority, P-core affinity, OC, network QoS, foreground-priority). Reverts everything when the game exits.</div>
+                    <div class="card-section-desc">When game mode is on, Vispora watches for any game from the ~280-entry database and applies the gaming profile automatically (priority, P-core affinity, OC, network QoS, foreground-priority). Reverts everything when the game exits.</div>
                     <div id="settings-gamemode-rows">
                         <div style="font-size:13px;color:var(--text-secondary);padding:8px 0">Loading…</div>
                     </div>
@@ -2605,7 +2605,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12l2-2 4 4 8-8 4 4"/><path d="M3 21h18"/></svg>
                         GPU Stock Baseline
                     </div>
-                    <div class="card-section-desc">GhostShell remembers your GPU's true stock clocks (with any active OC backed out) so target / verify math stays accurate. Recapture after a driver update or if stock looks wrong.</div>
+                    <div class="card-section-desc">Vispora remembers your GPU's true stock clocks (with any active OC backed out) so target / verify math stays accurate. Recapture after a driver update or if stock looks wrong.</div>
                     <div id="settings-baseline-info" style="font-size:13px;color:var(--text-secondary);padding:0 0 8px;line-height:1.55">
                         Loading…
                     </div>
@@ -2622,7 +2622,7 @@
                         Snapshots &amp; Restore
                     </div>
                     <div class="card-section-desc">
-                        A snapshot bundles every GhostShell-touched registry path into a restorable backup. GhostShell auto-snapshots before any bulk apply or full reset. You can also create snapshots manually before risky changes — restoring rolls everything back in one click. Reboot is recommended after a full restore.
+                        A snapshot bundles every Vispora-touched registry path into a restorable backup. Vispora auto-snapshots before any bulk apply or full reset. You can also create snapshots manually before risky changes — restoring rolls everything back in one click. Reboot is recommended after a full restore.
                     </div>
                     <div class="form-row" style="margin-bottom:12px">
                         <div class="form-group" style="flex:2">
@@ -2645,7 +2645,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
                         Report a Problem
                     </div>
-                    <div class="card-section-desc">Found a bug? Open a pre-filled GitHub issue with your GhostShell version, hardware info, and the last 30 log lines already attached. GhostShell catches most errors automatically.</div>
+                    <div class="card-section-desc">Found a bug? Open a pre-filled GitHub issue with your Vispora version, hardware info, and the last 30 log lines already attached. Vispora catches most errors automatically.</div>
                     <div class="btn-group">
                         <button class="btn btn-sm btn-primary" onclick="reportProblemManually()">Report a problem</button>
                         <button class="btn btn-sm" onclick="window.open('https://github.com/DeroXP/ghostshell/issues','_blank')">View existing issues</button>
@@ -2658,7 +2658,7 @@
                         About
                     </div>
                     <div id="settings-about" style="font-size:13px;color:var(--text-secondary);line-height:1.7">
-                        <div style="font-size:18px;font-weight:600;color:var(--text-bright);margin-bottom:4px;letter-spacing:-0.01em">GhostShell <span style="color:var(--accent);font-family:var(--font-mono);font-size:14px">v<span id="settings-version">{{ version }}</span></span></div>
+                        <div style="font-size:18px;font-weight:600;color:var(--text-bright);margin-bottom:4px;letter-spacing:-0.01em">Vispora <span style="color:var(--accent);font-family:var(--font-mono);font-size:14px">v<span id="settings-version">{{ version }}</span></span></div>
                         <div>Settings are stored in <code style="color:var(--accent);font-size:12px;background:var(--bg-input);padding:2px 6px;border-radius:4px">%APPDATA%\GhostShell\</code></div>
                     </div>
                 </div>
@@ -2671,7 +2671,7 @@
                 <div class="page-header-row">
                     <div>
                         <div class="section-title">Operation Log</div>
-                        <div class="section-subtitle">Real-time log of every GhostShell operation. Streamed from the in-memory ring buffer (last 2000 lines).</div>
+                        <div class="section-subtitle">Real-time log of every Vispora operation. Streamed from the in-memory ring buffer (last 2000 lines).</div>
                     </div>
                     <div class="page-header-actions">
                         <button class="btn btn-danger" onclick="apiPost('/api/logs/clear').then(()=>{document.getElementById('full-log').innerHTML=''})">Clear Log</button>

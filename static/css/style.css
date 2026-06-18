@@ -37,18 +37,18 @@
     --text-tertiary:  #5a5a64;
     --text-faint:     #38383f;
 
-    /* ── Accent (rare-use green) ─────────────────────────────────────── */
-    --accent:         #5edda2;
-    --accent-bright:  #7eecb8;
-    --accent-deep:    #2ea864;
-    --accent-soft:    rgba(94, 221, 162, 0.10);
-    --accent-mid:     rgba(94, 221, 162, 0.22);
-    --accent-glow:    rgba(94, 221, 162, 0.32);
-    --accent-fg:      #03130b;
+    /* ── Accent (rare-use nacre) ─────────────────────────────────────── */
+    --accent:         #c4c1ff;
+    --accent-bright:  #d9d3ff;
+    --accent-deep:    #9f93e6;
+    --accent-soft:    rgba(196, 193, 255, 0.10);
+    --accent-mid:     rgba(196, 193, 255, 0.22);
+    --accent-glow:    rgba(196, 193, 255, 0.34);
+    --accent-fg:      #0a0814;
 
     /* ── Status ──────────────────────────────────────────────────────── */
-    --success:        #5edda2;
-    --success-soft:   rgba(94, 221, 162, 0.10);
+    --success:        #c4c1ff;
+    --success-soft:   rgba(196, 193, 255, 0.10);
     --warning:        #f0b341;
     --warning-soft:   rgba(240, 179, 65, 0.10);
     --danger:         #f06464;
@@ -75,12 +75,15 @@
     --shadow:    0 4px 16px rgba(0, 0, 0, 0.5);
     --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.6);
 
-    /* ── Gradients removed in the Win11 cleanup pass.  Aliases kept as
-       'none' so any straggler `background-image: var(--grad-card)`
-       reference becomes a no-op rather than breaking layout. */
-    --grad-card:       none;
-    --grad-card-hover: none;
-    --grad-hero:       none;
+    /* ── Iridescent nacre gradient — the canonical oil-slick sweep used
+       for accents/decorative sheens (mint → periwinkle → lilac → rose). */
+    --accent-gradient: linear-gradient(115deg, #a7f0e4 0%, #b8c8ff 32%, #d9b8ff 58%, #ffc4e6 82%, #a7f0e4 100%);
+
+    /* ── Card/hero sheens — revived as SUBTLE low-alpha nacre washes so
+       modals, cards and pin-keys pick up a faint oil-slick automatically. */
+    --grad-card:       linear-gradient(140deg, rgba(167, 240, 228, 0.06), rgba(217, 184, 255, 0.05), rgba(255, 196, 230, 0.05));
+    --grad-card-hover: linear-gradient(140deg, rgba(167, 240, 228, 0.10), rgba(217, 184, 255, 0.09), rgba(255, 196, 230, 0.09));
+    --grad-hero:       linear-gradient(140deg, rgba(167, 240, 228, 0.09), rgba(184, 200, 255, 0.07), rgba(217, 184, 255, 0.08), rgba(255, 196, 230, 0.08));
 
     /* ── Back-compat aliases (old inline styles) ─────────────────────── */
     --bg-void:        var(--bg-base);
@@ -180,7 +183,7 @@ body::before {
     width: 18px;
     height: 18px;
     color: var(--accent);
-    filter: drop-shadow(0 0 8px rgba(94, 221, 162, 0.4));
+    filter: drop-shadow(0 0 8px rgba(196, 193, 255, 0.4));
 }
 .titlebar-version {
     font-size: 11px;
@@ -907,7 +910,7 @@ select {
 }
 select:hover { border-color: var(--border-strong); }
 select:focus {
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%235edda2' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23c4c1ff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
 }
 select option {
     background: var(--bg-overlay);
@@ -1124,7 +1127,7 @@ select option {
     font-weight: 600;
     letter-spacing: -0.005em;
 }
-.status-badge.ok      { background: var(--accent-soft);  color: var(--accent); box-shadow: 0 0 0 1px rgba(94,221,162,0.20); }
+.status-badge.ok      { background: var(--accent-soft);  color: var(--accent); box-shadow: 0 0 0 1px rgba(196,193,255,0.20); }
 .status-badge.warn    { background: var(--warning-soft); color: var(--warning); box-shadow: 0 0 0 1px rgba(240,179,65,0.20); }
 .status-badge.danger  { background: var(--danger-soft);  color: var(--danger);  box-shadow: 0 0 0 1px rgba(240,100,100,0.20); }
 .status-badge.neutral { background: var(--bg-hover);     color: var(--text-secondary); }
@@ -1404,7 +1407,7 @@ input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-of
     border: 1px solid var(--border);
     color: var(--text-secondary);
 }
-.page-pill.ok      { background: var(--accent-soft);  color: var(--accent); border-color: rgba(94,221,162,0.20); }
+.page-pill.ok      { background: var(--accent-soft);  color: var(--accent); border-color: rgba(196,193,255,0.20); }
 .page-pill.warn    { background: var(--warning-soft); color: var(--warning); border-color: rgba(240,179,65,0.20); }
 .page-pill.danger  { background: var(--danger-soft);  color: var(--danger);  border-color: rgba(240,100,100,0.20); }
 .page-pill-dot {
@@ -1980,7 +1983,7 @@ input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-of
     border: 1px solid var(--border);
     flex-shrink: 0;
 }
-.input-dev-pill.high   { background: var(--accent-soft);  color: var(--accent); border-color: rgba(94,221,162,0.20); }
+.input-dev-pill.high   { background: var(--accent-soft);  color: var(--accent); border-color: rgba(196,193,255,0.20); }
 .input-dev-pill.normal { background: rgba(255,255,255,0.04); color: var(--text); }
 .input-dev-pill.low    { background: var(--warning-soft); color: var(--warning); border-color: rgba(240,179,65,0.20); }
 
@@ -2143,7 +2146,7 @@ input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-of
 }
 @keyframes liveDotPulse {
     0%, 100% { box-shadow: 0 0 0 0   var(--accent-glow); transform: scale(1); }
-    50%      { box-shadow: 0 0 0 6px rgba(94, 221, 162, 0); transform: scale(1.05); }
+    50%      { box-shadow: 0 0 0 6px rgba(196, 193, 255, 0); transform: scale(1.05); }
 }
 
 /* ═════════════════════════════════════════════════════════════════

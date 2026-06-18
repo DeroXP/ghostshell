@@ -79,10 +79,10 @@ async def lifespan(app: FastAPI):
 
 # ─── App ─────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="GhostShell-Cloud",
+    title="Vispora",
     version=settings.version,
     description=(
-        "Backend service for GhostShell v3.  Zero-knowledge license "
+        "Backend service for Vispora v3.  Zero-knowledge license "
         "enforcement, anonymous device identity, opt-in telemetry."
     ),
     lifespan=lifespan,

@@ -35,7 +35,7 @@ from typing import Optional
 # only two pieces of state hard-coded into the binary — everything else
 # (target dir, channel, etc) comes from args or install_info.json so the
 # updater stays usable across re-locations.
-UPDATER_VERSION  = "1.3.0"
+UPDATER_VERSION  = "1.4.0"
 SERVER_URL_DEFAULT = "https://ghostshell-site.up.railway.app"
 
 # ─── Paths ───────────────────────────────────────────────────────────
@@ -126,9 +126,11 @@ def main():
     # If target_exe is set but target_dir isn't, derive it
     if target_exe and not target_dir:
         target_dir = os.path.dirname(target_exe)
-    # If target_dir is set but target_exe isn't, default to GhostShell.exe
+    # If target_dir is set but target_exe isn't, pick rename-aware
+    # (Vispora.exe if present, else GhostShell.exe).
     if target_dir and not target_exe:
-        target_exe = os.path.join(target_dir, "GhostShell.exe")
+        from updater.installer import pick_app_exe
+        target_exe = pick_app_exe(target_dir)
 
     # v1.1.0 — if we don't know where GhostShell is (no args, no install
     # info), scan the PC for an existing install.  Found → update mode
@@ -137,7 +139,7 @@ def main():
     mode = "update"
     scan_result = None
     if not target_exe:
-        from updater.installer import find_existing_ghostshell, default_install_dir
+        from updater.installer import find_existing_ghostshell, default_install_dir, pick_app_exe
         scan_result = find_existing_ghostshell()
         if scan_result.get("found"):
             target_exe = scan_result["path"]
@@ -149,7 +151,7 @@ def main():
         else:
             mode = "install"
             target_dir = default_install_dir()
-            target_exe = os.path.join(target_dir, "GhostShell.exe")
+            target_exe = pick_app_exe(target_dir)
             log(f"auto-scan: no existing GhostShell — install mode, "
                 f"default dir {target_dir}")
     else:

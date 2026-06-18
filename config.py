@@ -1,9 +1,15 @@
-"""GhostShell Configuration Constants."""
+"""Vispora Configuration Constants."""
 import os
 
-APP_NAME = "GhostShell"
-APP_VERSION = "3.4.3"
+APP_NAME = "Vispora"
+APP_VERSION = "3.5.0-beta.1"
 APP_PORT = 5987
+
+# Vispora rebrand note: the on-disk AppData folder, the update-server host, the
+# update routes, and (for now) the shipped exe filename DELIBERATELY stay named
+# "GhostShell" so the existing installed base keeps auto-updating and keeps its
+# saved data (profiles, license, OC baselines).  Only user-visible branding +
+# the theme changed in this release.  See APPDATA_DIR below.
 
 # v3 — release channel + update server.  Default flipped to "stable"
 # now that v3.0.0 has shipped as the first stable build.  Beta channel
@@ -11,11 +17,13 @@ APP_PORT = 5987
 APP_CHANNEL_DEFAULT = "stable"
 UPDATE_SERVER_URL_DEFAULT = "https://ghostshell-site.up.railway.app"
 UPDATE_CHECK_INTERVAL_SEC = 3600    # check once per hour while running
-UPDATE_STATE_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "GhostShell", "update_state.json")
-PENDING_UPDATE_PATH = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "GhostShell", "pending_update.exe")
 
-# Paths
+# Paths.  APPDATA_DIR stays "GhostShell" on purpose (see rebrand note up top) —
+# renaming it would strand every existing user's saved data and desync the
+# standalone updater, which independently computes this same path.
 APPDATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "GhostShell")
+UPDATE_STATE_PATH = os.path.join(APPDATA_DIR, "update_state.json")
+PENDING_UPDATE_PATH = os.path.join(APPDATA_DIR, "pending_update.exe")
 VAULT_DB_PATH = os.path.join(APPDATA_DIR, "vault.db")
 LOG_FILE_PATH = os.path.join(APPDATA_DIR, "ghostshell.log")
 BACKUP_DIR = os.path.join(APPDATA_DIR, "backups")

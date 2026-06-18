@@ -93,7 +93,7 @@ function _ensureToastInfra() {
                 'flex-direction:column-reverse;gap:10px;z-index:99999;pointer-events:none;' +
                 'max-width:380px;font-family:Segoe UI,system-ui,sans-serif}' +
             '.gs-toast{pointer-events:auto;background:#13131a;border:1px solid #2a2a36;' +
-                'border-left:3px solid #5edda2;border-radius:6px;padding:12px 14px 12px 14px;' +
+                'border-left:3px solid #c4c1ff;border-radius:6px;padding:12px 14px 12px 14px;' +
                 'box-shadow:0 6px 16px rgba(0,0,0,0.45);color:#f5f5f7;font-size:12.5px;' +
                 'line-height:1.5;opacity:0;transform:translateX(20px);' +
                 'transition:opacity 240ms ease,transform 240ms ease;position:relative}' +
@@ -101,12 +101,12 @@ function _ensureToastInfra() {
             '.gs-toast.is-leaving{opacity:0;transform:translateX(20px)}' +
             '.gs-toast.gs-error{border-left-color:#f0888c;background:#1a1316}' +
             '.gs-toast.gs-warn{border-left-color:#fbbf24;background:#1a1714}' +
-            '.gs-toast.gs-info{border-left-color:#5edda2}' +
+            '.gs-toast.gs-info{border-left-color:#c4c1ff}' +
             '.gs-toast .gs-toast-title{font-weight:600;color:#f5f5f7;margin-bottom:4px;' +
                 'display:flex;align-items:center;gap:6px}' +
             '.gs-toast.gs-error .gs-toast-title{color:#f0888c}' +
             '.gs-toast.gs-warn .gs-toast-title{color:#fbbf24}' +
-            '.gs-toast.gs-info .gs-toast-title{color:#5edda2}' +
+            '.gs-toast.gs-info .gs-toast-title{color:#c4c1ff}' +
             '.gs-toast .gs-toast-msg{color:#c0c0c8;font-size:12px}' +
             '.gs-toast .gs-toast-sub{color:#7a7a82;font-size:11px;margin-top:6px;' +
                 'line-height:1.4;font-style:italic}' +
@@ -199,7 +199,7 @@ function showErrorToast(message, opts) {
     if (opts.submit !== false) {
         try {
             apiPost('/api/errors/submit', {
-                kind:      opts.kind || 'GhostShell error',
+                kind:      opts.kind || 'Vispora error',
                 message:   String(message || '').slice(0, 1000),
                 detail:    opts.detail || '',
                 user_note: opts.userNote || '',
@@ -207,7 +207,7 @@ function showErrorToast(message, opts) {
         } catch (_) { /* apiPost might not be defined yet during early errors */ }
     }
     return _showToast('error',
-        opts.title || 'GhostShell ran into an error',
+        opts.title || 'Vispora ran into an error',
         message,
         opts);
 }
@@ -273,7 +273,7 @@ async function _buildIssueBody(kind, message, detail) {
         '**Message:** `' + message + '`\n\n' +
         (detail ? ('**Detail:**\n```\n' + detail.slice(0, 1500) + '\n```\n\n') : '') +
         '## Environment\n\n' +
-        '- GhostShell: `' + v + '`\n' +
+        '- Vispora: `' + v + '`\n' +
         '- OS: `' + os + '`\n' +
         '- GPU: `' + gpu + '`\n' +
         '- CPU: `' + cpu + '`\n' +
@@ -308,7 +308,7 @@ function showErrorReportModal(kind, message, detail) {
             'border-radius:4px;font-size:10px;color:var(--text-dim);overflow:auto;max-height:160px;white-space:pre-wrap">' +
             d + '</pre></details>' : '') +
         '<div style="font-size:11px;color:var(--text-dim);line-height:1.5;margin-bottom:8px">' +
-            'GhostShell hit an unexpected error.  Send it to the maintainer ' +
+            'Vispora hit an unexpected error.  Send it to the maintainer ' +
             '(via Railway) and it\'ll get triaged + patched — no GitHub account needed. ' +
             'Payload: your hardware, recent logs, this error.  No personal data.' +
         '</div>' +
@@ -512,7 +512,7 @@ async function _apiHandle(url, fetchPromise) {
         // fire for our own error endpoints (would recurse).
         if (e && e.name !== 'AbortError' && /failed to fetch|network/i.test(msg)
             && !_isErrorReportPath) {
-            _maybeReportError('Cannot reach GhostShell backend', msg, 'URL: ' + url);
+            _maybeReportError('Cannot reach Vispora backend', msg, 'URL: ' + url);
         }
         return { ok: false, err: msg };
     }
@@ -605,7 +605,7 @@ async function closeWindow() {
 
 function showCloseChoiceModal() {
     openModal(
-        '<div class="modal-title">CLOSE GHOSTSHELL</div>' +
+        '<div class="modal-title">CLOSE VISPORA</div>' +
         '<div style="font-size:12px;color:var(--text-dim);margin-bottom:14px">' +
             'How would you like to close the app?' +
         '</div>' +
@@ -622,7 +622,7 @@ function showCloseChoiceModal() {
                     'nothing automatically. Click the tray icon to bring it back.</div>' +
             '</button>' +
             '<button class="close-choice-btn close-choice-quit" onclick="quitApp()">' +
-                '<div class="close-choice-title">✕ Quit GhostShell</div>' +
+                '<div class="close-choice-title">✕ Quit Vispora</div>' +
                 '<div class="close-choice-desc">Fully exit the app. Any active gaming tweaks ' +
                     'are reverted to normal first.</div>' +
             '</button>' +
@@ -659,7 +659,7 @@ async function closeToTrayOnly() {
 
 async function quitApp() {
     closeModal();
-    addLog('Quitting GhostShell...');
+    addLog('Quitting Vispora...');
     // Best-effort POST — the backend exits ~500ms later, the response
     // may or may not arrive depending on timing.  Either way, the app dies.
     try { await apiPost('/api/window/quit', {}, { timeoutMs: 3000 }); } catch (e) {}
@@ -721,14 +721,14 @@ async function loadSettingsPage() {
             : '';
         sEl.innerHTML =
             _settingsToggle(
-                'Start GhostShell at Windows login',
+                'Start Vispora at Windows login',
                 'Launches in the system tray ' + (autoStart.delay_seconds || 30) +
                 's after login so it doesn\'t slow your boot. ' + methodNote,
                 !!autoStart.enabled,
                 'toggleAutostart(this)') +
             _settingsRow(
                 'Login launch delay',
-                'How many seconds after login GhostShell waits before launching.',
+                'How many seconds after login Vispora waits before launching.',
                 '<input type="number" id="autostart-delay-input" min="0" max="600" value="' +
                     (autoStart.delay_seconds || 30) + '" ' +
                     'style="width:80px;background:var(--bg-input);border:1px solid var(--border);' +
@@ -741,7 +741,7 @@ async function loadSettingsPage() {
         }
         if (autoStart.legacy_run_key_present) {
             sEl.innerHTML += '<div style="font-size:10px;color:var(--orange);margin-top:8px">' +
-                'ⓘ Legacy Run-key entry detected from an older GhostShell version. ' +
+                'ⓘ Legacy Run-key entry detected from an older Vispora version. ' +
                 'Toggle autostart off then on again to clean it up.</div>';
         }
     }
@@ -757,7 +757,7 @@ async function loadSettingsPage() {
                 'Pulls the new build as soon as one is detected, before you click Install.',
                 !!updaterS.auto_download, "toggleUpdaterField(this, 'auto_download')") +
             _settingsToggle('Install updates silently',
-                'Apply updates and restart GhostShell with no prompt.  Off by default.',
+                'Apply updates and restart Vispora with no prompt.  Off by default.',
                 !!updaterS.auto_install, "toggleUpdaterField(this, 'auto_install')") +
             // v3 — channel + server-URL.  Default 'beta' until first stable
             // build ships; 'stable' shows a "coming soon" empty state on the
@@ -779,7 +779,7 @@ async function loadSettingsPage() {
             // in config.UPDATE_SERVER_URL_DEFAULT.
             _settingsRow(
                 'Update server',
-                'Where GhostShell pulls updates from.  Leave alone unless you\'re self-hosting.',
+                'Where Vispora pulls updates from.  Leave alone unless you\'re self-hosting.',
                 '<input type="text" id="updater-server-input" value="' + escAttr(updaterS.server_url || '') + '" ' +
                   'onchange="setUpdaterServerUrl(this.value)" ' +
                   'placeholder="https://ghostshell-site.up.railway.app" ' +
@@ -872,7 +872,7 @@ async function setUpdaterChannel(channel) {
     if (channel === 'beta') {
         if (!confirm('Switch to the Beta channel?\n\n' +
             'Beta builds get new features first and may have rough edges. ' +
-            'GhostShell will auto-update to whatever the latest beta is.\n\n' +
+            'Vispora will auto-update to whatever the latest beta is.\n\n' +
             'You can switch back to Stable anytime in Settings.\n\n' +
             'Continue?')) {
             var sel = document.getElementById('updater-channel-select');
@@ -955,7 +955,7 @@ async function loadSnapshots() {
     if (!c) return;
     if (snaps.length === 0) {
         c.innerHTML = '<div class="empty-state">No snapshots yet. ' +
-            'GhostShell auto-snapshots before any bulk apply or full reset, ' +
+            'Vispora auto-snapshots before any bulk apply or full reset, ' +
             'or you can take one manually before risky changes.</div>';
         return;
     }
@@ -1053,8 +1053,8 @@ function _renderGameModeSection(settings, status) {
     var dbCount = status.known_game_count != null ? status.known_game_count : '?';
     el.innerHTML =
         _settingsToggle(
-            'Auto-enable game mode at GhostShell launch',
-            'Starts the game-detection monitor automatically when GhostShell boots so any game you launch afterwards gets the gaming profile applied.',
+            'Auto-enable game mode at Vispora launch',
+            'Starts the game-detection monitor automatically when Vispora boots so any game you launch afterwards gets the gaming profile applied.',
             !!settings.auto_enable_on_boot,
             "toggleGameModeAutoEnable(this)") +
         '<div style="font-size:10px;color:var(--text-dim);margin-top:8px">' +
@@ -1241,7 +1241,7 @@ async function installDriver() {
     addLog('Launching driver installer...');
     var r = await apiPost('/api/driver/install', {});
     if (r && r.ok) {
-        addLog('Installer launched. Follow the NVIDIA setup prompts — GhostShell will confirm once the new driver is active.');
+        addLog('Installer launched. Follow the NVIDIA setup prompts — Vispora will confirm once the new driver is active.');
     } else {
         addLog('Install failed: ' + ((r && r.err) || 'unknown'));
     }
@@ -1469,7 +1469,7 @@ function debloatSelectAll(val) {
 // service the debloater turned off, restoring each to its recorded
 // original start type (or Manual as a safe fallback).
 async function restoreDebloatServices() {
-    if (!confirm('Re-enable all Windows services that GhostShell disabled?\n\n'
+    if (!confirm('Re-enable all Windows services that Vispora disabled?\n\n'
                  + 'Each service is restored to its original start type '
                  + '(the state it was in before you debloated).')) return;
     var btn = document.getElementById('btn-restore-svc');
@@ -2607,17 +2607,17 @@ async function genForField(fieldId) {
 // FULL GHOST
 // ═══════════════════════════════════════════════════════════════
 async function runFullGhost() {
-    if (!confirm('⚡ FULL GHOST MODE\n\nThis will run ALL modules:\n• Debloat\n• Optimize\n• Network\n• GPU\n• Privacy\n• Cleaner\n\nCreate a restore point first!\nContinue?')) return;
+    if (!confirm('⚡ FULL SPECTRUM MODE\n\nThis will run ALL modules:\n• Debloat\n• Optimize\n• Network\n• GPU\n• Privacy\n• Cleaner\n\nCreate a restore point first!\nContinue?')) return;
 
     switchPage('logs');
     termWrite('full-log', '╔══════════════════════════════════════╗');
-    termWrite('full-log', '║     FULL GHOST MODE ACTIVATED        ║');
+    termWrite('full-log', '║   FULL SPECTRUM MODE ACTIVATED       ║');
     termWrite('full-log', '╚══════════════════════════════════════╝');
 
     await apiPost('/api/full-ghost');
 
     termWrite('full-log', '');
-    termWrite('full-log', '═══ FULL GHOST COMPLETE ═══');
+    termWrite('full-log', '═══ FULL SPECTRUM COMPLETE ═══');
     termWrite('full-log', 'A system restart is recommended to apply all changes.');
 
     ['debloat', 'optimize', 'network', 'gpu', 'privacy', 'cleaner'].forEach(function(m) { updateBadge(m, true); });
@@ -2742,9 +2742,12 @@ function runBootSplash() {
         var h = canvas.height / dpr;
         ctx.fillStyle = 'rgba(10, 11, 13, 0.12)';
         ctx.fillRect(0, 0, w, h);
-        ctx.fillStyle = '#5edda2';
         ctx.font = fontSize + 'px JetBrains Mono, monospace';
+        // Iridescent oil-slick rain — each column cycles through the four
+        // Nacre stops (mint → periwinkle → lilac → rose) by column index.
+        var rainStops = ['#a7f0e4', '#b8c8ff', '#d9b8ff', '#ffc4e6'];
         for (var i = 0; i < drops.length; i++) {
+            ctx.fillStyle = rainStops[i % 4];
             var ch = chars[Math.floor(Math.random() * chars.length)];
             ctx.fillText(ch, i * fontSize, drops[i] * fontSize);
             if (drops[i] * fontSize > h && Math.random() > 0.975) drops[i] = 0;
@@ -2859,7 +2862,7 @@ function showUpdateModal() {
         if (!s.update_available) {
             openModal(
                 '<div class="modal-title">UP TO DATE</div>' +
-                '<p style="color:var(--text-dim)">GhostShell v' + escHtml(s.current_version) + ' is the latest version.</p>' +
+                '<p style="color:var(--text-dim)">Vispora v' + escHtml(s.current_version) + ' is the latest version.</p>' +
                 _renderUpdaterSettingsBlock(s.settings || {}) +
                 '<div class="modal-actions"><button class="btn" onclick="closeModal()">Close</button></div>'
             );
@@ -2908,7 +2911,7 @@ function _renderUpdaterSettingsBlock(s) {
     return '<div style="margin:10px 0 6px;font-size:10px;letter-spacing:1px;color:var(--text-dim);text-transform:uppercase">Update settings</div>' +
         row('auto_check',    'Check automatically',     'Look for new versions on launch + every 6 hours') +
         row('auto_download', 'Download in background',  'Pull the new build as soon as one is detected') +
-        row('auto_install',  'Install silently',        'Apply update + restart GhostShell with no prompt');
+        row('auto_install',  'Install silently',        'Apply update + restart Vispora with no prompt');
 }
 
 async function toggleUpdaterSetting(el, key) {
@@ -2947,14 +2950,14 @@ async function installUpdateNow() {
     var modal = document.getElementById('modal-content');
     if (modal) modal.innerHTML =
         '<div class="modal-title">INSTALLING...</div>' +
-        '<p style="color:var(--text-dim);font-size:11px;text-align:center">GhostShell will close and restart in a moment.</p>';
+        '<p style="color:var(--text-dim);font-size:11px;text-align:center">Vispora will close and restart in a moment.</p>';
 
     var r = await apiPost('/api/updater/install', {}, { timeoutMs: 10000 });
     if (r && r.ok) {
         addLog('Update install triggered — exiting in ~1s.');
         if (modal) modal.innerHTML =
             '<div class="modal-title" style="color:var(--accent)">UPDATING</div>' +
-            '<p style="color:var(--text-dim);font-size:11px;text-align:center">' + escHtml(r.msg || 'GhostShell is restarting.') + '</p>';
+            '<p style="color:var(--text-dim);font-size:11px;text-align:center">' + escHtml(r.msg || 'Vispora is restarting.') + '</p>';
     } else {
         var err = (r && r.err) || 'unknown';
         addLog('Install failed: ' + err);
@@ -2976,7 +2979,7 @@ async function _pollUpdaterStatus() {
             if (s.download_complete && !_updaterState.toastShown && _updaterState.lastSeen !== s.latest_version) {
                 _updaterState.toastShown = true;
                 _updaterState.lastSeen = s.latest_version;
-                showUpdateToast('GhostShell v' + s.latest_version + ' is ready to install.');
+                showUpdateToast('Vispora v' + s.latest_version + ' is ready to install.');
             }
         }
     } catch (e) { /* silent — periodic poll */ }
@@ -3131,7 +3134,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // everything else can wait a beat so the UI feels snappier on launch.
     runBootSplash();
     loadDashboard();
-    addLog('GhostShell initialized');
+    addLog('Vispora initialized');
 
     // Defer the secondary widgets to the next idle frame — pollLogs alone
     // won't fire for 2 s after that, well past first paint.
@@ -3994,7 +3997,7 @@ async function showHidHideDiagnostic() {
     var devs = d.devices || [];
     var lines = devs.map(function(x){
         var icon = x.is_vigembus ? '✓' : (x.will_hide ? '◉' : '○');
-        var note = x.is_vigembus ? 'GhostShell virtual (kept visible)'
+        var note = x.is_vigembus ? 'Vispora virtual (kept visible)'
                   : x.will_hide ? 'Will be hidden from games'
                   : 'Not currently in hide list';
         var vidPid = (x.vid && x.pid) ? (' [VID_' + x.vid + ' PID_' + x.pid + ']') : '';
@@ -4023,7 +4026,7 @@ async function forceEngageHidHide() {
         var msg = (r && r.err) ? r.err : 'Engagement failed for an unknown reason';
         showErrorToast('HidHide engagement failed: ' + msg +
               '. Common causes: HidHide CLI missing (reinstall HidHide), ' +
-              'controller not detected (reconnect), or GhostShell not running as admin.',
+              'controller not detected (reconnect), or Vispora not running as admin.',
               { timeoutMs: 12000 });
         _updateHidHideStatusBadge();
     }
@@ -4222,7 +4225,7 @@ async function runLatencyProbe() {
         '<br><span style="color:var(--text-tertiary);font-size:10px">' +
         r.valid + '/' + r.samples + ' samples observed' +
         (r.timeouts ? ' · ' + r.timeouts + ' timeouts' : '') +
-        ' · GhostShell pipeline only (excludes ViGEmBus/USB/game poll)' +
+        ' · Vispora pipeline only (excludes ViGEmBus/USB/game poll)' +
         '</span>';
 }
 
@@ -4240,7 +4243,7 @@ async function exportProfile() {
     var text = JSON.stringify(r.blob, null, 2);
     try {
         await navigator.clipboard.writeText(text);
-        showInfoToast('Profile copied to clipboard (' + text.length + ' chars). Paste into a text file or share with another GhostShell user via Import.');
+        showInfoToast('Profile copied to clipboard (' + text.length + ' chars). Paste into a text file or share with another Vispora user via Import.');
     } catch (e) {
         // Fallback — show in a prompt() so the user can manually copy
         prompt('Copy this profile JSON:', text);
@@ -6432,7 +6435,7 @@ function _renderLibrary() {
     }
     var when = new Date(data.scanned_at * 1000);
     summary.innerHTML = '<b>' + data.total + '</b> installed games detected · ' +
-        '<b>' + data.known + '</b> recognized by GhostShell · ' +
+        '<b>' + data.known + '</b> recognized by Vispora · ' +
         'last scan ' + when.toLocaleString();
 
     var games = (data.games || []).slice();
@@ -7447,8 +7450,8 @@ async function removeMenuSignature(exe, index) {
 // still calls it doesn't blow up.  GhostShell no longer starts RTSS
 // from any path; if a user wants it running they launch it themselves.
 async function startRtss() {
-    showInfoToast('RTSS is no longer auto-launched by GhostShell. Start it '
-        + 'yourself from the Start menu if you want it running — GhostShell '
+    showInfoToast('RTSS is no longer auto-launched by Vispora. Start it '
+        + 'yourself from the Start menu if you want it running — Vispora '
         + 'will still detect it for the OC-tool conflict warning.',
         { title: 'RTSS auto-launch removed', timeoutMs: 8000 });
 }
@@ -7726,11 +7729,11 @@ async function loadHWMonPage() {
 // ═══ Live Performance sampler (Hardware Monitor card) ═══
 var _perfPollTimer = null;
 var _perfChartColors = {
-    core:  '#5edda2',
-    mem:   '#7eecb8',
+    core:  '#c4c1ff',
+    mem:   '#a7f0e4',
     temp:  '#f0b341',
-    power: '#5edda2',
-    util:  '#5edda2',
+    power: '#b8c8ff',
+    util:  '#d9b8ff',
     fan:   '#a0a0a8',
 };
 var _perfChartUnits = {
@@ -8072,7 +8075,7 @@ async function loadOcCapability() {
         el.innerHTML =
             '<div style="color:var(--text-secondary)">Overclocking isn\'t available for your GPU.</div>' +
             '<div style="margin-top:4px;font-size:11px;color:var(--text-tertiary)">' +
-              'GhostShell\'s OC + Adaptive Tuning are NVIDIA-only right now. ' +
+              'Vispora\'s OC + Adaptive Tuning are NVIDIA-only right now. ' +
               'Detected: <b>' + escHtml((cap.vendor || 'unknown').toUpperCase()) + '</b> — ' +
               escHtml(cap.name || 'unknown') + '. ' +
               'Temperature, load, and clock telemetry still work for your GPU.' +
@@ -8429,7 +8432,7 @@ async function clearCrashRecoveryHistory() {
 }
 
 async function clearCrashRecoveryBlacklist() {
-    if (!confirm('Clear the per-game crash blacklist for ALL games?\n\nGhostShell will stop avoiding offsets that previously crashed.')) return;
+    if (!confirm('Clear the per-game crash blacklist for ALL games?\n\nVispora will stop avoiding offsets that previously crashed.')) return;
     await apiDelete('/api/gpu/crash-recovery/blacklist');
     termWrite('gpu-terminal', '✓ Crash blacklist cleared.');
     loadCrashRecoveryHistory();
@@ -8439,7 +8442,7 @@ async function testCrashRecovery() {
     if (!confirm('Fire a TEST crash-recovery event?\n\nThis writes a fake entry to the blacklist + history and fires the toast notification — but does NOT actually step down your saved profile.')) return;
     // Use core+1/mem+1 sentinel values so the test doesn't touch real blacklist entries.
     var r = await apiPost('/api/gpu/crash-recovery/test',
-        { exe: '__test__.exe', display_name: 'GhostShell Test', core: 1, mem: 1 });
+        { exe: '__test__.exe', display_name: 'Vispora Test', core: 1, mem: 1 });
     if (r && r.crashed) {
         termWrite('gpu-terminal',
             '✓ Test crash-recovery event fired (kind=' + r.kind + '). Toast should appear within 1-2s.');
@@ -8508,7 +8511,7 @@ async function verifyAppliedOc() {
                 '<b>⚠ Conflicting OC tool detected:</b> ' + names + '<br>' +
                 '<span style="color:var(--text-dim);font-size:10px">' +
                 'Close it (and disable its "Apply at Windows startup" option) before ' +
-                'applying OC in GhostShell — it re-asserts its own offsets every few ' +
+                'applying OC in Vispora — it re-asserts its own offsets every few ' +
                 'seconds and silently overrides our writes.</span></div>';
         }
     } catch (e) { /* silent */ }
@@ -9779,7 +9782,7 @@ async function _refreshDependencyBanner() {
     // ── State 2: restart pending ───────────────────────────────────
     if (restart && restart.pending) {
         var sources = [];
-        if (restart.by_ghostshell) sources.push('GhostShell drivers');
+        if (restart.by_ghostshell) sources.push('Vispora drivers');
         if (restart.by_windows)    sources.push('Windows updates');
         banner.style.display = '';
         banner.style.borderLeft = '3px solid var(--warning)';
@@ -9820,7 +9823,7 @@ async function restartNowAfterDeps() {
 async function restartLater() {
     var r = await apiPost('/api/dependencies/restart-later', {});
     if (r && r.ok) {
-        addLog('Restart deferred — will re-prompt on next GhostShell launch');
+        addLog('Restart deferred — will re-prompt on next Vispora launch');
         _refreshDependencyBanner();
     }
 }
@@ -9859,9 +9862,9 @@ function _showRecoveryApologyToast(report) {
     toast.className = 'post-install-toast ok';
     toast.style.borderLeft = '4px solid var(--accent)';
     toast.innerHTML =
-        '<div class="post-install-toast-title">GhostShell auto-fixed ' + n + ' legacy tweak' + (n !== 1 ? 's' : '') + '</div>' +
+        '<div class="post-install-toast-title">Vispora auto-fixed ' + n + ' legacy tweak' + (n !== 1 ? 's' : '') + '</div>' +
         '<div class="post-install-toast-msg">' +
-        'An earlier version of GhostShell applied ' + n + ' setting' + (n !== 1 ? 's' : '') +
+        'An earlier version of Vispora applied ' + n + ' setting' + (n !== 1 ? 's' : '') +
         ' that turned out to cause problems (Bluetooth audio glitches, SSD wear, broken Outlook search, etc.).  ' +
         'Sorry — we\'ve reverted them on your system.  ' +
         '<a href="#" onclick="_showRecoveryDetailsModal();return false;" style="color:var(--accent-bright);text-decoration:underline">' +
@@ -9892,7 +9895,7 @@ function _showRecoveryDetailsModal() {
             '<div style="padding:18px 22px;max-width:680px">' +
             '<h2 style="margin:0 0 8px;color:var(--text-bright);font-size:18px">A quick apology + what we changed</h2>' +
             '<p style="color:var(--text-secondary);font-size:13px;line-height:1.55;margin-bottom:14px">' +
-            'A pre-stable audit of GhostShell\'s optimizer caught several tweaks that older builds applied which actively cause problems on modern Windows.  We removed them from Apply All — and for users like you who already ran an older build, GhostShell scanned the registry on startup and reverted whatever it found.  Below is the full list of what changed on your machine.' +
+            'A pre-stable audit of Vispora\'s optimizer caught several tweaks that older builds applied which actively cause problems on modern Windows.  We removed them from Apply All — and for users like you who already ran an older build, Vispora scanned the registry on startup and reverted whatever it found.  Below is the full list of what changed on your machine.' +
             '</p>' +
             '<div style="background:var(--bg-overlay);border-radius:6px;padding:6px 0;margin-bottom:14px">';
         r.reverted.forEach(function(item) {
@@ -10247,7 +10250,7 @@ function _renderObsStatus(d) {
                         escHtml(det.version || '') + ' detected</span> ' +
                         '<span style="color:var(--text-tertiary)">at <span style="font-family:var(--font-mono);font-size:11px">' +
                         escHtml(det.path || '') + '</span></span><br>' +
-                        '<span style="color:var(--text-tertiary)">Toggle on to switch GhostShell\'s recorder backend from FFmpeg to OBS.</span>';
+                        '<span style="color:var(--text-tertiary)">Toggle on to switch Vispora\'s recorder backend from FFmpeg to OBS.</span>';
         return;
     }
     // Toggle is ON — check connection
@@ -10264,10 +10267,10 @@ function _renderObsStatus(d) {
             recLine = '<span style="color:var(--accent-bright);font-weight:600">○</span> ' +
                       '<span style="color:var(--text-bright)">Scene ready</span>' +
                       ' <span style="color:var(--text-tertiary)">but replay buffer not running. ' +
-                      'Click "Start replay buffer" or turn the GhostShell buffer toggle on.</span>';
+                      'Click "Start replay buffer" or turn the Vispora buffer toggle on.</span>';
         } else {
             recLine = '<span style="color:var(--text-tertiary)">' +
-                      'No GhostShell scene found in OBS yet. ' +
+                      'No Vispora scene found in OBS yet. ' +
                       'Click "Setup scene" to create it (Display Capture + audio sources).</span>';
         }
         box.innerHTML = '<span style="color:var(--accent);font-weight:600">● Connected</span> ' +
@@ -10373,7 +10376,7 @@ function openObsDownload() {
 }
 
 async function setupObsScene() {
-    addLog('Setting up GhostShell scene in OBS…');
+    addLog('Setting up Vispora scene in OBS…');
     var r = await apiPost('/api/obs/setup-scene', {});
     if (r && r.ok) {
         var created = (r.sources_created || []).join(', ') || 'nothing new';
@@ -10458,7 +10461,7 @@ function _renderStreamHelperStatus(d) {
     if (!box) return;
     if (!s.enabled) {
         box.style.color = 'var(--text-tertiary)';
-        box.innerHTML = 'Off — flip the toggle to let GhostShell take over OBS setup.';
+        box.innerHTML = 'Off — flip the toggle to let Vispora take over OBS setup.';
         return;
     }
     if (!d.obs_connected) {
@@ -10485,7 +10488,7 @@ function _renderStreamHelperStatus(d) {
     if (active && blockedAntiCheatGames.indexOf(String(active).toLowerCase()) >= 0) {
         anticheatNote = '<br><span style="color:var(--warning, #e0b850);font-size:11px">' +
                         '⚠ Heads up: ' + escHtml(active) + '\'s anti-cheat (Byfron / Vanguard) blocks OBS Game Capture hooks.  ' +
-                        'The Game Capture source will show a black preview regardless of what GhostShell sets.  ' +
+                        'The Game Capture source will show a black preview regardless of what Vispora sets.  ' +
                         'For these games, manually swap to Window Capture or Display Capture inside OBS.' +
                         '</span>';
     }

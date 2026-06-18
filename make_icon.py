@@ -1,8 +1,10 @@
-"""Generate assets/ghostshell.ico from the brand mark.
+"""Generate assets/ghostshell.ico from the brand mark (Vispora / Nacre).
 
-Renders the same stacked-layers ghost mark used in the titlebar + boot
+Renders the same stacked-layers mark used in the titlebar + boot
 splash at every standard Windows icon size (16/24/32/48/64/128/256),
-then packs them into one multi-resolution .ico file.
+then packs them into one multi-resolution .ico file.  (Filename stays
+ghostshell.ico for now — build.spec references it; the exe + icon file
+get renamed together in the Phase-2 exe rename.)
 
 Run:
     python make_icon.py
@@ -13,12 +15,14 @@ import math
 import os
 from PIL import Image, ImageDraw
 
-# ─── Tokens (match style.css) ─────────────────────────────────────────────
-BG          = (10, 11, 13, 255)      # #0a0b0d
-BG_INNER    = (6,  7,  8,  255)      # slight gradient feel
-ACCENT      = (94, 221, 162, 255)    # #5edda2
-ACCENT_DEEP = (46, 168, 100, 255)    # #2ea864 — for the layered look
-ACCENT_DIM  = (94, 221, 162, 110)    # for the bottom-layer alpha
+# ─── Tokens (Vispora Nacre — match style.css iridescent accent) ───────────
+# The three stacked layers get three distinct Nacre hues (mint -> lilac ->
+# rose) to fake the iridescent shift in a flat-fill PIL icon.
+BG          = (10, 11, 13, 255)       # #0a0b0d
+BG_INNER    = (6,  7,  8,  255)       # slight gradient feel
+ACCENT      = (167, 240, 228, 255)    # #a7f0e4 mint  — top "lit" layer
+ACCENT_DEEP = (217, 184, 255, 255)    # #d9b8ff lilac — middle layer
+ACCENT_DIM  = (255, 196, 230, 140)    # #ffc4e6 rose  — bottom (translucent)
 SHADOW      = (0, 0, 0, 90)
 
 OUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
