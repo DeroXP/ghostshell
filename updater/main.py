@@ -35,7 +35,7 @@ from typing import Optional
 # only two pieces of state hard-coded into the binary — everything else
 # (target dir, channel, etc) comes from args or install_info.json so the
 # updater stays usable across re-locations.
-UPDATER_VERSION  = "1.4.0"
+UPDATER_VERSION  = "1.4.1"
 SERVER_URL_DEFAULT = "https://ghostshell-site.up.railway.app"
 
 # ─── Paths ───────────────────────────────────────────────────────────
