@@ -18,7 +18,7 @@ from core import (system_info, debloater, optimizer, dns_manager, network_tweaks
                   gpu_overclock, autostart, driver_updater, temp_ceiling,
                   crash_recovery, perf_monitor, adaptive_tuning, health_audit,
                   snapshots, library_scanner, background_pauser, tournament_mode,
-                  net_monitor, gamepad_mapper, competitive_latency)
+                  net_monitor, gamepad_mapper, competitive_latency, latency_doctor)
 
 log = get_logger("app")
 
@@ -1384,6 +1384,17 @@ def api_competitive_apply():
 @app.route("/api/competitive/reset", methods=["POST"])
 def api_competitive_reset():
     return jsonify(competitive_latency.reset())
+
+
+# ─── Latency Doctor (beta.5) ─────────────────────────────────────────
+@app.route("/api/latency-doctor/scan")
+def api_latency_doctor_scan():
+    return jsonify(latency_doctor.scan())
+
+
+@app.route("/api/latency-doctor/fix", methods=["POST"])
+def api_latency_doctor_fix():
+    return jsonify(latency_doctor.fix())
 
 
 @app.route("/api/integrity/history")

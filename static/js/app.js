@@ -1633,6 +1633,62 @@ async function toggleCompetitive() {
     loadCompetitiveStatus();
 }
 
+// ─── Latency Doctor (beta.5) ───
+var _LD_ICON = { good: '✓', warn: '⚠', bad: '✗', info: '·' };
+var _LD_COLOR = { good: 'var(--accent)', warn: 'var(--warning)', bad: 'var(--danger)', info: 'var(--text-tertiary)' };
+
+function renderLatencyDoctor(s) {
+    var box = document.getElementById('ld-results');
+    if (!box || !s || !s.checks) { if (box) box.innerHTML = '<div style="font-size:12px;color:var(--text-tertiary)">Scan unavailable.</div>'; return; }
+    var gradeColor = s.score >= 80 ? 'var(--accent)' : s.score >= 60 ? 'var(--warning)' : 'var(--danger)';
+    var rows = s.checks.map(function(c) {
+        return '<div style="display:flex;gap:10px;padding:8px 0;border-top:1px solid var(--border-faint)">' +
+            '<span style="color:' + (_LD_COLOR[c.status] || 'var(--text)') + ';font-weight:700;width:14px;text-align:center;flex:none">' + (_LD_ICON[c.status] || '·') + '</span>' +
+            '<div style="flex:1;min-width:0">' +
+              '<div style="font-size:13px;color:var(--text)"><b>' + escHtml(c.label) + '</b> · <span style="color:var(--text-secondary)">' + escHtml(c.current || '') + '</span>' +
+                (c.status === 'good' ? '' : ' <span style="color:var(--text-tertiary)">→ ' + escHtml(c.ideal || '') + '</span>') +
+                ' <span style="font-size:11px;color:var(--text-tertiary)">[' + escHtml(c.verdict || '') + ']</span></div>' +
+              '<div style="font-size:11px;color:var(--text-tertiary);line-height:1.45;margin-top:1px">' + escHtml(c.detail || '') + '</div>' +
+            '</div></div>';
+    }).join('');
+    var fixBtn = s.fixable_issues > 0
+        ? '<button class="btn btn-primary btn-sm" onclick="fixLatencyDoctor()" id="ld-fix-btn">Fix ' + s.fixable_issues + ' safe issue' + (s.fixable_issues > 1 ? 's' : '') + '</button>'
+        : '<span style="font-size:12px;color:var(--accent)">No safe fixes pending ✓</span>';
+    box.innerHTML =
+        '<div style="display:flex;align-items:center;gap:14px;margin-bottom:6px">' +
+          '<div style="font-size:30px;font-weight:700;color:' + gradeColor + ';line-height:1">' + escHtml(s.grade) + '</div>' +
+          '<div style="flex:1"><div style="font-size:13px;color:var(--text)">Latency readiness: <b>' + s.score + '/100</b></div>' +
+          '<div style="font-size:11px;color:var(--text-tertiary)">Scored on the proven levers only — informational items don\'t affect the grade.</div></div>' +
+          fixBtn +
+        '</div>' + rows;
+}
+
+async function runLatencyDoctor() {
+    var btn = document.getElementById('ld-scan-btn');
+    var box = document.getElementById('ld-results');
+    if (btn) { btn.disabled = true; btn.textContent = 'Scanning…'; }
+    if (box) box.innerHTML = '<div style="font-size:12px;color:var(--text-tertiary)">Reading your system…</div>';
+    try {
+        var s = await apiGet('/api/latency-doctor/scan');
+        renderLatencyDoctor(s);
+    } catch (e) { if (box) box.innerHTML = '<div style="font-size:12px;color:var(--danger)">Scan failed.</div>'; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Re-scan'; }
+}
+
+async function fixLatencyDoctor() {
+    var fb = document.getElementById('ld-fix-btn');
+    if (fb) { fb.disabled = true; fb.textContent = 'Applying…'; }
+    var r = await apiPost('/api/latency-doctor/fix', {});
+    if (r && r.ok) {
+        showInfoToast('Applied the safe latency fixes. (Some — HID queue, flip-model — finish applying after a reboot.)', { title: 'Latency Doctor' });
+        if (r.rescan) renderLatencyDoctor(r.rescan);
+        loadCompetitiveStatus();
+    } else {
+        showErrorToast('Latency Doctor could not apply fixes: ' + ((r && r.err) || 'unknown'));
+        if (fb) { fb.disabled = false; fb.textContent = 'Retry'; }
+    }
+}
+
 async function runOptimize(categories) {
     var term = document.getElementById('optimize-terminal');
     term.innerHTML = '';
