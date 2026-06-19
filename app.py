@@ -18,7 +18,8 @@ from core import (system_info, debloater, optimizer, dns_manager, network_tweaks
                   gpu_overclock, autostart, driver_updater, temp_ceiling,
                   crash_recovery, perf_monitor, adaptive_tuning, health_audit,
                   snapshots, library_scanner, background_pauser, tournament_mode,
-                  net_monitor, gamepad_mapper, competitive_latency, latency_doctor)
+                  net_monitor, gamepad_mapper, competitive_latency, latency_doctor,
+                  competitive_advisor)
 
 log = get_logger("app")
 
@@ -1395,6 +1396,12 @@ def api_latency_doctor_scan():
 @app.route("/api/latency-doctor/fix", methods=["POST"])
 def api_latency_doctor_fix():
     return jsonify(latency_doctor.fix())
+
+
+# ─── Competitive Game Advisor (beta.6) ───────────────────────────────
+@app.route("/api/advisor/scan")
+def api_advisor_scan():
+    return jsonify(competitive_advisor.advise())
 
 
 @app.route("/api/integrity/history")

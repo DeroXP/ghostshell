@@ -1689,6 +1689,49 @@ async function fixLatencyDoctor() {
     }
 }
 
+// ─── Competitive Game Advisor (beta.6) ───
+function _advisorChecklist(s) {
+    if (!s.checklist) return '';
+    var rows = s.checklist.map(function(c) {
+        return '<div style="display:flex;gap:10px;padding:7px 0;border-top:1px solid var(--border-faint)">' +
+            '<div style="flex:1;min-width:0"><div style="font-size:13px;color:var(--text)"><b>' + escHtml(c.setting) +
+            '</b> → <span style="color:var(--accent)">' + escHtml(c.do) + '</span></div>' +
+            '<div style="font-size:11px;color:var(--text-tertiary);line-height:1.45;margin-top:1px">' + escHtml(c.why) + '</div></div></div>';
+    }).join('');
+    var capnote = s.fps_cap ? (' (cap = ' + s.fps_cap + ' fps for your ' + s.refresh_hz + ' Hz)') : '';
+    return '<div style="font-size:12px;color:var(--text-secondary);margin-top:4px">Set these in each game\'s Video settings' + capnote + ':</div>' + rows;
+}
+
+function renderAdvisor(s) {
+    var box = document.getElementById('advisor-results');
+    if (!box || !s) { if (box) box.innerHTML = 'Scan unavailable.'; return; }
+    if (!s.detected || !s.detected.length) {
+        box.innerHTML = '<div style="font-size:12px;color:var(--text-tertiary)">No known competitive games detected' +
+            (s.total_installed ? (' among ' + s.total_installed + ' installed') : '') +
+            '. The checklist below applies to any competitive title.</div>' + _advisorChecklist(s);
+        return;
+    }
+    var chips = s.detected.map(function(g) {
+        return '<span style="display:inline-block;font-size:12px;background:var(--accent-soft);color:var(--accent);padding:3px 10px;border-radius:20px;margin:0 6px 6px 0">' + escHtml(g.title) + '</span>';
+    }).join('');
+    var notes = s.detected.filter(function(g){return g.note;}).map(function(g) {
+        return '<div style="font-size:11px;color:var(--text-tertiary);margin:2px 0"><b style="color:var(--text-secondary)">' + escHtml(g.title) + ':</b> ' + escHtml(g.note) + '</div>';
+    }).join('');
+    box.innerHTML = '<div style="font-size:12px;color:var(--text-secondary);margin-bottom:6px">Detected ' + s.detected.length +
+        ' competitive ' + (s.detected.length > 1 ? 'games' : 'game') + ':</div><div style="margin-bottom:8px">' + chips + '</div>' +
+        _advisorChecklist(s) + '<div style="margin-top:8px;border-top:1px solid var(--border-faint);padding-top:8px">' + notes + '</div>';
+}
+
+async function runAdvisor() {
+    var btn = document.getElementById('advisor-btn');
+    var box = document.getElementById('advisor-results');
+    if (btn) { btn.disabled = true; btn.textContent = 'Scanning…'; }
+    if (box) box.innerHTML = '<div style="font-size:12px;color:var(--text-tertiary)">Scanning your game libraries…</div>';
+    try { renderAdvisor(await apiGet('/api/advisor/scan')); }
+    catch (e) { if (box) box.innerHTML = '<div style="font-size:12px;color:var(--danger)">Scan failed.</div>'; }
+    if (btn) { btn.disabled = false; btn.textContent = 'Re-scan'; }
+}
+
 async function runOptimize(categories) {
     var term = document.getElementById('optimize-terminal');
     term.innerHTML = '';
