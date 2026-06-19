@@ -676,7 +676,7 @@ function switchPage(page) {
     currentPage = page;
 
     if (page === 'debloat') loadDebloatScan();
-    if (page === 'optimize') loadProModeStatus();   // v3.3.1-beta.8
+    if (page === 'optimize') { loadProModeStatus(); loadCompetitiveStatus(); }   // v3.3.1-beta.8 / beta.3
     if (page === 'network') { loadNetworkInfo(); startNetMonPoll(); }
     else { stopNetMonPoll(); }
     if (page === 'gpu') loadGpuInfo();
@@ -1594,6 +1594,45 @@ async function toggleProMode(el) {
 // ═══════════════════════════════════════════════════════════════
 // OPTIMIZE
 // ═══════════════════════════════════════════════════════════════
+// ─── Competitive Latency Mode (beta.3) ───
+async function loadCompetitiveStatus() {
+    var st = document.getElementById('competitive-status');
+    var btn = document.getElementById('competitive-btn');
+    if (!st || !btn) return;
+    try {
+        var s = await apiGet('/api/competitive/status');
+        var res = (s && s.timer_resolution_ms != null) ? (s.timer_resolution_ms + ' ms') : '—';
+        if (s && s.enabled) {
+            st.innerHTML = 'Status: <b style="color:var(--accent)">ON</b> · timer resolution ' + res +
+                           (s.timer_hold_active ? ' (held)' : '');
+            btn.textContent = 'Disable';
+            btn.classList.remove('btn-primary');
+        } else {
+            st.innerHTML = 'Status: off · timer resolution ' + res;
+            btn.textContent = 'Enable';
+            btn.classList.add('btn-primary');
+        }
+    } catch (e) { st.textContent = 'Status unavailable'; }
+}
+
+async function toggleCompetitive() {
+    var btn = document.getElementById('competitive-btn');
+    var s = await apiGet('/api/competitive/status').catch(function(){ return {}; });
+    var enabling = !(s && s.enabled);
+    if (btn) { btn.disabled = true; btn.textContent = enabling ? 'Enabling…' : 'Disabling…'; }
+    var r = await apiPost(enabling ? '/api/competitive/apply' : '/api/competitive/reset', {});
+    if (btn) btn.disabled = false;
+    if (r && r.ok) {
+        showInfoToast(enabling
+            ? 'Competitive Latency on. (HID queue + GlobalTimerResolution apply fully after a reboot.)'
+            : 'Competitive Latency reverted to Windows defaults.',
+            { title: 'Competitive Latency' });
+    } else {
+        showErrorToast('Could not change Competitive Latency: ' + ((r && r.err) || 'unknown'));
+    }
+    loadCompetitiveStatus();
+}
+
 async function runOptimize(categories) {
     var term = document.getElementById('optimize-terminal');
     term.innerHTML = '';

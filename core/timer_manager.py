@@ -23,6 +23,85 @@ def _reg(key, val, data, vtype="REG_DWORD"):
 
 
 # ═══════════════════════════════════════════════════════════════
+# Real timer-resolution hold (beta.3)
+# ═══════════════════════════════════════════════════════════════
+# The module was named "Timer Resolution Manager" but never actually SET the
+# timer resolution — it only toggled dynamic tick / platform clock / HPET.
+# Windows 11 lets the global timer resolution drift to ~15.6 ms when nothing
+# requests better, and since Win10 2004 a foreground game's timeBeginPeriod no
+# longer reliably applies system-wide.  We hold 0.5 ms via ntdll while Vispora
+# runs (the request persists for the lifetime of the process), which tightens
+# OS timer-driven scheduling/wait granularity and trims tail/1%-low input and
+# frame-pacing latency.  Reversible: release it or just exit.
+import ctypes as _ct
+
+try:
+    _ntdll = _ct.WinDLL("ntdll")
+except Exception:
+    _ntdll = None
+
+_KERNEL_KEY = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel"
+_timer_hold = {"active": False, "target_ms": 0.5}
+
+
+def query_timer_resolution_ms():
+    """Current system timer resolution in ms (None if unavailable)."""
+    if not _ntdll:
+        return None
+    try:
+        mn = _ct.c_ulong(); mx = _ct.c_ulong(); cur = _ct.c_ulong()
+        _ntdll.NtQueryTimerResolution(_ct.byref(mn), _ct.byref(mx), _ct.byref(cur))
+        return round(cur.value / 10000.0, 4)   # 100ns units -> ms
+    except Exception:
+        return None
+
+
+def start_timer_resolution_hold(target_ms: float = 0.5) -> dict:
+    """Request and HOLD a fine timer resolution for as long as this process
+    lives.  Also sets GlobalTimerResolutionRequests=1 so the request applies
+    system-wide on Win11 (takes effect after a reboot)."""
+    if not _ntdll:
+        return {"ok": False, "err": "ntdll unavailable"}
+    try:
+        desired = _ct.c_ulong(int(round(target_ms * 10000)))  # ms -> 100ns
+        cur = _ct.c_ulong()
+        st = _ntdll.NtSetTimerResolution(desired, True, _ct.byref(cur))
+        ok = (st == 0)
+        if ok:
+            _timer_hold["active"] = True
+            _timer_hold["target_ms"] = target_ms
+        # Win11: allow a single process's request to apply globally (reboot).
+        backup_registry(_KERNEL_KEY, "session_kernel")
+        _reg(_KERNEL_KEY, "GlobalTimerResolutionRequests", "1")
+        now = query_timer_resolution_ms()
+        log.info(f"Timer resolution hold {'ON' if ok else 'FAILED'} "
+                 f"(target {target_ms}ms, now {now}ms)")
+        return {"ok": ok, "resolution_ms": now}
+    except Exception as e:
+        log.warning(f"timer resolution hold failed: {e}")
+        return {"ok": False, "err": str(e)}
+
+
+def stop_timer_resolution_hold() -> dict:
+    """Release the fine-resolution request (lets Windows return to default)."""
+    if not _ntdll:
+        return {"ok": False, "err": "ntdll unavailable"}
+    try:
+        cur = _ct.c_ulong()
+        # SetResolution=False releases THIS process's request.
+        _ntdll.NtSetTimerResolution(_ct.c_ulong(int(0.5 * 10000)), False, _ct.byref(cur))
+        _timer_hold["active"] = False
+        log.info("Timer resolution hold released")
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
+
+
+def is_timer_hold_active() -> bool:
+    return bool(_timer_hold["active"])
+
+
+# ═══════════════════════════════════════════════════════════════
 # Timer Resolution
 # ═══════════════════════════════════════════════════════════════
 def get_timer_status() -> dict:
@@ -67,11 +146,9 @@ def get_timer_status() -> dict:
         except Exception:
             pass
 
-    # Try to get current timer resolution via PowerShell
-    r3 = run_ps(
-        "[System.Diagnostics.Stopwatch]::IsHighResolution; "
-        "[System.Diagnostics.Stopwatch]::Frequency"
-    )
+    # Actual current timer resolution (ms) via ntdll, plus our hold state.
+    result["current_resolution_ms"] = query_timer_resolution_ms()
+    result["resolution_hold_active"] = is_timer_hold_active()
 
     return result
 
@@ -107,9 +184,10 @@ def apply_timer_tweaks(disable_dynamic_tick: bool = True,
         log.info(f"  {'✓' if ok else '✗'} Disable HPET device")
         results.append({"name": "Disable HPET", "ok": ok})
 
-    # Disable platform tick (already in optimizer but good to ensure)
-    r = run_cmd(["bcdedit", "/set", "useplatformtick", "yes"])
-    results.append({"name": "Platform Tick Override", "ok": r["ok"]})
+    # beta.3 — REMOVED the `bcdedit /set useplatformtick yes` line that used to
+    # be here.  optimizer.py deliberately dropped it: on TSC-capable systems
+    # it's a no-op, and on others it forces HPET/ACPI ticks which RAISES idle
+    # wakeups and latency — the opposite of what this module is for.
 
     return results
 

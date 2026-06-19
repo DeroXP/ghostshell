@@ -18,7 +18,7 @@ from core import (system_info, debloater, optimizer, dns_manager, network_tweaks
                   gpu_overclock, autostart, driver_updater, temp_ceiling,
                   crash_recovery, perf_monitor, adaptive_tuning, health_audit,
                   snapshots, library_scanner, background_pauser, tournament_mode,
-                  net_monitor, gamepad_mapper)
+                  net_monitor, gamepad_mapper, competitive_latency)
 
 log = get_logger("app")
 
@@ -1368,6 +1368,22 @@ def api_integrity_status():
         return jsonify(integrity_scan.get_status())
     except Exception as e:
         return jsonify({"ok": False, "err": str(e)})
+
+
+# ─── Competitive Input Latency (beta.3) ──────────────────────────────
+@app.route("/api/competitive/status")
+def api_competitive_status():
+    return jsonify(competitive_latency.status())
+
+
+@app.route("/api/competitive/apply", methods=["POST"])
+def api_competitive_apply():
+    return jsonify(competitive_latency.apply())
+
+
+@app.route("/api/competitive/reset", methods=["POST"])
+def api_competitive_reset():
+    return jsonify(competitive_latency.reset())
 
 
 @app.route("/api/integrity/history")
@@ -4138,6 +4154,15 @@ def main():
         except Exception as e:
             log.warning(f"Failed to start temp_ceiling watchdog: {e}")
     _delayed(saved_oc_delay, _start_temp_ceiling)
+
+    # beta.3 — if Competitive Latency mode was left enabled, re-assert the
+    # 0.5 ms timer-resolution hold (it only lasts for the process lifetime).
+    def _reassert_competitive():
+        try:
+            competitive_latency.apply_on_boot()
+        except Exception as e:
+            log.warning(f"competitive latency boot re-assert failed: {e}")
+    _delayed(2, _reassert_competitive)
 
     # Start Flask in background thread
     flask_thread = threading.Thread(target=start_flask, daemon=True)

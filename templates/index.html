@@ -389,6 +389,17 @@
                 </div>
             </div>
 
+            <div class="card" id="competitive-card" style="margin-bottom:14px">
+                <div style="display:flex;align-items:center;gap:14px">
+                    <div style="flex:1;min-width:0">
+                        <div style="font-size:15px;font-weight:600;color:var(--text-bright)">Competitive Latency Mode</div>
+                        <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;line-height:1.5">One click for the proven input-latency wins, gathered in one place: a real 0.5&nbsp;ms timer-resolution hold, mouse acceleration off (1:1 raw aim), Game&nbsp;DVR/Game&nbsp;Bar off, CPU pinned 100% with USB-suspend &amp; PCIe-ASPM off, foreground-priority quanta, and HID queue trim. Placebos (MenuShowDelay, ThreadDpcEnable, HPET) are deliberately left out. Fully reversible.</div>
+                        <div id="competitive-status" style="font-size:12px;color:var(--text-tertiary);margin-top:7px">Checking…</div>
+                    </div>
+                    <button class="btn btn-primary" id="competitive-btn" onclick="toggleCompetitive()" style="white-space:nowrap">Enable</button>
+                </div>
+            </div>
+
             <div class="warn-box">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
                 <span><b>Reset to default</b> reverts every tweak back to stock Windows settings. Tweaks marked <span style="color:var(--warning)">Aggressive</span> have known trade-offs (security mitigations, advanced features, services). Click each card to toggle, or use the bulk buttons in the page header.</span>
