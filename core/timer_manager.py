@@ -40,7 +40,6 @@ try:
 except Exception:
     _ntdll = None
 
-_KERNEL_KEY = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel"
 _timer_hold = {"active": False, "target_ms": 0.5}
 
 
@@ -57,9 +56,15 @@ def query_timer_resolution_ms():
 
 
 def start_timer_resolution_hold(target_ms: float = 0.5) -> dict:
-    """Request and HOLD a fine timer resolution for as long as this process
-    lives.  Also sets GlobalTimerResolutionRequests=1 so the request applies
-    system-wide on Win11 (takes effect after a reboot)."""
+    """Best-effort: request a fine timer resolution for this process's lifetime.
+
+    HONESTY NOTE (corrected in beta.4): since Windows 10 v2004, timer-resolution
+    requests are largely per-process — a game that doesn't request a fine timer
+    itself is NOT guaranteed our resolution, so this is a low-cost best-effort,
+    NOT a reliable click-to-photon win.  We previously also wrote
+    GlobalTimerResolutionRequests=1; independent research refuted that registry
+    value as restoring global behavior, so it was REMOVED.  Kept only because
+    it's harmless and helps the few apps that do honor the global tick."""
     if not _ntdll:
         return {"ok": False, "err": "ntdll unavailable"}
     try:
@@ -70,15 +75,12 @@ def start_timer_resolution_hold(target_ms: float = 0.5) -> dict:
         if ok:
             _timer_hold["active"] = True
             _timer_hold["target_ms"] = target_ms
-        # Win11: allow a single process's request to apply globally (reboot).
-        backup_registry(_KERNEL_KEY, "session_kernel")
-        _reg(_KERNEL_KEY, "GlobalTimerResolutionRequests", "1")
         now = query_timer_resolution_ms()
-        log.info(f"Timer resolution hold {'ON' if ok else 'FAILED'} "
+        log.info(f"Timer resolution best-effort {'ON' if ok else 'FAILED'} "
                  f"(target {target_ms}ms, now {now}ms)")
         return {"ok": ok, "resolution_ms": now}
     except Exception as e:
-        log.warning(f"timer resolution hold failed: {e}")
+        log.warning(f"timer resolution request failed: {e}")
         return {"ok": False, "err": str(e)}
 
 

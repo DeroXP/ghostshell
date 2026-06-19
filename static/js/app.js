@@ -1600,18 +1600,18 @@ async function loadCompetitiveStatus() {
     var btn = document.getElementById('competitive-btn');
     if (!st || !btn) return;
     try {
-        var s = await apiGet('/api/competitive/status');
-        var res = (s && s.timer_resolution_ms != null) ? (s.timer_resolution_ms + ' ms') : '—';
-        if (s && s.enabled) {
-            st.innerHTML = 'Status: <b style="color:var(--accent)">ON</b> · timer resolution ' + res +
-                           (s.timer_hold_active ? ' (held)' : '');
-            btn.textContent = 'Disable';
-            btn.classList.remove('btn-primary');
-        } else {
-            st.innerHTML = 'Status: off · timer resolution ' + res;
-            btn.textContent = 'Enable';
-            btn.classList.add('btn-primary');
+        var s = await apiGet('/api/competitive/status') || {};
+        var bits = [];
+        bits.push(s.enabled ? '<b style="color:var(--accent)">ON</b>' : 'off');
+        if (s.recommended_fps_cap) {
+            bits.push('set in-game FPS cap to <b>' + s.recommended_fps_cap + '</b>' +
+                      (s.refresh_hz ? ' (your display: ' + s.refresh_hz + ' Hz)' : ''));
         }
+        if (s.flip_model_enabled) bits.push('flip-model on');
+        if (s.timer_resolution_ms != null) bits.push('timer ' + s.timer_resolution_ms + ' ms');
+        st.innerHTML = 'Status: ' + bits.join(' · ');
+        btn.textContent = s.enabled ? 'Disable' : 'Enable';
+        btn.classList.toggle('btn-primary', !s.enabled);
     } catch (e) { st.textContent = 'Status unavailable'; }
 }
 

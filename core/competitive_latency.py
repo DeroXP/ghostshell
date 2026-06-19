@@ -5,11 +5,22 @@ gaming — gathered into one place (they were previously scattered across the
 CPU / gaming / hard / power / latency tweak sets, so a user could easily miss
 the important ones like mouse-acceleration-off, which lived in 'hard tweaks').
 
+beta.4 — corrected after deeper cited research:
+  * REMOVED the GlobalTimerResolutionRequests=1 registry hack (independently
+    refuted) and re-labeled the 0.5 ms timer hold as a low-cost BEST-EFFORT,
+    not a guaranteed latency win (it's largely per-process since Win10 v2004).
+  * ADDED the two research-confirmed REAL wins: the Win11 windowed-game
+    flip-model optimization, and a computed in-game FPS-cap recommendation.
+
 Included (each backed up before write, fully reversible):
-  - Hold the global timer resolution at 0.5 ms (timer_manager) — the biggest
-    genuinely-missing lever; tightens OS scheduling/wait granularity.
+  - Win11 "Optimizations for windowed games" (flip model) ON — REAL win: lets
+    borderless reach exclusive-fullscreen latency on DX10/11.
   - Mouse acceleration OFF ("Enhance Pointer Precision") — 1:1 deterministic aim
     (applied live via SystemParametersInfo, no re-login needed).
+  - In-game FPS-cap recommendation (status only) — the single most reliable
+    display-side lever; surfaced as advice because an in-game cap beats a
+    driver/RTSS cap for latency, so we don't force one.
+  - 0.5 ms timer resolution (best-effort; honest caveat above).
   - Game DVR / Game Bar capture OFF — removes overlay input hooks + capture cost.
   - Win32PrioritySeparation = 0x26 — short, variable, foreground-boosted quanta.
   - Power Throttling (EcoQoS) OFF — keeps game helper threads at full clock.
@@ -27,7 +38,7 @@ import json
 import os
 
 from config import APPDATA_DIR
-from core.utils import run_cmd, backup_registry, get_logger
+from core.utils import run_cmd, run_ps, backup_registry, get_logger
 from core import timer_manager
 
 log = get_logger("competitive")
@@ -47,6 +58,95 @@ _PRIO_KEY   = r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl"
 _PT_KEY     = r"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling"
 _MOUCLASS   = r"HKLM\SYSTEM\CurrentControlSet\Services\mouclass\Parameters"
 _KBDCLASS   = r"HKLM\SYSTEM\CurrentControlSet\Services\kbdclass\Parameters"
+# Win11 "Optimizations for windowed games" (blt-model -> flip-model). Research-
+# confirmed REAL win: lets borderless reach exclusive-fullscreen latency.
+_DXPREF_KEY = r"HKCU\Software\Microsoft\DirectX\UserGpuPreferences"
+_DXPREF_VAL = "DirectXUserGlobalSettings"
+
+
+def _read_dx_global() -> str:
+    r = run_cmd(["reg", "query", _DXPREF_KEY, "/v", _DXPREF_VAL])
+    if not r.get("ok"):
+        return ""
+    for line in (r.get("out") or "").splitlines():
+        if _DXPREF_VAL in line and "REG_SZ" in line:
+            return line.split("REG_SZ", 1)[1].strip()
+    return ""
+
+
+def _set_flip_model(enable: bool):
+    """Toggle the global 'Optimizations for windowed games' (SwapEffectUpgradeEnable)
+    inside the semicolon-delimited DirectXUserGlobalSettings string, preserving
+    any other keys already there."""
+    cur = _read_dx_global()
+    d = {}
+    for p in cur.split(";"):
+        if "=" in p:
+            k, v = p.split("=", 1)
+            d[k.strip()] = v.strip()
+    d["SwapEffectUpgradeEnable"] = "1" if enable else "0"
+    s = ";".join(f"{k}={v}" for k, v in d.items()) + ";"
+    run_cmd(["reg", "add", _DXPREF_KEY, "/v", _DXPREF_VAL, "/t", "REG_SZ", "/d", s, "/f"])
+
+
+def _flip_model_enabled() -> bool:
+    return "swapeffectupgradeenable=1" in _read_dx_global().lower().replace(" ", "")
+
+
+_REFRESH_PS = r'''
+$sig=@"
+using System;using System.Runtime.InteropServices;
+public class Disp{
+ [DllImport("user32.dll",CharSet=CharSet.Ansi)] public static extern bool EnumDisplaySettings(string d,int m,ref DEVMODE dm);
+ [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Ansi)] public struct DEVMODE{
+  [MarshalAs(UnmanagedType.ByValTStr,SizeConst=32)] public string dmDeviceName;
+  public short s1; public short s2; public short s3; public short s4; public int dmFields;
+  public int px; public int py; public int dor; public int dfo;
+  public short col; public short dup; public short yres; public short tt; public short coll;
+  [MarshalAs(UnmanagedType.ByValTStr,SizeConst=32)] public string dmFormName;
+  public short lp; public int bpp; public int w; public int h; public int flags; public int freq;
+  public int icm; public int icmi; public int media; public int dith; public int r1; public int r2; public int pw; public int ph;
+ }
+}
+"@
+Add-Type $sig
+$max=0
+for($i=1;$i -le 8;$i++){ $dm=New-Object Disp+DEVMODE; if([Disp]::EnumDisplaySettings("\\.\DISPLAY$i",-1,[ref]$dm)){ if($dm.freq -gt $max){$max=$dm.freq} } }
+$max
+'''
+
+
+def _primary_refresh_hz():
+    """Highest CURRENT refresh across all connected displays (the gaming panel).
+
+    Uses EnumDisplaySettings per display — Win32_VideoController only reports a
+    single mode per GPU, so on a multi-monitor setup it can return the wrong
+    monitor's refresh (e.g. a 180 Hz secondary instead of the 240 Hz primary)."""
+    try:
+        r = run_ps(_REFRESH_PS)
+        v = int((r.get("out") or "").strip().splitlines()[-1])
+        if 20 < v < 1000:
+            return v
+    except Exception:
+        pass
+    # Fallback: best CurrentRefreshRate from Win32_VideoController.
+    try:
+        r = run_ps("Get-CimInstance Win32_VideoController | "
+                   "Where-Object { $_.CurrentRefreshRate -gt 0 } | "
+                   "Sort-Object CurrentRefreshRate -Descending | "
+                   "Select-Object -First 1 -ExpandProperty CurrentRefreshRate")
+        return int((r.get("out") or "").strip().splitlines()[0])
+    except Exception:
+        return None
+
+
+def recommended_fps_cap(refresh):
+    """Optimal in-game FPS cap below refresh (keeps VRR in range / avoids the
+    V-Sync-ON backpressure lag).  In-game limiters beat driver/RTSS caps for
+    latency, so this is surfaced as a recommendation, not force-applied."""
+    if not refresh:
+        return None
+    return refresh - (3 if refresh < 200 else 5)
 
 
 def _reg(key, val, data, vtype="REG_DWORD"):
@@ -96,9 +196,14 @@ def _load() -> dict:
 def apply() -> dict:
     log.info("Applying Competitive Latency mode...")
     res = []
+    # Win11 windowed-game flip-model — a research-confirmed REAL win.
+    backup_registry(_DXPREF_KEY, "competitive_dxpref")
+    _set_flip_model(True)
+    res.append({"name": "Win11 windowed-game optimizations (flip model)", "ok": True})
+
     t = timer_manager.start_timer_resolution_hold(0.5)
-    res.append({"name": "Timer resolution held at 0.5 ms", "ok": bool(t.get("ok")),
-                "detail": f"{t.get('resolution_ms')} ms"})
+    res.append({"name": "Timer resolution 0.5 ms (best-effort, not a guaranteed win)",
+                "ok": bool(t.get("ok")), "detail": f"{t.get('resolution_ms')} ms"})
 
     backup_registry(_MOUSE_KEY, "competitive_mouse")
     _set_mouse_accel(False)
@@ -137,6 +242,7 @@ def reset() -> dict:
     log.info("Reverting Competitive Latency mode...")
     res = []
     timer_manager.stop_timer_resolution_hold()
+    _set_flip_model(False)
     _set_mouse_accel(True)
     _reg(_GDVR_STORE, "GameDVR_Enabled", "1")
     _reg(_GDVR_CAP, "AppCaptureEnabled", "1")
@@ -152,10 +258,14 @@ def reset() -> dict:
 
 
 def status() -> dict:
+    refresh = _primary_refresh_hz()
     return {
         "enabled": bool(_load().get("enabled")),
         "timer_resolution_ms": timer_manager.query_timer_resolution_ms(),
         "timer_hold_active": timer_manager.is_timer_hold_active(),
+        "flip_model_enabled": _flip_model_enabled(),
+        "refresh_hz": refresh,
+        "recommended_fps_cap": recommended_fps_cap(refresh),
     }
 
 
