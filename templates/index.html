@@ -2573,6 +2573,29 @@
                 </div>
             </div>
 
+            <div class="card" id="startup-manager-card" style="margin-bottom:16px">
+                <div class="card-section">
+                    <div class="card-section-title">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                        Startup Manager
+                    </div>
+                    <div class="card-section-desc">Once Vispora is up, gracefully launch your chosen apps — staggered (one at a time), run as you (de-elevated, not as admin), and skipping anything already running. Opt-in; nothing starts unless you turn it on.</div>
+                    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:12px 0">
+                        <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);cursor:pointer"><input type="checkbox" id="sm-enabled" onchange="smSaveSettings()"> Enable startup launching</label>
+                        <span style="font-size:12px;color:var(--text-tertiary)">Initial delay <input type="number" id="sm-initial" min="0" max="120" value="8" onchange="smSaveSettings()" style="width:52px;padding:4px 6px;border-radius:5px;background:var(--bg-input);border:1px solid var(--border);color:var(--text);font-size:12px"> s</span>
+                        <span style="font-size:12px;color:var(--text-tertiary)">Stagger <input type="number" id="sm-stagger" min="0" max="60" value="3" onchange="smSaveSettings()" style="width:52px;padding:4px 6px;border-radius:5px;background:var(--bg-input);border:1px solid var(--border);color:var(--text);font-size:12px"> s</span>
+                        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-tertiary);cursor:pointer"><input type="checkbox" id="sm-skip" onchange="smSaveSettings()"> Skip if already running</label>
+                    </div>
+                    <div id="sm-list" style="margin:6px 0"><div class="card-section-desc">Loading…</div></div>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center">
+                        <button class="btn btn-sm btn-primary" onclick="smBrowse()">Add app…</button>
+                        <input type="text" id="sm-manual-path" placeholder="…or paste a full path / shortcut" style="flex:1;min-width:200px;font-size:12px;padding:7px 10px;border-radius:6px;background:var(--bg-input);border:1px solid var(--border);color:var(--text)">
+                        <button class="btn btn-sm" onclick="smAddManual()">Add path</button>
+                        <button class="btn btn-sm" onclick="smLaunchNow()">Launch now</button>
+                    </div>
+                </div>
+            </div>
+
             <div class="card">
                 <div class="card-section">
                     <div class="card-section-title">

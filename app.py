@@ -19,7 +19,7 @@ from core import (system_info, debloater, optimizer, dns_manager, network_tweaks
                   crash_recovery, perf_monitor, adaptive_tuning, health_audit,
                   snapshots, library_scanner, background_pauser, tournament_mode,
                   net_monitor, gamepad_mapper, competitive_latency, latency_doctor,
-                  competitive_advisor)
+                  competitive_advisor, startup_manager)
 
 log = get_logger("app")
 
@@ -1402,6 +1402,66 @@ def api_latency_doctor_fix():
 @app.route("/api/advisor/scan")
 def api_advisor_scan():
     return jsonify(competitive_advisor.advise())
+
+
+# ─── Startup Manager (beta.8) ────────────────────────────────────────
+@app.route("/api/startup/settings", methods=["GET", "POST"])
+def api_startup_settings():
+    if request.method == "POST":
+        d = request.get_json(silent=True) or {}
+        return jsonify(startup_manager.set_settings(
+            enabled=d.get("enabled"), initial_delay_s=d.get("initial_delay_s"),
+            stagger_s=d.get("stagger_s"), skip_if_running=d.get("skip_if_running")))
+    return jsonify(startup_manager.get_settings())
+
+
+@app.route("/api/startup/add", methods=["POST"])
+def api_startup_add():
+    d = request.get_json(silent=True) or {}
+    return jsonify(startup_manager.add_app(d.get("path"), d.get("name"), d.get("delay_s", 0)))
+
+
+@app.route("/api/startup/remove", methods=["POST"])
+def api_startup_remove():
+    d = request.get_json(silent=True) or {}
+    return jsonify(startup_manager.remove_app(d.get("id")))
+
+
+@app.route("/api/startup/update", methods=["POST"])
+def api_startup_update():
+    d = request.get_json(silent=True) or {}
+    aid = d.pop("id", None)
+    return jsonify(startup_manager.update_app(aid, **d))
+
+
+@app.route("/api/startup/reorder", methods=["POST"])
+def api_startup_reorder():
+    d = request.get_json(silent=True) or {}
+    return jsonify(startup_manager.reorder(d.get("order")))
+
+
+@app.route("/api/startup/launch-now", methods=["POST"])
+def api_startup_launch_now():
+    return jsonify(startup_manager.launch_all_async(manual=True))
+
+
+@app.route("/api/startup/browse", methods=["POST"])
+def api_startup_browse():
+    """Open a native file picker (.exe/.lnk) via the webview window."""
+    try:
+        import webview
+        wins = webview.windows
+        if not wins:
+            return jsonify({"ok": False, "err": "no window"})
+        result = wins[0].create_file_dialog(
+            webview.OPEN_DIALOG, allow_multiple=False,
+            file_types=("Apps & shortcuts (*.exe;*.lnk)", "All files (*.*)"))
+        if not result:
+            return jsonify({"ok": True, "cancelled": True, "path": ""})
+        path = result[0] if isinstance(result, (list, tuple)) else result
+        return jsonify({"ok": True, "path": path})
+    except Exception as e:
+        return jsonify({"ok": False, "err": str(e)})
 
 
 @app.route("/api/integrity/history")
@@ -4181,6 +4241,15 @@ def main():
         except Exception as e:
             log.warning(f"competitive latency boot re-assert failed: {e}")
     _delayed(2, _reassert_competitive)
+
+    # beta.8 — Startup Manager: gracefully launch the user's app list once
+    # Vispora is up (it applies its own configured initial delay + stagger).
+    def _arm_startup_manager():
+        try:
+            startup_manager.run_on_boot()
+        except Exception as e:
+            log.warning(f"startup manager boot failed: {e}")
+    _delayed(3, _arm_startup_manager)
 
     # Start Flask in background thread
     flask_thread = threading.Thread(target=start_flask, daemon=True)

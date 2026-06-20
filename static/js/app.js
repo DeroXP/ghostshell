@@ -684,7 +684,7 @@ function switchPage(page) {
     if (page === 'privacy') loadPrivacyStatus();
     if (page === 'vault') checkVaultStatus();
     if (page === 'logs') loadFullLog();
-    if (page === 'settings') loadSettingsPage();   // v2.9.5
+    if (page === 'settings') { loadSettingsPage(); loadStartupManager(); }   // v2.9.5 / beta.8
 }
 
 
@@ -1730,6 +1730,62 @@ async function runAdvisor() {
     try { renderAdvisor(await apiGet('/api/advisor/scan')); }
     catch (e) { if (box) box.innerHTML = '<div style="font-size:12px;color:var(--danger)">Scan failed.</div>'; }
     if (btn) { btn.disabled = false; btn.textContent = 'Re-scan'; }
+}
+
+// ─── Startup Manager (beta.8) ───
+async function loadStartupManager() {
+    try {
+        var s = await apiGet('/api/startup/settings');
+        if (!s) return;
+        var e = document.getElementById('sm-enabled'); if (e) e.checked = !!s.enabled;
+        var i = document.getElementById('sm-initial'); if (i) i.value = s.initial_delay_s;
+        var st = document.getElementById('sm-stagger'); if (st) st.value = s.stagger_s;
+        var sk = document.getElementById('sm-skip'); if (sk) sk.checked = s.skip_if_running !== false;
+        smRenderRows(s.apps || []);
+    } catch (e) {}
+}
+function smRenderRows(apps) {
+    var box = document.getElementById('sm-list'); if (!box) return;
+    if (!apps.length) { box.innerHTML = '<div class="card-section-desc">No apps yet — add the apps you want Vispora to launch on startup.</div>'; return; }
+    box.innerHTML = apps.map(function(a) {
+        var warn = a.exists === false ? ' <span style="color:var(--warning);font-size:11px">(missing)</span>' : '';
+        return '<div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid var(--border-faint)">' +
+            '<input type="checkbox" ' + (a.enabled !== false ? 'checked' : '') + ' onchange="smToggle(\'' + a.id + '\',this.checked)" title="enabled">' +
+            '<div style="flex:1;min-width:0"><div style="font-size:13px;color:var(--text)">' + escHtml(a.name) + warn + '</div>' +
+            '<div style="font-size:11px;color:var(--text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + escHtml(a.path) + '</div></div>' +
+            '<span style="font-size:11px;color:var(--text-tertiary);white-space:nowrap">+<input type="number" min="0" max="60" value="' + (a.delay_s || 0) + '" onchange="smSetDelay(\'' + a.id + '\',this.value)" style="width:46px;padding:3px 5px;border-radius:4px;background:var(--bg-input);border:1px solid var(--border);color:var(--text);font-size:11px"> s</span>' +
+            '<button class="btn btn-sm" onclick="smRemove(\'' + a.id + '\')" title="remove" style="padding:4px 9px">✕</button></div>';
+    }).join('');
+}
+async function smSaveSettings() {
+    await apiPost('/api/startup/settings', {
+        enabled: document.getElementById('sm-enabled').checked,
+        initial_delay_s: parseInt(document.getElementById('sm-initial').value) || 0,
+        stagger_s: parseInt(document.getElementById('sm-stagger').value) || 0,
+        skip_if_running: document.getElementById('sm-skip').checked,
+    });
+}
+async function smAdd(path) {
+    if (!path) return;
+    var r = await apiPost('/api/startup/add', { path: path });
+    if (r && r.ok) loadStartupManager();
+    else showErrorToast('Could not add: ' + ((r && r.err) || 'unknown'));
+}
+async function smBrowse() {
+    var r = await apiPost('/api/startup/browse', {});
+    if (r && r.ok && r.path) smAdd(r.path);
+    else if (r && !r.ok) showErrorToast('File picker failed: ' + (r.err || ''));
+}
+function smAddManual() {
+    var el = document.getElementById('sm-manual-path');
+    if (el && el.value.trim()) { smAdd(el.value.trim()); el.value = ''; }
+}
+async function smRemove(id) { await apiPost('/api/startup/remove', { id: id }); loadStartupManager(); }
+async function smToggle(id, enabled) { await apiPost('/api/startup/update', { id: id, enabled: enabled }); }
+async function smSetDelay(id, val) { await apiPost('/api/startup/update', { id: id, delay_s: parseInt(val) || 0 }); }
+async function smLaunchNow() {
+    await apiPost('/api/startup/launch-now', {});
+    showInfoToast('Launching your startup apps now (staggered)…', { title: 'Startup Manager' });
 }
 
 async function runOptimize(categories) {
