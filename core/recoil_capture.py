@@ -51,7 +51,7 @@ import threading
 import time
 from typing import Optional
 
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 from config import APPDATA_DIR
 
 log = get_logger(__name__)
@@ -1038,9 +1038,7 @@ def _load_user_presets() -> list:
 
 
 def _save_user_presets(presets: list) -> None:
-    os.makedirs(APPDATA_DIR, exist_ok=True)
-    with open(USER_PRESETS_PATH, "w", encoding="utf-8") as f:
-        json.dump({"presets": presets}, f, indent=2)
+    atomic_write_json(USER_PRESETS_PATH, {"presets": presets})
 
 
 def list_user_presets() -> list:

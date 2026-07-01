@@ -12,7 +12,7 @@ import os
 import time
 import threading
 from config import APPDATA_DIR
-from core.utils import run_ps, run_cmd, get_logger
+from core.utils import run_ps, run_cmd, get_logger, atomic_write_json
 
 log = get_logger("profiles")
 
@@ -423,11 +423,7 @@ def _capture_baseline() -> dict:
 
 
 def _save_baseline(baseline: dict):
-    try:
-        with open(BASELINE_FILE, "w") as f:
-            json.dump(baseline, f, indent=2)
-    except Exception as e:
-        log.warning(f"Could not save baseline: {e}")
+    atomic_write_json(BASELINE_FILE, baseline)
 
 
 def _load_baseline() -> dict:
@@ -1287,11 +1283,7 @@ def _load_gp_settings() -> dict:
 
 
 def _save_gp_settings(d: dict):
-    try:
-        with open(_GAME_PROFILES_SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(d, f, indent=2)
-    except Exception as e:
-        log.warning(f"Could not save game_profiles settings: {e}")
+    atomic_write_json(_GAME_PROFILES_SETTINGS_PATH, d)
 
 
 def get_settings() -> dict:

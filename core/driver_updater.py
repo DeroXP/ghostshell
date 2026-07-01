@@ -36,7 +36,7 @@ import urllib.request
 from typing import Optional
 
 from config import APPDATA_DIR
-from core.utils import get_logger, run_ps
+from core.utils import get_logger, run_ps, atomic_write_json
 
 log = get_logger("driver_updater")
 
@@ -185,11 +185,7 @@ def _load_settings() -> dict:
 
 
 def _save_settings(s: dict):
-    try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(s, f, indent=2)
-    except Exception as e:
-        log.warning(f"Could not save driver updater settings: {e}")
+    atomic_write_json(SETTINGS_PATH, s)
 
 
 def get_settings() -> dict:
@@ -346,8 +342,7 @@ def _resolve_nvidia_ids(gpu_name: str) -> Optional[tuple]:
                 cache[gpu_name.lower()] = {"psid": ids[0], "pfid": ids[1],
                                            "ts": time.time(),
                                            "tv": LOOKUP_TABLE_VERSION}
-                with open(PSID_CACHE_PATH, "w", encoding="utf-8") as f:
-                    json.dump(cache, f, indent=2)
+                atomic_write_json(PSID_CACHE_PATH, cache)
             except Exception:
                 pass
             return ids

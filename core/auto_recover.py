@@ -54,7 +54,7 @@ import time
 from typing import Optional
 
 from config import APPDATA_DIR
-from core.utils import run_cmd, run_ps, get_logger
+from core.utils import run_cmd, run_ps, get_logger, atomic_write_json
 
 log = get_logger("auto_recover")
 
@@ -368,13 +368,11 @@ def recover_legacy_bad_tweaks() -> dict:
 
     if reverted:
         try:
-            os.makedirs(APPDATA_DIR, exist_ok=True)
-            with open(_REPORT_PATH, "w", encoding="utf-8") as f:
-                json.dump({
-                    "ts":         time.time(),
-                    "count":      len(reverted),
-                    "reverted":   reverted,
-                }, f, indent=2)
+            atomic_write_json(_REPORT_PATH, {
+                "ts":         time.time(),
+                "count":      len(reverted),
+                "reverted":   reverted,
+            })
             log.info(f"Auto-recover: reverted {len(reverted)} legacy bad tweaks; "
                      f"report at {_REPORT_PATH}")
         except Exception as e:

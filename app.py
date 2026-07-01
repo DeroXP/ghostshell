@@ -27,6 +27,16 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["SECRET_KEY"] = os.urandom(24).hex()
 
 
+def _qint(name: str, default: int) -> int:
+    """Parse an int query param, falling back to `default` on anything
+    malformed instead of raising (the frontend always sends valid ints,
+    but a hand-typed URL / bad proxy shouldn't 500 the route)."""
+    try:
+        return int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Global error handlers — every route returns JSON, never HTML.
 # Without these, an uncaught exception sends Flask's default HTML 500
@@ -576,16 +586,16 @@ def api_gpu_oc_verify():
 
     Query params: core_offset (int), mem_offset (int), power_pct (int)
     """
-    core = int(request.args.get("core_offset", 0))
-    mem = int(request.args.get("mem_offset", 0))
-    power = int(request.args.get("power_pct", 100))
+    core = _qint("core_offset", 0)
+    mem = _qint("mem_offset", 0)
+    power = _qint("power_pct", 100)
     return jsonify(gpu_overclock.verify_oc_applied(core, mem, power))
 
 
 @app.route("/api/gpu/oc/driver-events")
 def api_gpu_oc_driver_events():
     """Recent NVIDIA/AMD driver TDR/crash events from Windows Event Log."""
-    seconds = int(request.args.get("seconds", 300))
+    seconds = _qint("seconds", 300)
     return jsonify(gpu_overclock.check_driver_events(seconds_back=seconds))
 
 
@@ -859,14 +869,14 @@ def api_perf_status():
 @app.route("/api/perf/samples")
 def api_perf_samples():
     """Chart-ready arrays for the last N seconds (default 60)."""
-    seconds = int(request.args.get("seconds", 60))
+    seconds = _qint("seconds", 60)
     return jsonify(perf_monitor.get_chart_data(seconds=seconds))
 
 
 @app.route("/api/perf/score")
 def api_perf_score():
     """Stability score (0-100) over the last N seconds (default 30)."""
-    seconds = int(request.args.get("seconds", 30))
+    seconds = _qint("seconds", 30)
     return jsonify(perf_monitor.compute_stability_score(seconds=seconds))
 
 
@@ -2180,13 +2190,13 @@ def api_network_live():
 
 @app.route("/api/network/history")
 def api_network_history():
-    secs = int(request.args.get("seconds", 60))
+    secs = _qint("seconds", 60)
     return jsonify({"history": net_monitor.get_history(seconds=secs)})
 
 
 @app.route("/api/network/top")
 def api_network_top():
-    n = int(request.args.get("limit", 15))
+    n = _qint("limit", 15)
     return jsonify({"top": net_monitor.get_top_processes(limit=n)})
 
 

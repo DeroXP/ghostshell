@@ -127,21 +127,27 @@ def prep_for_gaming_async(on_done=None):
         _state["running"] = True
         _state["started_at"] = time.time()
         _state["steps"] = []
-        log.info("=== BOOT PREP: priming system for gaming ===")
-
-        _step("Flush DNS cache", _flush_dns)
-        _step("Trim working sets", _flush_working_sets)
-        _step("Clear standby list", _clear_standby_list)
-        _step("MMCSS gaming profile", _mmcss_gaming_profile)
-        _step("Foreground boost", _foreground_boost)
-        _step("Network throttle off", _network_throttle_off)
-        _step("High performance power", _high_performance_power)
-
-        _state["finished_at"] = time.time()
-        _state["running"] = False
-        _state["done"] = True
-        duration = _state["finished_at"] - _state["started_at"]
-        log.info(f"=== BOOT PREP: done in {duration:.1f}s ===")
+        try:
+            log.info("=== BOOT PREP: priming system for gaming ===")
+            _step("Flush DNS cache", _flush_dns)
+            _step("Trim working sets", _flush_working_sets)
+            _step("Clear standby list", _clear_standby_list)
+            _step("MMCSS gaming profile", _mmcss_gaming_profile)
+            _step("Foreground boost", _foreground_boost)
+            _step("Network throttle off", _network_throttle_off)
+            _step("High performance power", _high_performance_power)
+        except Exception as e:
+            # Belt-and-suspenders: individual steps already catch their own
+            # errors via _step(), but if anything here still slips through,
+            # we must not leave "running" stuck True / "done" stuck False —
+            # that would silently wedge this feature for the rest of the session.
+            log.warning(f"boot prep runner raised unexpectedly: {e}")
+        finally:
+            _state["finished_at"] = time.time()
+            _state["running"] = False
+            _state["done"] = True
+            duration = _state["finished_at"] - _state["started_at"]
+            log.info(f"=== BOOT PREP: done in {duration:.1f}s ===")
 
         if on_done:
             try:

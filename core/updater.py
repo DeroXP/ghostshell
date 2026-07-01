@@ -47,7 +47,7 @@ from typing import Optional
 
 from config import (APP_VERSION, APPDATA_DIR,
                     APP_CHANNEL_DEFAULT, UPDATE_SERVER_URL_DEFAULT)
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 import hashlib
 
 log = get_logger("updater")
@@ -93,9 +93,7 @@ def write_install_info() -> dict:
             "version":      APP_VERSION,
             "updated_at":   time.time(),
         }
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(INSTALL_INFO_PATH, "w", encoding="utf-8") as f:
-            json.dump(info, f, indent=2)
+        atomic_write_json(INSTALL_INFO_PATH, info)
         return info
     except Exception as e:
         log.debug(f"install_info.json write failed: {e}")
@@ -137,13 +135,7 @@ def _read_installed_updater_version() -> str:
 def _write_installed_updater_version(version: str) -> None:
     """Record the version we just downloaded next to the binary so the
     next boot can compare against /version/updater without spawning it."""
-    try:
-        os.makedirs(UPDATER_DIR, exist_ok=True)
-        with open(UPDATER_VERSION_PATH, "w", encoding="utf-8") as f:
-            json.dump({"version": version, "downloaded_at": time.time()},
-                      f, indent=2)
-    except Exception as e:
-        log.debug(f"updater_version.json write failed: {e}")
+    atomic_write_json(UPDATER_VERSION_PATH, {"version": version, "downloaded_at": time.time()})
 
 
 def ensure_updater_installed_async() -> dict:
@@ -325,11 +317,7 @@ def _load_settings() -> dict:
 
 
 def _save_settings(settings: dict):
-    try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2)
-    except Exception as e:
-        log.warning(f"Could not save updater settings: {e}")
+    atomic_write_json(SETTINGS_PATH, settings)
 
 
 def get_settings() -> dict:

@@ -40,7 +40,7 @@ import time
 import glob
 from typing import Optional
 
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 from config import APPDATA_DIR
 
 log = get_logger(__name__)
@@ -655,9 +655,4 @@ def _load_cache() -> Optional[dict]:
 
 
 def _save_cache(data: dict):
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except OSError as e:
-        log.warning(f"failed to write library cache: {e}")
+    atomic_write_json(CACHE_FILE, data)

@@ -47,7 +47,7 @@ import time
 from typing import Optional
 
 from config import APPDATA_DIR
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 
 log = get_logger(__name__)
 
@@ -102,12 +102,7 @@ def _load_settings() -> dict:
 
 
 def _save_settings(s: dict) -> None:
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(s, f, indent=2)
-    except Exception as e:
-        log.warning(f"stream_helper settings save failed: {e}")
+    atomic_write_json(_SETTINGS_PATH, s)
 
 
 def get_settings() -> dict:

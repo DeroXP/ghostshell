@@ -22,7 +22,7 @@ import re
 import uuid
 
 from config import APPDATA_DIR, APP_VERSION
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_text
 
 log = get_logger("device_id")
 
@@ -50,13 +50,10 @@ def get_device_id() -> str:
 
     # Slow path: generate + persist.
     new_id = str(uuid.uuid4())
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(DEVICE_ID_FILE, "w", encoding="utf-8") as f:
-            f.write(new_id)
+    if atomic_write_text(DEVICE_ID_FILE, new_id):
         log.info(f"Generated new anonymous device ID: {new_id}")
-    except Exception as e:
-        log.error(f"Failed to persist device.id ({e}); using ephemeral ID for this run")
+    else:
+        log.error("Failed to persist device.id; using ephemeral ID for this run")
     return new_id
 
 

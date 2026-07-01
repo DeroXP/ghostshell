@@ -13,11 +13,12 @@ import threading
 import time
 
 from config import APPDATA_DIR
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 
 log = get_logger("startup_mgr")
 SETTINGS_PATH = os.path.join(APPDATA_DIR, "startup_manager_settings.json")
 _CREATE_NO_WINDOW = 0x08000000
+_launch_lock = threading.Lock()
 
 _DEFAULTS = {
     "enabled": False,
@@ -38,11 +39,7 @@ def _load() -> dict:
 
 
 def _save(s: dict):
-    try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(s, f, indent=2)
-    except Exception as e:
-        log.warning(f"startup settings save failed: {e}")
+    atomic_write_json(SETTINGS_PATH, s)
 
 
 def get_settings() -> dict:
@@ -144,24 +141,33 @@ def _launch_one(app, skip_if_running) -> dict:
 
 
 def launch_all(manual=False) -> dict:
-    s = _load()
-    if not manual and not s.get("enabled"):
-        return {"ok": True, "skipped": "disabled"}
-    apps = [a for a in s.get("apps", []) if a.get("enabled", True)]
-    skip = s.get("skip_if_running", True)
-    stagger = s.get("stagger_s", 3)
-    results = []
-    for i, a in enumerate(apps):
-        if a.get("delay_s"):
-            time.sleep(a["delay_s"])
-        results.append(_launch_one(a, skip))
-        if i < len(apps) - 1 and stagger:
-            time.sleep(stagger)
-    log.info(f"startup: launched {sum(1 for r in results if r['reason'] == 'launched')}/{len(apps)}")
-    return {"ok": True, "results": results}
+    if not _launch_lock.acquire(blocking=False):
+        log.info("startup: launch already in progress — skipping duplicate run")
+        return {"ok": True, "skipped": "already-running"}
+    try:
+        s = _load()
+        if not manual and not s.get("enabled"):
+            return {"ok": True, "skipped": "disabled"}
+        apps = [a for a in s.get("apps", []) if a.get("enabled", True)]
+        skip = s.get("skip_if_running", True)
+        stagger = s.get("stagger_s", 3)
+        results = []
+        for i, a in enumerate(apps):
+            if a.get("delay_s"):
+                time.sleep(a["delay_s"])
+            results.append(_launch_one(a, skip))
+            if i < len(apps) - 1 and stagger:
+                time.sleep(stagger)
+        log.info(f"startup: launched {sum(1 for r in results if r['reason'] == 'launched')}/{len(apps)}")
+        return {"ok": True, "results": results}
+    finally:
+        _launch_lock.release()
 
 
 def launch_all_async(manual=False):
+    if _launch_lock.locked():
+        log.info("startup: launch already in progress — ignoring extra trigger")
+        return {"ok": True, "started": False, "reason": "already-running"}
     threading.Thread(target=lambda: launch_all(manual=manual), daemon=True).start()
     return {"ok": True, "started": True}
 

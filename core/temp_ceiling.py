@@ -35,7 +35,7 @@ import time
 from typing import Any
 
 from config import APPDATA_DIR
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 
 log = get_logger("temp_ceiling")
 
@@ -94,12 +94,7 @@ def _load() -> dict[str, Any]:
 
 
 def _save(settings: dict[str, Any]) -> None:
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2)
-    except Exception as e:
-        log.warning(f"Could not save temp_ceiling settings: {e}")
+    atomic_write_json(SETTINGS_PATH, settings)
 
 
 def get_settings() -> dict[str, Any]:

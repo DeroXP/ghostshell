@@ -65,7 +65,7 @@ import subprocess
 from typing import Optional, Iterable
 
 from config import APPDATA_DIR
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 
 log = get_logger("integrity_scan")
 
@@ -240,12 +240,7 @@ def _load_settings() -> dict:
 
 
 def _save_settings(s: dict) -> None:
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(s, f, indent=2)
-    except Exception as e:
-        log.debug(f"settings save failed: {e}")
+    atomic_write_json(SETTINGS_PATH, s)
 
 
 def get_settings() -> dict:
@@ -312,13 +307,9 @@ def get_history(limit: int = 50) -> list:
 def _write_status_snapshot() -> None:
     """Mirror the in-memory state to disk so callers reading the file
     directly (or the UI on a fresh page load) see the latest."""
-    try:
-        with _state_lock:
-            snap = dict(_state)
-        with open(STATUS_PATH, "w", encoding="utf-8") as f:
-            json.dump(snap, f, indent=2)
-    except Exception:
-        pass
+    with _state_lock:
+        snap = dict(_state)
+    atomic_write_json(STATUS_PATH, snap)
 
 
 def get_status() -> dict:
@@ -1079,34 +1070,42 @@ def _scheduler_loop(stop: threading.Event) -> None:
     _set_thread_priority_below_normal()
     log.info("integrity-scan scheduler started")
     while not stop.is_set():
-        settings = _load_settings()
-        if not settings.get("enabled"):
-            # Re-check every 5 minutes whether the user re-enabled
-            if stop.wait(GATE_RECHECK_SEC): return
-            continue
-        interval = float(settings.get("interval_sec", DEFAULT_INTERVAL_SEC))
-        last_run = float(settings.get("last_run_ts") or 0.0)
-        time_until_next = max(0.0, (last_run + interval) - time.time())
-        with _state_lock:
-            _state["next_run_at"] = last_run + interval
-        if time_until_next > 0:
-            if stop.wait(time_until_next): return
-            continue
-        # Time's up — check gating
-        ok, reason = _safe_to_run()
-        if not ok:
-            log.debug(f"integrity scan deferred: {reason}")
-            if stop.wait(GATE_RECHECK_SEC): return
-            continue
         try:
-            run_once()
-        except Exception as e:
-            log.warning(f"integrity scan cycle raised: {e}")
-            # Mark this attempt as "ran" so we don't tight-loop on a
-            # persistent crash; the next cycle still waits interval.
             settings = _load_settings()
-            settings["last_run_ts"] = time.time()
-            _save_settings(settings)
+            if not settings.get("enabled"):
+                # Re-check every 5 minutes whether the user re-enabled
+                if stop.wait(GATE_RECHECK_SEC): return
+                continue
+            interval = float(settings.get("interval_sec", DEFAULT_INTERVAL_SEC))
+            last_run = float(settings.get("last_run_ts") or 0.0)
+            time_until_next = max(0.0, (last_run + interval) - time.time())
+            with _state_lock:
+                _state["next_run_at"] = last_run + interval
+            if time_until_next > 0:
+                if stop.wait(time_until_next): return
+                continue
+            # Time's up — check gating
+            ok, reason = _safe_to_run()
+            if not ok:
+                log.debug(f"integrity scan deferred: {reason}")
+                if stop.wait(GATE_RECHECK_SEC): return
+                continue
+            try:
+                run_once()
+            except Exception as e:
+                log.warning(f"integrity scan cycle raised: {e}")
+                # Mark this attempt as "ran" so we don't tight-loop on a
+                # persistent crash; the next cycle still waits interval.
+                settings = _load_settings()
+                settings["last_run_ts"] = time.time()
+                _save_settings(settings)
+        except Exception as e:
+            # Anything unexpected outside the run_once() call itself (a bad
+            # settings read, a gating-check bug, ...) must not silently kill
+            # this thread — that would permanently disable integrity scanning
+            # for the rest of the session with no user-visible indication.
+            log.warning(f"integrity scan scheduler iteration raised: {e}")
+            if stop.wait(GATE_RECHECK_SEC): return
 
 
 def start() -> dict:

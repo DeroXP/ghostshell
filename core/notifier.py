@@ -2,7 +2,7 @@
 import os
 import json
 import threading
-from core.utils import run_ps, get_logger
+from core.utils import run_ps, get_logger, atomic_write_json
 
 log = get_logger("notifier")
 
@@ -30,11 +30,7 @@ def _load_settings() -> dict:
 
 
 def _save_settings(s: dict):
-    try:
-        with open(_settings_path(), "w") as f:
-            json.dump(s, f, indent=2)
-    except Exception as e:
-        log.warning(f"Could not save notifier settings: {e}")
+    atomic_write_json(_settings_path(), s)
 
 
 def is_enabled() -> bool:

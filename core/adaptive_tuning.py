@@ -52,7 +52,7 @@ import time
 from typing import Any, Optional
 
 from config import APPDATA_DIR
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 
 log = get_logger("adaptive")
 
@@ -292,14 +292,7 @@ def _load_json(path: str, default):
 
 
 def _save_json(path: str, data) -> bool:
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        return True
-    except Exception as e:
-        log.warning(f"Could not save {os.path.basename(path)}: {e}")
-        return False
+    return atomic_write_json(path, data)
 
 
 def _norm_exe(exe: str) -> str:

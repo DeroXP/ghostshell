@@ -44,7 +44,7 @@ import threading
 import time
 from typing import Optional
 
-from core.utils import get_logger, run_cmd, run_ps
+from core.utils import get_logger, run_cmd, run_ps, atomic_write_json
 from config import APPDATA_DIR
 
 log = get_logger(__name__)
@@ -73,12 +73,7 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict):
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-    except OSError as e:
-        log.warning(f"failed to save tournament state: {e}")
+    atomic_write_json(STATE_PATH, state)
 
 
 def _wipe_state():

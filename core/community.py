@@ -38,7 +38,7 @@ import urllib.request
 from typing import Optional
 
 from config import APP_VERSION, APPDATA_DIR, UPDATE_SERVER_URL_DEFAULT
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json, atomic_write_text
 
 log = get_logger(__name__)
 
@@ -89,12 +89,7 @@ def _load_settings() -> dict:
 
 
 def _save_settings(s: dict) -> None:
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(s, f, indent=2)
-    except Exception as e:
-        log.debug(f"community settings save failed: {e}")
+    atomic_write_json(SETTINGS_PATH, s)
 
 
 def get_settings() -> dict:
@@ -125,11 +120,7 @@ def _get_anon_id() -> str:
                 return aid
         except Exception: pass
     aid = secrets.token_hex(8)
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(ANON_ID_PATH, "w", encoding="utf-8") as f:
-            f.write(aid)
-    except Exception: pass
+    atomic_write_text(ANON_ID_PATH, aid)
     return aid
 
 
@@ -217,11 +208,7 @@ def _load_cache() -> dict:
 
 
 def _save_cache(data: dict) -> None:
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(COMMUNITY_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception: pass
+    atomic_write_json(COMMUNITY_CACHE_PATH, data)
 
 
 def fetch_games(force: bool = False) -> dict:

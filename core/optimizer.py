@@ -2,7 +2,7 @@
 import json
 import os
 import time
-from core.utils import run_ps, run_cmd, get_logger, backup_registry, detect_drive_type
+from core.utils import run_ps, run_cmd, get_logger, backup_registry, detect_drive_type, atomic_write_json
 from config import APPDATA_DIR
 
 log = get_logger("optimize")
@@ -67,9 +67,7 @@ def get_pro_mode() -> dict:
 def set_pro_mode(enabled: bool) -> dict:
     """Persist the Pro Mode toggle.  Called from the UI."""
     try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(_PRO_MODE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"enabled": bool(enabled)}, f, indent=2)
+        atomic_write_json(_PRO_MODE_PATH, {"enabled": bool(enabled)})
         log.info(f"Pro Mode → {'ON' if enabled else 'OFF'}")
         return {"ok": True, "enabled": bool(enabled)}
     except Exception as e:
@@ -97,9 +95,7 @@ def _capture_power_baseline() -> str:
                     guid = part
                     break
         if guid:
-            os.makedirs(APPDATA_DIR, exist_ok=True)
-            with open(_POWER_BASELINE_PATH, "w", encoding="utf-8") as f:
-                json.dump({"guid": guid, "captured_ts": time.time()}, f)
+            atomic_write_json(_POWER_BASELINE_PATH, {"guid": guid, "captured_ts": time.time()})
             log.info(f"  ✓ Power scheme baseline captured: {guid}")
         return guid
     except Exception as e:

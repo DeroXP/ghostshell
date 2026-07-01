@@ -47,7 +47,7 @@ import sys
 from typing import Optional
 
 from config import APP_NAME, APPDATA_DIR
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 
 log = get_logger("autostart")
 
@@ -74,11 +74,7 @@ def _load_settings() -> dict:
 
 
 def _save_settings(d: dict):
-    try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(d, f, indent=2)
-    except Exception as e:
-        log.warning(f"Could not save autostart settings: {e}")
+    atomic_write_json(SETTINGS_PATH, d)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -37,7 +37,7 @@ import urllib.request
 from typing import Optional
 
 from config import APP_VERSION, APPDATA_DIR, UPDATE_SERVER_URL_DEFAULT
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 
 log = get_logger(__name__)
 
@@ -68,12 +68,7 @@ def _load_settings() -> dict:
 
 
 def _save_settings(s: dict) -> None:
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(s, f, indent=2)
-    except Exception as e:
-        log.debug(f"error_reporter settings save failed: {e}")
+    atomic_write_json(SETTINGS_PATH, s)
 
 
 def get_settings() -> dict:
@@ -240,12 +235,10 @@ def _save_local(report: dict) -> str:
     (and recover the body for a manual submission) if the Railway POST
     fails.  Returns the saved path."""
     try:
-        os.makedirs(REPORTS_DIR, exist_ok=True)
         ts = int(time.time())
         fn = f"{ts}_{report.get('hash','?')}.json"
         path = os.path.join(REPORTS_DIR, fn)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2)
+        atomic_write_json(path, report)
         _prune_local_reports()
         return path
     except Exception as e:

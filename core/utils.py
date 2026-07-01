@@ -149,6 +149,50 @@ def run_cmd(args: list, timeout: int = 60) -> dict:
         return {"ok": False, "out": "", "err": str(e)}
 
 
+def atomic_write_json(path: str, data) -> bool:
+    """Write JSON to `path` without ever leaving a truncated/corrupt file behind.
+
+    Writes to a sibling temp file first, then `os.replace()`s it into place —
+    `os.replace` is atomic on Windows (same volume), so a crash/kill mid-write
+    lands on either the old complete file or the new complete file, never a
+    half-written one. Settings/state readers already fall back to defaults on
+    a bad json.load, but that fallback silently loses the user's saved data —
+    this prevents the corruption that fallback was papering over."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        get_logger("utils").warning(f"atomic_write_json failed for {path}: {e}")
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def atomic_write_text(path: str, text: str, encoding: str = "utf-8") -> bool:
+    """Same crash-safety as atomic_write_json, for plain-text files (raw
+    IDs, the Windows hosts file, etc.) that aren't JSON-encoded."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding=encoding) as f:
+            f.write(text)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        get_logger("utils").warning(f"atomic_write_text failed for {path}: {e}")
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
 # 3.4.3 — cap on how many .reg backups we keep.  Every tweak apply
 # calls backup_registry(); the old code never pruned, so the backups
 # dir grew one tiny .reg per tweak forever (the dev machine had 702

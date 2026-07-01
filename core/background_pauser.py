@@ -37,7 +37,7 @@ import time
 from ctypes import wintypes
 from typing import Optional
 
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 from config import APPDATA_DIR
 
 log = get_logger(__name__)
@@ -201,12 +201,7 @@ def _load_json(path: str, default):
 
 
 def _save_json(path: str, data):
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except OSError as e:
-        log.warning(f"failed to write {path}: {e}")
+    atomic_write_json(path, data)
 
 
 def get_settings() -> dict:

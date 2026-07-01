@@ -37,7 +37,7 @@ from typing import Any
 
 from config import APPDATA_DIR
 from core.device_id import collect_hardware_fingerprint, get_device_id
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 
 log = get_logger("cloud_client")
 
@@ -87,12 +87,7 @@ def _load_settings() -> dict[str, Any]:
 
 def _save_settings(s: dict[str, Any]) -> None:
     with _settings_lock:
-        try:
-            os.makedirs(APPDATA_DIR, exist_ok=True)
-            with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump(s, f, indent=2)
-        except Exception as e:
-            log.warning(f"Could not save cloud settings: {e}")
+        atomic_write_json(SETTINGS_PATH, s)
 
 
 def get_settings() -> dict[str, Any]:

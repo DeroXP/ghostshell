@@ -38,7 +38,7 @@ import json
 import os
 
 from config import APPDATA_DIR
-from core.utils import run_cmd, run_ps, backup_registry, get_logger
+from core.utils import run_cmd, run_ps, backup_registry, get_logger, atomic_write_json
 from core import timer_manager
 
 log = get_logger("competitive")
@@ -179,11 +179,7 @@ def _set_mouse_accel(enabled: bool):
 
 
 def _save(enabled: bool):
-    try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump({"enabled": bool(enabled)}, f)
-    except Exception as e:
-        log.debug(f"competitive settings save failed: {e}")
+    atomic_write_json(SETTINGS_PATH, {"enabled": bool(enabled)})
 
 def _load() -> dict:
     try:

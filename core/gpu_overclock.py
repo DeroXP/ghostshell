@@ -24,7 +24,7 @@ import os
 import threading
 import time
 from typing import Optional
-from core.utils import run_cmd, run_ps, get_logger
+from core.utils import run_cmd, run_ps, get_logger, atomic_write_json
 from config import APPDATA_DIR
 
 # NVAPI integration — used for TRUE clock offsets on consumer GeForce.
@@ -238,11 +238,7 @@ def _load_stock_baseline() -> dict | None:
 
 
 def _save_stock_baseline(data: dict):
-    try:
-        with open(STOCK_BASELINE_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        log.warning(f"Could not save stock baseline: {e}")
+    atomic_write_json(STOCK_BASELINE_PATH, data)
 
 
 def _capture_stock_baseline() -> dict:
@@ -3031,8 +3027,7 @@ def save_profile(profile: dict, auto: bool = False) -> dict:
             "created_auto": bool(auto),
             "saved_at": time.time(),
         }
-        with open(OC_PROFILE_PATH, "w", encoding="utf-8") as f:
-            json.dump(profile, f, indent=2)
+        atomic_write_json(OC_PROFILE_PATH, profile)
 
         # Append to history
         history = []
@@ -3044,8 +3039,7 @@ def save_profile(profile: dict, auto: bool = False) -> dict:
                 history = []
         history.append(profile)
         history = history[-50:]  # keep last 50
-        with open(OC_HISTORY_PATH, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
+        atomic_write_json(OC_HISTORY_PATH, history)
 
         log.info(f"OC profile saved: {profile}")
         return {"ok": True, "profile": profile}

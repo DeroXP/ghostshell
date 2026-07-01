@@ -3,7 +3,7 @@ import os
 import shutil
 from datetime import datetime
 from config import TELEMETRY_HOSTS, FIREWALL_BLOCK_EXES
-from core.utils import run_ps, run_cmd, get_logger, backup_registry
+from core.utils import run_ps, run_cmd, get_logger, backup_registry, atomic_write_text
 
 log = get_logger("privacy")
 
@@ -160,8 +160,8 @@ def apply_hosts_blocking() -> dict:
     block += f"{HOSTS_MARKER}\n"
 
     try:
-        with open(HOSTS_PATH, "w", encoding="utf-8") as f:
-            f.write(content + block)
+        if not atomic_write_text(HOSTS_PATH, content + block):
+            return {"ok": False, "err": "Could not write hosts file"}
         log.info(f"  ✓ Blocked {len(TELEMETRY_HOSTS)} telemetry domains")
         # Flush DNS
         run_cmd(["ipconfig", "/flushdns"])
@@ -185,8 +185,7 @@ def remove_hosts_blocking() -> dict:
             content = parts[0].rstrip() + "\n"
             if len(parts) > 2:
                 content += parts[2]  # keep anything after second marker
-            with open(HOSTS_PATH, "w", encoding="utf-8") as f:
-                f.write(content)
+            atomic_write_text(HOSTS_PATH, content)
             run_cmd(["ipconfig", "/flushdns"])
             log.info("  ✓ Hosts blocking removed")
             return {"ok": True}

@@ -58,7 +58,7 @@ import time
 from ctypes import wintypes
 from typing import Optional
 
-from core.utils import get_logger
+from core.utils import get_logger, atomic_write_json
 from config import APPDATA_DIR
 from core import xinput_ctypes as xi
 
@@ -491,15 +491,10 @@ def _load_state(use_cache: bool = True) -> dict:
 
 def _save_state(state: dict):
     global _state_cache
-    try:
-        os.makedirs(APPDATA_DIR, exist_ok=True)
-        with open(PROFILES_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
+    if atomic_write_json(PROFILES_PATH, state):
         # Invalidate cache so next poll-loop tick re-reads
         with _state_cache_lock:
             _state_cache = state
-    except OSError as e:
-        log.warning(f"failed to save gamepad profiles: {e}")
 
 
 # ────────────────────────────────────────────────────────────────────
