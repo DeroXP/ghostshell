@@ -249,6 +249,7 @@ def get_entries(search: str = "", category: str = "") -> dict:
     conn.close()
 
     entries = []
+    had_decrypt_errors = False
     for row in rows:
         try:
             decrypted = _decrypt(row["data"])
@@ -270,9 +271,15 @@ def get_entries(search: str = "", category: str = "") -> dict:
             entries.append(entry)
         except (InvalidToken, json.JSONDecodeError) as e:
             log.warning(f"Failed to decrypt entry {row['id']}: {e}")
+            had_decrypt_errors = True
             continue
 
-    return {"ok": True, "entries": entries, "count": len(entries)}
+    # had_decrypt_errors lets the caller tell "vault is empty" apart from
+    # "some/all entries failed to decrypt" (e.g. unlocked with a PIN that
+    # doesn't match the key these rows were encrypted under) — without it,
+    # {entries: [], count: 0} looks identical in both cases.
+    return {"ok": True, "entries": entries, "count": len(entries),
+            "had_decrypt_errors": had_decrypt_errors}
 
 
 def get_entry_password(entry_id: str) -> dict:

@@ -557,20 +557,28 @@ def run_install_pipeline() -> int:
     server.update_step("verify", "active", "Computing SHA-256…")
     expected = (info.get("sha256") or "").lower()
     actual   = dl["sha256"].lower()
-    if expected:
-        if actual != expected:
-            err = (f"SHA-256 mismatch — expected {expected[:16]}…, "
-                   f"got {actual[:16]}….  Aborting to avoid installing "
-                   f"a corrupted or tampered build.")
-            server.update_step("verify", "error", err)
-            server.set_error(err)
-            try: os.remove(dl["path"])
-            except Exception: pass
-            return 6
-        server.update_step("verify", "done", "SHA-256 OK")
-    else:
-        server.update_step("verify", "skipped",
-                            "server didn't provide sha256 — skipped")
+    if not expected:
+        # Fail CLOSED, not open — a missing hash is indistinguishable from a
+        # MITM/misconfigured server stripping it, and installing an
+        # unverified binary is exactly the scenario this check exists to
+        # prevent.  Refuse rather than silently skip.
+        err = ("Server did not provide a SHA-256 hash for this build — "
+               "refusing to install an unverified binary.")
+        server.update_step("verify", "error", err)
+        server.set_error(err)
+        try: os.remove(dl["path"])
+        except Exception: pass
+        return 6
+    if actual != expected:
+        err = (f"SHA-256 mismatch — expected {expected[:16]}…, "
+               f"got {actual[:16]}….  Aborting to avoid installing "
+               f"a corrupted or tampered build.")
+        server.update_step("verify", "error", err)
+        server.set_error(err)
+        try: os.remove(dl["path"])
+        except Exception: pass
+        return 6
+    server.update_step("verify", "done", "SHA-256 OK")
 
     # ── Step 5: Install ────────────────────────────────────────
     if _check_cancelled(): return 1

@@ -220,10 +220,25 @@ def _register_all() -> list:
 
 
 def _unregister_all(registered: list) -> None:
+    """Best-effort unregister of every hotkey ID we previously registered.
+
+    UnregisterHotKey's return value is checked (not just wrapped in a
+    bare try/except) because a silent failure here means that ID stays
+    globally registered under its OLD binding — the next _register_all()
+    for a rebind would then fail with "already grabbed", and without a
+    log line that would look like an unrelated registration bug rather
+    than what it actually is."""
+    global _last_err
     user32 = ctypes.windll.user32
-    for hk_id, _ in registered:
-        try: user32.UnregisterHotKey(None, hk_id)
-        except Exception: pass
+    for hk_id, hotkey_str in registered:
+        try:
+            if not user32.UnregisterHotKey(None, hk_id):
+                err = ctypes.get_last_error()
+                _last_err = (f"UnregisterHotKey(id={hk_id}, {hotkey_str}) failed: "
+                             f"WinErr {err} — this hotkey may stay stuck registered")
+                log.warning(_last_err)
+        except Exception as e:
+            log.warning(f"UnregisterHotKey(id={hk_id}, {hotkey_str}) raised: {e}")
 
 
 def _fire_callback(hotkey_id: int) -> None:

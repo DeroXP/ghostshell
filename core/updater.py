@@ -694,31 +694,41 @@ def download_update() -> dict:
 
     # v3 — verify SHA-256 against the server-provided hash.  Belt-and-
     # suspenders: catches CDN corruption + MITM rewriting + truncated
-    # downloads.  If sha256 wasn't supplied (legacy server), skip the
-    # check rather than refuse the update.
+    # downloads.  Fail CLOSED if the server didn't supply one — a missing
+    # hash is indistinguishable from a MITM/misconfigured server stripping
+    # it, and installing an unverified binary is exactly what this check
+    # exists to prevent.  (The live release server always includes
+    # sha256; there is no legacy-server case left to accommodate.)
     expected_sha = _update_state.get("latest_sha256") or ""
-    if expected_sha:
-        try:
-            h = hashlib.sha256()
-            with open(dest, "rb") as f:
-                for chunk in iter(lambda: f.read(1 << 20), b""):
-                    h.update(chunk)
-            actual_sha = h.hexdigest()
-        except Exception as e:
-            _update_state["error"] = f"Hash check failed: {e}"
-            try: os.remove(dest)
-            except OSError: pass
-            return {"ok": False, "err": _update_state["error"]}
-        if actual_sha.lower() != expected_sha.lower():
-            err = (f"Downloaded file failed SHA-256 check — "
-                   f"expected {expected_sha[:16]}…, got {actual_sha[:16]}…. "
-                   "File may be corrupted; download will retry on next check.")
-            log.warning(err)
-            _update_state["error"] = err
-            try: os.remove(dest)
-            except OSError: pass
-            return {"ok": False, "err": err}
-        log.info(f"  SHA-256 verified")
+    if not expected_sha:
+        err = ("Server did not provide a SHA-256 hash for this build — "
+               "refusing to install an unverified binary.")
+        log.warning(err)
+        _update_state["error"] = err
+        try: os.remove(dest)
+        except OSError: pass
+        return {"ok": False, "err": err}
+    try:
+        h = hashlib.sha256()
+        with open(dest, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        actual_sha = h.hexdigest()
+    except Exception as e:
+        _update_state["error"] = f"Hash check failed: {e}"
+        try: os.remove(dest)
+        except OSError: pass
+        return {"ok": False, "err": _update_state["error"]}
+    if actual_sha.lower() != expected_sha.lower():
+        err = (f"Downloaded file failed SHA-256 check — "
+               f"expected {expected_sha[:16]}…, got {actual_sha[:16]}…. "
+               "File may be corrupted; download will retry on next check.")
+        log.warning(err)
+        _update_state["error"] = err
+        try: os.remove(dest)
+        except OSError: pass
+        return {"ok": False, "err": err}
+    log.info(f"  SHA-256 verified")
 
     _update_state["progress"] = 100
     _update_state["download_complete"] = True

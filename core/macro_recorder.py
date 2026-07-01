@@ -243,6 +243,16 @@ def record_event(source: str, trigger: str, pressed: bool,
         return    # unknown source
 
     with _lock:
+        # Re-check phase now that we hold the lock — it's checked
+        # unlocked above purely so the common not-recording case (this
+        # runs on every input event, up to 8 kHz) doesn't pay lock
+        # overhead, but that means phase could have flipped to
+        # "stopped"/"idle" between the check above and here. Without
+        # this re-check, a stray event could land in a list that
+        # stop_recording() already snapshotted, or worse, in the NEXT
+        # session's freshly-reset list if a restart raced in between.
+        if _state["phase"] != "recording":
+            return
         _state["events"].append({
             "ts":      time.perf_counter() - _state["started_at"],
             "source":  source,
@@ -279,6 +289,9 @@ def record_stick_sample(side: str, x_raw: int, y_raw: int) -> None:
     _state["_last_stick_ts"][side]  = now
     _state["_last_stick_val"][side] = (int(x_raw), int(y_raw))
     with _lock:
+        # Re-check phase under the lock — see record_event()'s comment.
+        if _state["phase"] != "recording":
+            return
         _state["stick_samples"].append({
             "ts":   now - _state["started_at"],
             "side": side,
@@ -308,6 +321,9 @@ def record_trigger_sample(side: str, value_0_255: int) -> None:
     _state["_last_trigger_ts"][side]  = now
     _state["_last_trigger_val"][side] = v
     with _lock:
+        # Re-check phase under the lock — see record_event()'s comment.
+        if _state["phase"] != "recording":
+            return
         _state["trigger_samples"].append({
             "ts":    now - _state["started_at"],
             "side":  side,
@@ -327,6 +343,9 @@ def record_mouse_move_delta(dx: int, dy: int) -> None:
     period = 1.0 / float(_state["mouse_move_sample_hz"])
     last_ts = _state["_last_mouse_move_ts"]
     with _lock:
+        # Re-check phase under the lock — see record_event()'s comment.
+        if _state["phase"] != "recording":
+            return
         if now - last_ts < period:
             # Aggregate into the most recent sample if it exists
             if _state["mouse_moves"]:

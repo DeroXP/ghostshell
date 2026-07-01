@@ -225,6 +225,13 @@ _state = {
     "error":              None,
     "manual_link":        None,    # for AMD / unknown — point user at vendor site
 }
+# Guards multi-field _state updates so a concurrent get_status() (polled
+# from the Flask UI thread) can't read a snapshot that mixes fields from
+# before and after one of these updates.  Deliberately NOT held across
+# subprocess.run/time.sleep/network calls elsewhere in this module —
+# only around the quick, purely-local write bursts — so a slow driver
+# download or the 45-minute install watcher never blocks status polling.
+_state_lock = threading.Lock()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -424,49 +431,56 @@ def check_for_update(force: bool = False) -> dict:
     _state["error"]    = None
     try:
         gpu = detect_gpu()
-        _state["vendor"]          = gpu.get("vendor")
-        _state["model"]           = gpu.get("model")
-        _state["current_version"] = gpu.get("current_version")
-        _state["update_available"] = False
-        _state["latest_version"]   = None
-        _state["download_url"]     = None
-        _state["release_url"]      = None
-        _state["release_date"]     = None
-        _state["size_mb"]          = None
-        _state["manual_link"]      = None
+        with _state_lock:
+            _state["vendor"]          = gpu.get("vendor")
+            _state["model"]           = gpu.get("model")
+            _state["current_version"] = gpu.get("current_version")
+            _state["update_available"] = False
+            _state["latest_version"]   = None
+            _state["download_url"]     = None
+            _state["release_url"]      = None
+            _state["release_date"]     = None
+            _state["size_mb"]          = None
+            _state["manual_link"]      = None
 
         if gpu["vendor"] == "nvidia":
             r = _check_nvidia_latest(gpu["model"])
+            with _state_lock:
+                if r["ok"]:
+                    _state["latest_version"] = r["version"]
+                    _state["download_url"]   = r["download_url"]
+                    _state["release_url"]    = r["release_url"]
+                    _state["release_date"]   = r["release_date"]
+                    _state["size_mb"]        = r["size_mb"]
+                    cur = _version_tuple(gpu["current_version"])
+                    lat = _version_tuple(r["version"])
+                    _state["update_available"] = (lat > cur)
+                else:
+                    _state["error"]       = r.get("err")
+                    _state["manual_link"] = r.get("manual_link")
             if r["ok"]:
-                _state["latest_version"] = r["version"]
-                _state["download_url"]   = r["download_url"]
-                _state["release_url"]    = r["release_url"]
-                _state["release_date"]   = r["release_date"]
-                _state["size_mb"]        = r["size_mb"]
-                cur = _version_tuple(gpu["current_version"])
-                lat = _version_tuple(r["version"])
-                _state["update_available"] = (lat > cur)
                 if _state["update_available"]:
                     log.info(f"NVIDIA driver update: {gpu['current_version']} -> {r['version']}")
                 else:
                     log.info(f"NVIDIA driver up to date: {gpu['current_version']}")
-            else:
-                _state["error"]       = r.get("err")
-                _state["manual_link"] = r.get("manual_link")
         elif gpu["vendor"] == "amd":
             # AMD: just point at the download page.  Auto-install would
             # require driving the AMD installer EULA which we can't.
-            _state["manual_link"] = "https://www.amd.com/en/support"
-            _state["error"]       = ("AMD: please use the AMD support site to download the latest "
-                                      "Adrenalin driver for your card.")
+            with _state_lock:
+                _state["manual_link"] = "https://www.amd.com/en/support"
+                _state["error"]       = ("AMD: please use the AMD support site to download the latest "
+                                          "Adrenalin driver for your card.")
         else:
-            _state["error"] = "Could not detect a supported GPU (NVIDIA / AMD)."
+            with _state_lock:
+                _state["error"] = "Could not detect a supported GPU (NVIDIA / AMD)."
 
-        _state["last_check_ts"] = time.time()
+        with _state_lock:
+            _state["last_check_ts"] = time.time()
+            snapshot = _state.copy()
         s = _load_settings()
-        s["last_check_ts"] = _state["last_check_ts"]
+        s["last_check_ts"] = snapshot["last_check_ts"]
         _save_settings(s)
-        return _state.copy()
+        return snapshot
     finally:
         _state["checking"] = False
 
@@ -531,12 +545,14 @@ def download_driver() -> dict:
     # Already downloaded?  NVIDIA installers are >100 MB, so use that as
     # a sanity threshold.
     if os.path.exists(dest) and os.path.getsize(dest) > 100 * 1024 * 1024:
-        _state["downloaded_path"]   = dest
-        _state["download_progress"] = 100
+        with _state_lock:
+            _state["downloaded_path"]   = dest
+            _state["download_progress"] = 100
         return {"ok": True, "path": dest, "cached": True}
 
-    _state["downloading"]       = True
-    _state["download_progress"] = 0
+    with _state_lock:
+        _state["downloading"]       = True
+        _state["download_progress"] = 0
     log.info(f"Downloading NVIDIA driver from {url}")
     try:
         cmd = (
@@ -561,8 +577,9 @@ def download_driver() -> dict:
     if r.returncode != 0 or not os.path.exists(dest):
         return {"ok": False, "err": (r.stderr or r.stdout or "Download failed")[:200]}
     size_mb = os.path.getsize(dest) / (1024 * 1024)
-    _state["downloaded_path"]   = dest
-    _state["download_progress"] = 100
+    with _state_lock:
+        _state["downloaded_path"]   = dest
+        _state["download_progress"] = 100
     log.info(f"Driver download complete: {dest} ({size_mb:.1f} MB)")
     return {"ok": True, "path": dest, "size_mb": round(size_mb, 1)}
 
@@ -613,10 +630,11 @@ def _watch_install(target_version: str, prev_version: str):
             changed = (cur != prev_version)
             reached = (tgt is None) or (_version_tuple(cur) >= tgt)
             if changed and reached:
-                _state["current_version"]  = cur
-                _state["update_available"] = False
-                _state["install_result"]   = "success"
-                _state["install_message"]  = f"Driver updated to {cur}."
+                with _state_lock:
+                    _state["current_version"]  = cur
+                    _state["update_available"] = False
+                    _state["install_result"]   = "success"
+                    _state["install_message"]  = f"Driver updated to {cur}."
                 log.info(f"Driver install confirmed — now on {cur}")
                 # The installer has served its purpose; reclaim the space.
                 try:
@@ -630,9 +648,10 @@ def _watch_install(target_version: str, prev_version: str):
                 except OSError:
                     pass
                 return
-        _state["install_result"]  = "unconfirmed"
-        _state["install_message"] = ("Could not confirm the driver version "
-                                     "changed — check NVIDIA's installer window.")
+        with _state_lock:
+            _state["install_result"]  = "unconfirmed"
+            _state["install_message"] = ("Could not confirm the driver version "
+                                         "changed — check NVIDIA's installer window.")
         log.info("Driver install watcher timed out without a version change")
     finally:
         _state["installing"] = False
@@ -712,11 +731,12 @@ def install_driver() -> dict:
     # launch does NOT mean the install ran or succeeded.  Kick off a slow
     # background watcher that confirms via nvidia-smi, surfaces a success
     # toast, and reclaims the installer once the new driver is live.
-    _state["installing"]      = True
-    _state["install_result"]  = None
-    _state["install_message"] = None
-    target = _state.get("latest_version") or ""
-    prev   = _state.get("current_version") or ""
+    with _state_lock:
+        _state["installing"]      = True
+        _state["install_result"]  = None
+        _state["install_message"] = None
+        target = _state.get("latest_version") or ""
+        prev   = _state.get("current_version") or ""
     threading.Thread(target=_watch_install, args=(target, prev),
                      daemon=True).start()
 
@@ -726,7 +746,8 @@ def install_driver() -> dict:
 
 
 def get_status() -> dict:
-    s = _state.copy()
+    with _state_lock:
+        s = _state.copy()
     s["settings"] = _load_settings()
     s["check_interval_hours"] = CHECK_INTERVAL_HOURS
     return s

@@ -133,33 +133,40 @@ async def register_device(
     is_new = not await _device_exists(db, req.device_id)
     ip_h   = _ip_hash(request)
 
-    await db.execute(
-        """
-        INSERT INTO devices
-            (id, gpu_model, gpu_model_norm, cpu_family, cpu_model, ram_gb,
-             ram_gb_bucket, os_build, app_version, last_ip_hash, last_seen)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW())
-        ON CONFLICT (id) DO UPDATE SET
-            gpu_model      = COALESCE(EXCLUDED.gpu_model,      devices.gpu_model),
-            gpu_model_norm = COALESCE(EXCLUDED.gpu_model_norm, devices.gpu_model_norm),
-            cpu_family     = COALESCE(EXCLUDED.cpu_family,     devices.cpu_family),
-            cpu_model      = COALESCE(EXCLUDED.cpu_model,      devices.cpu_model),
-            ram_gb         = COALESCE(EXCLUDED.ram_gb,         devices.ram_gb),
-            ram_gb_bucket  = COALESCE(EXCLUDED.ram_gb_bucket,  devices.ram_gb_bucket),
-            os_build       = COALESCE(EXCLUDED.os_build,       devices.os_build),
-            app_version    = COALESCE(EXCLUDED.app_version,    devices.app_version),
-            last_ip_hash   = EXCLUDED.last_ip_hash,
-            last_seen      = NOW()
-        """,
-        req.device_id, hw.gpu_model, _norm_gpu_model(hw.gpu_model),
-        hw.cpu_family, hw.cpu_model, hw.ram_gb,
-        _ram_bucket(hw.ram_gb), hw.os_build, hw.app_version, ip_h,
-    )
-    if is_new:
+    # Both writes must land together: if the process dies/times out between
+    # them, `is_new` would come back False on retry (the devices row already
+    # exists) and the device_settings insert below would never be attempted
+    # again, permanently missing a settings row for that device. Wrapping in
+    # a transaction means either both writes land or neither does, so a
+    # retry after a crash correctly re-attempts both.
+    async with db.transaction():
         await db.execute(
-            "INSERT INTO device_settings (device_id) VALUES ($1) ON CONFLICT DO NOTHING",
-            req.device_id,
+            """
+            INSERT INTO devices
+                (id, gpu_model, gpu_model_norm, cpu_family, cpu_model, ram_gb,
+                 ram_gb_bucket, os_build, app_version, last_ip_hash, last_seen)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                gpu_model      = COALESCE(EXCLUDED.gpu_model,      devices.gpu_model),
+                gpu_model_norm = COALESCE(EXCLUDED.gpu_model_norm, devices.gpu_model_norm),
+                cpu_family     = COALESCE(EXCLUDED.cpu_family,     devices.cpu_family),
+                cpu_model      = COALESCE(EXCLUDED.cpu_model,      devices.cpu_model),
+                ram_gb         = COALESCE(EXCLUDED.ram_gb,         devices.ram_gb),
+                ram_gb_bucket  = COALESCE(EXCLUDED.ram_gb_bucket,  devices.ram_gb_bucket),
+                os_build       = COALESCE(EXCLUDED.os_build,       devices.os_build),
+                app_version    = COALESCE(EXCLUDED.app_version,    devices.app_version),
+                last_ip_hash   = EXCLUDED.last_ip_hash,
+                last_seen      = NOW()
+            """,
+            req.device_id, hw.gpu_model, _norm_gpu_model(hw.gpu_model),
+            hw.cpu_family, hw.cpu_model, hw.ram_gb,
+            _ram_bucket(hw.ram_gb), hw.os_build, hw.app_version, ip_h,
         )
+        if is_new:
+            await db.execute(
+                "INSERT INTO device_settings (device_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                req.device_id,
+            )
 
     settings_row = await _get_settings(db, req.device_id)
     log.info(f"Device {'registered' if is_new else 'refreshed'}: {req.device_id} "

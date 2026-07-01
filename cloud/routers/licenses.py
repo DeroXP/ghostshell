@@ -217,16 +217,29 @@ async def activate(
             "deactivate one from your portal first",
         )
     slot = await _next_free_slot(db, lic["id"])
-    await db.execute(
-        """INSERT INTO license_devices
-              (license_id, slot_no, device_fp_hash,
-               gpu_model_norm, cpu_family, ram_gb_bucket,
-               activated_at, last_seen)
-           VALUES ($1, $2, $3, $4, $5, $6, now(), now())""",
-        lic["id"], slot, fp_hash,
-        req.buckets.gpu_model_norm, req.buckets.cpu_family,
-        req.buckets.ram_gb_bucket,
-    )
+    try:
+        await db.execute(
+            """INSERT INTO license_devices
+                  (license_id, slot_no, device_fp_hash,
+                   gpu_model_norm, cpu_family, ram_gb_bucket,
+                   activated_at, last_seen)
+               VALUES ($1, $2, $3, $4, $5, $6, now(), now())""",
+            lic["id"], slot, fp_hash,
+            req.buckets.gpu_model_norm, req.buckets.cpu_family,
+            req.buckets.ram_gb_bucket,
+        )
+    except asyncpg.UniqueViolationError:
+        # Two concurrent /activate calls for the same license can both pass
+        # the slot-count check above and race to insert the same slot_no —
+        # the UNIQUE(license_id, slot_no) constraint is the real guard
+        # against over-allocation, this just turns the loser's raw DB
+        # constraint error into a clean, actionable response instead of a
+        # generic 500.
+        raise HTTPException(
+            409,
+            f"all {settings.license_max_devices} device slots in use — "
+            "deactivate one from your portal first",
+        )
     log.info(f"License {lic['id']} activated on new slot {slot} "
              f"({used + 1}/{settings.license_max_devices}) "
              f"gpu={req.buckets.gpu_model_norm!r}")

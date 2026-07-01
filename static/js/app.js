@@ -383,19 +383,19 @@ async function sendErrorReportToMaintainer() {
         });
         if (r && r.ok) {
             if (r.duplicate) {
-                if (statusEl) statusEl.innerHTML = '<span style="color:var(--accent)">Already sent recently (deduped). Hash: ' + (r.hash || '?') + '</span>';
+                if (statusEl) statusEl.innerHTML = '<span style="color:var(--accent)">Already sent recently (deduped). Hash: ' + escHtml(r.hash || '?') + '</span>';
             } else if (r.skipped) {
-                if (statusEl) statusEl.innerHTML = '<span style="color:var(--warning)">Error reporting is off in Settings.  Saved locally: ' + (r.local_path || '?') + '</span>';
+                if (statusEl) statusEl.innerHTML = '<span style="color:var(--warning)">Error reporting is off in Settings.  Saved locally: ' + escHtml(r.local_path || '?') + '</span>';
             } else {
-                if (statusEl) statusEl.innerHTML = '<span style="color:var(--accent)">✓ Sent.  Reference hash: ' + (r.hash || '?') + '</span>';
+                if (statusEl) statusEl.innerHTML = '<span style="color:var(--accent)">✓ Sent.  Reference hash: ' + escHtml(r.hash || '?') + '</span>';
                 setTimeout(closeModal, 1800);
             }
         } else {
-            if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">Send failed: ' + ((r && r.err) || 'unknown') + ' — saved locally so you can retry.</span>';
+            if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">Send failed: ' + escHtml((r && r.err) || 'unknown') + ' — saved locally so you can retry.</span>';
             if (btn) { btn.disabled = false; btn.textContent = 'Retry →'; }
         }
     } catch (e) {
-        if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">Network error: ' + (e && e.message || e) + '</span>';
+        if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">Network error: ' + escHtml((e && e.message) || String(e)) + '</span>';
         if (btn) { btn.disabled = false; btn.textContent = 'Retry →'; }
     }
 }
@@ -1310,7 +1310,10 @@ function _renderHealthRow(c) {
             fix = '<button class="btn btn-sm" onclick="switchPage(\'' + escHtml(c.fix.page) + '\')" '
                 + 'style="margin-left:8px;flex-shrink:0">Open ' + escHtml(c.fix.page) + '</button>';
         } else if (c.fix.kind === 'route' && c.fix.method === 'POST') {
-            var bodyJson = JSON.stringify(c.fix.body || {}).replace(/"/g, '&quot;');
+            // escAttr (not just a raw "-only replace) so a single quote or
+            // angle bracket inside c.fix.body can't break out of the
+            // \'...\' string boundary in the onclick attribute below.
+            var bodyJson = escAttr(JSON.stringify(c.fix.body || {}));
             fix = '<button class="btn btn-sm btn-primary" '
                 + 'onclick="_healthFix(\'' + escHtml(c.fix.url) + '\', \'' + bodyJson + '\', this)" '
                 + 'style="margin-left:8px;flex-shrink:0">Fix it</button>';
@@ -1334,7 +1337,9 @@ function _renderHealthRow(c) {
 async function _healthFix(url, bodyJson, btn) {
     if (btn) { btn.disabled = true; btn.textContent = '…'; }
     try {
-        var body = JSON.parse(bodyJson.replace(/&quot;/g, '"'));
+        // Reverse escAttr()'s escaping (quotes + angle brackets) before parsing.
+        var body = JSON.parse(bodyJson.replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+                                       .replace(/&lt;/g, '<').replace(/&gt;/g, '>'));
         var r = await apiPost(url, body);
         addLog('Health fix → ' + url + ' ok=' + (r && r.ok));
     } catch (e) {
@@ -2659,7 +2664,11 @@ async function loadVaultEntries() {
     }
     var entries = data.entries || [];
     if (entries.length === 0) {
-        el.innerHTML = '<div style="color:var(--text-dim);text-align:center;padding:30px">No entries yet. Click "Add Entry" to get started.</div>';
+        if (data.had_decrypt_errors) {
+            el.innerHTML = '<div style="color:var(--red);text-align:center;padding:30px">Could not read any vault entries — they may be corrupted or encrypted under a different key. Check the app log for details.</div>';
+        } else {
+            el.innerHTML = '<div style="color:var(--text-dim);text-align:center;padding:30px">No entries yet. Click "Add Entry" to get started.</div>';
+        }
         return;
     }
     var html = '';
@@ -2694,7 +2703,8 @@ async function copyPassword(id) {
 
 async function deleteVaultEntry(id) {
     if (!confirm('Delete this entry permanently?')) return;
-    await fetch('/api/vault/entry/' + id, { method: 'DELETE' });
+    var r = await apiDelete('/api/vault/entry/' + id);
+    if (!r || !r.ok) { showErrorToast((r && r.err) || 'Failed to delete entry'); return; }
     loadVaultEntries();
 }
 
@@ -2753,12 +2763,14 @@ async function updateEntry(id) {
         category: document.getElementById('edit-category').value,
         notes: document.getElementById('edit-notes').value,
     };
-    var r = await fetch('/api/vault/entry/' + id, {
+    var url = '/api/vault/entry/' + id;
+    var r = await _apiHandle(url, fetch(url, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
-    }).then(function(res) { return res.json(); });
-    if (r.ok) { closeModal(); loadVaultEntries(); }
+    }));
+    if (r && r.ok) { closeModal(); loadVaultEntries(); }
+    else { showErrorToast((r && r.err) || 'Failed to update entry'); }
 }
 
 function openPasswordGen() {
@@ -4961,7 +4973,8 @@ async function deleteGpmProfile() {
         return;
     }
     if (!confirm('Delete profile "' + _gpmCurrentProfile.name + '"?')) return;
-    await fetch('/api/gamepad/profiles/' + encodeURIComponent(_gpmCurrentProfile.name), {method: 'DELETE'});
+    var r = await apiDelete('/api/gamepad/profiles/' + encodeURIComponent(_gpmCurrentProfile.name));
+    if (!r || !r.ok) { showErrorToast((r && r.err) || 'Failed to delete profile'); return; }
     loadGamepadMapper();
 }
 
@@ -8874,8 +8887,8 @@ function _renderBenchmarkComparison(el, result) {
 
 async function deleteOcProfile() {
     if (!confirm('Delete saved OC profile and reset GPU to stock?')) return;
-    var r = await fetch('/api/gpu/oc/profile', { method: 'DELETE' }).then(function(x) { return x.json(); });
-    if (r.ok) {
+    var r = await apiDelete('/api/gpu/oc/profile');
+    if (r && r.ok) {
         termWrite('gpu-terminal', '✓ Profile deleted, GPU reset to stock');
         loadOcProfile();
         var cs = document.getElementById('oc-core-slider'); if (cs) cs.value = 0;
@@ -8883,6 +8896,8 @@ async function deleteOcProfile() {
         var ps = document.getElementById('oc-power-slider'); if (ps) ps.value = 100;
         onOcSliderChange();
         pollOcLiveOnce();
+    } else {
+        termWrite('gpu-terminal', '✗ ' + ((r && r.err) || 'Failed to delete profile'));
     }
 }
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 import ctypes
 import threading
 import queue
+import time
 from ctypes import wintypes
 from typing import Optional
 
@@ -291,15 +292,47 @@ def start_keyboard_hook() -> dict:
     return {"ok": True}
 
 
+def _stop_hook_thread(thread: Optional[threading.Thread], tid: int, name: str) -> bool:
+    """Ask `tid`'s message pump to quit and wait for the thread to actually
+    exit before we let the caller believe the hook is gone.
+
+    PostThreadMessageW can fail if the target thread hasn't created a
+    message queue yet (a very real race if stop is called right after
+    start, before the thread reaches GetMessageW) — a stale thread left
+    running would keep its native hook installed while our module-level
+    _kb_cb_ref/_kb_hook (or the mouse equivalents) get overwritten by a
+    subsequent start(), risking Windows calling back into a callback
+    object Python has since garbage-collected. Retry briefly, then wait
+    for the thread to actually finish."""
+    if not tid:
+        return True
+    for attempt in range(5):
+        if _user32.PostThreadMessageW(tid, WM_QUIT, 0, 0):
+            break
+        if attempt == 4:
+            log.warning(f"{name}: PostThreadMessageW failed after retries "
+                        f"(tid={tid}); hook thread may not stop cleanly")
+            return False
+        time.sleep(0.05)
+    if thread is not None:
+        thread.join(timeout=1.0)
+        if thread.is_alive():
+            log.warning(f"{name}: hook thread did not exit within 1s after WM_QUIT")
+            return False
+    return True
+
+
 def stop_keyboard_hook() -> dict:
     global _kb_thread, _kb_thread_id
     with _lock:
-        tid = _kb_thread_id
-        if tid:
-            _user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
+        # Held for the whole stop (including the join below) — releasing
+        # early would let a concurrent start_keyboard_hook() slip in while
+        # the old thread is still exiting and recreate the same race this
+        # is meant to close.
+        ok = _stop_hook_thread(_kb_thread, _kb_thread_id, "keyboard hook")
         _kb_thread = None
         _kb_thread_id = 0
-    return {"ok": True}
+    return {"ok": ok}
 
 
 def start_mouse_hook() -> dict:
@@ -316,12 +349,10 @@ def start_mouse_hook() -> dict:
 def stop_mouse_hook() -> dict:
     global _mouse_thread, _mouse_thread_id
     with _lock:
-        tid = _mouse_thread_id
-        if tid:
-            _user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
+        ok = _stop_hook_thread(_mouse_thread, _mouse_thread_id, "mouse hook")
         _mouse_thread = None
         _mouse_thread_id = 0
-    return {"ok": True}
+    return {"ok": ok}
 
 
 def drain_events() -> list[dict]:

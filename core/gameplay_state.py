@@ -226,10 +226,24 @@ _state_cache: dict = {}  # exe -> {state, confidence, reasons, ticks_in_state}
 _consecutive_alt: dict = {} # exe -> count of consecutive alt-state classifications
 _samples_lock = threading.Lock()
 
+# Each per-exe deque is already bounded (maxlen=SAMPLES_WINDOW), but nothing
+# ever removed an exe's *entry* from these dicts once observed — only an
+# explicit reset() call does, and nothing wires that to "game closed". Over
+# a long-running install that sees many different games, the three dicts
+# would otherwise grow by one key per distinct exe forever. Cap the number
+# of tracked games and evict the oldest (dicts are insertion-ordered) when
+# a genuinely new game pushes past the cap.
+_MAX_TRACKED_GAMES = 64
+
 
 def _ensure(exe: str) -> None:
     with _samples_lock:
         if exe not in _samples:
+            if len(_samples) >= _MAX_TRACKED_GAMES:
+                oldest = next(iter(_samples))
+                _samples.pop(oldest, None)
+                _state_cache.pop(oldest, None)
+                _consecutive_alt.pop(oldest, None)
             _samples[exe] = deque(maxlen=SAMPLES_WINDOW)
         if exe not in _state_cache:
             _state_cache[exe] = {
