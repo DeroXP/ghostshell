@@ -187,11 +187,14 @@ def default_install_dir() -> str:
     pf = os.environ.get("ProgramFiles", r"C:\Program Files")
     # Probe: can we write to Program Files itself?  If yes we'll be
     # able to create our subdir there.  Otherwise fall back.
+    # Fresh installs get a "Vispora" folder; existing installs in the old
+    # GhostShell folders are still found by find_existing_ghostshell()'s
+    # candidate scan — this default only affects genuinely fresh installs.
     if os.path.isdir(pf) and os.access(pf, os.W_OK):
-        return os.path.join(pf, "GhostShell")
+        return os.path.join(pf, "Vispora")
     localappdata = os.environ.get("LOCALAPPDATA") or os.path.join(
         os.path.expanduser("~"), "AppData", "Local")
-    return os.path.join(localappdata, "Programs", "GhostShell")
+    return os.path.join(localappdata, "Programs", "Vispora")
 
 
 def _log(msg: str) -> None:

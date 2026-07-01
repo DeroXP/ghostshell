@@ -35,8 +35,11 @@ from typing import Optional
 # only two pieces of state hard-coded into the binary — everything else
 # (target dir, channel, etc) comes from args or install_info.json so the
 # updater stays usable across re-locations.
-UPDATER_VERSION  = "1.4.2"
-SERVER_URL_DEFAULT = "https://ghostshell-site.up.railway.app"
+UPDATER_VERSION  = "1.4.3"
+SERVER_URL_DEFAULT = "https://vispora.up.railway.app"
+# Old Railway domain (service renamed 2026-07-01) — dead, kept only so we
+# can recognize and migrate a stale --server arg from an old install.
+SERVER_URL_LEGACY  = "https://ghostshell-site.up.railway.app"
 
 # ─── Paths ───────────────────────────────────────────────────────────
 APPDATA_DIR  = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
@@ -122,6 +125,12 @@ def main():
     current_version = args["current_version"] or info.get("version", "")
     target_version = args["target_version"]
     server_url     = (args["server"] or SERVER_URL_DEFAULT).rstrip("/")
+    # An old install may pass the dead pre-rename Railway host via
+    # --server (from its stale saved settings) — migrate it here so the
+    # standalone updater still reaches the live server either way.
+    if "ghostshell-site.up.railway.app" in server_url:
+        log(f"  migrating dead server URL {server_url!r} → {SERVER_URL_DEFAULT!r}")
+        server_url = SERVER_URL_DEFAULT
 
     # If target_exe is set but target_dir isn't, derive it
     if target_exe and not target_dir:

@@ -19,7 +19,7 @@ from core import (system_info, debloater, optimizer, dns_manager, network_tweaks
                   crash_recovery, perf_monitor, adaptive_tuning, health_audit,
                   snapshots, library_scanner, background_pauser, tournament_mode,
                   net_monitor, gamepad_mapper, competitive_latency, latency_doctor,
-                  competitive_advisor, startup_manager)
+                  competitive_advisor, startup_manager, idle_mode)
 
 log = get_logger("app")
 
@@ -1472,6 +1472,32 @@ def api_startup_browse():
         return jsonify({"ok": True, "path": path})
     except Exception as e:
         return jsonify({"ok": False, "err": str(e)})
+
+
+# ─── Idle Mode (beta.12) — cool & quiet when no game is detected ─────
+@app.route("/api/idle/settings", methods=["GET", "POST"])
+def api_idle_settings():
+    if request.method == "POST":
+        d = request.get_json(silent=True) or {}
+        return jsonify(idle_mode.set_settings(
+            enabled=d.get("enabled"),
+            grace_minutes=d.get("grace_minutes"),
+            poll_seconds=d.get("poll_seconds"),
+            idle_power_pct=d.get("idle_power_pct"),
+            park_oc=d.get("park_oc"),
+            switch_power_plan=d.get("switch_power_plan")))
+    return jsonify(idle_mode.get_settings())
+
+
+@app.route("/api/idle/status")
+def api_idle_status():
+    return jsonify(idle_mode.get_status())
+
+
+@app.route("/api/idle/wake", methods=["POST"])
+def api_idle_wake():
+    """Force-release idle mode right now (restore full posture)."""
+    return jsonify(idle_mode.manual_release())
 
 
 @app.route("/api/integrity/history")
@@ -4260,6 +4286,15 @@ def main():
         except Exception as e:
             log.warning(f"startup manager boot failed: {e}")
     _delayed(3, _arm_startup_manager)
+
+    # beta.12 — Idle Mode: cool & quiet when no game is detected.  Arms
+    # its own watcher only if the user left it enabled.
+    def _arm_idle_mode():
+        try:
+            idle_mode.run_on_boot()
+        except Exception as e:
+            log.warning(f"idle mode boot failed: {e}")
+    _delayed(4, _arm_idle_mode)
 
     # Start Flask in background thread
     flask_thread = threading.Thread(target=start_flask, daemon=True)

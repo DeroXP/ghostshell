@@ -68,11 +68,11 @@ function renderHeader(st) {
     const title = document.getElementById('page-title');
     const appTitle = document.getElementById('app-title');
     if (st.mode === 'install') {
-        title.textContent = 'Install GhostShell';
-        appTitle.textContent = 'GhostShell Installer';
+        title.textContent = 'Install Vispora';
+        appTitle.textContent = 'Vispora Installer';
     } else {
-        title.textContent = 'Updating GhostShell';
-        appTitle.textContent = 'GhostShell Updater';
+        title.textContent = 'Updating Vispora';
+        appTitle.textContent = 'Vispora Updater';
     }
     document.getElementById('channel-tag').textContent =
         'channel: ' + (st.channel || '— pick —');
@@ -107,7 +107,7 @@ function renderInstallBanner(st) {
         const detail = document.getElementById('install-banner-detail');
         if (st.scan_result && (st.scan_result.candidates || []).length) {
             detail.textContent =
-                'No existing GhostShell found across ' +
+                'No existing Vispora found across ' +
                 st.scan_result.candidates.length +
                 ' standard locations.  Pick where to install it below.';
         }
@@ -188,7 +188,7 @@ function renderButtons(st) {
     } else {
         btnStart.disabled       = !(st.target_dir && st.channel);
         btnStart.style.display  = '';
-        btnStart.textContent    = st.mode === 'install' ? 'Install GhostShell' : 'Install Update';
+        btnStart.textContent    = st.mode === 'install' ? 'Install Vispora' : 'Install Update';
         btnCancel.style.display = '';
         btnCancel.textContent   = 'Cancel';
         btnClose.style.display  = 'none';
@@ -248,7 +248,7 @@ function _closeUpdaterNow() {
               'stroke="currentColor" stroke-width="3" ' +
               'style="vertical-align:middle;width:14px;height:14px;margin-right:6px">' +
               '<polyline points="20 6 9 17 4 12"/></svg>' +
-            'Update complete — GhostShell is launching.';
+            'Update complete — Vispora is launching.';
         box.style.display = '';
     }
     // Small delay so the banner has a frame to render before the

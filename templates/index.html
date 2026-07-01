@@ -2596,6 +2596,27 @@
                 </div>
             </div>
 
+            <div class="card" id="idle-mode-card" style="margin-bottom:16px">
+                <div class="card-section">
+                    <div class="card-section-title">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/></svg>
+                        Idle Mode — cool &amp; quiet
+                    </div>
+                    <div class="card-section-desc">When no game is detected for a while, Vispora eases the GPU power limit and switches to a Balanced power plan — cooler card, quieter fans, lower idle draw. Your PC stays fully usable for everything else; the instant a game launches, your exact overclock and power plan snap back. Opt-in.</div>
+                    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:12px 0">
+                        <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);cursor:pointer"><input type="checkbox" id="idle-enabled" onchange="idleSave()"> Enable Idle Mode</label>
+                        <span style="font-size:12px;color:var(--text-tertiary)">Engage after <input type="number" id="idle-grace" min="1" max="120" value="5" onchange="idleSave()" style="width:52px;padding:4px 6px;border-radius:5px;background:var(--bg-input);border:1px solid var(--border);color:var(--text);font-size:12px"> min idle</span>
+                        <span style="font-size:12px;color:var(--text-tertiary)">GPU power limit <input type="number" id="idle-power" min="50" max="100" value="70" onchange="idleSave()" style="width:52px;padding:4px 6px;border-radius:5px;background:var(--bg-input);border:1px solid var(--border);color:var(--text);font-size:12px"> %</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:6px 0">
+                        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-tertiary);cursor:pointer"><input type="checkbox" id="idle-park-oc" onchange="idleSave()"> Park overclock to stock while idle</label>
+                        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-tertiary);cursor:pointer"><input type="checkbox" id="idle-power-plan" onchange="idleSave()"> Switch to Balanced power plan while idle</label>
+                    </div>
+                    <div id="idle-status" style="margin:8px 0;font-size:12px;color:var(--text-tertiary)">Loading…</div>
+                    <div style="margin-top:8px"><button class="btn btn-sm" onclick="idleWake()">Wake now (restore full power)</button></div>
+                </div>
+            </div>
+
             <div class="card">
                 <div class="card-section">
                     <div class="card-section-title">

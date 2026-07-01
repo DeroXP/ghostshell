@@ -532,7 +532,17 @@ def download_driver() -> dict:
         return {"ok": False, "err": "Already downloading"}
 
     url = _state["download_url"]
-    fname = url.split("/")[-1].split("?")[0] or f"nvidia_{_state.get('latest_version','x')}.exe"
+    # The URL comes from NVIDIA's driver API over the network — validate it
+    # strictly before it's interpolated into the PowerShell download command
+    # below.  A MITM / hijacked / compromised endpoint returning a URL with
+    # embedded quotes or semicolons could otherwise inject PowerShell that
+    # runs in our elevated context.  Require plain https + URL-safe chars only.
+    if not re.match(r"^https://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$", url) or '"' in url:
+        return {"ok": False, "err": "driver download URL failed validation — refusing"}
+    # Derive a SAFE local filename (URL is validated, but the basename still
+    # feeds an -OutFile path, so strip it to a plain token defensively).
+    raw_fname = url.split("/")[-1].split("?")[0]
+    fname = re.sub(r"[^A-Za-z0-9._-]", "", raw_fname) or f"nvidia_{_state.get('latest_version','x')}.exe"
     if not fname.lower().endswith(".exe"):
         fname += ".exe"
     dest = os.path.join(DRIVERS_DIR, fname)

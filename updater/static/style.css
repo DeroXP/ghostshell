@@ -1,9 +1,9 @@
-/* GhostShell Updater — palette matched to the main app (style.css).
-   Frameless window with custom titlebar matching GhostShell's chrome. */
+/* Vispora Updater — palette matched to the main app (style.css).
+   Frameless window with custom titlebar matching Vispora's chrome. */
 
 :root {
-    /* Mirrors GhostShell's exact variables — keeping these in lockstep
-       means the updater feels like a smaller pane of the same app. */
+    /* Mirrors Vispora's exact "Nacre" variables — keeping these in
+       lockstep means the updater feels like a smaller pane of the same app. */
     --bg-base:        #020203;
     --bg-elevated:    #0a0a0c;
     --bg-overlay:     #131316;
@@ -16,13 +16,13 @@
     --text:           #f5f5f7;
     --text-secondary: #a0a0a8;
     --text-tertiary:  #5a5a64;
-    --accent:         #5edda2;
-    --accent-bright:  #7eecb8;
-    --accent-deep:    #2ea864;
-    --accent-soft:    rgba(94, 221, 162, 0.10);
-    --accent-mid:     rgba(94, 221, 162, 0.22);
-    --accent-glow:    rgba(94, 221, 162, 0.32);
-    --accent-fg:      #03130b;
+    --accent:         #c4c1ff;
+    --accent-bright:  #d9d3ff;
+    --accent-deep:    #9f93e6;
+    --accent-soft:    rgba(196, 193, 255, 0.10);
+    --accent-mid:     rgba(196, 193, 255, 0.22);
+    --accent-glow:    rgba(196, 193, 255, 0.34);
+    --accent-fg:      #0a0814;
     --warning:        #f0b341;
     --danger:         #f06464;
 

@@ -237,13 +237,32 @@ def _download_updater_worker(remote_version: str = "") -> None:
     boots can compare without re-downloading."""
     try:
         s = _load_settings()
-        url = (s.get("server_url") or UPDATE_SERVER_URL_DEFAULT).rstrip("/") + "/download/updater"
+        base = (s.get("server_url") or UPDATE_SERVER_URL_DEFAULT).rstrip("/")
+        url = base + "/download/updater"
         log.info(f"Auto-installing updater from {url}")
         import urllib.request
+
+        # Fetch the expected SHA-256 first so the downloaded binary can be
+        # verified — same fail-closed posture as app-update downloads.  A
+        # deploy landing between this fetch and the download shows up as a
+        # mismatch → clean retry on the next boot.
+        expected_sha = ""
+        try:
+            vreq = urllib.request.Request(base + "/version/updater", headers={
+                "User-Agent": f"GhostShell/{APP_VERSION}-updater-bootstrap"})
+            with urllib.request.urlopen(vreq, timeout=15) as vr:
+                expected_sha = ((json.loads(vr.read()) or {}).get("sha256") or "").lower()
+        except Exception as e:
+            log.debug(f"updater version pre-fetch failed: {e}")
+        if not expected_sha:
+            raise RuntimeError("server did not provide a SHA-256 for the "
+                               "updater — refusing to install an unverified binary")
+
         os.makedirs(UPDATER_DIR, exist_ok=True)
         tmp = UPDATER_EXE + ".part"
         req = urllib.request.Request(url, headers={
             "User-Agent": f"GhostShell/{APP_VERSION}-updater-bootstrap"})
+        h = hashlib.sha256()
         with urllib.request.urlopen(req, timeout=60) as r:
             total = int(r.headers.get("Content-Length", 0) or 0)
             with _updater_install_lock:
@@ -255,6 +274,7 @@ def _download_updater_worker(remote_version: str = "") -> None:
                     if not chunk:
                         break
                     f.write(chunk)
+                    h.update(chunk)
                     downloaded += len(chunk)
                     with _updater_install_lock:
                         _updater_install_state["downloaded"] = downloaded
@@ -264,6 +284,12 @@ def _download_updater_worker(remote_version: str = "") -> None:
             raise RuntimeError(
                 f"updater download too small ({sz} B) — Railway might not "
                 f"have the updater hosted yet, or returned an error page")
+        if h.hexdigest().lower() != expected_sha:
+            os.remove(tmp)
+            raise RuntimeError(
+                f"updater download failed SHA-256 check (expected "
+                f"{expected_sha[:16]}…, got {h.hexdigest()[:16]}…) — refusing "
+                f"to install; will retry next boot")
         os.replace(tmp, UPDATER_EXE)
         if remote_version:
             _write_installed_updater_version(remote_version)
@@ -273,6 +299,14 @@ def _download_updater_worker(remote_version: str = "") -> None:
         log.info(f"Updater installed at {UPDATER_EXE} ({sz} B)"
                  + (f" — v{remote_version}" if remote_version else ""))
     except Exception as e:
+        # Clean up a partial .part so a network drop mid-download doesn't
+        # leave stale bytes on disk for the next boot's retry to trip over.
+        try:
+            _part = UPDATER_EXE + ".part"
+            if os.path.exists(_part):
+                os.remove(_part)
+        except OSError:
+            pass
         with _updater_install_lock:
             _updater_install_state["err"] = str(e)
             _updater_install_state["running"] = False
@@ -310,7 +344,22 @@ def _load_settings() -> dict:
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return {**_DEFAULT_SETTINGS, **(data if isinstance(data, dict) else {})}
+        merged = {**_DEFAULT_SETTINGS, **(data if isinstance(data, dict) else {})}
+        # One-time migration: the Railway service was renamed and the old
+        # ghostshell-site domain is dead.  A saved server_url pointing at it
+        # would strand this install's update checks forever, so rewrite it
+        # to the new default and persist the fix.
+        from config import UPDATE_SERVER_URL_LEGACY
+        saved_url = (merged.get("server_url") or "")
+        if "ghostshell-site.up.railway.app" in saved_url:
+            merged["server_url"] = UPDATE_SERVER_URL_DEFAULT
+            log.info(f"Migrated saved update-server URL {saved_url!r} → "
+                     f"{UPDATE_SERVER_URL_DEFAULT!r} (old Railway domain is dead)")
+            try:
+                atomic_write_json(SETTINGS_PATH, merged)
+            except Exception:
+                pass    # in-memory value is migrated either way
+        return merged
     except Exception as e:
         log.warning(f"Could not load updater settings, using defaults: {e}")
         return dict(_DEFAULT_SETTINGS)

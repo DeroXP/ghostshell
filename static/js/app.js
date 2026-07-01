@@ -288,7 +288,7 @@ function showErrorReportModal(kind, message, detail) {
     // openModal might be defined if there's a parse error very early —
     // so we fall back to alert() in that worst-case.
     if (typeof openModal !== 'function') {
-        try { console.error('[GhostShell error]', kind, message, detail); } catch (_){}
+        try { console.error('[Vispora error]', kind, message, detail); } catch (_){}
         return;
     }
     const k = _escForModal(kind), m = _escForModal(message);
@@ -684,7 +684,7 @@ function switchPage(page) {
     if (page === 'privacy') loadPrivacyStatus();
     if (page === 'vault') checkVaultStatus();
     if (page === 'logs') loadFullLog();
-    if (page === 'settings') { loadSettingsPage(); loadStartupManager(); }   // v2.9.5 / beta.8
+    if (page === 'settings') { loadSettingsPage(); loadStartupManager(); loadIdleMode(); }   // v2.9.5 / beta.8 / beta.12
 }
 
 
@@ -782,7 +782,7 @@ async function loadSettingsPage() {
                 'Where Vispora pulls updates from.  Leave alone unless you\'re self-hosting.',
                 '<input type="text" id="updater-server-input" value="' + escAttr(updaterS.server_url || '') + '" ' +
                   'onchange="setUpdaterServerUrl(this.value)" ' +
-                  'placeholder="https://ghostshell-site.up.railway.app" ' +
+                  'placeholder="https://vispora.up.railway.app" ' +
                   'style="background:var(--bg-input);border:1px solid var(--border);color:var(--text);' +
                   'padding:4px 8px;border-radius:4px;font-family:var(--mono);font-size:11px;min-width:280px" />'
             );
@@ -897,7 +897,7 @@ async function setUpdaterServerUrl(url) {
         // Reset to default by reading the default-server-url from the
         // current status payload and writing that back.
         var st = await apiGet('/api/updater/status');
-        url = (st && st.default_server_url) || 'https://ghostshell-site.up.railway.app';
+        url = (st && st.default_server_url) || 'https://vispora.up.railway.app';
         var input = document.getElementById('updater-server-input');
         if (input) input.value = url;
     }
@@ -1791,6 +1791,67 @@ async function smSetDelay(id, val) { await apiPost('/api/startup/update', { id: 
 async function smLaunchNow() {
     await apiPost('/api/startup/launch-now', {});
     showInfoToast('Launching your startup apps now (staggered)…', { title: 'Startup Manager' });
+}
+
+// ─── Idle Mode (beta.12) ───
+var _idlePollTimer = null;
+async function loadIdleMode() {
+    var s = await apiGet('/api/idle/settings');
+    if (s && s.ok !== false) {
+        var set = function(id, v) { var el = document.getElementById(id); if (el) el.checked = v; };
+        var setv = function(id, v) { var el = document.getElementById(id); if (el) el.value = v; };
+        set('idle-enabled', !!s.enabled);
+        setv('idle-grace', s.grace_minutes != null ? s.grace_minutes : 5);
+        setv('idle-power', s.idle_power_pct != null ? s.idle_power_pct : 70);
+        set('idle-park-oc', s.park_oc !== false);
+        set('idle-power-plan', s.switch_power_plan !== false);
+    }
+    idleRefreshStatus();
+    // Poll the live status while the Settings page is open, so the user
+    // can watch it engage/release.  Cleared on page switch.
+    if (_idlePollTimer) clearInterval(_idlePollTimer);
+    _idlePollTimer = setInterval(function() {
+        if (currentPage !== 'settings') { clearInterval(_idlePollTimer); _idlePollTimer = null; return; }
+        idleRefreshStatus();
+    }, 6000);
+}
+async function idleRefreshStatus() {
+    var st = await apiGet('/api/idle/status');
+    var el = document.getElementById('idle-status');
+    if (!el) return;
+    if (!st || st.enabled === false) {
+        el.textContent = 'Idle Mode is off.';
+        el.style.color = 'var(--text-tertiary)';
+        return;
+    }
+    if (st.engaged) {
+        el.innerHTML = '<span style="color:var(--accent)">● Engaged</span> — cooling posture active. '
+            + escHtml(st.last_transition || '');
+    } else {
+        var mins = Math.floor((st.idle_seconds || 0) / 60);
+        var need = Math.floor((st.grace_seconds || 0) / 60);
+        el.textContent = 'Armed · not engaged (idle ' + mins + '/' + need + ' min). '
+            + (st.last_transition || '');
+        el.style.color = 'var(--text-tertiary)';
+    }
+}
+async function idleSave() {
+    var gp = parseInt(document.getElementById('idle-grace').value);
+    var pw = parseInt(document.getElementById('idle-power').value);
+    var r = await apiPost('/api/idle/settings', {
+        enabled: document.getElementById('idle-enabled').checked,
+        grace_minutes: isNaN(gp) ? 5 : gp,
+        idle_power_pct: isNaN(pw) ? 70 : pw,
+        park_oc: document.getElementById('idle-park-oc').checked,
+        switch_power_plan: document.getElementById('idle-power-plan').checked,
+    });
+    if (!r || !r.ok) showErrorToast((r && r.err) || 'Could not save Idle Mode settings');
+    else idleRefreshStatus();
+}
+async function idleWake() {
+    var r = await apiPost('/api/idle/wake', {});
+    if (r && r.ok) { showInfoToast('Full power restored.', { title: 'Idle Mode' }); idleRefreshStatus(); }
+    else showErrorToast((r && r.err) || 'Wake failed');
 }
 
 async function runOptimize(categories) {

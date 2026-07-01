@@ -83,7 +83,13 @@ def _load_settings() -> dict:
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f) or {}
-        return {**_DEFAULTS, **data}
+        merged = {**_DEFAULTS, **data}
+        # Migrate a saved server_url still pointing at the dead pre-rename
+        # Railway host (service renamed ghostshell-site → vispora).
+        if "ghostshell-site.up.railway.app" in (merged.get("server_url") or ""):
+            merged["server_url"] = UPDATE_SERVER_URL_DEFAULT
+            atomic_write_json(SETTINGS_PATH, merged)
+        return merged
     except Exception:
         return dict(_DEFAULTS)
 

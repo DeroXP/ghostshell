@@ -2,7 +2,7 @@
 import os
 
 APP_NAME = "Vispora"
-APP_VERSION = "3.5.0-beta.11"
+APP_VERSION = "3.5.0-beta.12"
 APP_PORT = 5987
 
 # Vispora rebrand note: the on-disk AppData folder, the update-server host, the
@@ -15,7 +15,13 @@ APP_PORT = 5987
 # now that v3.0.0 has shipped as the first stable build.  Beta channel
 # stays available for early-access testers.
 APP_CHANNEL_DEFAULT = "stable"
-UPDATE_SERVER_URL_DEFAULT = "https://ghostshell-site.up.railway.app"
+UPDATE_SERVER_URL_DEFAULT = "https://vispora.up.railway.app"
+# The Railway service was renamed ghostshell-site → vispora (2026-07-01).
+# The old ghostshell-site.up.railway.app domain is DEAD (404) — binaries
+# ≤3.5.0-beta.11 / stable 3.4.3 point at it and can only recover if the
+# old domain is re-added as an alias on Railway or the user updates
+# manually.  core/updater.py migrates any SAVED old server_url on load.
+UPDATE_SERVER_URL_LEGACY = "https://ghostshell-site.up.railway.app"
 UPDATE_CHECK_INTERVAL_SEC = 3600    # check once per hour while running
 
 # Paths.  APPDATA_DIR stays "GhostShell" on purpose (see rebrand note up top) —

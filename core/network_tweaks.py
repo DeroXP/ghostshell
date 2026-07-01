@@ -1,6 +1,6 @@
 """Network latency & adapter optimization."""
 import json
-from core.utils import run_ps, run_cmd, get_logger, backup_registry
+from core.utils import run_ps, run_cmd, get_logger, backup_registry, is_safe_ps_exe_name
 
 log = get_logger("network")
 
@@ -472,6 +472,13 @@ def apply_game_port_qos() -> list[dict]:
 def set_per_app_net_priority(exe_name: str, dscp: int = 46) -> dict:
     """Set DSCP priority for a specific executable.
     Used by the game profile engine to prioritize the active game + streaming app."""
+    # exe_name reaches a PowerShell -Command string below; process names come
+    # from live enumeration, so validate it as a plain .exe basename first to
+    # block injection (a process named with a quote/semicolon would otherwise
+    # execute in our elevated context).  Reject → no-op, not a broken rule.
+    if not is_safe_ps_exe_name(exe_name):
+        log.warning(f"per-app net priority skipped — unsafe exe name: {exe_name!r}")
+        return {"ok": False, "err": "unsafe exe name", "exe": exe_name}
     rule_name = f"GhostShell_Prio_{exe_name.replace('.exe', '').replace(' ', '_')}"
     run_ps(f'Remove-NetQosPolicy -Name "{rule_name}" -Confirm:$false -ErrorAction SilentlyContinue')
     r = run_ps(

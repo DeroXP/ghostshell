@@ -149,6 +149,26 @@ def run_cmd(args: list, timeout: int = 60) -> dict:
         return {"ok": False, "out": "", "err": str(e)}
 
 
+import re as _re
+# A real Windows executable basename: letters/digits/space and the handful
+# of punctuation chars that legitimately appear in game exe names — and
+# NOTHING that is dangerous inside a PowerShell double-quoted string
+# (no " ; ` $ & | < > ( ) newlines, etc).  Used to gate any exe name
+# BEFORE it is interpolated into a run_ps() -Command string; process
+# names come from Get-Process enumeration and an attacker who can name a
+# process/folder could otherwise break out of the quoting and run
+# arbitrary code in our elevated context.
+_SAFE_EXE_RE = _re.compile(r"^[A-Za-z0-9 ._+-]{1,120}\.exe$", _re.IGNORECASE)
+
+
+def is_safe_ps_exe_name(name: str) -> bool:
+    """True if `name` is a plain, shell-safe Windows .exe basename that can
+    be interpolated into a PowerShell -Command string without injection
+    risk.  Reject (don't try to escape) anything else — the callers just
+    skip that one policy, which is a graceful degrade, not a failure."""
+    return bool(name) and bool(_SAFE_EXE_RE.match(name.strip()))
+
+
 def atomic_write_json(path: str, data) -> bool:
     """Write JSON to `path` without ever leaving a truncated/corrupt file behind.
 

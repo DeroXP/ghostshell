@@ -12,7 +12,7 @@ import os
 import time
 import threading
 from config import APPDATA_DIR
-from core.utils import run_ps, run_cmd, get_logger, atomic_write_json
+from core.utils import run_ps, run_cmd, get_logger, atomic_write_json, is_safe_ps_exe_name
 
 log = get_logger("profiles")
 
@@ -501,12 +501,19 @@ def _apply_gaming_tweaks(pid: int, exe_name: str) -> list[str]:
              "/v","NetworkThrottlingIndex","/t","REG_DWORD","/d","4294967295","/f"])
     changes.append("Network throttling -> disabled")
 
-    # 7. DSCP 46 (highest priority — EF / expedited forwarding) for the game
-    rule = f"GhostShell_Game_{exe_name.replace('.exe','').replace(' ','_')}"
-    run_ps(f'Remove-NetQosPolicy -Name "{rule}" -Confirm:$false -ErrorAction SilentlyContinue')
-    run_ps(f'New-NetQosPolicy -Name "{rule}" -AppPathNameMatchCondition "{exe_name}" '
-           f'-DSCPAction 46 -NetworkProfile All -Confirm:$false -ErrorAction SilentlyContinue')
-    changes.append(f"DSCP 46 for {exe_name}")
+    # 7. DSCP 46 (highest priority — EF / expedited forwarding) for the game.
+    #    exe_name comes from live process enumeration, so validate it as a
+    #    plain .exe basename before it touches a PowerShell -Command string —
+    #    a process/folder named with a quote or semicolon would otherwise
+    #    inject into our elevated shell.  Reject → just skip the QoS tag.
+    if is_safe_ps_exe_name(exe_name):
+        rule = f"Vispora_Game_{exe_name.replace('.exe','').replace(' ','_')}"
+        run_ps(f'Remove-NetQosPolicy -Name "{rule}" -Confirm:$false -ErrorAction SilentlyContinue')
+        run_ps(f'New-NetQosPolicy -Name "{rule}" -AppPathNameMatchCondition "{exe_name}" '
+               f'-DSCPAction 46 -NetworkProfile All -Confirm:$false -ErrorAction SilentlyContinue')
+        changes.append(f"DSCP 46 for {exe_name}")
+    else:
+        log.warning(f"  skipped DSCP QoS for unsafe exe name: {exe_name!r}")
 
     # 8. Streaming software — prioritize any running streaming apps
     #    (DSCP 34 = AF41, Assured Forwarding high — below the game but above default)
@@ -516,8 +523,11 @@ def _apply_gaming_tweaks(pid: int, exe_name: str) -> list[str]:
         s_pid = s["pid"]
         # Raise streamer process priority to AboveNormal (not High — game gets High)
         run_ps(f"try {{ (Get-Process -Id {s_pid}).PriorityClass='AboveNormal' }} catch {{}}", timeout=3)
-        # DSCP 34 for streamer traffic
-        s_rule = f"GhostShell_Stream_{s_exe.replace('.exe','').replace(' ','_')}"
+        # DSCP 34 for streamer traffic — same exe-name validation as the game.
+        if not is_safe_ps_exe_name(s_exe):
+            log.warning(f"  skipped stream QoS for unsafe exe name: {s_exe!r}")
+            continue
+        s_rule = f"Vispora_Stream_{s_exe.replace('.exe','').replace(' ','_')}"
         run_ps(f'Remove-NetQosPolicy -Name "{s_rule}" -Confirm:$false -ErrorAction SilentlyContinue')
         run_ps(f'New-NetQosPolicy -Name "{s_rule}" -AppPathNameMatchCondition "{s_exe}" '
                f'-DSCPAction 34 -NetworkProfile All -Confirm:$false -ErrorAction SilentlyContinue')
@@ -598,12 +608,14 @@ def restore_normal_mode(reason: str = "game exit"):
         run_cmd(["powercfg","/setactive","SCHEME_CURRENT"])
         log.info("  Restored CPU idle -> enabled")
 
-    # 5. Remove any DSCP game rules
-    run_ps('Get-NetQosPolicy | Where-Object {$_.Name -like "GhostShell_Game_*"} | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue')
+    # 5. Remove any DSCP game rules — both the current Vispora_ prefix and
+    #    the legacy GhostShell_ prefix so rules created before the rename
+    #    still get cleaned up.
+    run_ps('Get-NetQosPolicy | Where-Object {$_.Name -like "Vispora_Game_*" -or $_.Name -like "GhostShell_Game_*"} | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue')
     log.info("  Removed DSCP game rules")
 
     # 5b. Remove streaming DSCP rules & restore streamer process priority to Normal
-    run_ps('Get-NetQosPolicy | Where-Object {$_.Name -like "GhostShell_Stream_*"} | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue')
+    run_ps('Get-NetQosPolicy | Where-Object {$_.Name -like "Vispora_Stream_*" -or $_.Name -like "GhostShell_Stream_*"} | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue')
     streamers = _engine.get("streaming_exes", []) or []
     for s_exe in streamers:
         # Revert any still-running streamer process to Normal priority
