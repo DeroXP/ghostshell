@@ -70,7 +70,7 @@ _CLIENT_DENY = {
     "notepad.exe", "notepad++.exe", "wordpad.exe", "calc.exe",
     "python.exe", "pythonw.exe", "cmd.exe", "powershell.exe",
     "conhost.exe", "wt.exe", "openssh.exe",
-    "ghostshell.exe", "ghostshellupdater.exe",
+    "ghostshell.exe", "ghostshellupdater.exe", "vispora.exe", "visporaupdater.exe",
     "presentmon.exe", "rtss.exe", "msi afterburner.exe",
 }
 

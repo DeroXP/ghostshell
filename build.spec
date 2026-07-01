@@ -126,7 +126,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='GhostShell',
+    name='Vispora',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -140,5 +140,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=True,
-    icon=os.path.join(base_path, 'assets', 'ghostshell.ico'),
+    icon=os.path.join(base_path, 'assets', 'vispora.ico'),
 )

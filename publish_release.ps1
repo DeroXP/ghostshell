@@ -23,7 +23,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root      = Split-Path -Parent $MyInvocation.MyCommand.Path
-$exePath   = Join-Path $root "dist\GhostShell.exe"
+$exePath   = Join-Path $root "dist\Vispora.exe"
 # Pick the notes file: explicit -NotesFile, then RELEASE_NOTES_<tag>.md,
 # falling back to the most recent RELEASE_NOTES file in the project root.
 if ($NotesFile -and (Test-Path $NotesFile)) {

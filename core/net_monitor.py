@@ -55,7 +55,7 @@ BURST_CONSECUTIVE   = 3
 # during gameplay or are GhostShell itself / system services that the
 # user can't reasonably pause).
 NEVER_FLAG = {
-    "ghostshell.exe", "python.exe", "pythonw.exe",
+    "ghostshell.exe", "vispora.exe", "python.exe", "pythonw.exe",
     "system", "system idle process",
     "svchost.exe",                    # too generic, false-positives
     "discord.exe", "discordcanary.exe", "discordptb.exe",

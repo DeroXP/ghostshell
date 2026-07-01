@@ -368,7 +368,7 @@ _IGNORE_PROCS = {
     "securityhealthservice.exe","securityhealthsystray.exe",
     "widgets.exe","phoneexperiencehost.exe",
     "gamebarpresencewriter.exe","gamebarftserver.exe",
-    "msmpeng.exe","ghostshell.exe","app.py","flask.exe",
+    "msmpeng.exe","ghostshell.exe","vispora.exe","app.py","flask.exe",
     "onedrive.exe","teams.exe","outlook.exe",
     "wallpaperengine32.exe","wallpaper32.exe",
 }

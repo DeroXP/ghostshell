@@ -72,5 +72,5 @@ exe = EXE(
     entitlements_file=None,
     # uac_admin so file copies into Program Files work without re-prompt
     uac_admin=True,
-    icon=os.path.join(base_path, 'assets', 'ghostshell.ico'),
+    icon=os.path.join(base_path, 'assets', 'vispora.ico'),
 )

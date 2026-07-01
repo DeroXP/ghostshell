@@ -124,8 +124,8 @@ NEVER_PAUSE_EXES = {
     "ubisoftconnect.exe", "uplay.exe", "ea.exe", "eadesktop.exe",
     "origin.exe", "riotclientux.exe", "rockstargameslauncher.exe",
     "galaxyclient.exe", "gog galaxy.exe",
-    # GhostShell itself
-    "ghostshell.exe", "python.exe", "pythonw.exe",
+    # GhostShell / Vispora itself
+    "ghostshell.exe", "vispora.exe", "python.exe", "pythonw.exe",
     # Windows core
     "explorer.exe", "winlogon.exe", "csrss.exe", "smss.exe",
     "lsass.exe", "services.exe", "system.exe", "system idle process",

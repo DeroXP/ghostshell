@@ -1,12 +1,9 @@
-"""Generate assets/ghostshell.ico — the Vispora "Velocity V" brand mark.
+"""Generate assets/vispora.ico — the Vispora "Velocity V" brand mark.
 
 Renders the iridescent (Nacre) Velocity V — two tapered blades forming a
 sharp V with a diagonal mint -> periwinkle -> lilac -> rose sweep — on a
 dark rounded tile, at every standard Windows icon size, packed into one
 multi-resolution .ico.
-
-(Filename stays ghostshell.ico for now — build.spec references it; the exe
-+ icon file get renamed together in the Phase-2 exe rename.)
 
 Run:
     python make_icon.py
@@ -31,7 +28,7 @@ V_LEFT  = [(22, 28), (38, 28), (49, 57), (43, 70)]
 V_RIGHT = [(49, 57), (58, 28), (74, 28), (55, 70)]
 
 OUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "assets", "ghostshell.ico")
+                        "assets", "vispora.ico")
 SIZES = [256, 128, 64, 48, 32, 24, 16]
 
 

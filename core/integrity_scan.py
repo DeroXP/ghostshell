@@ -105,9 +105,13 @@ _SELF_CLEAN_RULES = [
 
     # Cached old installer downloads.  Once an install has happened the
     # .exe sitting in updates/ is just a stale copy of the old version.
-    # 7 days is well past any sensible re-install window.
+    # 7 days is well past any sensible re-install window.  Vispora_* is
+    # the current cache prefix post exe-rename; GhostShell_* is kept so
+    # any installer cached before the rename still gets swept up.
     ("updates/GhostShell_*.exe", 7,  "old cached installer"),
     ("updates/GhostShell_*.zip", 7,  "old cached source bundle"),
+    ("updates/Vispora_*.exe",    7,  "old cached installer"),
+    ("updates/Vispora_*.zip",    7,  "old cached source bundle"),
 
     # Partial downloads that never completed.  1 day is generous — a
     # real download finishes in seconds.
@@ -343,7 +347,7 @@ def _get_user_idle_sec() -> float:
 def _is_ghostshell_foreground() -> bool:
     try:
         from core.gamepad_mapper import _get_foreground_exe_name
-        return (_get_foreground_exe_name() or "").lower() == "ghostshell.exe"
+        return (_get_foreground_exe_name() or "").lower() in ("ghostshell.exe", "vispora.exe")
     except Exception:
         return False
 
@@ -841,7 +845,7 @@ def _phase_c_health_probe(deadline_ts: float) -> dict:
             t for t in top5
             if t["rss_mb"] > 4096
             and t["name"].lower() not in (
-                "ghostshell.exe", "chrome.exe", "msedge.exe", "firefox.exe",
+                "ghostshell.exe", "vispora.exe", "chrome.exe", "msedge.exe", "firefox.exe",
                 "obs64.exe", "discord.exe", "spotify.exe",
             )
         ]

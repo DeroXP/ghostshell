@@ -590,22 +590,26 @@ def check_for_update() -> dict:
 
 
 def _prune_old_cached_installers(keep: str = "") -> int:
-    """Delete every GhostShell_*.exe / .zip in UPDATE_DIR except `keep`
-    (a bare filename).  Returns bytes freed.  Best-effort; swallows
+    """Delete every GhostShell_*/Vispora_*.exe / .zip in UPDATE_DIR except
+    `keep` (a bare filename).  Returns bytes freed.  Best-effort; swallows
     per-file errors (a file might be the one currently being read).
 
     3.4.3 — stops the updates cache from accumulating one ~44 MB
     installer per version.  The standalone updater does its own
     download for the actual install, so these cached copies are only
     used for the in-app 'already downloaded' fast-path — we never need
-    more than the current target."""
+    more than the current target.
+
+    Checks both the legacy "ghostshell_" prefix and the current
+    "vispora_" prefix (post exe-rename) so any installer cached before
+    the rename still gets cleaned up instead of sitting there forever."""
     freed = 0
     try:
         if not os.path.isdir(UPDATE_DIR):
             return 0
         for name in os.listdir(UPDATE_DIR):
             low = name.lower()
-            if not low.startswith("ghostshell_"):
+            if not (low.startswith("ghostshell_") or low.startswith("vispora_")):
                 continue
             if not (low.endswith(".exe") or low.endswith(".zip")
                     or low.endswith(".part")):
@@ -654,7 +658,7 @@ def download_update() -> dict:
         ext = ".zip"
     else:
         ext = ".exe"
-    dest = os.path.join(UPDATE_DIR, f"GhostShell_{version}{ext}")
+    dest = os.path.join(UPDATE_DIR, f"Vispora_{version}{ext}")
 
     # 3.4.3 — prune stale cached installers before caching the new one.
     # Each downloaded build is ~44 MB and the old code never removed
@@ -1108,11 +1112,12 @@ def _is_game_foreground() -> bool:
 
 
 def _is_ghostshell_foreground() -> bool:
-    """True if GhostShell's own window is in the foreground."""
+    """True if our own window (GhostShell or Vispora, pre/post rename) is
+    in the foreground."""
     try:
         from core.gamepad_mapper import _get_foreground_exe_name
         exe = (_get_foreground_exe_name() or "").lower()
-        return exe == "ghostshell.exe"
+        return exe in ("ghostshell.exe", "vispora.exe")
     except Exception:
         return False
 
