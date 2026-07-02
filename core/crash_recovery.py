@@ -289,6 +289,22 @@ def detect_crash(exit_ts: Optional[float] = None,
     }
 
 
+def _proven_oc_floor() -> "tuple[int, int]":
+    """beta.5 — the user's PROVEN OC (their saved manual profile) is the floor
+    below which a crash is NOT attributable to an OC climb.  Returns (0, 0) if
+    no profile is saved (pure-stock user) so any active OC is still evaluated."""
+    try:
+        from core import gpu_overclock
+        p = gpu_overclock.load_profile()
+        if not p or not p.get("exists"):
+            return (0, 0)
+        return (int(p.get("core_offset_mhz") or 0),
+                int(p.get("mem_offset_mhz")  or 0))
+    except Exception as e:
+        log.debug(f"could not read proven OC floor: {e}")
+        return (0, 0)
+
+
 # ─── Main entry — called by game_profiles on every game exit ─────────────
 def handle_game_exit(exe: str, display_name: str | None,
                      active_core: int, active_mem: int) -> dict:
@@ -321,37 +337,52 @@ def handle_game_exit(exe: str, display_name: str | None,
                 f"tdr={detection['tdr_count']}, crash={detection['crash_count']}, "
                 f"oc=core+{active_core}/mem+{active_mem})")
 
-    # Only blacklist + step-down if there was actually an OC active.  A
-    # crash at stock means the game itself crashed, not the OC — we just
-    # log it and notify the user.
+    # beta.5 — Only blame the OC if it was pushed ABOVE the user's PROVEN
+    # baseline (their saved manual OC profile).  A crash at/below the proven
+    # floor is not an OC-climb fault — it's the game/driver — so we must NOT
+    # blacklist it (blacklisting is >=, so blacklisting the baseline would make
+    # Adaptive Tuning refuse the user's own proven OC and ratchet it downward).
+    # This is what protects a startup-guard crash (card sitting at baseline)
+    # from poisoning the baseline.
+    floor_core, floor_mem = _proven_oc_floor()
+    oc_climbed = (active_core > floor_core) or (active_mem > floor_mem)
     blacklisted = False
     step_down: dict | None = None
-    if active_core > 0 or active_mem > 0:
+    if oc_climbed:
         add_to_blacklist(exe, active_core, active_mem, detection["kind"])
         blacklisted = True
         step_down = compute_safe_step_down(exe, active_core, active_mem)
 
-        # Update saved profile to the stepped-down values + apply.  This
-        # is the auto-recovery — next launch the game runs at safe clocks.
+        # beta.5 — CRITICAL: NEVER write the user's saved manual OC profile
+        # here.  The old code called gpu_overclock.save_profile({...,
+        # apply_on_startup:True}, auto=True), which overwrote the user's proven
+        # baseline with a crash-derived value AND re-armed an unproven OC at
+        # boot — the exact data-corruption + crash-on-startup pair the beta.5
+        # incident was about.  The saved profile is immutable ground truth.  We
+        # still apply a TRANSIENT step-down to the card so the user isn't left
+        # sitting on the crashing clock; Adaptive Tuning's own state + the crash
+        # blacklist (read by _is_safe_to_step_to / _detect_auto_revert) carry
+        # the persistent learning — not the user's profile.
         try:
             from core import gpu_overclock
-            gpu_overclock.save_profile({
-                "core_offset_mhz": step_down["core"],
-                "mem_offset_mhz":  step_down["mem"],
-                "power_pct":       100,         # don't touch the power slider
-                "apply_on_startup": True,
-            }, auto=True)
             apply_r = gpu_overclock.apply_oc(
                 core_offset_mhz=step_down["core"],
                 mem_offset_mhz=step_down["mem"],
-                power_pct=100,
+                power_pct=100,                  # don't touch the power slider
             )
             log.info(
-                f"Crash auto-recovery applied: core+{step_down['core']} / "
-                f"mem+{step_down['mem']} (apply_ok={apply_r.get('ok')})"
+                f"Crash auto-recovery: transient step-down to core+"
+                f"{step_down['core']}/mem+{step_down['mem']} "
+                f"(apply_ok={apply_r.get('ok')}) — user profile left untouched"
             )
         except Exception as e:
             log.error(f"Crash auto-recovery failed: {e}")
+    elif active_core > 0 or active_mem > 0:
+        log.info(
+            f"{name} crashed at/below the proven OC floor "
+            f"(core+{active_core}/mem+{active_mem} ≤ core+{floor_core}/"
+            f"mem+{floor_mem}) — not blaming the OC, no blacklist/step-down"
+        )
 
     # ── Toast within 5 s ───────────────────────────────────────────────
     notif_ok = False

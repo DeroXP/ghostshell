@@ -393,6 +393,22 @@ _engine = {
 }
 
 
+def note_active_oc(core: int, mem: int) -> None:
+    """beta.5 — Adaptive Tuning calls this whenever it applies a NEW offset so
+    the crash-recovery snapshot (_engine['active_oc_*']) always reflects what is
+    ACTUALLY on the card, not the value captured once at game-start.
+
+    Without it, AT's startup-guard fast-forward (and any subsequent step-up)
+    changed the real clocks while _engine stayed frozen at baseline — so a
+    climbed offset that TDR-crashed the game got mis-attributed to baseline,
+    never blacklisted, and re-applied every launch (an indefinite crash loop).
+    Only meaningful while a game is active; a no-op otherwise so stray AT/manual
+    applies outside gaming mode don't leave a phantom active OC behind."""
+    if _engine.get("gaming_mode"):
+        _engine["active_oc_core"] = int(core)
+        _engine["active_oc_mem"]  = int(mem)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Baseline — capture & restore "normal" system state
 # ═══════════════════════════════════════════════════════════════

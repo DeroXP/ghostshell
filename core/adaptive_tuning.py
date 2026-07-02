@@ -73,6 +73,16 @@ OPENING_PHASE_SEC = 5 * 60          # 5 minutes
 OPENING_PHASE_WARMUP_RATIO = 0.5    # use 50% of normal warmup time
 OPENING_PHASE_GOOD_RATIO   = 0.5    # need 50% of normal "consecutive good"
 
+# beta.5 — Startup safety guard.  Shader compilation during a game's first
+# seconds is a HARSHER GPU-stability test than steady gameplay, so an OC that
+# scored "clean" mid-session can still crash on the next launch's load screen.
+# For the first STARTUP_GUARD_SEC after engage, AT holds the user's PROVEN
+# baseline OC and makes NO changes — it does not even re-apply a previously-
+# found (climbed) offset until the game has survived this window.  This turns a
+# would-be crash-on-startup (before AT can react) into, at worst, a recoverable
+# mid-session crash that auto-revert + the blacklist already handle.
+STARTUP_GUARD_SEC = 90
+
 # v3.1 — Step-size hot-streak.  After N successful step-ups without a
 # step-down, the step size doubles temporarily so we close the gap to
 # the real ceiling faster.  Step-down resets the streak.
@@ -317,6 +327,10 @@ _runtime: dict[str, Any] = {
     "gameplay_conf":     0.0,
     "gameplay_reasons":  [],
     "gameplay_baseline": {},
+    # beta.5 — startup-guard: hold baseline through the fragile startup window,
+    # fast-forward to the remembered climbed offset only after the game survives.
+    "startup_guard_until": 0.0,
+    "climb_target":        None,       # (core, mem) remembered offset above baseline
 }
 _lock = threading.Lock()
 
@@ -1520,15 +1534,27 @@ def _apply_offsets(exe: str, core: int, mem: int, reason: str) -> bool:
             power_pct=100,
         )
         ok = bool(result.get("ok"))
+        # beta.5 — CRITICAL: AT must NEVER write the user's saved manual OC
+        # profile.  The old code called gpu_overclock.save_profile({...},
+        # apply_on_startup=True) on every step, so each exploratory climb
+        # OVERWROTE the user's proven baseline (e.g. +450/+2500 → +525/+2700)
+        # AND armed the unproven value to apply at the next boot.  That both
+        # destroyed the user's known-good config (reseed/baseline then read the
+        # corrupted value) and caused crash-on-startup.  AT's chosen offset now
+        # lives ONLY in its own per-game state (current_core / best_stable_*);
+        # the saved profile stays the user's immutable ground-truth floor.
         if ok:
-            # Persist to the saved-profile slot too so subsequent boots /
-            # manual checks see what AT picked.
-            gpu_overclock.save_profile({
-                "core_offset_mhz": core,
-                "mem_offset_mhz":  mem,
-                "power_pct":       100,
-                "apply_on_startup": True,
-            }, auto=True)
+            # beta.5 — keep game_profiles' crash-recovery snapshot in sync with
+            # what's ACTUALLY on the card.  _apply_offsets is the SINGLE chokepoint
+            # for every AT OC change (engage / startup-guard fast-forward / step-up
+            # / step-down), so updating it here means a climbed offset that later
+            # crashes is attributed to (and blacklisted at) the REAL offset, not a
+            # stale baseline snapshot — closing the fast-forward crash-loop hole.
+            try:
+                from core import game_profiles
+                game_profiles.note_active_oc(core, mem)
+            except Exception as e:
+                log.debug(f"note_active_oc failed: {e}")
         log.info(f"AT apply core+{core}/mem+{mem} → {'OK' if ok else 'FAIL'} ({reason})")
         return ok
     except Exception as e:
@@ -1568,6 +1594,56 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
     # Warm-up — give the game time to load shaders, populate VRAM, etc.
     if stop_event.wait(warmup):
         return
+
+    # beta.5 — STARTUP GUARD.  Make NO OC change until the game has survived
+    # STARTUP_GUARD_SEC from engage.  If it exits (crashes) during the guard we
+    # bail here having only ever applied the proven baseline — so a startup
+    # crash can never be blamed on (or caused by) AT.  Only after surviving the
+    # window do we fast-forward to the remembered climbed offset, converting a
+    # would-be crash-on-load into an in-session event auto-revert can catch.
+    with _lock:
+        guard_until  = float(_runtime.get("startup_guard_until", 0.0) or 0.0)
+        climb_target = _runtime.get("climb_target")
+    remaining = guard_until - time.time()
+    if remaining > 0:
+        if stop_event.wait(remaining):
+            return  # game exited during the guard — never applied the climb
+    if climb_target:
+        tc, tm = int(climb_target[0]), int(climb_target[1])
+        safe, why = _is_safe_to_step_to(exe, tc, tm, "core")
+        if safe:
+            if _apply_offsets(exe, tc, tm, "post-startup-ffwd"):
+                st = get_game_state(exe)
+                st["current_core"] = tc
+                st["current_mem"]  = tm
+                _save_game_state(exe, st)
+                with _lock:
+                    _runtime["current_core"] = tc
+                    _runtime["current_mem"]  = tm
+                    _runtime["climb_target"] = None
+                log.info(f"AT survived startup guard — fast-forwarded to "
+                         f"remembered core+{tc}/mem+{tm}")
+        else:
+            # The remembered offset is now unsafe (blacklisted after it crashed,
+            # temp cooldown, etc.).  Drop the persisted current_core back to
+            # baseline so we STOP re-arming the blacklisted climb on every launch
+            # (otherwise climb_target keeps pointing at the crashed offset and we
+            # retry-then-refuse it forever).  AT re-explores upward from baseline,
+            # and _is_safe_to_step_to keeps refusing anything >= the blacklisted
+            # offset, so it converges just below the crash point.
+            st = get_game_state(exe)
+            bcore = int(st.get("baseline_core", 0))
+            bmem  = int(st.get("baseline_mem",  0))
+            st["current_core"] = bcore
+            st["current_mem"]  = bmem
+            _save_game_state(exe, st)
+            with _lock:
+                _runtime["climb_target"] = None
+                _runtime["current_core"] = bcore
+                _runtime["current_mem"]  = bmem
+            log.warning(f"AT startup guard: remembered core+{tc}/mem+{tm} no "
+                        f"longer safe ({why}) — reset to baseline core+{bcore}/"
+                        f"mem+{bmem}, will re-explore")
 
     # Alternate which axis we bump first — start with core (more visible
     # FPS gain), alternate with mem on every other promotion.
@@ -2158,8 +2234,21 @@ def _engage(exe: str, display_name: str | None, state: dict) -> dict:
 
     cc = int(state.get("current_core", 0))
     cm = int(state.get("current_mem",  0))
+    bc = int(state.get("baseline_core", 0))
+    bm = int(state.get("baseline_mem",  0))
+    # beta.5 — STARTUP GUARD.  Never re-apply a previously-CLIMBED offset during
+    # the fragile startup/shader-compile window.  If the saved offset sits above
+    # the user's proven baseline, apply the BASELINE now and hand the climbed
+    # target to the tuning loop, which fast-forwards to it only after the game
+    # survives STARTUP_GUARD_SEC.  If the saved offset is at/below baseline
+    # (fresh game, or just-reseeded), there's nothing risky to defer.
+    climb_target = (cc, cm) if (cc > bc or cm > bm) else None
+    engage_core, engage_mem = (bc, bm) if climb_target else (cc, cm)
+    startup_guard_until = time.time() + STARTUP_GUARD_SEC
     # v3.1 — opening phase: relaxed thresholds for the first 5 min so
     # AT closes on the rough ceiling faster.  Set BEFORE the loop starts.
+    # (Starts counting from engage; the guard above gates the FIRST OC change,
+    # so opening-phase aggression only takes effect after startup is survived.)
     state["opening_phase_until"] = time.time() + OPENING_PHASE_SEC
     _save_game_state(exe, state)
     # beta.14 — pause the stock OC drift watchdog while AT owns the
@@ -2171,7 +2260,13 @@ def _engage(exe: str, display_name: str | None, state: dict) -> dict:
         gpu_overclock.pause_oc_watchdog("adaptive_tuning")
     except Exception as e:
         log.debug(f"pause_oc_watchdog failed: {e}")
-    apply_ok = _apply_offsets(exe, cc, cm, "engage") if (cc or cm) else True
+    apply_ok = (_apply_offsets(exe, engage_core, engage_mem,
+                               "engage-baseline" if climb_target else "engage")
+                if (engage_core or engage_mem) else True)
+    if climb_target:
+        log.info(f"AT startup guard: holding baseline core+{bc}/mem+{bm} for "
+                 f"{STARTUP_GUARD_SEC}s before fast-forwarding to remembered "
+                 f"core+{cc}/mem+{cm}")
 
     # Stop any existing loop (shouldn't be one but be defensive)
     with _lock:
@@ -2182,8 +2277,12 @@ def _engage(exe: str, display_name: str | None, state: dict) -> dict:
         ev = threading.Event()
         _runtime["active_exe"]       = _norm_exe(exe)
         _runtime["active_display"]   = display_name
-        _runtime["current_core"]     = cc
-        _runtime["current_mem"]      = cm
+        # beta.5 — startup-guard state read by the tuning loop.
+        _runtime["startup_guard_until"] = startup_guard_until
+        _runtime["climb_target"]        = climb_target
+        # Reflect what's ACTUALLY applied right now (baseline if guarding).
+        _runtime["current_core"]     = engage_core
+        _runtime["current_mem"]      = engage_mem
         _runtime["consecutive_good"] = 0
         _runtime["step_count"]       = 0
         _runtime["started_at"]       = time.time()
@@ -2232,13 +2331,23 @@ def _engage(exe: str, display_name: str | None, state: dict) -> dict:
     except Exception as e:
         log.debug(f"gameplay_state.set_target failed: {e}")
 
-    log.info(f"AT engaged for {display_name} starting at core+{cc}/mem+{cm} "
-             f"(apply_ok={apply_ok})")
+    log.info(f"AT engaged for {display_name} — applied core+{engage_core}/"
+             f"mem+{engage_mem}"
+             + (f" (holding baseline; will climb to core+{cc}/mem+{cm} after "
+                f"startup guard)" if climb_target else "")
+             + f" (apply_ok={apply_ok})")
+    # beta.5 — CRITICAL: report what was ACTUALLY applied to the card, NOT the
+    # remembered climb.  game_profiles stores this in _engine["active_oc_*"] and
+    # hands it to crash_recovery on exit; returning the climbed cc/cm would make
+    # a startup-guard crash (card at baseline) get blamed on — and blacklisted +
+    # persisted from — an offset that never ran, re-corrupting the user profile.
     return {
         "engaged":       True,
         "tracked":       True,
-        "starting_core": cc,
-        "starting_mem":  cm,
+        "starting_core": engage_core,
+        "starting_mem":  engage_mem,
+        "climb_target_core": climb_target[0] if climb_target else None,
+        "climb_target_mem":  climb_target[1] if climb_target else None,
         "apply_ok":      apply_ok,
     }
 
@@ -2375,6 +2484,9 @@ def on_game_exit(exe: str, display_name: str | None,
         _runtime["started_at"]      = None
         _runtime["last_score"]      = None
         _runtime["last_verdict"]    = None
+        # beta.5 — clear startup-guard state so it can't leak to the next game.
+        _runtime["startup_guard_until"] = 0.0
+        _runtime["climb_target"]        = None
 
     log.info(f"AT session ended for {display_name}: "
              f"{'CRASH' if was_crash else 'clean'}, "
