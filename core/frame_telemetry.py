@@ -404,6 +404,60 @@ PRESENTMON_TIMED_SEC = 3600          # 1 h per session before restart
 _CREATE_NO_WINDOW    = 0x08000000     # subprocess flag
 
 
+_stray_session_cleanup_done = False
+
+
+def _cleanup_stray_pm_sessions() -> None:
+    """beta.7 — best-effort: stop leaked 'ghostshell_*' PresentMon ETW sessions
+    left behind by prior runs / older builds.
+
+    beta.4/5 launched PresentMon with a UNIQUE per-launch --session_name while
+    keeping --stop_existing_session (which only stops a same-named session), so
+    hard-killed captures leaked OS-level ETW sessions (ghostshell_<pid>_<stamp>)
+    that ACCUMULATED across a play session until ETW saturated — "N events were
+    lost", empty CSVs, frame capture dead system-wide until a reboot.  beta.6's
+    fixed session name stops NEW accumulation, but pre-existing leaks persist
+    until stopped.  This clears them on startup so upgrading users self-heal
+    without a manual reset or reboot.
+
+    Runs once per process.  Needs elevation (the app runs elevated for GPU OC /
+    power-plan control); silently no-ops if `logman` fails or access is denied.
+    Safe to stop even our CURRENT fixed-name session — the caller relaunches PM2
+    (with --stop_existing_session) immediately after.
+    """
+    global _stray_session_cleanup_done
+    if _stray_session_cleanup_done:
+        return
+    _stray_session_cleanup_done = True
+    try:
+        r = subprocess.run(
+            ["logman", "query", "-ets"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        if r.returncode != 0 or not r.stdout:
+            return
+        stray = []
+        for line in r.stdout.splitlines():
+            tok = line.split()
+            if tok and tok[0].lower().startswith("ghostshell_"):
+                stray.append(tok[0])
+        for name in stray:
+            try:
+                subprocess.run(
+                    ["logman", "stop", name, "-ets"],
+                    capture_output=True, timeout=10,
+                    creationflags=_CREATE_NO_WINDOW,
+                )
+                log.info(f"frame_telemetry: cleared stray PresentMon ETW session {name}")
+            except Exception as e:
+                log.debug(f"could not stop stray session {name}: {e}")
+        if stray:
+            log.info(f"frame_telemetry: cleaned {len(stray)} stray PresentMon ETW session(s)")
+    except Exception as e:
+        log.debug(f"stray PM session cleanup skipped: {e}")
+
+
 def _start_presentmon(pid: int, prefer_pm2: bool = True) -> Optional[dict]:
     """Spawn a PresentMon subprocess targeting the given PID.
 
@@ -414,6 +468,10 @@ def _start_presentmon(pid: int, prefer_pm2: bool = True) -> Optional[dict]:
     Returns {"proc": Popen, "csv_path": str, "variant": "pm1"|"pm2"}
     on success, None on failure.
     """
+    # beta.7 — clear any leaked ghostshell_* ETW sessions from older builds /
+    # prior runs before we start capturing, so accumulated leaks can't saturate
+    # ETW and kill frame capture.  Once per process, best-effort.
+    _cleanup_stray_pm_sessions()
     # ── PM 2.x preferred path ─────────────────────────────────────
     if prefer_pm2:
         pm2_svc = _detect_pm2_service()
