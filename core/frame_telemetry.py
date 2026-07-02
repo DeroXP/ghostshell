@@ -491,13 +491,22 @@ def _start_presentmon2(pid: int, cli_path: str) -> Optional[dict]:
         tempfile.gettempdir(),
         f"ghostshell_pm2_{pid}_{stamp}.csv",
     )
-    # Unique ETW session name per launch.  PresentMon's DEFAULT session name is
-    # literally "PresentMon", so if the user runs any other PresentMon-based tool
-    # (CapFrameX, the PresentMon overlay, some Afterburner setups) both fight over
-    # the same session and the loser dies with "error code 4201" (session already
-    # running) — no CSV, zero frames.  A private per-launch name sidesteps that
-    # entirely and also makes our own PM2 restarts collision-proof.
-    session_name = f"ghostshell_{pid}_{stamp}"
+    # FIXED, app-private ETW session name — reused every launch, paired with
+    # --stop_existing_session below.  Two goals:
+    #   1. Don't use PresentMon's DEFAULT name ("PresentMon"), so we never fight
+    #      another PresentMon-based tool (CapFrameX / the PM overlay / some
+    #      Afterburner setups) for the same session (that collision => error 4201,
+    #      no CSV, zero frames).  A custom name sidesteps it.
+    #   2. Reclaim OUR OWN session on every (re)launch.  beta.4 used a UNIQUE
+    #      per-launch name (ghostshell_{pid}_{stamp}) — but --stop_existing_session
+    #      only stops a session of the SAME name, so a unique name meant it NEVER
+    #      matched and NEVER cleaned up the prior session.  Over a long play
+    #      session (game switches + hourly --timed restarts) hard-killed PM2
+    #      sessions then ACCUMULATED in the PresentMon service until ETW saturated
+    #      ("N events were lost", empty CSVs, capture dead system-wide until a
+    #      reboot).  A fixed name makes --stop_existing_session actually reclaim
+    #      the previous session each time, so nothing piles up.
+    session_name = "ghostshell_frametelemetry"
     cmd = [
         cli_path,
         "--process_id", str(int(pid)),
