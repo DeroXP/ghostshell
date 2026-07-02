@@ -465,13 +465,18 @@ def _start_presentmon2(pid: int, cli_path: str) -> Optional[dict]:
       --output_file <path>
       --timed <sec>
       --terminate_after_timed
-      --terminate_existing_session  (terminate a previous capture session)
+      --stop_existing_session       (clear a stale session, THEN capture)
       --no_console_stats            (suppress live stats output)
 
-    beta.5: the flag is --terminate_existing_session, NOT --terminate_existing.
-    PresentMon 2.x's CLI parser is strict and rejects unknown args, so the old
-    --terminate_existing made PM2 exit immediately and AT silently got no
-    samples (the sampler then restart-looped forever).
+    3.5.1-beta.2: use --stop_existing_session, NOT --terminate_existing_session.
+    They read almost identically but do OPPOSITE things — verified against
+    PresentMon 2.3.0's own --help:
+       --stop_existing_session      → stop an existing same-named session, then
+                                      START a new capture (what we want).
+       --terminate_existing_session → stop the existing session then EXIT.
+    The old code used --terminate_existing_session, so PM2 printed
+    "exits without capturing anything; ignoring all other options" and
+    quit immediately — no CSV, zero frame samples, AT silently blind.
     """
     csv_path = os.path.join(
         tempfile.gettempdir(),
@@ -483,7 +488,7 @@ def _start_presentmon2(pid: int, cli_path: str) -> Optional[dict]:
         "--output_file", csv_path,
         "--timed", str(PRESENTMON_TIMED_SEC),
         "--terminate_after_timed",
-        "--terminate_existing_session",
+        "--stop_existing_session",
         "--no_console_stats",
     ]
     try:
@@ -556,19 +561,21 @@ def _parse_presentmon_csv(handle: dict) -> int:
                     _state["pm_csv_header"] = header
                     _state["pm_csv_pos"]    = pos
             f.seek(pos)
-            # beta.5 — match columns by NAME, case-insensitively, with NO
-            # fixed-index fallback.  PresentMon changed both the casing AND
-            # the column set between versions:
-            #   1.x : msBetweenPresents, TimeInSeconds, ProcessID, Application
-            #   2.x : MsBetweenPresents, CPUStartTime,  ProcessID, Application
-            # The old code matched only the lowercase 1.x name (plus a myth,
-            # "FrameTime", that no PresentMon version emits) and, failing that,
-            # trusted fixed index 13 — which in 2.x is MsGPUTime, NOT frame
-            # time.  So with PM2 installed (AT's preferred source) the tuner
-            # was fed GPU-time as if it were frametime.  Now we resolve the
-            # frame-time column case-insensitively and refuse to parse if we
-            # can't find it, rather than read a wrong column.
-            hdr_lower = [h.lower() for h in header]
+            # Match columns by NAME, case-insensitively, with NO fixed-index
+            # fallback.  PresentMon changed the frame-time column name across
+            # versions (verified against the CLIs' actual CSV output):
+            #   1.x       : msBetweenPresents  (+ TimeInSeconds, ProcessID, Application)
+            #   2.3.0     : FrameTime          (+ CPUStartTime,  ProcessID, Application)
+            # The old code looked ONLY for msBetweenPresents and explicitly
+            # dropped "FrameTime" believing it was "a myth no PresentMon
+            # emits" — but PM 2.3.0's header is literally
+            #   Application,ProcessID,...,CPUStartTime,FrameTime,CPUBusy,...
+            # so with PM2 (AT's preferred source) idx_ft came back None and
+            # every frame was skipped → 0 samples.  Match FrameTime FIRST
+            # (current 2.x) then fall back to msBetweenPresents (1.x/older).
+            # PM 2.x writes a UTF-8 BOM, so the first header cell is
+            # "﻿Application" — strip it so name matching still works.
+            hdr_lower = [h.lower().lstrip("﻿") for h in header]
 
             def _col(*names, default=None):
                 for nm in names:
@@ -578,13 +585,13 @@ def _parse_presentmon_csv(handle: dict) -> int:
 
             idx_pid  = _col("ProcessID", default=1)
             idx_name = _col("Application", default=0)
-            idx_ft   = _col("msBetweenPresents", default=None)  # 1.x or 2.x (case-insensitive)
+            idx_ft   = _col("FrameTime", "msBetweenPresents", default=None)
             # (we use wall-clock time.time() per sample, so the CSV timestamp
             #  column — TimeInSeconds in 1.x / CPUStartTime in 2.x — isn't read)
             if idx_ft is None:
                 log.warning(
-                    "PresentMon CSV: no frame-time (MsBetweenPresents) column "
-                    f"in header {header} — skipping (will not guess a column)"
+                    "PresentMon CSV: no frame-time column (FrameTime / "
+                    f"msBetweenPresents) in header {header} — skipping"
                 )
                 return 0
 

@@ -622,6 +622,16 @@ def _migrate_state(state: dict, exe: str) -> dict:
     # so an existing profile for Spider-Man / CoD picks up the right posture).
     if "target" not in state or state["target"] not in VALID_TARGETS:
         state["target"] = _auto_classify_target(state.get("exe", exe))
+    # beta.2 (3.5.1) — enforce the invariant: max_fps / low_latency targets
+    # OWN the perf posture, so AT must be OFF for them.  The original
+    # backfill above only set the target FIELD; a game already tracked
+    # before the target feature (e.g. Spider-Man 2) kept enabled=True, so
+    # AT stayed engaged and — since its mode cap sits BELOW a tuned OC —
+    # spun uselessly showing "unstable".  Force it off here so it
+    # self-heals on the next state load.  (To run AT on such a game,
+    # switch its target to auto/balanced.)
+    if state.get("target") in ("max_fps", "low_latency") and state.get("enabled"):
+        state["enabled"] = False
     # v3 — older rows pre-date the baseline_* fields.  Pull the user's
     # current OC profile as the baseline.  Also lift current_/best_stable_
     # up to the baseline if they're below it (the user has clearly
