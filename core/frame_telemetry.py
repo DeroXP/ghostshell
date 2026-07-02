@@ -292,6 +292,14 @@ _state = {
 }
 _state_lock = threading.Lock()
 
+
+def _is_presentmon(src) -> bool:
+    """True for any PresentMon source variant ("presentmon" = 1.x, "presentmon2" = 2.x).
+    All CSV-tailing / FPS-derivation paths must accept BOTH — early builds only
+    matched "presentmon", so the PM2 path silently sampled nothing."""
+    return bool(src) and str(src).startswith("presentmon")
+
+
 _samples = deque(maxlen=600)
 _samples_lock = threading.Lock()
 
@@ -478,16 +486,25 @@ def _start_presentmon2(pid: int, cli_path: str) -> Optional[dict]:
     "exits without capturing anything; ignoring all other options" and
     quit immediately — no CSV, zero frame samples, AT silently blind.
     """
+    stamp    = int(time.time())
     csv_path = os.path.join(
         tempfile.gettempdir(),
-        f"ghostshell_pm2_{pid}_{int(time.time())}.csv",
+        f"ghostshell_pm2_{pid}_{stamp}.csv",
     )
+    # Unique ETW session name per launch.  PresentMon's DEFAULT session name is
+    # literally "PresentMon", so if the user runs any other PresentMon-based tool
+    # (CapFrameX, the PresentMon overlay, some Afterburner setups) both fight over
+    # the same session and the loser dies with "error code 4201" (session already
+    # running) — no CSV, zero frames.  A private per-launch name sidesteps that
+    # entirely and also makes our own PM2 restarts collision-proof.
+    session_name = f"ghostshell_{pid}_{stamp}"
     cmd = [
         cli_path,
         "--process_id", str(int(pid)),
         "--output_file", csv_path,
         "--timed", str(PRESENTMON_TIMED_SEC),
         "--terminate_after_timed",
+        "--session_name", session_name,
         "--stop_existing_session",
         "--no_console_stats",
     ]
@@ -950,7 +967,7 @@ def get_recent_stats(seconds: int = 30) -> dict:
 
     # FPS: prefer 1000/avg_frametime for PresentMon (more accurate),
     # use RTSS's reported avg for RTSS (it's already smoothed).
-    if src == "presentmon" or all((s.get("fps_avg") or 0) == 0 for s in recent):
+    if _is_presentmon(src) or all((s.get("fps_avg") or 0) == 0 for s in recent):
         avg_fps = (1000.0 / avg_ft) if avg_ft > 0 else None
         # max FPS = inverse of fastest (smallest) frametime
         max_fps = (1000.0 / fts[0]) if fts[0] > 0 else None
@@ -987,7 +1004,7 @@ def get_live_snapshot() -> dict:
         s = _samples[-1]
     src = _state.get("source")
     # For PresentMon, derive instantaneous FPS from the latest frametime
-    if src == "presentmon" and s["frametime_ms"] > 0:
+    if _is_presentmon(src) and s["frametime_ms"] > 0:
         fps = 1000.0 / s["frametime_ms"]
     else:
         fps = s.get("fps_avg", 0.0)
@@ -1015,7 +1032,7 @@ def _sampler_loop(stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         try:
             src = _state.get("source")
-            if src == "presentmon":
+            if _is_presentmon(src):
                 with _state_lock:
                     handle = _state.get("pm_proc")
                 if handle:
@@ -1076,7 +1093,7 @@ def get_status() -> dict:
     # (Minecraft Java's OpenGL is the typical case), it'd show
     # "connected" forever while emitting zero frame samples.
     pm_health = None
-    if src == "presentmon":
+    if _is_presentmon(src):
         proc      = (pm_proc or {}).get("proc") if pm_proc else None
         alive     = bool(proc and proc.poll() is None) if proc else False
         csv_size  = 0

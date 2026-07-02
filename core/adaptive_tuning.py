@@ -205,6 +205,9 @@ AUTO_CLASSIFY: dict[str, str] = {
     "wukong.exe":                         "visual",
     "blackmythwukong.exe":                "visual",
     "spiderman2.exe":                     "visual",
+    "spider-man2.exe":                    "visual",   # Nixxes hyphenated exe
+    "spider-man.exe":                     "visual",
+    "milesmorales.exe":                   "visual",
     "marvel-spiderman.exe":               "visual",
     "hogwartslegacy.exe":                 "visual",
     "godofwarragnarok.exe":               "visual",
@@ -630,8 +633,19 @@ def _migrate_state(state: dict, exe: str) -> dict:
         state["mode"] = _auto_classify(exe)
     # beta.13 — backfill the optimization target (auto-classify known games
     # so an existing profile for Spider-Man / CoD picks up the right posture).
-    if "target" not in state or state["target"] not in VALID_TARGETS:
+    had_target = "target" in state and state["target"] in VALID_TARGETS
+    if not had_target:
         state["target"] = _auto_classify_target(state.get("exe", exe))
+        # beta.4 (3.5.1) — one-shot mode alignment on the VERY FIRST target
+        # backfill only: a pre-existing max_fps game (e.g. Spider-Man 2 created
+        # before the target feature) may carry a stale mode=balanced, which
+        # scores/steps the OC far less aggressively than the visual posture
+        # max_fps wants.  Align it to visual ONCE.  This is gated on the target
+        # having been ABSENT — any setter (set_game_mode/target/enabled) writes
+        # a state that already HAS target, so this never fires again and can't
+        # clobber a later user mode edit (the beta.2 every-load-invariant bug).
+        if state["target"] == "max_fps":
+            state["mode"] = "visual"
     # beta.3 (3.5.1) — do NOT force the enabled flag here.  An earlier
     # beta.2 tried to enforce "max_fps ⟹ AT off" on every load, which made
     # the AT toggle impossible to turn on for those games (it flipped right
