@@ -7446,7 +7446,8 @@ async function _refreshAdaptiveDiagnostics() {
         var live = ft.live || {};
         var recent = ft.recent || {};
         var pmh    = ft.pm_health || null;
-        var srcLbl = (ft.available.source === 'presentmon') ? 'PresentMon (Microsoft)' :
+        var srcLbl = (ft.available.source === 'presentmon')  ? 'PresentMon 1.x (Microsoft)' :
+                     (ft.available.source === 'presentmon2') ? 'PresentMon 2.x (Microsoft)' :
                      ft.available.source;
         // Lead with the truth — installed AND producing frames is what
         // "connected" should mean.  PresentMon being installed but not
