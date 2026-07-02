@@ -1624,26 +1624,39 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                 log.info(f"AT survived startup guard — fast-forwarded to "
                          f"remembered core+{tc}/mem+{tm}")
         else:
-            # The remembered offset is now unsafe (blacklisted after it crashed,
-            # temp cooldown, etc.).  Drop the persisted current_core back to
-            # baseline so we STOP re-arming the blacklisted climb on every launch
-            # (otherwise climb_target keeps pointing at the crashed offset and we
-            # retry-then-refuse it forever).  AT re-explores upward from baseline,
-            # and _is_safe_to_step_to keeps refusing anything >= the blacklisted
-            # offset, so it converges just below the crash point.
-            st = get_game_state(exe)
-            bcore = int(st.get("baseline_core", 0))
-            bmem  = int(st.get("baseline_mem",  0))
-            st["current_core"] = bcore
-            st["current_mem"]  = bmem
-            _save_game_state(exe, st)
+            # The remembered offset can't be fast-forwarded right now.  Split the
+            # reason exactly like the step-up path (line ~2058):
+            #   • TRANSIENT (thermal / power-bound) — routine on a warm startup
+            #     (hot load screen, shader compile).  Do NOT forget the learned
+            #     offset: hold baseline for now and let the normal step loop
+            #     re-approach it as the GPU cools; next launch fast-forwards it
+            #     again.  Resetting here would throw away the user's learned OC
+            #     on every hot start.
+            #   • PERSISTENT (blacklisted after a crash / mode-cap) — drop the
+            #     persisted current_core back to baseline so we STOP re-arming a
+            #     genuinely-bad or out-of-range offset every launch; AT then
+            #     re-explores upward and _is_safe_to_step_to keeps refusing
+            #     anything ≥ the blacklisted offset, converging below it.
+            transient = ("thermal" in why or "power-bound" in why)
             with _lock:
                 _runtime["climb_target"] = None
-                _runtime["current_core"] = bcore
-                _runtime["current_mem"]  = bmem
-            log.warning(f"AT startup guard: remembered core+{tc}/mem+{tm} no "
-                        f"longer safe ({why}) — reset to baseline core+{bcore}/"
-                        f"mem+{bmem}, will re-explore")
+            if transient:
+                log.info(f"AT startup guard: deferring fast-forward to core+{tc}/"
+                         f"mem+{tm} (transient: {why}) — holding baseline, keeping "
+                         f"the learned offset for later this session / next launch")
+            else:
+                st = get_game_state(exe)
+                bcore = int(st.get("baseline_core", 0))
+                bmem  = int(st.get("baseline_mem",  0))
+                st["current_core"] = bcore
+                st["current_mem"]  = bmem
+                _save_game_state(exe, st)
+                with _lock:
+                    _runtime["current_core"] = bcore
+                    _runtime["current_mem"]  = bmem
+                log.warning(f"AT startup guard: remembered core+{tc}/mem+{tm} no "
+                            f"longer safe ({why}) — reset to baseline core+{bcore}/"
+                            f"mem+{bmem}, will re-explore")
 
     # Alternate which axis we bump first — start with core (more visible
     # FPS gain), alternate with mem on every other promotion.
