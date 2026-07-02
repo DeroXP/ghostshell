@@ -544,31 +544,27 @@ def _start_presentmon2(pid: int, cli_path: str) -> Optional[dict]:
     "exits without capturing anything; ignoring all other options" and
     quit immediately — no CSV, zero frame samples, AT silently blind.
     """
-    stamp    = int(time.time())
-    csv_path = os.path.join(
-        tempfile.gettempdir(),
-        f"ghostshell_pm2_{pid}_{stamp}.csv",
-    )
     # FIXED, app-private ETW session name — reused every launch, paired with
     # --stop_existing_session below.  Two goals:
     #   1. Don't use PresentMon's DEFAULT name ("PresentMon"), so we never fight
     #      another PresentMon-based tool (CapFrameX / the PM overlay / some
     #      Afterburner setups) for the same session (that collision => error 4201,
     #      no CSV, zero frames).  A custom name sidesteps it.
-    #   2. Reclaim OUR OWN session on every (re)launch.  beta.4 used a UNIQUE
-    #      per-launch name (ghostshell_{pid}_{stamp}) — but --stop_existing_session
-    #      only stops a session of the SAME name, so a unique name meant it NEVER
-    #      matched and NEVER cleaned up the prior session.  Over a long play
-    #      session (game switches + hourly --timed restarts) hard-killed PM2
-    #      sessions then ACCUMULATED in the PresentMon service until ETW saturated
-    #      ("N events were lost", empty CSVs, capture dead system-wide until a
-    #      reboot).  A fixed name makes --stop_existing_session actually reclaim
-    #      the previous session each time, so nothing piles up.
+    #   2. Reclaim OUR OWN session on every (re)launch.  A fixed name makes
+    #      --stop_existing_session actually reclaim the previous session each
+    #      time, so nothing piles up (see _cleanup_stray_pm_sessions for why a
+    #      unique-per-launch name leaked sessions and saturated ETW).
     session_name = "ghostshell_frametelemetry"
+    # beta.8 — STREAM via --output_stdout, do NOT write --output_file.  PM 2.x
+    # holds its --output_file with an EXCLUSIVE lock while capturing, so the
+    # sampler could never open it to tail (every read => "used by another
+    # process" / PermissionError => 0 samples the whole session).  A stdout pipe
+    # has no lock and delivers rows in real time, so we read + parse them off the
+    # pipe in _pm_stdout_reader instead of tailing a file.
     cmd = [
         cli_path,
         "--process_id", str(int(pid)),
-        "--output_file", csv_path,
+        "--output_stdout",
         "--timed", str(PRESENTMON_TIMED_SEC),
         "--terminate_after_timed",
         "--session_name", session_name,
@@ -578,23 +574,123 @@ def _start_presentmon2(pid: int, cli_path: str) -> Optional[dict]:
     try:
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             creationflags=_CREATE_NO_WINDOW,
+            text=True, bufsize=1, encoding="utf-8", errors="replace",
         )
-        log.info(f"PresentMon 2.x started: pid={pid} csv={csv_path} cli={cli_path}")
-        return {"proc": proc, "csv_path": csv_path, "variant": "pm2"}
+        reader_stop = threading.Event()
+        reader = threading.Thread(
+            target=_pm_stdout_reader, args=(proc, reader_stop),
+            daemon=True, name=f"pm2-stdout-reader-{pid}",
+        )
+        reader.start()
+        log.info(f"PresentMon 2.x started (stdout stream): pid={pid} cli={cli_path}")
+        return {"proc": proc, "variant": "pm2", "stream": True,
+                "reader_stop": reader_stop, "reader_thread": reader}
     except Exception as e:
         log.warning(f"PresentMon 2.x spawn failed: {e}")
         return None
 
 
+def _pm_stdout_reader(proc, stop_event: threading.Event) -> None:
+    """Read PresentMon 2.x CSV rows off its stdout pipe and append per-frame
+    frametime samples to the shared ring buffer, in real time.
+
+    This replaces file-tailing for PM 2.x: PM2 locks its --output_file
+    exclusively while capturing, so the sampler could never read it.  Blocking
+    line reads on the pipe end when PM2 exits (game closed / --timed hit) or
+    when stop_event is set (retarget / stop_tracking); the sampler loop then
+    restarts a fresh PM2 + reader as needed."""
+    idx_pid = idx_ft = idx_name = None
+    header_done = False
+    added = 0
+    try:
+        # readline() (not `for line in proc.stdout`) — the file iterator reads
+        # ahead in large chunks, which batches/delays lines from a live pipe;
+        # readline returns each line as soon as PresentMon flushes it.
+        while True:
+            if stop_event.is_set():
+                break
+            line = proc.stdout.readline()
+            if line == "":            # EOF — PM2 exited
+                break
+            line = line.strip()
+            if not line or "," not in line:
+                continue
+            if not header_done:
+                cells = [c.strip().lower().lstrip("﻿") for c in line.split(",")]
+
+                def _col(*names, default=None):
+                    for nm in names:
+                        if nm in cells:
+                            return cells.index(nm)
+                    return default
+
+                idx_pid  = _col("processid", default=1)
+                idx_name = _col("application", default=0)
+                # PM 2.3.0 = FrameTime; older = msBetweenPresents.
+                idx_ft   = _col("frametime", "msbetweenpresents", default=None)
+                header_done = True
+                # Lock-free single-key writes (atomic under the GIL).  We must
+                # NOT take _state_lock here: start_tracking()/retarget calls
+                # _stop_presentmon() (which join()s this thread) WHILE holding
+                # _state_lock, so grabbing it here would deadlock/stall the join.
+                _state["pm_csv_header"] = line
+                _state["pm_stream_rows"] = 0
+                if idx_ft is None:
+                    log.warning(f"PM2 stdout: no frametime column in header: {line[:140]}")
+                continue
+            if idx_ft is None:
+                continue
+            row = line.split(",")
+            if len(row) <= max(idx_pid, idx_ft, idx_name):
+                continue
+            try:
+                pid_v = int(row[idx_pid])
+                ft_ms = float(row[idx_ft])
+                name  = row[idx_name].lower()
+            except (ValueError, IndexError):
+                continue
+            if ft_ms <= 0 or ft_ms > 1000:
+                # Skip dropped frames / hiccups beyond 1 s — they poison the
+                # variance calc more than they inform.
+                continue
+            with _samples_lock:
+                _samples.append({
+                    "ts":           time.time(),
+                    "pid":          pid_v,
+                    "name":         name,
+                    "fps_avg":      0.0,
+                    "fps_min":      0.0,
+                    "fps_max":      0.0,
+                    "frametime_ms": ft_ms,
+                })
+            added += 1
+            if added <= 3 or added % 250 == 0:
+                _state["pm_stream_rows"] = added   # lock-free (see header note)
+    except Exception as e:
+        _state["last_err"] = f"pm2 stdout reader: {e}"
+        log.debug(f"PM2 stdout reader ended: {e}")
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        _state["pm_stream_rows"] = added
+    log.info(f"PM2 stdout reader exited ({added} rows read)")
+
+
 def _stop_presentmon(handle: Optional[dict]) -> None:
-    """Politely terminate the PresentMon subprocess and clean up its CSV.
-    PresentMon catches SIGTERM and writes a clean trailer to the CSV;
-    if it doesn't exit within 3 s we hard-kill it."""
+    """Politely terminate the PresentMon subprocess (+ its stdout reader for the
+    PM 2.x stream path).  If it doesn't exit within 3 s we hard-kill it."""
     if not handle:
         return
+    # Signal the stdout reader (PM 2.x stream) to stop first.
+    rs = handle.get("reader_stop")
+    if rs:
+        try: rs.set()
+        except Exception: pass
     proc = handle.get("proc")
     if proc:
         try:
@@ -605,7 +701,12 @@ def _stop_presentmon(handle: Optional[dict]) -> None:
                 proc.wait(timeout=2)
         except Exception as e:
             log.debug(f"PresentMon terminate failed: {e}")
-    # Best-effort CSV cleanup so /temp doesn't fill up over time
+    # Join the reader thread now that the pipe is closing (unblocks its read).
+    rt = handle.get("reader_thread")
+    if rt:
+        try: rt.join(timeout=2)
+        except Exception: pass
+    # Legacy PM 1.x file cleanup (stream path has no csv_path).
     csv_path = handle.get("csv_path")
     if csv_path and os.path.exists(csv_path):
         try: os.remove(csv_path)
@@ -943,9 +1044,10 @@ def start_tracking(pid: Optional[int] = None,
             handle = _start_presentmon(int(pid), prefer_pm2=have_pm2)
             if handle:
                 _state["pm_proc"]     = handle
-                _state["pm_csv_path"] = handle["csv_path"]
+                _state["pm_csv_path"] = handle.get("csv_path")  # None for PM2 stream
                 _state["pm_csv_pos"]  = 0
                 _state["pm_csv_header"] = None
+                _state["pm_stream_rows"] = 0
                 _state["source"]      = ("presentmon2" if handle.get("variant") == "pm2"
                                           else "presentmon")
             else:
@@ -1121,10 +1223,14 @@ def _sampler_loop(stop_event: threading.Event) -> None:
                             if new_h:
                                 with _state_lock:
                                     _state["pm_proc"]     = new_h
-                                    _state["pm_csv_path"] = new_h["csv_path"]
+                                    _state["pm_csv_path"] = new_h.get("csv_path")
                         presentmon_restart_cooldown = time.time() + 5
                     else:
-                        _parse_presentmon_csv(handle)
+                        # PM 2.x streams frames via its own stdout reader thread
+                        # (_pm_stdout_reader); only the legacy PM 1.x file path
+                        # needs tailing from here.
+                        if not handle.get("stream"):
+                            _parse_presentmon_csv(handle)
             # v3.3.1-beta.5: RTSS sampler branch removed.  When source
             # is None we just don't sample frame data; AT classifier
             # gracefully degrades to GPU-util-only signals.
@@ -1148,6 +1254,7 @@ def get_status() -> dict:
         pm_proc     = _state.get("pm_proc")
         pm_csv_path = _state.get("pm_csv_path")
         pm_csv_pos  = _state.get("pm_csv_pos") or 0
+        pm_stream_rows = _state.get("pm_stream_rows") or 0
     avail   = is_available()
     recent  = get_recent_stats(30)
     live    = get_live_snapshot()
@@ -1163,6 +1270,7 @@ def get_status() -> dict:
     if _is_presentmon(src):
         proc      = (pm_proc or {}).get("proc") if pm_proc else None
         alive     = bool(proc and proc.poll() is None) if proc else False
+        is_stream = bool((pm_proc or {}).get("stream")) if pm_proc else False
         csv_size  = 0
         try:
             if pm_csv_path and os.path.exists(pm_csv_path):
@@ -1172,15 +1280,20 @@ def get_status() -> dict:
             buf_count = len(_samples)
         pm_health = {
             "alive":      alive,
+            # PM 2.x streams over stdout (no file); PM 1.x tails a CSV.
+            "mode":       "stdout-stream" if is_stream else "csv-tail",
             "csv_path":   pm_csv_path,
             "csv_size":   csv_size,
             "csv_read_pos": pm_csv_pos,
+            "stream_rows":  pm_stream_rows,
             "buffer_samples": buf_count,
             "rc":         proc.returncode if (proc and not alive) else None,
-            # If PresentMon is alive but CSV is empty / not growing,
-            # it's likely the game uses a present path PresentMon 1.x
-            # can't capture (OpenGL, some Vulkan paths).
-            "producing_frames": (alive and csv_size > 1024 and buf_count > 0),
+            # "producing" = subprocess alive AND frames actually reaching the
+            # ring buffer.  For the stream path there's no file to size-check,
+            # so we rely on the buffer (fed by _pm_stdout_reader); for the
+            # legacy file path we also require the CSV to be growing.
+            "producing_frames": (alive and buf_count > 0
+                                 and (is_stream or csv_size > 1024)),
         }
     return {
         "running":     running,
