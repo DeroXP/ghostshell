@@ -963,6 +963,20 @@ def api_adaptive_game_mode():
     ))
 
 
+@app.route("/api/adaptive/game-target", methods=["POST"])
+def api_adaptive_game_target():
+    """Body: { exe, target }.  Set the per-game optimization target
+    (auto | max_fps | low_latency | balanced).  max_fps holds the user's
+    proven OC at full GPU power + Ultimate plan; low_latency engages the
+    competitive-latency tweaks per session.  Both auto-disable AT for the
+    game so the target owns the posture."""
+    data = request.get_json(force=True) or {}
+    return jsonify(adaptive_tuning.set_game_target(
+        exe=data.get("exe", ""),
+        target=data.get("target", "auto"),
+    ))
+
+
 @app.route("/api/adaptive/apply-best", methods=["POST"])
 def api_adaptive_apply_best():
     """Body: { exe }.  Push this game's recorded best-stable offsets to

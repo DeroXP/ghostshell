@@ -571,9 +571,114 @@ def _apply_gaming_tweaks(pid: int, exe_name: str) -> list[str]:
     return changes
 
 
+# ── Per-game optimization target dispatch (beta.13) ──────────────────
+# Holds what apply_target() changed for the CURRENTLY-tracked game, so
+# restore_target() can reverse exactly that on exit.  The engine tracks
+# one game at a time, so a single slot is sufficient.
+_target_restore: dict = {}
+
+
+def _active_power_guid() -> str:
+    """GUID of the currently-active Windows power scheme, or '' if unknown."""
+    r = run_cmd(["powercfg", "/getactivescheme"], timeout=6)
+    if not r.get("ok"):
+        return ""
+    for part in (r.get("out") or "").split():
+        if len(part) == 36 and part.count("-") == 4:
+            return part
+    return ""
+
+
+def apply_target(exe: str) -> None:
+    """Compose the perf posture for this game's optimization target
+    (auto-classified / set in adaptive_tuning state).  Called at game-start,
+    right before AT's own engage.  Reuses existing primitives and captures
+    what it changes so restore_target() can reverse it on exit.
+
+      max_fps     → hold the user's PROVEN saved OC at 100% GPU power +
+                    Ultimate power plan.  AT is off for the game (set with
+                    the target) so nothing caps the card back down.
+      low_latency → engage Competitive Latency for the session (timer,
+                    flip-model, 1:1 mouse, DVR/throttle off).  GPU OC isn't
+                    the lever for these CPU-bound titles, so it's untouched.
+      auto/balanced → nothing; the normal mode-driven AT flow runs.
+    """
+    global _target_restore
+    try:
+        from core import adaptive_tuning
+        target = (adaptive_tuning.get_game_state(exe) or {}).get("target", "auto")
+    except Exception:
+        target = "auto"
+    if target in ("auto", "balanced"):
+        _target_restore = {}
+        return
+    restore = {"target": target, "exe": exe}
+    try:
+        if target == "max_fps":
+            from core import gpu_overclock, optimizer
+            restore["power_guid"] = _active_power_guid()
+            prof = gpu_overclock.load_profile()
+            has = bool(prof.get("exists"))
+            restore["oc"] = {
+                "core":  int(prof.get("core_offset_mhz", 0) or 0) if has else 0,
+                "mem":   int(prof.get("mem_offset_mhz", 0) or 0) if has else 0,
+                "power": int(prof.get("power_pct", 100) or 100) if has else 100,
+            }
+            optimizer.apply_ultimate_power_plan()
+            gpu_overclock.apply_oc(core_offset_mhz=restore["oc"]["core"],
+                                   mem_offset_mhz=restore["oc"]["mem"],
+                                   power_pct=100)
+            log.info(f"  Max-FPS target: held OC core+{restore['oc']['core']}/"
+                     f"mem+{restore['oc']['mem']} @ 100% power + Ultimate power plan")
+        elif target == "low_latency":
+            from core import competitive_latency
+            already = bool(competitive_latency.status().get("enabled"))
+            restore["we_enabled_latency"] = (not already)
+            if not already:
+                competitive_latency.apply()
+                log.info("  Low-Latency target: engaged Competitive Latency for this session")
+            else:
+                log.info("  Low-Latency target: Competitive Latency already on — leaving as-is")
+    except Exception as e:
+        log.warning(f"apply_target({target}) failed: {e}")
+    _target_restore = restore
+
+
+def restore_target() -> None:
+    """Reverse whatever apply_target() applied for the just-exited game."""
+    global _target_restore
+    r, _target_restore = _target_restore, {}
+    if not r:
+        return
+    target = r.get("target")
+    try:
+        if target == "max_fps":
+            from core import gpu_overclock
+            oc = r.get("oc") or {}
+            # Re-apply the saved profile (resets GPU power_pct to the user's
+            # normal value) then restore the prior power plan.
+            gpu_overclock.apply_oc(core_offset_mhz=int(oc.get("core", 0)),
+                                   mem_offset_mhz=int(oc.get("mem", 0)),
+                                   power_pct=int(oc.get("power", 100)))
+            guid = r.get("power_guid") or ""
+            if guid:
+                run_cmd(["powercfg", "/setactive", guid], timeout=6)
+            log.info("  Max-FPS target released: restored saved OC + prior power plan")
+        elif target == "low_latency":
+            if r.get("we_enabled_latency"):
+                from core import competitive_latency
+                competitive_latency.reset()
+                log.info("  Low-Latency target released: reverted Competitive Latency")
+    except Exception as e:
+        log.warning(f"restore_target failed: {e}")
+
+
 def restore_normal_mode(reason: str = "game exit"):
     """Revert ALL hard tweaks back to the saved baseline — guaranteed normal state."""
     log.info(f"Restoring normal mode (reason: {reason})...")
+    # beta.13 — reverse any per-game optimization-target posture first
+    # (GPU OC / power plan / competitive latency), before the generic tweaks.
+    restore_target()
     # Capture the game name BEFORE we clear engine state, so we can use it in the notification.
     _prev_game = _engine.get("active_game")
     baseline = _load_baseline()
@@ -1144,6 +1249,15 @@ def _monitor_loop():
                         perf_monitor.start(consumer="game-mode")
                     except Exception as e:
                         log.debug(f"perf_monitor start failed: {e}")
+
+                    # beta.13 — apply this game's optimization TARGET posture
+                    # (max_fps / low_latency) BEFORE AT engages.  For targeted
+                    # games AT is auto-disabled, so on_game_start below no-ops
+                    # for them and won't fight the posture we just set.
+                    try:
+                        apply_target(exe)
+                    except Exception as e:
+                        log.debug(f"apply_target failed: {e}")
 
                     # v3 — engage Adaptive Tuning if this game is opted in.
                     # AT applies its own learned offsets (overriding the

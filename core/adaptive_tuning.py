@@ -226,6 +226,45 @@ AUTO_CLASSIFY: dict[str, str] = {
 }
 
 
+# ── Per-game optimization TARGET (beta.13) ──────────────────────────────
+# A higher-level intent than `mode`: what is this game FOR?
+#   auto        — no override; behave as before (mode-driven AT).
+#   max_fps     — GPU-bound title, push raw native FPS: hold the user's
+#                 PROVEN saved OC at full GPU power + Ultimate power plan,
+#                 and keep AT OFF (its mode caps sit BELOW a tuned user OC,
+#                 so letting it manage would only cap the card down).
+#   low_latency — latency/frametime-sensitive (competitive shooters):
+#                 engage the competitive-latency tweaks for the session;
+#                 GPU OC isn't the lever (these titles are CPU-bound).
+#   balanced    — explicit "just the normal adaptive behaviour".
+# Read by game_profiles.apply_target() at game-start.
+VALID_TARGETS = ("auto", "max_fps", "low_latency", "balanced")
+
+# Auto-assigned target for known titles so the right posture applies the
+# FIRST time the game is seen — no manual setup.  Spider-Man (Insomniac,
+# GPU-bound → raw FPS) → max_fps; Call of Duty (IW engine, CPU-bound →
+# fast/consistent inputs) → low_latency.
+AUTO_TARGET = {
+    # Spider-Man PC ports (Nixxes) — raw native FPS, Frame-Gen left off by user
+    "spider-man.exe":       "max_fps",
+    "milesmorales.exe":     "max_fps",
+    "spider-man2.exe":      "max_fps",
+    "marvel-spiderman.exe": "max_fps",
+    "spiderman2.exe":       "max_fps",
+    # Call of Duty — all IW-engine titles — input timing + frametime
+    "modernwarfare.exe":    "low_latency",
+    "blackopscoldwar.exe":  "low_latency",
+    "vanguard.exe":         "low_latency",
+    "cod22-cod.exe":        "low_latency",
+    "cod23-cod.exe":        "low_latency",
+    "cod.exe":              "low_latency",   # CoD-HQ launcher (BO6 / WZ / MWII+III)
+}
+
+
+def _auto_classify_target(exe: str) -> str:
+    return AUTO_TARGET.get((exe or "").lower().strip(), "auto")
+
+
 def _auto_classify(exe: str) -> str:
     """Pick a default mode for a newly-seen game based on a small built-in
     table of known titles.  Falls back to settings.default_mode."""
@@ -520,13 +559,20 @@ def _empty_state(exe: str) -> dict:
     # took ~10-30 minutes of accumulated playtime crawling back up to
     # the user's own ceiling before it could even start exploring.
     user_core, user_mem = _user_oc_baseline()
+    tgt = _auto_classify_target(exe)
     return {
         "exe":               _norm_exe(exe),
-        "enabled":           bool(get_settings().get("default_per_game_enabled", False)),
+        # beta.13 — max_fps/low_latency targets OWN the perf posture, so AT
+        # starts OFF for them (their mode caps sit below a tuned OC anyway).
+        # Everything else honors the global default-per-game-enabled setting.
+        "enabled":           False if tgt in ("max_fps", "low_latency")
+                             else bool(get_settings().get("default_per_game_enabled", False)),
         # v3.1 — tuning mode chosen at game-creation time, user-editable.
         # Auto-classified for known titles (CS2 → competitive, Cyberpunk
         # → visual, etc.); falls back to settings.default_mode.
         "mode":              _auto_classify(exe),
+        # beta.13 — per-game optimization target (see VALID_TARGETS).
+        "target":            tgt,
         # v3 — baselines start at the user's current OC, not 0.
         "current_core":      user_core,
         "current_mem":       user_mem,
@@ -572,6 +618,10 @@ def _migrate_state(state: dict, exe: str) -> dict:
     safety/confidence fields set."""
     if "mode" not in state or state["mode"] not in MODE_PRESETS:
         state["mode"] = _auto_classify(exe)
+    # beta.13 — backfill the optimization target (auto-classify known games
+    # so an existing profile for Spider-Man / CoD picks up the right posture).
+    if "target" not in state or state["target"] not in VALID_TARGETS:
+        state["target"] = _auto_classify_target(state.get("exe", exe))
     # v3 — older rows pre-date the baseline_* fields.  Pull the user's
     # current OC profile as the baseline.  Also lift current_/best_stable_
     # up to the baseline if they're below it (the user has clearly
@@ -728,6 +778,34 @@ def set_game_mode(exe: str, mode: str) -> dict:
         if _runtime.get("active_exe") == key:
             _runtime["consecutive_good"] = 0
     return {"ok": True, "exe": key, "mode": mode}
+
+
+def set_game_target(exe: str, target: str) -> dict:
+    """Set the per-game optimization TARGET (beta.13).  Valid:
+       auto | max_fps | low_latency | balanced.  Read by
+       game_profiles.apply_target() at game-start to compose the right
+       posture (max_fps → hold proven OC + full GPU power + Ultimate plan;
+       low_latency → competitive-latency tweaks for the session).
+
+       max_fps/low_latency also switch AT OFF for this game: the target
+       owns the GPU/latency posture, and AT's mode caps sit below a tuned
+       OC (so it could only cap a max_fps card down)."""
+    if target not in VALID_TARGETS:
+        return {"ok": False, "err": f"invalid target '{target}'",
+                "valid": list(VALID_TARGETS)}
+    states = _load_json(STATE_PATH, {})
+    key = _norm_exe(exe)
+    if key not in states:
+        states[key] = _empty_state(exe)
+    states[key]["target"] = target
+    if target in ("max_fps", "low_latency"):
+        states[key]["enabled"] = False
+    _save_json(STATE_PATH, states)
+    log.info(f"AT target set: {key} → {target}"
+             + (" (AT auto-disabled — target owns the posture)"
+                if target in ("max_fps", "low_latency") else ""))
+    return {"ok": True, "exe": key, "target": target,
+            "at_enabled": bool(states[key]["enabled"])}
 
 
 def set_game_knobs(exe: str,
