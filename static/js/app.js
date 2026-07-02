@@ -7153,7 +7153,7 @@ async function loadAdaptiveGames() {
                 '<option value="competitive"' + (mode === 'competitive' ? ' selected' : '') + '>Competitive</option>' +
                 '<option value="visual"' + (mode === 'visual' ? ' selected' : '') + '>Visual</option>' +
               '</select>' +
-              '<label style="font-size:11.5px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase" title="What this game is FOR. Max FPS holds your proven OC at full GPU power + Ultimate power plan (AT off, so it can\'t cap you down). Low Latency engages competitive-latency tweaks for the session. Auto = normal adaptive behaviour.">Target</label>' +
+              '<label style="font-size:11.5px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase" title="What this game is FOR. Max FPS = full GPU power + Ultimate power plan, and Adaptive Tuning climbs your OC above baseline for more frames (stability-gated). Low Latency = competitive-latency tweaks for the session (GPU OC left alone, these titles are CPU-bound). Auto = normal adaptive behaviour.">Target</label>' +
               '<select onchange="setAdaptiveGameTarget(\'' + escHtml(exe) + '\', this.value)" style="width:auto;min-width:130px;padding:5px 28px 5px 10px;font-size:12.5px">' +
                 '<option value="auto"' + (target === 'auto' ? ' selected' : '') + '>Auto</option>' +
                 '<option value="max_fps"' + (target === 'max_fps' ? ' selected' : '') + '>Max FPS</option>' +
@@ -7256,8 +7256,8 @@ async function setAdaptiveGameTarget(exe, target) {
     if (r && r.ok) {
         addLog('Optimization target for ' + exe + ' → ' + target
             + (r.at_enabled === false ? ' (adaptive tuning off — target owns the posture)' : ''));
-        if (target === 'max_fps') showInfoToast('Max FPS: holds your proven OC at full GPU power + Ultimate power plan when this game runs.', { title: exe });
-        else if (target === 'low_latency') showInfoToast('Low Latency: engages the competitive-latency tweaks while this game runs.', { title: exe });
+        if (target === 'max_fps') showInfoToast('Max FPS: full GPU power + Ultimate power plan, and Adaptive Tuning climbs your OC above baseline for more frames (stability-gated).', { title: exe });
+        else if (target === 'low_latency') showInfoToast('Low Latency: engages the competitive-latency tweaks while this game runs (GPU OC left alone — these titles are CPU-bound).', { title: exe });
     } else {
         showErrorToast((r && r.err) || 'Could not set target');
     }

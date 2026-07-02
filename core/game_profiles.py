@@ -595,9 +595,10 @@ def apply_target(exe: str) -> None:
     right before AT's own engage.  Reuses existing primitives and captures
     what it changes so restore_target() can reverse it on exit.
 
-      max_fps     → hold the user's PROVEN saved OC at 100% GPU power +
-                    Ultimate power plan.  AT is off for the game (set with
-                    the target) so nothing caps the card back down.
+      max_fps     → set the FLOOR: the user's proven saved OC at 100% GPU
+                    power + Ultimate power plan.  Adaptive Tuning (enabled +
+                    visual for max_fps games) then climbs ABOVE this floor
+                    for more frames, gated by stability + temp ceiling.
       low_latency → engage Competitive Latency for the session (timer,
                     flip-model, 1:1 mouse, DVR/throttle off).  GPU OC isn't
                     the lever for these CPU-bound titles, so it's untouched.

@@ -560,17 +560,27 @@ def _empty_state(exe: str) -> dict:
     # the user's own ceiling before it could even start exploring.
     user_core, user_mem = _user_oc_baseline()
     tgt = _auto_classify_target(exe)
+    # beta.3 (3.5.1) — target sets the AT posture:
+    #   max_fps     → AT ON, visual mode: climb the OC ABOVE the proven
+    #                 baseline for more frames (the ceiling is baseline-
+    #                 relative now, so it has real room).
+    #   low_latency → AT OFF: CoD-style titles are CPU-bound, GPU OC isn't
+    #                 the lever; the competitive-latency posture is.
+    #   auto/balanced → honor the global default-per-game-enabled setting.
+    if tgt == "max_fps":
+        tgt_enabled, tgt_mode = True, "visual"
+    elif tgt == "low_latency":
+        tgt_enabled, tgt_mode = False, _auto_classify(exe)
+    else:
+        tgt_enabled = bool(get_settings().get("default_per_game_enabled", False))
+        tgt_mode    = _auto_classify(exe)
     return {
         "exe":               _norm_exe(exe),
-        # beta.13 — max_fps/low_latency targets OWN the perf posture, so AT
-        # starts OFF for them (their mode caps sit below a tuned OC anyway).
-        # Everything else honors the global default-per-game-enabled setting.
-        "enabled":           False if tgt in ("max_fps", "low_latency")
-                             else bool(get_settings().get("default_per_game_enabled", False)),
+        "enabled":           tgt_enabled,
         # v3.1 — tuning mode chosen at game-creation time, user-editable.
         # Auto-classified for known titles (CS2 → competitive, Cyberpunk
         # → visual, etc.); falls back to settings.default_mode.
-        "mode":              _auto_classify(exe),
+        "mode":              tgt_mode,
         # beta.13 — per-game optimization target (see VALID_TARGETS).
         "target":            tgt,
         # v3 — baselines start at the user's current OC, not 0.
@@ -622,16 +632,12 @@ def _migrate_state(state: dict, exe: str) -> dict:
     # so an existing profile for Spider-Man / CoD picks up the right posture).
     if "target" not in state or state["target"] not in VALID_TARGETS:
         state["target"] = _auto_classify_target(state.get("exe", exe))
-    # beta.2 (3.5.1) — enforce the invariant: max_fps / low_latency targets
-    # OWN the perf posture, so AT must be OFF for them.  The original
-    # backfill above only set the target FIELD; a game already tracked
-    # before the target feature (e.g. Spider-Man 2) kept enabled=True, so
-    # AT stayed engaged and — since its mode cap sits BELOW a tuned OC —
-    # spun uselessly showing "unstable".  Force it off here so it
-    # self-heals on the next state load.  (To run AT on such a game,
-    # switch its target to auto/balanced.)
-    if state.get("target") in ("max_fps", "low_latency") and state.get("enabled"):
-        state["enabled"] = False
+    # beta.3 (3.5.1) — do NOT force the enabled flag here.  An earlier
+    # beta.2 tried to enforce "max_fps ⟹ AT off" on every load, which made
+    # the AT toggle impossible to turn on for those games (it flipped right
+    # back off).  Now the target/enabled coupling lives only in the setters
+    # (set_game_target / set_game_enabled), so the user's toggle sticks and
+    # max_fps games run AT to climb the OC for more FPS.
     # v3 — older rows pre-date the baseline_* fields.  Pull the user's
     # current OC profile as the baseline.  Also lift current_/best_stable_
     # up to the baseline if they're below it (the user has clearly
@@ -791,15 +797,17 @@ def set_game_mode(exe: str, mode: str) -> dict:
 
 
 def set_game_target(exe: str, target: str) -> dict:
-    """Set the per-game optimization TARGET (beta.13).  Valid:
+    """Set the per-game optimization TARGET.  Valid:
        auto | max_fps | low_latency | balanced.  Read by
-       game_profiles.apply_target() at game-start to compose the right
-       posture (max_fps → hold proven OC + full GPU power + Ultimate plan;
-       low_latency → competitive-latency tweaks for the session).
+       game_profiles.apply_target() at game-start.
 
-       max_fps/low_latency also switch AT OFF for this game: the target
-       owns the GPU/latency posture, and AT's mode caps sit below a tuned
-       OC (so it could only cap a max_fps card down)."""
+       Posture set here (beta.3 3.5.1):
+         max_fps     → AT ON + visual mode: climb the OC ABOVE the proven
+                       baseline for more frames (ceiling is baseline-relative
+                       now), plus full GPU power + Ultimate power plan.
+         low_latency → AT OFF (CoD-style titles are CPU-bound, GPU OC isn't
+                       the lever) + competitive-latency tweaks for the session.
+         auto/balanced → leave the AT enable flag as-is."""
     if target not in VALID_TARGETS:
         return {"ok": False, "err": f"invalid target '{target}'",
                 "valid": list(VALID_TARGETS)}
@@ -808,14 +816,15 @@ def set_game_target(exe: str, target: str) -> dict:
     if key not in states:
         states[key] = _empty_state(exe)
     states[key]["target"] = target
-    if target in ("max_fps", "low_latency"):
+    if target == "max_fps":
+        states[key]["enabled"] = True
+        states[key]["mode"]    = "visual"
+    elif target == "low_latency":
         states[key]["enabled"] = False
     _save_json(STATE_PATH, states)
-    log.info(f"AT target set: {key} → {target}"
-             + (" (AT auto-disabled — target owns the posture)"
-                if target in ("max_fps", "low_latency") else ""))
-    return {"ok": True, "exe": key, "target": target,
-            "at_enabled": bool(states[key]["enabled"])}
+    at_en = bool(states[key]["enabled"])
+    log.info(f"AT target set: {key} → {target} (AT {'on/visual' if at_en else 'off'})")
+    return {"ok": True, "exe": key, "target": target, "at_enabled": at_en}
 
 
 def set_game_knobs(exe: str,
@@ -1258,10 +1267,30 @@ def _is_safe_to_step_to(exe: str, core: int, mem: int,
     """
     p = _preset_for(exe)
     state = get_game_state(exe)
-    if core > p["max_core_offset"]:
-        return False, f"core+{core} exceeds {_get_mode(exe)}-mode cap ({p['max_core_offset']})"
-    if mem > p["max_mem_offset"]:
-        return False, f"mem+{mem} exceeds {_get_mode(exe)}-mode cap ({p['max_mem_offset']})"
+    # The mode cap is HEADROOM ABOVE the user's proven baseline OC, not an
+    # absolute offset.  Before 3.5.1-beta.3 this compared the absolute
+    # offset against the cap (e.g. visual 350) — but a user's baseline is
+    # their hand-tuned OC (e.g. +450), which already EXCEEDS every mode cap,
+    # so AT could never step up on ANY game for anyone running a real OC.
+    # It just sat stuck at baseline reporting "unstable".  Now the ceiling
+    # is baseline + headroom (also clamped to the hard gpu_overclock max),
+    # so AT explores UPWARD from where the user already proved stable.
+    bc = int(state.get("baseline_core", 0))
+    bm = int(state.get("baseline_mem", 0))
+    core_ceiling = bc + int(p["max_core_offset"])
+    mem_ceiling  = bm + int(p["max_mem_offset"])
+    try:
+        from core.gpu_overclock import MAX_CORE_OFFSET_MHZ, MAX_MEM_OFFSET_MHZ
+        core_ceiling = min(core_ceiling, MAX_CORE_OFFSET_MHZ)
+        mem_ceiling  = min(mem_ceiling,  MAX_MEM_OFFSET_MHZ)
+    except Exception:
+        pass
+    if core > core_ceiling:
+        return False, (f"core+{core} exceeds {_get_mode(exe)}-mode ceiling "
+                       f"(baseline+{p['max_core_offset']} = {core_ceiling})")
+    if mem > mem_ceiling:
+        return False, (f"mem+{mem} exceeds {_get_mode(exe)}-mode ceiling "
+                       f"(baseline+{p['max_mem_offset']} = {mem_ceiling})")
     # Per-game crash blacklist (managed by crash_recovery)
     try:
         from core import crash_recovery
