@@ -762,6 +762,15 @@ def api_gpu_oc_profile_save():
     return jsonify(gpu_overclock.save_profile(data))
 
 
+@app.route("/api/gpu/oc/profile/reapply", methods=["POST"])
+def api_gpu_oc_profile_reapply():
+    """beta.9 — toggle 'reapply this OC on every boot' on the saved profile.
+    Body: {enabled: bool}.  Auto-tuned OCs save with reapply OFF; this is the
+    opt-in switch the user flips once they trust the result."""
+    data = request.get_json(force=True) or {}
+    return jsonify(gpu_overclock.set_profile_apply_on_startup(bool(data.get("enabled", False))))
+
+
 @app.route("/api/gpu/oc/profile", methods=["DELETE"])
 def api_gpu_oc_profile_delete():
     """Delete saved profile and reset GPU."""
