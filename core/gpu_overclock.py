@@ -1836,6 +1836,30 @@ def end_stability_probe() -> dict:
 CORE_REFINE_TOLERANCE_MHZ = 5    # stop core refinement when gap ≤ 5 MHz (tight = pushes to true ceiling)
 MEM_REFINE_TOLERANCE_MHZ = 15    # stop memory refinement when gap ≤ 15 MHz
 
+# beta.10 — HOW we overclock, redesigned:
+#
+# GUARD BAND — the binary search finds the CRASH EDGE, but an OC you game on
+# daily must not sit 5 MHz from a crash (ambient temp, driver updates, and
+# workload spikes eat that margin instantly).  After the edge is found, the
+# locked value backs off by this much.  This is the difference between "passed
+# a 15s lab probe" and "stable every day".
+CORE_GUARD_BAND_MHZ = 25
+MEM_GUARD_BAND_MHZ  = 100
+
+# MEM PERF REGRESSION — modern GDDR6/6X/7 does error-detection-and-replay
+# (EDR): past the memory's real sweet spot, errors get silently corrected via
+# retries, so PERFORMANCE DROPS long before anything crashes.  A crash-point
+# search therefore overshoots badly — it happily picks a "stable" +3000 that
+# measures SLOWER than +2200.  We track each mem step's measured FPS and treat
+# a ≥ this-% drop vs the best lower offset as the effective ceiling, then lock
+# the best-MEASURED offset, not the highest survivable one.
+MEM_PERF_REGRESSION_PCT = 3.0
+
+# CONFIRMATION — a value that passes one 10-15s refine probe gets ONE longer
+# re-test at the guard-banded lock before the axis advances.  Catches
+# borderline offsets that survive short windows but fail sustained load.
+CONFIRM_DURATION_S = 25
+
 _auto_oc_session = {
     "active": False,
     "phase": "idle",
@@ -1908,9 +1932,34 @@ def auto_oc_start(core_step_mhz: int = 75, mem_step_mhz: int = 250, max_steps: i
     try: clear_crash_state()
     except Exception: pass
 
+    # beta.10 — SEED FROM THE PROVEN BASELINE.  Starting every hunt from +0
+    # wastes steps climbing through territory the user's saved profile already
+    # proved, and with only ~14 short probes the search often crash-bounds
+    # early and lands BELOW the OC the user games on daily — the #1 reason
+    # results felt weak.  If a saved profile exists, the FIRST step validates
+    # it (one probe at exactly those values); if it passes, the core search
+    # starts from profile core and the mem search from profile mem.  If it
+    # fails, we fall back to the classic from-zero hunt.
+    seed_core = seed_mem = 0
+    try:
+        p = load_profile()
+        if p and p.get("exists"):
+            seed_core = max(0, int(p.get("core_offset_mhz") or 0))
+            seed_mem  = max(0, int(p.get("mem_offset_mhz") or 0))
+    except Exception as e:
+        log.debug(f"Auto-OC baseline seed read failed: {e}")
+    has_seed = seed_core > 0 or seed_mem > 0
+
     _auto_oc_session.update({
         "active": True,
-        "phase": "core_jump",
+        "phase": "baseline_check" if has_seed else "core_jump",
+        "baseline_core_seed": seed_core,
+        "baseline_mem_seed":  seed_mem,
+        "baseline_proven":    False,
+        "core_confirm_retries": 0,
+        "mem_confirm_retries":  0,
+        "final_retries":        0,
+        "mem_perf":             [],
         "step": 0,
         "max_iters": max(8, min(20, max_steps)),
         "current_core": 0,
@@ -1937,12 +1986,15 @@ def auto_oc_start(core_step_mhz: int = 75, mem_step_mhz: int = 250, max_steps: i
         "crash_count_mem":             0,
         "_last_oob_crash_ts":          0.0,
     })
-    log.info(f"Auto-OC v3 started: core_jump={core_step_mhz} mem_jump={mem_step_mhz} max_iters={max_steps} max_power={max_power}")
+    log.info(f"Auto-OC v4 started: core_jump={core_step_mhz} mem_jump={mem_step_mhz} "
+             f"max_iters={max_steps} max_power={max_power} "
+             f"seed={'core+%d/mem+%d' % (seed_core, seed_mem) if has_seed else 'none (from 0)'}")
     return {
         "ok": True,
-        "phase": "core_jump",
-        "estimated_steps": 9,
-        "estimated_time_min": 5,
+        "phase": _auto_oc_session["phase"],
+        "seeded_from_profile": has_seed,
+        "estimated_steps": 11,
+        "estimated_time_min": 6,
         "pre_max_power_pct": _auto_oc_session.get("pre_max_power_pct", 100),
     }
 
@@ -1960,8 +2012,15 @@ def _phase_duration(phase: str) -> int:
         return 10   # was 18 — crash detection is fast at high stress
     if phase in ("core_refine", "mem_refine"):
         return 15   # was 25 — refinement still needs a bit more confidence
+    # beta.10 — validate the user's saved profile as the search floor.
+    if phase == "baseline_check":
+        return 15
+    # beta.10 — one longer confirmation at the guard-banded lock per axis.
+    if phase in ("core_confirm", "mem_confirm"):
+        return CONFIRM_DURATION_S
     if phase == "final_validation":
-        return 30   # was 60 — sufficient for last-mile validation
+        return 45   # beta.10: 30 → 45 — the final combined OC deserves the
+                    # longest window; it's what the user will game on.
     # v2.9.9.7 — post-crash sanity check.  15s is plenty: if the GPU is
     # going to crash again at the last-stable offset, it crashes within
     # the first 8s under heavy WebGL stress.  We give it 7s of headroom.
@@ -2128,18 +2187,36 @@ def auto_oc_next(prev_result: dict = None) -> dict:
         # (or the GPU crashed at all during the session), NEVER test at or
         # above that point again, even if some later probe falsely reports
         # the lower value as stable.  Survives missed verdicts.
-        if not stable and sess["phase"] in ("core_jump", "core_refine"):
+        if not stable and sess["phase"] in ("core_jump", "core_refine", "core_confirm"):
             floor = sess.get("session_unstable_floor_core")
             cur   = int(sess.get("current_core", 0))
             if floor is None or cur < floor:
                 sess["session_unstable_floor_core"] = cur
-        if not stable and sess["phase"] in ("mem_jump", "mem_refine"):
+        if not stable and sess["phase"] in ("mem_jump", "mem_refine", "mem_confirm"):
             floor = sess.get("session_unstable_floor_mem")
             cur   = int(sess.get("current_mem", 0))
             if floor is None or cur < floor:
                 sess["session_unstable_floor_mem"] = cur
 
-        if sess["phase"] in ("core_jump", "core_refine"):
+        if sess["phase"] == "baseline_check":
+            # beta.10 — we just probed the user's saved profile values.
+            if stable:
+                sess["baseline_proven"] = True
+                sess["stable_core"] = int(sess.get("baseline_core_seed", 0))
+                log.info(f"Auto-OC baseline proven: core+{sess['stable_core']}/"
+                         f"mem+{sess.get('baseline_mem_seed', 0)} — searching upward from there")
+            else:
+                # Saved profile didn't hold up — classic from-zero hunt.  Don't
+                # blame either axis (this was a combined probe).
+                sess["baseline_proven"] = False
+                sess["baseline_core_seed"] = 0
+                sess["baseline_mem_seed"]  = 0
+                log.warning("Auto-OC baseline check FAILED — saved profile isn't "
+                            "stable under stress; falling back to a from-zero hunt")
+            sess["phase"] = "core_jump"
+            sess["current_core"] = sess["stable_core"]
+            sess["current_mem"]  = 0
+        elif sess["phase"] in ("core_jump", "core_refine"):
             if stable:
                 # v3.1.1 — refuse to mark current_core as stable if it's at
                 # or above the session crash floor.  Probe miss → bail.
@@ -2206,6 +2283,18 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                             f"lower power limit."
                         )
         elif sess["phase"] in ("mem_jump", "mem_refine"):
+            # beta.10 — record this step's measured performance.  GDDR6/6X/7
+            # error-detection-and-replay (EDR) silently retries corrupted
+            # transfers, so past the real sweet spot FPS DROPS while the probe
+            # still reports "stable".  Tuning mem by crash point alone
+            # overshoots into that error-correction zone — the classic reason
+            # auto-OC'd memory measures WORSE than a hand-tuned lower value.
+            _fps   = float(prev_result.get("avg_fps") or 0.0)
+            _valid = bool(prev_result.get("frame_data_valid", _fps > 0)) and _fps > 0
+            sess.setdefault("mem_perf", []).append({
+                "mem": int(sess["current_mem"]), "fps": _fps,
+                "valid": _valid, "stable": bool(stable),
+            })
             if stable:
                 # v3.1.1 — mirror of core path: refuse stable mark above floor
                 floor = sess.get("session_unstable_floor_mem")
@@ -2220,7 +2309,29 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                             sess["current_mem"] < sess["unstable_mem"]):
                         sess["unstable_mem"] = sess["current_mem"]
                 else:
-                    sess["stable_mem"] = sess["current_mem"]
+                    # beta.10 — EDR perf-regression gate: if this (higher) mem
+                    # offset measured ≥ MEM_PERF_REGRESSION_PCT slower than the
+                    # best LOWER offset, memory is already error-correcting.
+                    # Treat it as the effective ceiling (soft — no crash budget).
+                    best_prior = max(
+                        (e["fps"] for e in sess["mem_perf"]
+                         if e["valid"] and e["stable"] and e["mem"] < sess["current_mem"]),
+                        default=0.0,
+                    )
+                    if (_valid and best_prior > 0 and
+                            _fps < best_prior * (1.0 - MEM_PERF_REGRESSION_PCT / 100.0)):
+                        log.info(
+                            f"Auto-OC: mem+{sess['current_mem']} is 'stable' but "
+                            f"measured {_fps:.1f} fps vs {best_prior:.1f} at a lower "
+                            f"offset ({(1 - _fps / best_prior) * 100:.1f}% slower) — "
+                            f"GDDR error-correction zone; treating as ceiling"
+                        )
+                        stable = False   # for search purposes only (soft fail)
+                        if (sess["unstable_mem"] is None or
+                                sess["current_mem"] < sess["unstable_mem"]):
+                            sess["unstable_mem"] = sess["current_mem"]
+                    else:
+                        sess["stable_mem"] = sess["current_mem"]
             if not stable:
                 if sess["unstable_mem"] is None or sess["current_mem"] < sess["unstable_mem"]:
                     sess["unstable_mem"] = sess["current_mem"]
@@ -2243,6 +2354,59 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                         f"mem+{sess['stable_mem']} as winner and advancing to final validation"
                     )
                     sess["phase"] = "_post_crash_settle_mem"
+        elif sess["phase"] == "core_confirm":
+            # beta.10 — longer re-test at the guard-banded core lock.
+            if stable:
+                log.info(f"Auto-OC core lock CONFIRMED at +{sess['stable_core']} "
+                         f"({CONFIRM_DURATION_S}s sustained)")
+                sess["phase"] = "mem_jump"
+                # Seed the mem search from the proven profile mem (if the
+                # baseline check passed) instead of climbing from 0.
+                seed = int(sess.get("baseline_mem_seed", 0)) if sess.get("baseline_proven") else 0
+                sess["stable_mem"]   = seed
+                sess["current_mem"]  = seed
+                sess["unstable_mem"] = None
+            else:
+                retries = int(sess.get("core_confirm_retries", 0))
+                if retries < 2 and sess["stable_core"] > 0:
+                    sess["core_confirm_retries"] = retries + 1
+                    sess["stable_core"] = max(0, sess["stable_core"] - max(CORE_GUARD_BAND_MHZ, 15))
+                    log.warning(f"Auto-OC core confirm FAILED — dropping lock to "
+                                f"+{sess['stable_core']} and re-confirming "
+                                f"({sess['core_confirm_retries']}/2)")
+                    # stay in core_confirm; Step 3 re-emits at the new value
+                else:
+                    sess["stable_core"] = max(0, sess["stable_core"] - sess["core_jump_mhz"] // 2)
+                    log.warning(f"Auto-OC core confirm failed twice — settling at "
+                                f"+{sess['stable_core']} and advancing to memory")
+                    sess["phase"] = "mem_jump"
+                    seed = int(sess.get("baseline_mem_seed", 0)) if sess.get("baseline_proven") else 0
+                    sess["stable_mem"]   = seed
+                    sess["current_mem"]  = seed
+                    sess["unstable_mem"] = None
+        elif sess["phase"] == "mem_confirm":
+            # beta.10 — longer re-test at the locked mem value.
+            if stable:
+                log.info(f"Auto-OC mem lock CONFIRMED at +{sess['stable_mem']} "
+                         f"({CONFIRM_DURATION_S}s sustained)")
+                sess["phase"]        = "final_validation"
+                sess["current_core"] = sess["stable_core"]
+                sess["current_mem"]  = sess["stable_mem"]
+            else:
+                retries = int(sess.get("mem_confirm_retries", 0))
+                if retries < 2 and sess["stable_mem"] > 0:
+                    sess["mem_confirm_retries"] = retries + 1
+                    sess["stable_mem"] = max(0, sess["stable_mem"] - MEM_GUARD_BAND_MHZ)
+                    log.warning(f"Auto-OC mem confirm FAILED — dropping lock to "
+                                f"+{sess['stable_mem']} and re-confirming "
+                                f"({sess['mem_confirm_retries']}/2)")
+                else:
+                    sess["stable_mem"] = max(0, sess["stable_mem"] - sess["mem_jump_mhz"] // 2)
+                    log.warning(f"Auto-OC mem confirm failed twice — settling at "
+                                f"+{sess['stable_mem']} and advancing to final validation")
+                    sess["phase"]        = "final_validation"
+                    sess["current_core"] = sess["stable_core"]
+                    sess["current_mem"]  = sess["stable_mem"]
         elif sess["phase"] in ("_post_crash_settle_core", "_post_crash_settle_mem"):
             # Frontend just ran a 15s sanity probe at the last-stable offset.
             # If THAT crashed too, the GPU isn't in a recoverable state — bail.
@@ -2267,18 +2431,34 @@ def auto_oc_next(prev_result: dict = None) -> dict:
         elif sess["phase"] == "final_validation":
             sess["validated"] = stable
             if not stable:
-                # Final validation crashed — back off MINIMALLY (just past the noise floor).
-                # We're at or near the true ceiling; a small step is enough.
-                old_core = sess["stable_core"]
-                sess["stable_core"] = max(0, old_core - 15)
-                sess["stable_mem"]  = max(0, sess["stable_mem"] - 30)
-                log.warning(f"Final validation unstable; minimal backoff to "
-                            f"core+{sess['stable_core']} mem+{sess['stable_mem']}")
-            sess["phase"] = "done"
+                # beta.10 — back off a full guard band and RE-VALIDATE (up to
+                # twice) instead of saving the backed-off pair blind.  The old
+                # code backed off -15/-30 and went straight to done with
+                # validated=False — i.e. it saved values that were never
+                # actually re-tested after a failed validation.
+                sess["stable_core"] = max(0, sess["stable_core"] - CORE_GUARD_BAND_MHZ)
+                sess["stable_mem"]  = max(0, sess["stable_mem"] - MEM_GUARD_BAND_MHZ)
+                retries = int(sess.get("final_retries", 0))
+                if retries < 2:
+                    sess["final_retries"] = retries + 1
+                    log.warning(f"Final validation unstable — backing off to "
+                                f"core+{sess['stable_core']} mem+{sess['stable_mem']} "
+                                f"and RE-validating ({sess['final_retries']}/2)")
+                    # stay in final_validation; Step 3 re-emits at the new pair
+                else:
+                    log.warning(f"Final validation failed after {retries} backoffs — "
+                                f"finishing at core+{sess['stable_core']} "
+                                f"mem+{sess['stable_mem']} (validated=False)")
+                    sess["phase"] = "done"
+            else:
+                sess["phase"] = "done"
 
     # Step 2: Hard step cap
     sess["step"] += 1
-    if sess["step"] > sess["max_iters"] + 4:  # +4 safety buffer
+    # beta.10 — +10 buffer (was +4): the redesigned flow adds baseline_check,
+    # two axis confirmations (each with up to 2 retries), and up to 2
+    # final-validation retries on top of the search steps.
+    if sess["step"] > sess["max_iters"] + 10:
         log.warning("Auto-OC hit max iteration cap; finalizing with current best")
         sess["phase"] = "done"
 
@@ -2292,12 +2472,23 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                 session_floor=sess.get("session_unstable_floor_core"),
             )
             if kind == "done":
-                # Core converged — start memory phase
-                log.info(f"Auto-OC core converged: stable=+{sess['stable_core']} MHz")
-                sess["phase"] = "mem_jump"
-                sess["current_mem"] = 0
-                sess["unstable_mem"] = None
-                continue  # re-enter loop to compute mem step
+                # beta.10 — core edge found.  Apply the daily-driver GUARD BAND
+                # below the crash edge (only when a real edge was found — if we
+                # ran out of ceiling with no crash, there's no edge to back off
+                # from), never dropping below the session-proven baseline.
+                edge = int(sess["stable_core"])
+                locked = edge
+                if sess["unstable_core"] is not None:
+                    locked = max(0, edge - CORE_GUARD_BAND_MHZ)
+                if sess.get("baseline_proven"):
+                    locked = max(locked, int(sess.get("baseline_core_seed", 0)))
+                sess["stable_core"] = locked
+                log.info(f"Auto-OC core edge +{edge} → guard-banded lock +{locked}; "
+                         f"confirming with a {CONFIRM_DURATION_S}s sustained probe")
+                sess["phase"] = "core_confirm"
+                sess["current_core"] = locked
+                sess["current_mem"]  = 0
+                break  # emit the confirmation probe
             sess["current_core"] = nxt
             sess["phase"] = "core_refine" if kind == "refine" else "core_jump"
             break
@@ -2310,13 +2501,52 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                 session_floor=sess.get("session_unstable_floor_mem"),
             )
             if kind == "done":
-                log.info(f"Auto-OC mem converged: stable=+{sess['stable_mem']} MHz")
-                sess["phase"] = "final_validation"
+                # beta.10 — pick the PERFORMANCE PEAK, not the survival edge.
+                # If a lower mem offset measurably outperformed the converged
+                # edge (GDDR error-correction eating the gains), lock the
+                # best-measured offset instead.  Otherwise guard-band the edge.
+                edge = int(sess["stable_mem"])
+                locked = edge
+                perf = [e for e in sess.get("mem_perf", [])
+                        if e["valid"] and e["stable"] and e["mem"] <= edge]
+                peak = max(perf, key=lambda e: e["fps"], default=None) if perf else None
+                edge_fps = next((e["fps"] for e in reversed(perf) if e["mem"] == edge), 0.0)
+                if (peak and peak["mem"] < edge and edge_fps > 0 and
+                        peak["fps"] > edge_fps * (1.0 + MEM_PERF_REGRESSION_PCT / 100.0)):
+                    locked = int(peak["mem"])
+                    log.info(f"Auto-OC mem: perf peak +{locked} ({peak['fps']:.1f} fps) beats "
+                             f"edge +{edge} ({edge_fps:.1f} fps) — locking the FASTER offset")
+                elif sess["unstable_mem"] is not None:
+                    locked = max(0, edge - MEM_GUARD_BAND_MHZ)
+                    log.info(f"Auto-OC mem edge +{edge} → guard-banded lock +{locked}")
+                sess["stable_mem"] = locked
+                sess["phase"] = "mem_confirm"
                 sess["current_core"] = sess["stable_core"]
-                sess["current_mem"] = sess["stable_mem"]
-                break
+                sess["current_mem"]  = locked
+                break  # emit the confirmation probe
             sess["current_mem"] = nxt
             sess["phase"] = "mem_refine" if kind == "refine" else "mem_jump"
+            break
+
+        # BASELINE CHECK (beta.10) ────────────────────
+        # First step of a seeded session: probe the user's saved profile
+        # values exactly as saved.  The prev-result handler decides whether
+        # the search starts from there or from zero.
+        if sess["phase"] == "baseline_check":
+            sess["current_core"] = int(sess.get("baseline_core_seed", 0))
+            sess["current_mem"]  = int(sess.get("baseline_mem_seed", 0))
+            break
+
+        # AXIS CONFIRMATION (beta.10) ─────────────────
+        # Longer sustained probe at the guard-banded lock.  The prev-result
+        # handler advances (or steps down and re-confirms) based on the verdict.
+        if sess["phase"] == "core_confirm":
+            sess["current_core"] = sess["stable_core"]
+            sess["current_mem"]  = 0
+            break
+        if sess["phase"] == "mem_confirm":
+            sess["current_core"] = sess["stable_core"]
+            sess["current_mem"]  = sess["stable_mem"]
             break
 
         # POST-CRASH SETTLE (v2.9.9.7) ────────────────
@@ -2429,6 +2659,15 @@ def auto_oc_next(prev_result: dict = None) -> dict:
 def _phase_label(sess: dict) -> str:
     """Human-readable label for the current step."""
     p = sess["phase"]
+    if p == "baseline_check":
+        return (f"Validating your saved OC (core +{sess['current_core']}, "
+                f"mem +{sess['current_mem']}) as the starting point")
+    if p == "core_confirm":
+        return (f"Confirming core +{sess['stable_core']} MHz with a "
+                f"{CONFIRM_DURATION_S}s sustained test (crash edge minus safety margin)")
+    if p == "mem_confirm":
+        return (f"Confirming memory +{sess['stable_mem']} MHz with a "
+                f"{CONFIRM_DURATION_S}s sustained test (best-measured offset)")
     if p == "core_jump":
         return f"Core jump: trying +{sess['current_core']} MHz (looking for first crash)"
     if p == "core_refine":
@@ -2574,38 +2813,40 @@ BENCH_FINAL_VALIDATION_S     = 120    # was 30 — final pass with both winners
 BENCH_MAX_LADDER_LEN         = 40     # 25 MHz × up to ~1000 MHz core ceiling
 
 
-def _default_core_ladder(max_offset: int) -> list[int]:
-    """Build the core-clock offset ladder.
+def _build_ladder(max_offset: int, hard_cap: int, step: int,
+                  proven: int = 0) -> list[int]:
+    """beta.10 — build an offset ladder, optionally focused around a PROVEN
+    saved-profile value.
 
-    First entry MUST be 0 so we capture a stock baseline score before any OC.
-    Subsequent steps are BENCH_CORE_STEP_MHZ apart up to `max_offset` (clamped
-    at MAX_CORE_OFFSET_MHZ).  Smaller steps than Quick Tune so we can find the
-    actual performance peak — not just where it crashes.
-    """
-    cap = min(max_offset, MAX_CORE_OFFSET_MHZ)
+    Always starts at 0 (rung 0 = the stock baseline score every gain% is
+    measured against).  Without a proven value it climbs 0..cap in fixed
+    steps, exactly as before.  WITH one, it skips the dead territory below
+    the proven OC (start ~2 steps under it as a sanity bracket) and extends
+    the cap to proven + 4 steps — a user hand-tuned to +2500 mem needs the
+    ladder to explore ABOVE +2500, not spend 40 minutes re-proving 0..2400."""
+    cap = min(max_offset, hard_cap)
+    proven = max(0, min(int(proven or 0), hard_cap))
+    if proven > 0:
+        cap = min(hard_cap, max(cap, proven + 4 * step))
     if cap <= 0:
         return [0]
     rungs = [0]
-    step = BENCH_CORE_STEP_MHZ
-    cur = step
+    cur = max(step, proven - 2 * step) if proven > 0 else step
     while cur <= cap and len(rungs) < BENCH_MAX_LADDER_LEN:
         rungs.append(cur)
         cur += step
     return rungs
 
 
-def _default_mem_ladder(max_offset: int) -> list[int]:
+def _default_core_ladder(max_offset: int, proven: int = 0) -> list[int]:
+    """Core-clock offset ladder (see _build_ladder for the proven-value focus).
+    Smaller steps than Quick Tune so we find the actual performance peak."""
+    return _build_ladder(max_offset, MAX_CORE_OFFSET_MHZ, BENCH_CORE_STEP_MHZ, proven)
+
+
+def _default_mem_ladder(max_offset: int, proven: int = 0) -> list[int]:
     """Memory ladder uses bigger steps because GDDR is more forgiving."""
-    cap = min(max_offset, MAX_MEM_OFFSET_MHZ)
-    if cap <= 0:
-        return [0]
-    rungs = [0]
-    step = BENCH_MEM_STEP_MHZ
-    cur = step
-    while cur <= cap and len(rungs) < BENCH_MAX_LADDER_LEN:
-        rungs.append(cur)
-        cur += step
-    return rungs
+    return _build_ladder(max_offset, MAX_MEM_OFFSET_MHZ, BENCH_MEM_STEP_MHZ, proven)
 
 
 def benchmark_oc_start(core_max_offset: int = 600, mem_max_offset: int = 2500,
@@ -2647,8 +2888,18 @@ def benchmark_oc_start(core_max_offset: int = 600, mem_max_offset: int = 2500,
             apply_oc(core_offset_mhz=0, mem_offset_mhz=0, power_pct=pct)
             log.info(f"Benchmark-Tune: power limit maxed → {max_w}W ({pct}%)")
 
-    core_ladder = _default_core_ladder(core_max_offset)
-    mem_ladder  = _default_mem_ladder(mem_max_offset)
+    # beta.10 — focus the ladders around the user's proven saved OC (if any):
+    # skip the dead territory below it and extend the ceiling above it.
+    proven_core = proven_mem = 0
+    try:
+        _p = load_profile()
+        if _p and _p.get("exists"):
+            proven_core = max(0, int(_p.get("core_offset_mhz") or 0))
+            proven_mem  = max(0, int(_p.get("mem_offset_mhz") or 0))
+    except Exception as e:
+        log.debug(f"Benchmark-Tune proven-OC read failed: {e}")
+    core_ladder = _default_core_ladder(core_max_offset, proven=proven_core)
+    mem_ladder  = _default_mem_ladder(mem_max_offset, proven=proven_mem)
 
     # v3.1.2 — clear stale OOB crash record so this session only sees
     # crashes that actually happen during the run.
