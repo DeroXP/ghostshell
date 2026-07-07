@@ -277,18 +277,22 @@ def _ensure_lhm_settings_minimized(exe_path: str) -> None:
         return False
     cfg_path = os.path.join(os.path.dirname(exe_path),
                              "LibreHardwareMonitor.config")
-    # 3.5.2 — use LHM's REAL settings keys (from its MainForm menu items; the
-    # PersistentSettings file stores each option as <menuItem>.Checked).  The
-    # old list seeded made-up names ("startupMinimized", "closeMinimizes", …)
-    # that LHM simply ignores — so the main window popped up on every launch
-    # even though our config write "succeeded".
-    #   startMinMenuItem.Checked = Options → Start Minimized   (THE fix)
-    #   minTrayMenuItem.Checked  = Options → Minimize To Tray
-    #   minCloseMenuItem.Checked = Options → Minimize On Close
+    # 3.5.2 — use LHM's REAL settings keys.  Verified against LHM source
+    # (LibreHardwareMonitor.Windows.Forms/UI/MainForm.cs):
+    #   new UserOption("startMinMenuItem", false, startMinMenuItem, _settings)
+    #   new UserOption("minTrayMenuItem",  true,  minTrayMenuItem,  _settings)
+    #   new UserOption("minCloseMenuItem", false, minCloseMenuItem, _settings)
+    # i.e. the persisted key is the bare menu-item name — NO ".Checked"
+    # suffix.  The old list seeded made-up names ("startupMinimized",
+    # "closeMinimizes", …) that LHM simply ignores, so the main window
+    # popped up on every launch even though our config write "succeeded".
+    #   startMinMenuItem = Options → Start Minimized   (THE fix)
+    #   minTrayMenuItem  = Options → Minimize To Tray
+    #   minCloseMenuItem = Options → Minimize On Close
     tray_keys = {
-        "startMinMenuItem.Checked":  "true",
-        "minTrayMenuItem.Checked":   "true",
-        "minCloseMenuItem.Checked":  "true",
+        "startMinMenuItem":  "true",
+        "minTrayMenuItem":   "true",
+        "minCloseMenuItem":  "true",
     }
     seed_xml = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
