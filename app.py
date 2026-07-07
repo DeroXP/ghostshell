@@ -3354,6 +3354,10 @@ def api_updater_settings():
         auto_check, auto_download, auto_install (bool)
         channel ('stable' | 'beta')         ← v3
         server_url (str, optional)          ← v3 — override Railway URL
+        local_update_dir (str, optional)    ← beta.11 — folder with
+                                              version.json + Vispora.exe;
+                                              non-empty switches the updater
+                                              to LOCAL mode, '' back to server
     """
     if request.method == "GET":
         return jsonify({"ok": True, "settings": updater.get_settings()})
@@ -3364,6 +3368,7 @@ def api_updater_settings():
         auto_install=data.get("auto_install"),
         channel=data.get("channel"),
         server_url=data.get("server_url"),
+        local_update_dir=data.get("local_update_dir"),
     ))
 
 

@@ -785,6 +785,19 @@ async function loadSettingsPage() {
                   'placeholder="https://vispora.up.railway.app" ' +
                   'style="background:var(--bg-input);border:1px solid var(--border);color:var(--text);' +
                   'padding:4px 8px;border-radius:4px;font-family:var(--mono);font-size:11px;min-width:280px" />'
+            ) +
+            // beta.11 — LOCAL update folder.  Non-empty switches the updater to
+            // local mode: it reads version.json + Vispora.exe from this folder
+            // instead of the server (for when the release server is offline).
+            _settingsRow(
+                'Local update folder',
+                'Folder with version.json + Vispora.exe.  When set, updates come ' +
+                'from this folder instead of the update server (clear it to go back online).',
+                '<input type="text" id="updater-localdir-input" value="' + escAttr(updaterS.local_update_dir || '') + '" ' +
+                  'onchange="setUpdaterLocalDir(this.value)" ' +
+                  'placeholder="(empty = use update server)" ' +
+                  'style="background:var(--bg-input);border:1px solid var(--border);color:var(--text);' +
+                  'padding:4px 8px;border-radius:4px;font-family:var(--mono);font-size:11px;min-width:280px" />'
             );
     }
 
@@ -910,6 +923,18 @@ async function setUpdaterServerUrl(url) {
         addLog('Update server set to "' + url + '"');
     } else {
         showErrorToast('Could not set server URL: ' + ((r && r.err) || 'unknown'));
+    }
+}
+
+// beta.11 — local update folder.  Empty = back to server mode.
+async function setUpdaterLocalDir(dir) {
+    dir = (dir || '').trim();
+    var r = await apiPost('/api/updater/settings', { local_update_dir: dir });
+    if (r && r.ok) {
+        addLog(dir ? 'Updates now come from local folder: ' + dir
+                   : 'Local update mode off — back to the update server');
+    } else {
+        showErrorToast('Could not set local update folder: ' + ((r && r.err) || 'unknown'));
     }
 }
 

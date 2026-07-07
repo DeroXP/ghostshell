@@ -170,6 +170,15 @@ def ensure_updater_up_to_date_async() -> dict:
     Always non-blocking — the worker handles the actual network I/O on
     its own thread.  Returns immediately so the boot path doesn't stall
     on flaky internet."""
+    # beta.11 — local update mode has no server to fetch/refresh the
+    # standalone updater from, and doesn't need it (installs go through the
+    # self-contained bat swap).  Skip quietly.
+    try:
+        if (_load_settings().get("local_update_dir") or "").strip():
+            log.info("Updater self-refresh skipped — local update mode")
+            return {"ok": True, "skipped": "local update mode"}
+    except Exception:
+        pass
     with _updater_install_lock:
         if _updater_install_state["running"]:
             return {"ok": True, "running": True}
@@ -335,6 +344,12 @@ _DEFAULT_SETTINGS = {
     # "beta"     → newest builds, where v3.x lives.  Default for now.
     "channel":    APP_CHANNEL_DEFAULT,
     "server_url": UPDATE_SERVER_URL_DEFAULT,
+    # beta.11 — LOCAL UPDATE MODE.  When set to an existing folder containing
+    # version.json + Vispora.exe, the updater checks THAT folder instead of the
+    # HTTP release server: version compare, sha-256, staging, and the headless
+    # install gating all work exactly the same — just sourced from disk.  Lets
+    # updates keep flowing with the Railway server stopped.  Empty = server mode.
+    "local_update_dir": "",
 }
 
 
@@ -377,7 +392,8 @@ def set_settings(auto_check: Optional[bool] = None,
                  auto_download: Optional[bool] = None,
                  auto_install: Optional[bool] = None,
                  channel: Optional[str] = None,
-                 server_url: Optional[str] = None) -> dict:
+                 server_url: Optional[str] = None,
+                 local_update_dir: Optional[str] = None) -> dict:
     s = _load_settings()
     if auto_check    is not None: s["auto_check"]    = bool(auto_check)
     if auto_download is not None: s["auto_download"] = bool(auto_download)
@@ -393,11 +409,18 @@ def set_settings(auto_check: Optional[bool] = None,
             s["server_url"] = url
         else:
             return {"ok": False, "err": "server_url must start with http:// or https://"}
+    if local_update_dir is not None:
+        d = (local_update_dir or "").strip()
+        if d and not os.path.isdir(d):
+            return {"ok": False,
+                    "err": f"local_update_dir does not exist or is not a folder: {d}"}
+        s["local_update_dir"] = d   # empty string = back to server mode
     _save_settings(s)
     log.info(f"Updater settings saved: check={s['auto_check']} "
              f"download={s['auto_download']} install={s['auto_install']} "
              f"channel={s.get('channel', APP_CHANNEL_DEFAULT)} "
-             f"server={s.get('server_url', UPDATE_SERVER_URL_DEFAULT)}")
+             f"server={s.get('server_url', UPDATE_SERVER_URL_DEFAULT)} "
+             f"local_dir={s.get('local_update_dir') or '(server mode)'}")
     return {"ok": True, "settings": s}
 
 
@@ -539,11 +562,79 @@ def _ps_get_json(url: str, timeout_s: int = 30) -> Optional[dict]:
 # ═══════════════════════════════════════════════════════════════════════════
 # Public API: check / download / install
 # ═══════════════════════════════════════════════════════════════════════════
+def _check_local_update(local_dir: str, s: dict) -> dict:
+    """beta.11 — LOCAL update source: read version.json + Vispora.exe from a
+    folder on disk instead of the HTTP release server.
+
+    The folder layout is exactly what the Railway repo already uses
+    (releases/<channel>/version.json + Vispora.exe), so pointing this at that
+    working copy means new builds keep flowing with the server stopped.  The
+    sha256/size the server used to compute per-request are computed here from
+    the exe itself; everything downstream (staged copy, hash re-verify,
+    install gating, bat swap) is unchanged."""
+    vjson_path = os.path.join(local_dir, "version.json")
+    exe_path   = os.path.join(local_dir, "Vispora.exe")
+    if not os.path.isfile(vjson_path) or not os.path.isfile(exe_path):
+        err = (f"Local update folder is missing version.json or Vispora.exe: "
+               f"{local_dir}")
+        _update_state["error"] = err
+        log.warning(f"  {err}")
+        return {"ok": False, "err": err, "source": "local"}
+    try:
+        with open(vjson_path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        latest_ver_s = str(data.get("version") or "").strip()
+        notes        = (data.get("notes") or "")[:1500]
+        if not latest_ver_s:
+            raise ValueError("version.json has no 'version' field")
+        h = hashlib.sha256()
+        with open(exe_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        sha256     = h.hexdigest()
+        size_bytes = os.path.getsize(exe_path)
+    except Exception as e:
+        err = f"Could not read local update folder ({local_dir}): {e}"
+        _update_state["error"] = err
+        log.warning(f"  {err}")
+        return {"ok": False, "err": err, "source": "local"}
+
+    latest_ver  = _parse_version(latest_ver_s)
+    current_ver = _parse_version(APP_VERSION)
+    is_newer    = latest_ver > current_ver
+
+    _update_state["latest_version"]   = latest_ver_s.lstrip("vV")
+    _update_state["latest_notes"]     = notes
+    _update_state["latest_url"]       = "local:" + exe_path
+    _update_state["latest_sha256"]    = sha256
+    _update_state["latest_size"]      = size_bytes
+    _update_state["update_available"] = is_newer
+
+    s["last_check_ts"] = time.time()
+    _save_settings(s)
+
+    if is_newer:
+        log.info(f"  Local update available: v{APP_VERSION} -> v{latest_ver_s} "
+                 f"({local_dir})")
+    else:
+        log.info(f"  Already up to date vs local folder (v{APP_VERSION})")
+    return {
+        "ok": True, "update_available": is_newer,
+        "current": APP_VERSION, "latest": latest_ver_s,
+        "notes": notes if is_newer else "",
+        "sha256": sha256, "size_bytes": size_bytes,
+        "channel": s.get("channel", APP_CHANNEL_DEFAULT),
+        "server_url": "local:" + local_dir,
+        "source": "local",
+    }
+
+
 def check_for_update() -> dict:
-    """Hit the Railway release server and update _update_state with the
-    result.  v3 swap from GitHub — the server's /version/<channel>
-    endpoint returns one JSON object per channel containing the latest
-    version + sha256 + download URL.
+    """Hit the release source and update _update_state with the result.
+
+    beta.11 — when settings.local_update_dir is set, the "release source" is
+    that folder on disk (see _check_local_update); otherwise it's the HTTP
+    release server's /version/<channel> endpoint as before.
 
     Returns the standard {ok, update_available, current, latest, ...}
     payload that the UI consumes.
@@ -566,6 +657,12 @@ def check_for_update() -> dict:
 
     try:
         s = _load_settings()
+
+        # beta.11 — local mode takes over the whole check when configured.
+        local_dir = (s.get("local_update_dir") or "").strip()
+        if local_dir:
+            return _check_local_update(local_dir, s)
+
         channel    = s.get("channel",    APP_CHANNEL_DEFAULT)
         server_url = s.get("server_url", UPDATE_SERVER_URL_DEFAULT).rstrip("/")
         endpoint   = f"{server_url}/version/{channel}"
@@ -732,7 +829,21 @@ def download_update() -> dict:
     _update_state["download_complete"] = False
     log.info(f"Downloading {url} -> {dest}")
     try:
-        ok = _ps_download(url, dest)
+        # beta.11 — local source: "download" = copy the exe from the local
+        # update folder.  The sha-256 verify below still runs on the staged
+        # copy, so a mid-copy modification or truncation is caught the same
+        # way a corrupted network download would be.
+        if url.startswith("local:"):
+            src = url[len("local:"):]
+            try:
+                import shutil
+                shutil.copy2(src, dest)
+                ok = True
+            except Exception as e:
+                log.warning(f"  Local update copy failed: {e}")
+                ok = False
+        else:
+            ok = _ps_download(url, dest)
     finally:
         _update_state["downloading"] = False
 
@@ -811,6 +922,17 @@ def install_update_now() -> dict:
     # Looking at the first two bytes is fast and reliable for any
     # Windows PE.
     if _looks_like_exe(path):
+        # beta.11 — local mode installs via the self-contained bat swap.  The
+        # standalone GhostShellUpdater re-downloads the build from the HTTP
+        # server itself (ignoring our staged file), which can't work when the
+        # update source is a folder on disk / the server is stopped.  The
+        # staged file here is already sha-256-verified, so the direct swap is
+        # exactly as trustworthy.
+        if (_update_state.get("latest_url") or "").startswith("local:"):
+            if not getattr(sys, "frozen", False):
+                return {"ok": True,
+                        "msg": "Update staged. Running from source — no exe swap."}
+            return _apply_exe_update_via_bat(path, sys.executable)
         return _apply_exe_update_async(path)
     if path.lower().endswith(".zip"):
         return _apply_zip_update(path)
