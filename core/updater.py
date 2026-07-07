@@ -1086,6 +1086,14 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
     bat_path    = os.path.join(UPDATE_DIR, "update.bat")
     status_path = os.path.join(UPDATE_DIR, "last_install.status")
 
+    # beta.11 — PyInstaller ONEFILE runs as TWO processes of the same exe
+    # (bootloader parent + Python child); waiting on our own PID alone leaves
+    # the sibling still holding the exe image, so the copy below bounced off a
+    # file lock 20 times and the update silently failed.  After the PID wait,
+    # ALSO wait for the exe's image name to vanish from tasklist entirely
+    # (bounded), then force-kill any zombie as a last resort — the app already
+    # committed to exiting when this script was spawned.
+    exe_image = os.path.basename(current_exe)
     bat = (
         '@echo off\r\n'
         'setlocal\r\n'
@@ -1102,6 +1110,17 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
         'timeout /t 1 /nobreak >nul\r\n'
         'goto wait_loop\r\n'
         ':pid_gone\r\n'
+        f'echo Waiting for all {exe_image} processes to exit...\r\n'
+        'set iwait=0\r\n'
+        ':image_loop\r\n'
+        f'tasklist /FI "IMAGENAME eq {exe_image}" 2>nul | find /I "{exe_image}" >nul\r\n'
+        'if errorlevel 1 goto image_gone\r\n'
+        'set /a iwait+=1\r\n'
+        f'if %iwait% gtr 30 taskkill /F /IM "{exe_image}" >nul 2>nul\r\n'
+        'if %iwait% gtr 35 goto image_gone\r\n'
+        'timeout /t 1 /nobreak >nul\r\n'
+        'goto image_loop\r\n'
+        ':image_gone\r\n'
         'set retries=20\r\n'
         ':try_copy\r\n'
         f'copy /y "{new_exe}" "{current_exe}" >nul 2>nul\r\n'
