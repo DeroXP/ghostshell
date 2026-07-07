@@ -1094,9 +1094,24 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
     # (bounded), then force-kill any zombie as a last resort — the app already
     # committed to exiting when this script was spawned.
     exe_image = os.path.basename(current_exe)
+    # 3.5.2 — bat hardening after a real in-the-field failure (bat left on
+    # disk, no status file, no copy, no relaunch — it died silently):
+    #   • Writes a STARTED marker FIRST, so "no status file" now cleanly means
+    #     "the script never even ran" vs "it ran and failed" (status says FAIL)
+    #     vs "it succeeded" (OK).
+    #   • Sleeps use `ping -n 2 127.0.0.1` instead of `timeout /t 1` —
+    #     `timeout` requires an interactive console and errors out instantly
+    #     in a hidden/detached cmd, turning every wait loop into a fast-spin.
+    #   • Spawn flags below no longer combine DETACHED_PROCESS with
+    #     CREATE_NO_WINDOW (they're mutually exclusive console modes; DETACHED
+    #     wins and leaves cmd with NO console at all), and add
+    #     CREATE_BREAKAWAY_FROM_JOB so the script survives the app's job
+    #     object being torn down on exit (kill-on-close jobs kill detached
+    #     children too — the silent death we observed).
     bat = (
         '@echo off\r\n'
         'setlocal\r\n'
+        f'echo STARTED > "{status_path}"\r\n'
         'echo === GhostShell Update ===\r\n'
         f'echo Waiting for PID {pid} to exit...\r\n'
         'powershell -NoProfile -Command '
@@ -1107,7 +1122,7 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
         'if errorlevel 1 goto pid_gone\r\n'
         'set /a wait+=1\r\n'
         'if %wait% gtr 60 goto pid_gone\r\n'
-        'timeout /t 1 /nobreak >nul\r\n'
+        'ping -n 2 127.0.0.1 >nul\r\n'
         'goto wait_loop\r\n'
         ':pid_gone\r\n'
         f'echo Waiting for all {exe_image} processes to exit...\r\n'
@@ -1118,7 +1133,7 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
         'set /a iwait+=1\r\n'
         f'if %iwait% gtr 30 taskkill /F /IM "{exe_image}" >nul 2>nul\r\n'
         'if %iwait% gtr 35 goto image_gone\r\n'
-        'timeout /t 1 /nobreak >nul\r\n'
+        'ping -n 2 127.0.0.1 >nul\r\n'
         'goto image_loop\r\n'
         ':image_gone\r\n'
         'set retries=20\r\n'
@@ -1127,7 +1142,7 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
         'if %errorlevel% == 0 goto copy_ok\r\n'
         'set /a retries-=1\r\n'
         'if %retries% gtr 0 (\r\n'
-        '  timeout /t 1 /nobreak >nul\r\n'
+        '  ping -n 2 127.0.0.1 >nul\r\n'
         '  goto try_copy\r\n'
         ')\r\n'
         f'echo FAIL: copy failed after 20 retries > "{status_path}"\r\n'
@@ -1144,14 +1159,23 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
         f.write(bat)
 
     try:
-        DETACHED_PROCESS = 0x00000008
         CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         CREATE_NEW_PROCESS_GROUP = 0x00000200
-        subprocess.Popen(
-            ["cmd.exe", "/c", bat_path],
-            creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
-            close_fds=True,
-        )
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+        try:
+            subprocess.Popen(
+                ["cmd.exe", "/c", bat_path],
+                creationflags=(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+                               | CREATE_BREAKAWAY_FROM_JOB),
+                close_fds=True,
+            )
+        except OSError:
+            # Job denies breakaway — spawn without it (still hidden-console).
+            subprocess.Popen(
+                ["cmd.exe", "/c", bat_path],
+                creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                close_fds=True,
+            )
     except Exception as e:
         log.error(f"  Could not spawn updater script: {e}")
         return {"ok": False, "err": f"Could not spawn updater: {e}"}
@@ -1479,15 +1503,28 @@ def check_post_install_state() -> dict:
     else:
         # Same version still running — either the swap was rejected (file
         # locked, AV) or the user double-launched the old exe.
+        # 3.5.2 — the bat now writes STARTED first, so the status string
+        # distinguishes the failure modes:
+        #   no status file → the swap script never ran at all (spawn failed)
+        #   "STARTED"      → it ran but was killed mid-swap (job teardown / AV)
+        #   "FAIL: …"      → it ran to completion but every copy was rejected
+        bs = (bat_status or "").upper()
+        if not bat_status:
+            detail = "the update script never ran (spawn failed)"
+        elif bs.startswith("STARTED"):
+            detail = ("the update script was killed mid-swap "
+                      "(likely by the app's process teardown or antivirus)")
+        else:
+            detail = bat_status
         outcome = {
             "state":    "install_failed",
             "previous": prev,
             "current":  APP_VERSION,
             "expected": pending,
-            "bat":      bat_status or "no status file",
+            "bat":      detail,
         }
         log.warning(f"Post-install: still on v{APP_VERSION}, "
-                    f"expected v{pending} (bat status: {bat_status})")
+                    f"expected v{pending} (bat status: {bat_status or 'none'})")
 
     # Clear flags so we don't repeat ourselves next launch
     s["previous_version"]        = ""

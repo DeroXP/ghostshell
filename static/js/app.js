@@ -926,6 +926,21 @@ async function setUpdaterServerUrl(url) {
     }
 }
 
+// 3.5.2 — instant toggle for "reapply saved OC on startup".  Auto-tuned OCs
+// save with this OFF (opt-in boot reapply, beta.9); flipping the checkbox now
+// persists immediately instead of waiting for a full profile re-save.
+async function toggleOcReapplyOnBoot(enabled) {
+    var r = await apiPost('/api/gpu/oc/profile/reapply', { enabled: !!enabled });
+    if (r && r.ok) {
+        addLog(enabled ? 'Saved OC will re-apply on startup'
+                       : 'Saved OC will NOT auto-apply on startup');
+    } else {
+        showErrorToast('Could not update startup setting: ' + ((r && r.err) || 'no saved profile'));
+        var chk = document.getElementById('oc-apply-on-startup');
+        if (chk) chk.checked = !enabled;   // revert the visual state
+    }
+}
+
 // beta.11 — local update folder.  Empty = back to server mode.
 async function setUpdaterLocalDir(dir) {
     dir = (dir || '').trim();

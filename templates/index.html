@@ -1065,7 +1065,7 @@
                             <button class="btn btn-sm btn-danger" onclick="deleteOcProfile()">Delete</button>
                         </div>
                         <label style="display:flex;align-items:center;gap:8px;margin-top:14px;font-size:12.5px;color:var(--text-secondary)">
-                            <input type="checkbox" id="oc-apply-on-startup" checked style="width:auto;flex-shrink:0"> Apply on Vispora startup
+                            <input type="checkbox" id="oc-apply-on-startup" checked style="width:auto;flex-shrink:0" onchange="toggleOcReapplyOnBoot(this.checked)"> Apply on Vispora startup
                         </label>
                     </div>
                 </div>

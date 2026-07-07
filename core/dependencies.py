@@ -274,15 +274,21 @@ def _ensure_lhm_settings_minimized(exe_path: str) -> None:
     one <add key="..." value="..."/> per setting.  Keys we care about
     map to LHM's tray-behavior options."""
     if not exe_path:
-        return
+        return False
     cfg_path = os.path.join(os.path.dirname(exe_path),
                              "LibreHardwareMonitor.config")
+    # 3.5.2 — use LHM's REAL settings keys (from its MainForm menu items; the
+    # PersistentSettings file stores each option as <menuItem>.Checked).  The
+    # old list seeded made-up names ("startupMinimized", "closeMinimizes", …)
+    # that LHM simply ignores — so the main window popped up on every launch
+    # even though our config write "succeeded".
+    #   startMinMenuItem.Checked = Options → Start Minimized   (THE fix)
+    #   minTrayMenuItem.Checked  = Options → Minimize To Tray
+    #   minCloseMenuItem.Checked = Options → Minimize On Close
     tray_keys = {
-        "mainForm.MinimizeToTray":   "true",
-        "startupMinimized":          "true",
-        "hiddenMenuItem.Checked":    "true",
+        "startMinMenuItem.Checked":  "true",
         "minTrayMenuItem.Checked":   "true",
-        "closeMinimizes":            "true",
+        "minCloseMenuItem.Checked":  "true",
     }
     seed_xml = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -299,38 +305,53 @@ def _ensure_lhm_settings_minimized(exe_path: str) -> None:
             with open(cfg_path, "w", encoding="utf-8") as f:
                 f.write(seed_xml)
             log.debug(f"seeded LHM startup config: {cfg_path}")
+            return True
         except Exception as e:
             log.debug(f"LHM config seed to {cfg_path} failed: {e}")
-        return
+        return False
     # Existing config (LHM has run before) — only INJECT the tray keys
     # if they're missing.  Don't disturb user-customized keys (sensor
     # plot visibility, window position, theme, etc.).
     try:
-        with open(cfg_path, "r", encoding="utf-8") as f:
+        with open(cfg_path, "r", encoding="utf-8-sig") as f:
             existing = f.read()
     except Exception as e:
         log.debug(f"LHM config read failed: {e}")
-        return
-    missing_keys = [k for k in tray_keys if f'key="{k}"' not in existing]
-    if not missing_keys:
-        return     # already has all the keys we want
-    inject = "".join(
-        f'    <add key="{k}" value="{tray_keys[k]}"/>\n'
-        for k in missing_keys
-    )
-    # Splice before the closing </appSettings>; if that tag isn't
-    # there, leave the file alone rather than corrupt it.
-    if "</appSettings>" not in existing:
-        log.debug(f"LHM config missing </appSettings>; not modifying")
-        return
-    new_xml = existing.replace("</appSettings>", inject + "  </appSettings>", 1)
+        return False
+    # 3.5.2 — FORCE-correct existing values, don't just inject missing keys.
+    # After LHM runs once it persists its own defaults (…Checked = false), so
+    # "key already present" used to mean "leave the window-popping value in
+    # place".  Now: rewrite a present-but-false value to true, and inject any
+    # key that's absent.
+    import re as _re
+    changed = []
+    for k, v in tray_keys.items():
+        pat = _re.compile(
+            r'(<add\s+key="' + _re.escape(k) + r'"\s+value=")([^"]*)(")')
+        m = pat.search(existing)
+        if m:
+            if m.group(2).lower() != v:
+                existing = pat.sub(lambda mm: mm.group(1) + v + mm.group(3),
+                                   existing, count=1)
+                changed.append(f"{k}={v} (was {m.group(2)})")
+        else:
+            if "</appSettings>" not in existing:
+                log.debug("LHM config missing </appSettings>; not modifying")
+                return False
+            existing = existing.replace(
+                "</appSettings>",
+                f'    <add key="{k}" value="{v}" />\n  </appSettings>', 1)
+            changed.append(f"{k}={v} (injected)")
+    if not changed:
+        return False     # already correct
     try:
         with open(cfg_path, "w", encoding="utf-8") as f:
-            f.write(new_xml)
-        log.debug(f"injected {len(missing_keys)} tray key(s) into LHM config: "
-                  f"{', '.join(missing_keys)}")
+            f.write(existing)
+        log.info(f"LHM tray config corrected: {', '.join(changed)}")
+        return True
     except Exception as e:
-        log.debug(f"LHM config inject failed: {e}")
+        log.debug(f"LHM config write failed: {e}")
+    return False
 
 
 def start_lhm() -> dict:
@@ -1335,6 +1356,31 @@ def check_on_boot() -> dict:
                 "wmi_registered": bool(launch.get("wmi_registered")),
                 "message":  launch.get("message"),
             })
+        elif lhm_state.get("installed") and lhm_state.get("running"):
+            # 3.5.2 — self-heal a window-popping LHM.  If the on-disk config
+            # needed correcting (start-minimized keys absent/false), the
+            # RUNNING instance both shows its main window AND would rewrite
+            # the bad values back on graceful exit (LHM persists its settings
+            # at shutdown).  Force-kill (skips its config save) and relaunch —
+            # start_lhm re-verifies the config and LHM comes back in the tray.
+            exe = _find_lhm_exe()
+            if exe and _ensure_lhm_settings_minimized(exe):
+                log.info("LHM running with window-popping config — restarting it hidden")
+                try:
+                    subprocess.run(["taskkill", "/F", "/IM", "LibreHardwareMonitor.exe"],
+                                   capture_output=True, timeout=10)
+                    time.sleep(1.0)
+                except Exception as e:
+                    log.debug(f"LHM force-kill failed: {e}")
+                launch = start_lhm()
+                nudge_results.append({
+                    "key":     "lhm",
+                    "launched": True,
+                    "restarted_hidden": True,
+                    "running":  bool(launch.get("running")),
+                    "wmi_registered": bool(launch.get("wmi_registered")),
+                    "message":  "Restarted Libre Hardware Monitor minimized to the tray",
+                })
     except Exception as e:
         log.debug(f"LHM boot-time nudge failed: {e}")
 

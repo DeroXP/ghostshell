@@ -2,7 +2,7 @@
 import os
 
 APP_NAME = "Vispora"
-APP_VERSION = "3.5.1"
+APP_VERSION = "3.5.2"
 APP_PORT = 5987
 
 # Vispora rebrand note: the on-disk AppData folder, the update-server host, the
