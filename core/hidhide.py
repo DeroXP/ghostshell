@@ -1,5 +1,5 @@
 """HidHide integration — hide the physical controller from every process
-EXCEPT GhostShell so the game sees only the ViGEmBus virtual pad.
+EXCEPT Vispora so the game sees only the ViGEmBus virtual pad.
 
 HidHide is a kernel driver by Nefarius (the same author as ViGEmBus —
 they're designed to work together).  It's signed, free, and ships a
@@ -46,12 +46,20 @@ Notes
 """
 
 from __future__ import annotations
+import json
 import os
 import re
 import subprocess
 from typing import Optional
 
-from core.utils import get_logger, run_cmd
+from config import APPDATA_DIR
+from core.utils import get_logger, run_cmd, atomic_write_json
+
+# Written while an engage is in force, removed by disengage().  HidHide keeps
+# its hide-list and cloak in driver state that outlives the process — and a
+# reboot — so if we die while engaged, this is how the next launch knows there
+# is something to undo (recover_orphaned).
+_ENGAGED_MARKER = os.path.join(APPDATA_DIR, "hidhide_engaged.json")
 
 log = get_logger(__name__)
 
@@ -245,27 +253,39 @@ def engage_for_controller(physical_instance_ids: list[str],
         "whitelisted_apps":  list_whitelisted_apps(),
     }
 
+    # Only what was NOT already there counts as ours.  Everything used to be
+    # claimed, so disengage() un-hid devices and un-registered apps the user
+    # had set up themselves (a DS4Windows configuration, say).
+    prior_devices = "\n".join(prior["hidden_devices"]).lower()
+    prior_apps    = "\n".join(prior["whitelisted_apps"]).lower()
+
     failed: list[str] = []
     hidden_ours: list[str] = []
     for iid in physical_instance_ids:
         r = hide_device(iid)
         if r.get("ok"):
-            hidden_ours.append(iid)
+            if _to_symbolic_link(iid).lower() not in prior_devices:
+                hidden_ours.append(iid)
         else:
             failed.append(f"hide {iid}: {r.get('err') or r.get('out')}")
 
     wr = whitelist_app(app_path)
     if not wr.get("ok"):
         failed.append(f"whitelist {app_path}: {wr.get('err') or wr.get('out')}")
+    whitelisted_ours = app_path if app_path.lower() not in prior_apps else ""
     cr = cloak_on()
     if not cr.get("ok"):
         failed.append(f"cloak-on: {cr.get('err') or cr.get('out')}")
 
+    atomic_write_json(_ENGAGED_MARKER, {
+        "prior_state": prior, "hidden_ours": hidden_ours,
+        "whitelisted_app": whitelisted_ours,
+    })
     return {
         "ok":           not failed,
         "prior_state":  prior,
         "hidden_ours":  hidden_ours,
-        "whitelisted_app": app_path,
+        "whitelisted_app": whitelisted_ours,
         "errors":       failed,
     }
 
@@ -273,7 +293,7 @@ def engage_for_controller(physical_instance_ids: list[str],
 def disengage(prior_state: dict, hidden_ours: list[str],
               whitelisted_app: str) -> dict:
     """Reverse engage_for_controller — un-hide every device WE added,
-    un-whitelist GhostShell, restore cloak to its prior on/off state.
+    un-whitelist Vispora, restore cloak to its prior on/off state.
     Devices that were ALREADY hidden before we touched things are left
     alone."""
     log.info("HidHide disengage: restoring prior state")
@@ -283,7 +303,27 @@ def disengage(prior_state: dict, hidden_ours: list[str],
         unwhitelist_app(whitelisted_app)
     if not prior_state.get("cloaked"):
         cloak_off()
+    try:
+        os.remove(_ENGAGED_MARKER)
+    except OSError:
+        pass
     return {"ok": True}
+
+
+def recover_orphaned() -> dict:
+    """Undo an engage that a previous run never got to reverse — it crashed,
+    was killed, or the PC lost power.  Without this the physical controller
+    stays invisible to every game until the user happens to switch the mapper
+    on and off again.  Call once at startup, before anything can engage."""
+    try:
+        with open(_ENGAGED_MARKER, "r", encoding="utf-8") as f:
+            m = json.load(f) or {}
+    except (OSError, ValueError):
+        return {"ok": True, "recovered": False}
+    log.warning("HidHide was left engaged by a previous run — restoring")
+    disengage(m.get("prior_state") or {}, m.get("hidden_ours") or [],
+              m.get("whitelisted_app") or "")
+    return {"ok": True, "recovered": True}
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -338,7 +378,7 @@ def download_and_install(timeout_sec: int = 180) -> dict:
         # 1. Fetch latest-release JSON
         api = "https://api.github.com/repos/nefarius/HidHide/releases/latest"
         req = urllib.request.Request(api, headers={
-            "User-Agent": "GhostShell/3.3 HidHide-installer",
+            "User-Agent": "Vispora/3.3 HidHide-installer",
             "Accept":     "application/vnd.github+json",
         })
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -371,7 +411,7 @@ def download_and_install(timeout_sec: int = 180) -> dict:
         })
         tmp_dir = tempfile.gettempdir()
         out_path = os.path.join(tmp_dir, fname)
-        dreq = urllib.request.Request(url, headers={"User-Agent": "GhostShell/3.3"})
+        dreq = urllib.request.Request(url, headers={"User-Agent": "Vispora/3.3"})
         with urllib.request.urlopen(dreq, timeout=60) as resp, open(out_path, "wb") as f:
             total = int(resp.headers.get("Content-Length", 0)) or size
             chunk = 64 * 1024
@@ -405,13 +445,13 @@ def download_and_install(timeout_sec: int = 180) -> dict:
         # popups.  Rather than subject the user to a chain of error dialogs,
         # we launch the installer GUI and background-poll for the kernel
         # driver to come online.  Single-click install for the user, and
-        # the moment they finish, GhostShell's banner switches to
+        # the moment they finish, Vispora's banner switches to
         # "Installed ✓" automatically.
         _install_status.update({
             "phase":        "installing",
             "progress_pct": 100,
             "msg":          ("Installer window opened — click through it. "
-                             "GhostShell will detect when it's done."),
+                             "Vispora will detect when it's done."),
         })
         if fname.lower().endswith(".msi"):
             # MSI is reliable as a silent install — no GUI fight here

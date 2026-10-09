@@ -1,13 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
-# GhostShell Updater build spec — produces dist/GhostShellUpdater.exe
+# Vispora Updater build spec — produces dist/VisporaUpdater.exe
 #
 # This is the STANDALONE updater app:
 #   • Flask + pywebview backend (server.py)
 #   • Install pipeline (installer.py)
 #   • UI assets (templates/, static/)
 #
-# Hosted on the Railway release server at /download/updater.  GhostShell
-# auto-fetches it on first run to %APPDATA%/GhostShell/updater/.
+# Hosted on the Railway release server at /download/updater.  Vispora
+# auto-fetches it on first run to %APPDATA%/Vispora/updater/.
 #
 # Usage:  pyinstaller updater_helper.spec --noconfirm
 import os
@@ -57,7 +57,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='GhostShellUpdater',
+    name='VisporaUpdater',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

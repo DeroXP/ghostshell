@@ -9,7 +9,7 @@ buffer wiring lands in beta.16 / beta.17 / beta.18.
 
 Architecture
 ────────────
-GhostShell does NOT bundle OBS Studio.  OBS is GPLv2 and redistributing
+Vispora does NOT bundle OBS Studio.  OBS is GPLv2 and redistributing
 it would require us to comply with the license; instead we detect the
 user's existing OBS install (or prompt them to download it from
 obsproject.com) and drive it externally via the OBS WebSocket plugin
@@ -19,7 +19,7 @@ When the user enables the OBS backend toggle:
   1. We connect to OBS' WebSocket server (default port 4455) using the
      obsws-python client.
   2. We programmatically create a scene collection + profile + scene +
-     sources matching GhostShell's clipper settings (display capture
+     sources matching Vispora's clipper settings (display capture
      for the chosen monitor, Audio Output Capture for system audio
      via OBS' built-in WGC + WASAPI loopback, Audio Input Capture
      for the mic).
@@ -27,7 +27,7 @@ When the user enables the OBS backend toggle:
      duration.
   4. The save-clip hotkey fires SaveReplayBuffer over the WebSocket.
   5. We move the resulting file from OBS' output directory into our
-     own Videos/GhostShell/Clips folder.
+     own Videos/Vispora/Clips folder.
 
 OBS handles the actual capture via Windows.Graphics.Capture (WGC),
 which is materially better than FFmpeg's DXGI Desktop Duplication for
@@ -41,6 +41,7 @@ import threading
 import time
 from typing import Optional
 
+from config import APP_NAME, LEGACY_APP_NAME
 from core.utils import get_logger
 
 log = get_logger(__name__)
@@ -49,7 +50,7 @@ log = get_logger(__name__)
 # obsws_python logs its own tracebacks on connection failure (even
 # when the exception is caught by us).  Silence it — our connect()
 # already surfaces a friendly error.  Done at module-import time so
-# the rate-limited auto-reconnect thread doesn't spam ghostshell.log
+# the rate-limited auto-reconnect thread doesn't spam vispora.log
 # with ConnectionRefusedError stack traces every 30 s.
 try:
     import logging as _logging
@@ -235,8 +236,8 @@ _DEFAULT_SETTINGS = {
     "websocket_port":   4455,
     "websocket_password": "",     # OBS sets one by default in newer builds
     "auto_launch_obs":   True,    # spawn obs64.exe on buffer-start if not running
-    "scene_collection": "GhostShell",
-    "profile":          "GhostShell",
+    "scene_collection": APP_NAME,
+    "profile":          APP_NAME,
 }
 
 
@@ -319,7 +320,7 @@ def connect(force_reconnect: bool = False) -> dict:
     Returns the populated _conn_state dict.  On failure, `connected`
     is False and `connect_err` carries a human-readable hint.
 
-    Multiple GhostShell threads may call this concurrently (Flask
+    Multiple Vispora threads may call this concurrently (Flask
     request handlers); serialize with _client_lock so we don't end up
     with two half-open clients fighting over the socket.
     """
@@ -432,16 +433,16 @@ def launch_obs() -> dict:
         import subprocess
         # --minimize-to-tray puts OBS in the tray instead of stealing
         # focus; --disable-shutdown-check skips the "do you want to
-        # stop streaming" prompt when GhostShell shuts down later;
-        # --collection ... + --profile ... select the GhostShell-
-        # configured scene/profile (beta.17 will create these).
+        # stop streaming" prompt when Vispora shuts down later;
+        # --collection ... + --profile ... select the scene collection
+        # and profile named in settings.
         s = get_settings()
         argv = [
             exe,
             "--minimize-to-tray",
             "--disable-shutdown-check",
-            "--collection", s.get("scene_collection") or "GhostShell",
-            "--profile",    s.get("profile") or "GhostShell",
+            "--collection", s.get("scene_collection") or APP_NAME,
+            "--profile",    s.get("profile") or APP_NAME,
         ]
         # OBS expects to be launched from its install dir (DLLs look
         # for relative paths).  cwd to the bin/64bit folder.
@@ -462,7 +463,7 @@ def launch_obs() -> dict:
 #
 # get_status() is called by the Capture-page poll every ~6 seconds.
 # If the user enabled the OBS toggle and we're NOT connected (either
-# because GhostShell just booted or OBS closed mid-session), we
+# because Vispora just booted or OBS closed mid-session), we
 # attempt a quiet reconnect — but rate-limited so a closed OBS doesn't
 # burn 4 s of timeout on every poll.
 
@@ -510,27 +511,52 @@ def boot_autoconnect() -> None:
 
 # ─── Scene + replay buffer (v3.3.0-beta.18+) ────────────────────────
 #
-# GhostShell owns a single OBS scene + a small set of sources, named
-# with a "GhostShell " prefix so they don't collide with whatever the
+# Vispora owns a single OBS scene + a small set of sources, named
+# with a "Vispora " prefix so they don't collide with whatever the
 # user has configured for streaming or their own recording workflow.
 # Scene setup is idempotent — re-running it is a no-op if everything's
 # already in place.
 
-GS_SCENE_NAME      = "GhostShell"
-GS_INPUT_DISPLAY   = "GhostShell Display"
-GS_INPUT_SYS_AUDIO = "GhostShell System Audio"
-GS_INPUT_MIC       = "GhostShell Mic"
+SCENE_NAME      = APP_NAME
+INPUT_DISPLAY   = f"{APP_NAME} Display"
+INPUT_SYS_AUDIO = f"{APP_NAME} System Audio"
+INPUT_MIC       = f"{APP_NAME} Mic"
+
+
+def adopt_legacy_names(client, scene: str, inputs) -> None:
+    """Rename a scene and inputs that a pre-rename build created in the
+    user's OBS (same names, old app name) to their current names.
+
+    Without this the setup code below would not recognise them and would
+    create a second scene with a duplicate set of capture sources beside the
+    old one.  Only ever touches objects we created; skips any whose new name
+    is already taken.  Best-effort — on any failure setup simply proceeds and
+    creates what it can't find."""
+    def legacy(name: str) -> str:
+        return name.replace(APP_NAME, LEGACY_APP_NAME, 1)
+    try:
+        scenes = {s["sceneName"] for s in client.get_scene_list().scenes}
+        if legacy(scene) in scenes and scene not in scenes:
+            client.set_scene_name(legacy(scene), scene)
+            log.info(f"OBS: renamed scene '{legacy(scene)}' -> '{scene}'")
+        existing = {i["inputName"] for i in client.get_input_list().inputs}
+        for name in inputs:
+            if legacy(name) in existing and name not in existing:
+                client.set_input_name(legacy(name), name)
+                log.info(f"OBS: renamed source '{legacy(name)}' -> '{name}'")
+    except Exception as e:
+        log.debug(f"OBS: could not adopt pre-rename scene/sources: {e}")
 
 
 def _scene_state_unlocked():
-    """Returns (existing_scene_names, existing_input_names) for the
-    GhostShell scene.  Called holding _client_lock."""
+    """Returns (existing_scene_names, existing_input_names) for our
+    scene.  Called holding _client_lock."""
     sl = _client.get_scene_list()
     scenes = [s["sceneName"] for s in sl.scenes]
     items = set()
-    if GS_SCENE_NAME in scenes:
+    if SCENE_NAME in scenes:
         try:
-            il = _client.get_scene_item_list(GS_SCENE_NAME)
+            il = _client.get_scene_item_list(SCENE_NAME)
             items = {it["sourceName"] for it in il.scene_items}
         except Exception:
             pass
@@ -540,7 +566,7 @@ def _scene_state_unlocked():
 def setup_scene(monitor_idx: int = 0,
                  system_audio: bool = True,
                  mic_enabled: bool = False) -> dict:
-    """Create the GhostShell scene + sources if missing.  Idempotent.
+    """Create the Vispora scene + sources if missing.  Idempotent.
 
     Returns {ok, err, scene, sources_created: [str]}.  `sources_created`
     only lists sources that were newly created on this call so the UI
@@ -552,22 +578,24 @@ def setup_scene(monitor_idx: int = 0,
                     "scene": "", "sources_created": []}
         created = []
         try:
+            adopt_legacy_names(_client, SCENE_NAME,
+                               (INPUT_DISPLAY, INPUT_SYS_AUDIO, INPUT_MIC))
             scenes, existing_inputs = _scene_state_unlocked()
-            if GS_SCENE_NAME not in scenes:
-                _client.create_scene(GS_SCENE_NAME)
-                log.info(f"OBS: created scene '{GS_SCENE_NAME}'")
+            if SCENE_NAME not in scenes:
+                _client.create_scene(SCENE_NAME)
+                log.info(f"OBS: created scene '{SCENE_NAME}'")
                 created.append("scene")
 
             # Make it the current program scene so OBS records it.
-            _client.set_current_program_scene(GS_SCENE_NAME)
+            _client.set_current_program_scene(SCENE_NAME)
 
             # Display Capture (monitor_capture).  method=2 = WGC on
             # Win10+ which handles fullscreen-exclusive games far
             # better than method=0 (DXGI Desktop Duplication, the
-            # same API GhostShell's FFmpeg path was struggling with).
-            if GS_INPUT_DISPLAY not in existing_inputs:
+            # same API Vispora's FFmpeg path was struggling with).
+            if INPUT_DISPLAY not in existing_inputs:
                 _client.create_input(
-                    GS_SCENE_NAME, GS_INPUT_DISPLAY, "monitor_capture",
+                    SCENE_NAME, INPUT_DISPLAY, "monitor_capture",
                     {
                         "monitor":        int(monitor_idx),
                         "method":         2,      # WGC
@@ -582,7 +610,7 @@ def setup_scene(monitor_idx: int = 0,
                 # changed capture target setting.
                 try:
                     _client.set_input_settings(
-                        GS_INPUT_DISPLAY,
+                        INPUT_DISPLAY,
                         {"monitor": int(monitor_idx), "method": 2,
                           "capture_cursor": True},
                         True,
@@ -593,9 +621,9 @@ def setup_scene(monitor_idx: int = 0,
             # System audio via WASAPI Output Capture (loopback on the
             # default playback device).  This is OBS's native loopback
             # support, no third-party drivers needed.
-            if system_audio and GS_INPUT_SYS_AUDIO not in existing_inputs:
+            if system_audio and INPUT_SYS_AUDIO not in existing_inputs:
                 _client.create_input(
-                    GS_SCENE_NAME, GS_INPUT_SYS_AUDIO,
+                    SCENE_NAME, INPUT_SYS_AUDIO,
                     "wasapi_output_capture",
                     {"device_id": "default"},
                     True,
@@ -605,9 +633,9 @@ def setup_scene(monitor_idx: int = 0,
 
             # Mic via WASAPI Input Capture.  "default" matches whatever
             # the user has set as Windows' default recording device.
-            if mic_enabled and GS_INPUT_MIC not in existing_inputs:
+            if mic_enabled and INPUT_MIC not in existing_inputs:
                 _client.create_input(
-                    GS_SCENE_NAME, GS_INPUT_MIC,
+                    SCENE_NAME, INPUT_MIC,
                     "wasapi_input_capture",
                     {"device_id": "default"},
                     True,
@@ -615,7 +643,7 @@ def setup_scene(monitor_idx: int = 0,
                 log.info("OBS: created Mic capture (default device)")
                 created.append("mic")
 
-            return {"ok": True, "scene": GS_SCENE_NAME,
+            return {"ok": True, "scene": SCENE_NAME,
                     "sources_created": created, "err": ""}
         except Exception as e:
             log.exception("OBS setup_scene failed")
@@ -673,7 +701,7 @@ def ensure_replay_buffer(buffer_seconds: int = 60) -> dict:
 
 def stop_replay_buffer_safe() -> dict:
     """Stop the OBS replay buffer if running.  Idempotent + tolerant —
-    failures are logged but don't propagate (called during GhostShell
+    failures are logged but don't propagate (called during Vispora
     shutdown / buffer-toggle-off)."""
     with _client_lock:
         if _client is None or not _conn_state["connected"]:
@@ -710,7 +738,7 @@ def save_replay(target_dir: Optional[str] = None,
             if not getattr(status, "output_active", False):
                 return {"ok": False, "path": "",
                         "err": "OBS replay buffer isn't running — "
-                                "turn the GhostShell buffer toggle on first."}
+                                "turn the Vispora buffer toggle on first."}
             try:
                 prev = _client.get_last_replay_buffer_replay()
                 prev_path = getattr(prev, "saved_replay_path", "") or ""
@@ -743,7 +771,7 @@ def save_replay(target_dir: Optional[str] = None,
                     "err": f"OBS didn't return a finalized clip within {timeout:.0f}s.  "
                             f"Check OBS' recording log."}
 
-        # Optional move to GhostShell's clips dir
+        # Optional move to Vispora's clips dir
         if target_dir:
             try:
                 import shutil as _shutil
@@ -783,8 +811,8 @@ def get_recording_status() -> dict:
             return out
         try:
             scenes, items = _scene_state_unlocked()
-            out["scene_ready"] = (GS_SCENE_NAME in scenes
-                                    and GS_INPUT_DISPLAY in items)
+            out["scene_ready"] = (SCENE_NAME in scenes
+                                    and INPUT_DISPLAY in items)
             status = _client.get_replay_buffer_status()
             out["buffer_running"] = bool(getattr(status, "output_active", False))
             # Newer OBS reports duration / sizes via separate calls.
@@ -798,7 +826,7 @@ def get_recording_status() -> dict:
 
 def is_ready_for_recording() -> bool:
     """True when the OBS backend should handle save-clip requests
-    instead of GhostShell's FFmpeg path.  Used by clipper.save_clip()
+    instead of Vispora's FFmpeg path.  Used by clipper.save_clip()
     to route between backends."""
     s = get_settings()
     return bool(s.get("enabled") and _conn_state["connected"])

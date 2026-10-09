@@ -1,6 +1,6 @@
 """Community game library — crowd-sourced known-games list.
 
-When a user adds a game to their custom-games list (because GhostShell
+When a user adds a game to their custom-games list (because Vispora
 didn't recognize their game), we POST that exe + display name to the
 Railway server's /community/games endpoint.  Other users fetch
 /community/games on boot and auto-merge the result into their local
@@ -8,12 +8,12 @@ KNOWN_GAME_EXES.
 
 Privacy
 ───────
-Submission payload: { exe, name, anon_id, ghostshell_version }
+Submission payload: { exe, name, anon_id, version }
   • exe       lowercase exe filename (e.g. "cs2.exe")
   • name      display name (e.g. "Counter-Strike 2")
   • anon_id   random 16-char per-install ID — server uses it for dedup
               + light abuse heuristics, never linked to anything else
-  • version   GhostShell version (for filtering ancient builds out)
+  • version   Vispora version (for filtering ancient builds out)
 
 No PII, no path info, no user identifier.
 
@@ -23,7 +23,7 @@ Settings.community.enabled = False suppresses all network I/O.
 
 Local fallback
 ──────────────
-If Railway is unreachable, GhostShell still works fine — just doesn't
+If Railway is unreachable, Vispora still works fine — just doesn't
 auto-add community games until next successful fetch.  Cached list is
 persisted so a brief outage doesn't wipe it.
 """
@@ -35,9 +35,9 @@ import secrets
 import threading
 import time
 import urllib.request
-from typing import Optional
 
-from config import APP_VERSION, APPDATA_DIR, UPDATE_SERVER_URL_DEFAULT
+from config import (APP_NAME, APP_VERSION, APPDATA_DIR, OWN_PROCESS_NAMES,
+                    UPDATE_SERVER_URL_DEFAULT, is_dead_update_server)
 from core.utils import get_logger, atomic_write_json, atomic_write_text
 
 log = get_logger(__name__)
@@ -70,7 +70,7 @@ _CLIENT_DENY = {
     "notepad.exe", "notepad++.exe", "wordpad.exe", "calc.exe",
     "python.exe", "pythonw.exe", "cmd.exe", "powershell.exe",
     "conhost.exe", "wt.exe", "openssh.exe",
-    "ghostshell.exe", "ghostshellupdater.exe", "vispora.exe", "visporaupdater.exe",
+    *OWN_PROCESS_NAMES,
     "presentmon.exe", "rtss.exe", "msi afterburner.exe",
 }
 
@@ -85,8 +85,8 @@ def _load_settings() -> dict:
             data = json.load(f) or {}
         merged = {**_DEFAULTS, **data}
         # Migrate a saved server_url still pointing at the dead pre-rename
-        # Railway host (service renamed ghostshell-site → vispora).
-        if "ghostshell-site.up.railway.app" in (merged.get("server_url") or ""):
+        # Railway host.
+        if is_dead_update_server(merged.get("server_url")):
             merged["server_url"] = UPDATE_SERVER_URL_DEFAULT
             atomic_write_json(SETTINGS_PATH, merged)
         return merged
@@ -159,7 +159,7 @@ def _valid_name(name: str) -> bool:
 def submit_game(exe: str, name: str) -> dict:
     """POST a custom game to the community server.  Skipped if community
     sharing is disabled.  Best-effort — network errors are logged but
-    don't fail GhostShell's local add."""
+    don't fail Vispora's local add."""
     s = _load_settings()
     if not s.get("enabled") or not s.get("auto_submit"):
         return {"ok": True, "skipped": "community sharing off"}
@@ -183,7 +183,7 @@ def submit_game(exe: str, name: str) -> dict:
                 url, data=data, method="POST",
                 headers={
                     "Content-Type": "application/json",
-                    "User-Agent":   f"GhostShell/{APP_VERSION}",
+                    "User-Agent":   f"{APP_NAME}/{APP_VERSION}",
                 },
             )
             with urllib.request.urlopen(req, timeout=8) as r:
@@ -235,7 +235,7 @@ def fetch_games(force: bool = False) -> dict:
     url = (s.get("server_url") or UPDATE_SERVER_URL_DEFAULT).rstrip("/") + "/community/games"
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": f"GhostShell/{APP_VERSION}"})
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}"})
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
         games = data.get("games") or []
@@ -259,7 +259,7 @@ def fetch_games(force: bool = False) -> dict:
 
 def merge_into_known_games_async() -> None:
     """Fetch + merge community games into KNOWN_GAME_EXES.  Runs on a
-    background thread; safe to call at GhostShell boot."""
+    background thread; safe to call at Vispora boot."""
     def _worker():
         try:
             r = fetch_games()

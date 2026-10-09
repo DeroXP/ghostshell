@@ -1,5 +1,5 @@
 """Error reporting backend — POSTs error reports to the Railway server
-so the GhostShell maintainer can see + patch them.
+so the Vispora maintainer can see + patch them.
 
 Replaces the old "open a pre-filled GitHub issue" flow.  GitHub
 required the user to have an account, hit New Issue, paste the body,
@@ -23,7 +23,7 @@ NOT sent:
   • Anything else not explicitly listed
 
 Reports live at:
-    %APPDATA%/GhostShell/error_reports/<timestamp>_<hash>.json
+    %APPDATA%/Vispora/error_reports/<timestamp>_<hash>.json
 ... AND on Railway under /errors/list (admin-gated by a token).
 """
 from __future__ import annotations
@@ -36,7 +36,8 @@ import time
 import urllib.request
 from typing import Optional
 
-from config import APP_VERSION, APPDATA_DIR, UPDATE_SERVER_URL_DEFAULT
+from config import (APP_NAME, APP_VERSION, APPDATA_DIR,
+                    UPDATE_SERVER_URL_DEFAULT, is_dead_update_server)
 from core.utils import get_logger, atomic_write_json
 
 log = get_logger(__name__)
@@ -50,7 +51,7 @@ _DEFAULTS = {
     "server_url":        UPDATE_SERVER_URL_DEFAULT,
     "last_sent_at":      0.0,
     "last_sent_count":   0,              # this-session counter
-    "include_log_lines": True,           # last 30 lines of ghostshell.log
+    "include_log_lines": True,           # last 30 lines of vispora.log
 }
 
 
@@ -64,8 +65,8 @@ def _load_settings() -> dict:
             data = json.load(f) or {}
         merged = {**_DEFAULTS, **data}
         # Migrate a saved server_url still pointing at the dead pre-rename
-        # Railway host (service renamed ghostshell-site → vispora).
-        if "ghostshell-site.up.railway.app" in (merged.get("server_url") or ""):
+        # Railway host.
+        if is_dead_update_server(merged.get("server_url")):
             merged["server_url"] = UPDATE_SERVER_URL_DEFAULT
             atomic_write_json(SETTINGS_PATH, merged)
         return merged
@@ -287,7 +288,7 @@ def submit_report(kind: str, message: str, detail: str = "",
             url, data=body, method="POST",
             headers={
                 "Content-Type": "application/json",
-                "User-Agent":   f"GhostShell/{APP_VERSION}",
+                "User-Agent":   f"{APP_NAME}/{APP_VERSION}",
             },
         )
         with urllib.request.urlopen(req, timeout=8) as r:
@@ -308,17 +309,6 @@ def submit_report(kind: str, message: str, detail: str = "",
         return {"ok": False, "err": str(e),
                 "hash": h, "local_path": local_path,
                 "url": url}
-
-
-def submit_report_async(kind: str, message: str, detail: str = "",
-                         user_note: str = "") -> None:
-    """Fire-and-forget variant.  Use this from inside other modules
-    when you want to report an error but don't want to block."""
-    def _worker():
-        try: submit_report(kind, message, detail, user_note)
-        except Exception as e: log.debug(f"async report failed: {e}")
-    threading.Thread(target=_worker, daemon=True,
-                     name="error-report-async").start()
 
 
 # ─── Status ────────────────────────────────────────────────────────

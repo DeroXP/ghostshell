@@ -39,7 +39,9 @@ import os
 
 from config import APPDATA_DIR
 from core.utils import run_cmd, run_ps, backup_registry, get_logger, atomic_write_json
-from core import timer_manager
+from core import timer_manager, reg_originals
+
+_SCOPE = "competitive"      # reg_originals scope: everything apply() changes
 
 log = get_logger("competitive")
 
@@ -86,6 +88,7 @@ def _set_flip_model(enable: bool):
             d[k.strip()] = v.strip()
     d["SwapEffectUpgradeEnable"] = "1" if enable else "0"
     s = ";".join(f"{k}={v}" for k, v in d.items()) + ";"
+    reg_originals.remember(_DXPREF_KEY, _DXPREF_VAL, s, "REG_SZ", scope=_SCOPE)
     run_cmd(["reg", "add", _DXPREF_KEY, "/v", _DXPREF_VAL, "/t", "REG_SZ", "/d", s, "/f"])
 
 
@@ -150,12 +153,14 @@ def recommended_fps_cap(refresh):
 
 
 def _reg(key, val, data, vtype="REG_DWORD"):
+    reg_originals.remember(key, val, data, vtype, scope=_SCOPE)
     return run_cmd(["reg", "add", key, "/v", val, "/t", vtype, "/d", data, "/f"])["ok"]
 
 def _regdel(key, val):
     return run_cmd(["reg", "delete", key, "/v", val, "/f"])["ok"]
 
 def _powercfg(sub, setting, val):
+    reg_originals.remember_power(sub, setting, scope=_SCOPE)
     run_cmd(["powercfg", "/setacvalueindex", "SCHEME_CURRENT", sub, setting, str(val)])
     run_cmd(["powercfg", "/setdcvalueindex", "SCHEME_CURRENT", sub, setting, str(val)])
 
@@ -179,7 +184,29 @@ def _set_mouse_accel(enabled: bool):
 
 
 def _save(enabled: bool):
-    atomic_write_json(SETTINGS_PATH, {"enabled": bool(enabled)})
+    # "recorded": every value apply() changed has its prior state on record,
+    # so reset() can put exactly that back.  Not so when an older build
+    # applied the mode and it has stayed on since: applying again finds the
+    # values already changed and has nothing left to record.
+    prev = _load()
+    recorded = bool(enabled) and (bool(prev.get("recorded")) or not prev.get("enabled"))
+    atomic_write_json(SETTINGS_PATH, {"enabled": bool(enabled), "recorded": recorded})
+
+
+def _apply_mouse_params_from_registry() -> None:
+    """Make the mouse-acceleration values now in the registry take effect
+    immediately (they are otherwise only read at sign-in)."""
+    def _n(name, default):
+        v = reg_originals.read_value(_MOUSE_KEY, name) or {}
+        try:
+            return int(v.get("data", default))
+        except (TypeError, ValueError):
+            return default
+    arr = (ctypes.c_int * 3)(_n("MouseThreshold1", 6), _n("MouseThreshold2", 10), _n("MouseSpeed", 1))
+    try:
+        ctypes.windll.user32.SystemParametersInfoW(0x0004, 0, arr, 0x03)  # SPI_SETMOUSE
+    except Exception as e:
+        log.debug(f"SPI_SETMOUSE failed: {e}")
 
 def _load() -> dict:
     try:
@@ -235,20 +262,38 @@ def apply() -> dict:
 
 
 def reset() -> dict:
+    """Undo apply(): every value goes back to what it was before apply()
+    changed it.
+
+    This used to write fixed "Windows defaults" instead — so a player who
+    already had pointer precision off got mouse acceleration switched ON
+    after every session (reset runs automatically at each game exit for
+    low-latency targets), Game DVR was forced on, and the min/max CPU state
+    and PCIe power settings apply() had changed were never reverted at all.
+    """
     log.info("Reverting Competitive Latency mode...")
     res = []
     timer_manager.stop_timer_resolution_hold()
-    _set_flip_model(False)
-    _set_mouse_accel(True)
-    _reg(_GDVR_STORE, "GameDVR_Enabled", "1")
-    _reg(_GDVR_CAP, "AppCaptureEnabled", "1")
-    _reg(_PRIO_KEY, "Win32PrioritySeparation", "2")
-    _regdel(_PT_KEY, "PowerThrottlingOff")
-    _powercfg(_USB_SUB, _USB_SET, 1)           # Windows default: USB suspend on
-    run_cmd(["powercfg", "/S", "SCHEME_CURRENT"])
-    _regdel(_MOUCLASS, "MouseDataQueueSize")
-    _regdel(_KBDCLASS, "KeyboardDataQueueSize")
-    res.append({"name": "Reverted to Windows defaults", "ok": True})
+    if _load().get("recorded"):
+        r = reg_originals.restore_all(_SCOPE)
+        _apply_mouse_params_from_registry()
+        res.append({"name": f"{r['restored']} setting(s) restored to their previous values",
+                    "ok": r["failed"] == 0})
+    else:
+        # Applied by a build that kept no record of the prior values: the
+        # fixed defaults are the only thing left to go back to.
+        with reg_originals.suspended():
+            _set_flip_model(False)
+            _set_mouse_accel(True)
+            _reg(_GDVR_STORE, "GameDVR_Enabled", "1")
+            _reg(_GDVR_CAP, "AppCaptureEnabled", "1")
+            _reg(_PRIO_KEY, "Win32PrioritySeparation", "2")
+            _regdel(_PT_KEY, "PowerThrottlingOff")
+            _powercfg(_USB_SUB, _USB_SET, 1)           # Windows default: USB suspend on
+            run_cmd(["powercfg", "/S", "SCHEME_CURRENT"])
+            _regdel(_MOUCLASS, "MouseDataQueueSize")
+            _regdel(_KBDCLASS, "KeyboardDataQueueSize")
+        res.append({"name": "Reverted to Windows defaults", "ok": True})
     _save(False)
     return {"ok": True, "results": res}
 

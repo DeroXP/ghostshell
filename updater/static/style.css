@@ -50,7 +50,7 @@ html, body {
     -webkit-user-select: none;
 }
 
-/* ─── Frameless titlebar (matches GhostShell's chrome) ─── */
+/* ─── Frameless titlebar (matches Vispora's chrome) ─── */
 .titlebar {
     height: 38px;
     background: rgba(2, 2, 3, 0.7);
@@ -281,7 +281,7 @@ ul.steps .detail {
     width: 0%;
 }
 
-/* ─── Install-mode banner (no existing GhostShell found) ─── */
+/* ─── Install-mode banner (no existing Vispora found) ─── */
 .install-banner {
     display: flex;
     align-items: flex-start;
@@ -353,7 +353,7 @@ ul.steps .detail {
     line-height: 1.55;
 }
 /* v1.2.0 — when the install pipeline completes the box flips green and
-   hosts the "GhostShell is launching — closing in Ns" countdown. */
+   hosts the "Vispora is launching — closing in Ns" countdown. */
 .error-box.success {
     background: rgba(74, 222, 128, 0.08);
     border-color: rgba(74, 222, 128, 0.32);

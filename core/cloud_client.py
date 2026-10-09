@@ -1,4 +1,4 @@
-"""HTTP client for the GhostShell-Cloud backend.
+"""HTTP client for the Vispora-Cloud backend.
 
 Design rules (in priority order):
   1. **Dormant by default.**  If the user hasn't set a cloud URL in
@@ -13,9 +13,9 @@ Design rules (in priority order):
      locally first, then push.  If the push fails the queue picks it up
      later.
 
-Settings are stored in `%APPDATA%\\GhostShell\\cloud_client_settings.json`:
+Settings are stored in `%APPDATA%\\Vispora\\cloud_client_settings.json`:
     {
-      "cloud_url":            "https://ghostshell-cloud.up.railway.app",
+      "cloud_url":            "https://<your-cloud-service>.up.railway.app",
       "telemetry_opt_in":     false,
       "sync_opt_in":          false,
       "news_opt_in":          true,
@@ -160,7 +160,7 @@ def _request(method: str, path: str, body: dict | None = None,
     data = json.dumps(body).encode("utf-8") if body is not None else None
     headers = {
         "Accept":       "application/json",
-        "User-Agent":   "GhostShell-Client",
+        "User-Agent":   "Vispora-Client",
         "X-Device-ID":  get_device_id(),
     }
     if data is not None:

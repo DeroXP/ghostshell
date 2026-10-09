@@ -27,7 +27,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from typing import Any
 
 import asyncpg
 
@@ -224,7 +223,7 @@ async def cmd_forget_trial(args: argparse.Namespace) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="admin_mint",
-        description="GhostShell-Cloud admin CLI (Phase B dev tool, no Stripe)",
+        description="Vispora-Cloud admin CLI (Phase B dev tool, no Stripe)",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 

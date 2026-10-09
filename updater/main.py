@@ -1,15 +1,15 @@
-"""GhostShellUpdater — standalone updater app.
+"""VisporaUpdater — standalone updater app.
 
 Two-process architecture:
-  • GhostShell.exe — the main app.  Lives in the user's chosen install
+  • Vispora.exe — the main app.  Lives in the user's chosen install
     directory.  When it detects an update, it:
        1. Writes install_info.json with target_dir, channel, current
           version, and PID.
        2. Spawns this updater with --auto-confirm.
        3. Exits.
-  • GhostShellUpdater.exe — this app.  Lives in
-    %APPDATA%/GhostShell/updater/GhostShellUpdater.exe.  Auto-installed
-    by GhostShell on first run by downloading from Railway.
+  • VisporaUpdater.exe — this app.  Lives in
+    %APPDATA%/Vispora/updater/VisporaUpdater.exe.  Auto-installed
+    by Vispora on first run by downloading from Railway.
 
 This file is the entry point.  We start Flask on a free port, point a
 pywebview window at it, and let the user (or --auto-confirm) drive the
@@ -19,6 +19,7 @@ Logic separation:
   main.py        — process entry, arg parsing, webview lifecycle
   server.py      — Flask routes + state management
   installer.py   — actual install steps (detect/close/download/swap)
+  paths.py       — names + on-disk locations shared by the three above
 """
 from __future__ import annotations
 
@@ -29,42 +30,24 @@ import socket
 import sys
 import threading
 import time
-from typing import Optional
+
+from updater.paths import INSTALL_INFO, log
 
 # Updater's own version + the Railway server it talks to.  These are the
 # only two pieces of state hard-coded into the binary — everything else
 # (target dir, channel, etc) comes from args or install_info.json so the
 # updater stays usable across re-locations.
-UPDATER_VERSION  = "1.4.3"
+UPDATER_VERSION  = "1.4.4"
 SERVER_URL_DEFAULT = "https://vispora.up.railway.app"
-# Old Railway domain (service renamed 2026-07-01) — dead, kept only so we
-# can recognize and migrate a stale --server arg from an old install.
-SERVER_URL_LEGACY  = "https://ghostshell-site.up.railway.app"
-
-# ─── Paths ───────────────────────────────────────────────────────────
-APPDATA_DIR  = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
-                             "GhostShell")
-UPDATER_DIR  = os.path.join(APPDATA_DIR, "updater")
-STATE_PATH   = os.path.join(UPDATER_DIR, "state.json")
-LOG_PATH     = os.path.join(UPDATER_DIR, "updater.log")
-INSTALL_INFO = os.path.join(APPDATA_DIR, "install_info.json")  # written by GhostShell
-
-os.makedirs(UPDATER_DIR, exist_ok=True)
-
-
-def log(line: str) -> None:
-    """Append a timestamped line to updater.log.  Best-effort."""
-    try:
-        from datetime import datetime
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {line}\n")
-    except Exception:
-        pass
+# The release server's previous hostname — dead since the Railway service was
+# renamed on 2026-07-01.  Kept only so a stale --server arg passed by an old
+# install can be recognised and pointed at the live server instead.
+_DEAD_SERVER_HOST = "ghostshell-site.up.railway.app"
 
 
 def _find_free_port() -> int:
     """Find any free local port for the Flask backend.  Avoids hardcoded
-    ports that would collide with GhostShell's 5987 or anything else."""
+    ports that would collide with Vispora's 5987 or anything else."""
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
@@ -74,9 +57,9 @@ def _find_free_port() -> int:
 
 def parse_args(argv) -> dict:
     """CLI:
-        GhostShellUpdater.exe
-            [--target-dir <path>]         GhostShell install directory
-            [--target-exe <path>]         explicit GhostShell.exe path
+        VisporaUpdater.exe
+            [--target-dir <path>]         Vispora install directory
+            [--target-exe <path>]         explicit path to the app exe
             [--channel stable|beta]
             [--current-version <v>]
             [--target-version <v>]        version to install (auto if omitted)
@@ -84,7 +67,7 @@ def parse_args(argv) -> dict:
             [--server <url>]              override the Railway URL
             [--silent]                    no window — install + exit
     """
-    p = argparse.ArgumentParser(prog="GhostShellUpdater")
+    p = argparse.ArgumentParser(prog="VisporaUpdater")
     p.add_argument("--target-dir",     default="")
     p.add_argument("--target-exe",     default="")
     p.add_argument("--channel",        default="", choices=("", "stable", "beta"))
@@ -97,7 +80,7 @@ def parse_args(argv) -> dict:
 
 
 def load_install_info() -> dict:
-    """Read what GhostShell wrote about its own install (path, channel,
+    """Read what Vispora wrote about its own install (path, channel,
     version).  Returns {} if it doesn't exist — UI will then ask user."""
     if not os.path.exists(INSTALL_INFO):
         return {}
@@ -112,7 +95,7 @@ def load_install_info() -> dict:
 def main():
     args = parse_args(sys.argv[1:])
     log(f"───────────────────────────────")
-    log(f"GhostShellUpdater v{UPDATER_VERSION} invoked")
+    log(f"VisporaUpdater v{UPDATER_VERSION} invoked")
     log(f"  args: {args}")
 
     # Merge args + install_info.json — args win where both exist.
@@ -128,40 +111,40 @@ def main():
     # An old install may pass the dead pre-rename Railway host via
     # --server (from its stale saved settings) — migrate it here so the
     # standalone updater still reaches the live server either way.
-    if "ghostshell-site.up.railway.app" in server_url:
+    if _DEAD_SERVER_HOST in server_url:
         log(f"  migrating dead server URL {server_url!r} → {SERVER_URL_DEFAULT!r}")
         server_url = SERVER_URL_DEFAULT
 
     # If target_exe is set but target_dir isn't, derive it
     if target_exe and not target_dir:
         target_dir = os.path.dirname(target_exe)
-    # If target_dir is set but target_exe isn't, pick rename-aware
-    # (Vispora.exe if present, else GhostShell.exe).
+    # If target_dir is set but target_exe isn't, pick whichever app exe
+    # is already in that folder (see installer.pick_app_exe).
     if target_dir and not target_exe:
         from updater.installer import pick_app_exe
         target_exe = pick_app_exe(target_dir)
 
-    # v1.1.0 — if we don't know where GhostShell is (no args, no install
+    # v1.1.0 — if we don't know where Vispora is (no args, no install
     # info), scan the PC for an existing install.  Found → update mode
     # with the discovered path; not found → install mode with a default
     # directory.  User can still pick a different one in the UI.
     mode = "update"
     scan_result = None
     if not target_exe:
-        from updater.installer import find_existing_ghostshell, default_install_dir, pick_app_exe
-        scan_result = find_existing_ghostshell()
+        from updater.installer import find_existing_install, default_install_dir, pick_app_exe
+        scan_result = find_existing_install()
         if scan_result.get("found"):
             target_exe = scan_result["path"]
             target_dir = scan_result["dir"]
             channel    = channel or scan_result.get("channel", "")
             current_version = current_version or scan_result.get("version", "")
             mode = "update"
-            log(f"auto-scan: found existing GhostShell at {target_exe}")
+            log(f"auto-scan: found existing install at {target_exe}")
         else:
             mode = "install"
             target_dir = default_install_dir()
             target_exe = pick_app_exe(target_dir)
-            log(f"auto-scan: no existing GhostShell — install mode, "
+            log(f"auto-scan: no existing install — install mode, "
                 f"default dir {target_dir}")
     else:
         log(f"using explicit target from args: {target_exe}")
@@ -211,13 +194,13 @@ def main():
             time.sleep(0.05)
 
     # Open the pywebview window.  Frameless + custom titlebar (rendered
-    # in index.html) so it looks like a smaller pane of GhostShell itself
+    # in index.html) so it looks like a smaller pane of Vispora itself
     # instead of a generic OS-chrome dialog.  Rectangular aspect ratio —
     # the step list reads better as a wider+shorter panel than a square.
     try:
         import webview
         window = webview.create_window(
-            "GhostShell Updater",
+            "Vispora Updater",
             f"http://127.0.0.1:{port}",
             width=720,
             height=580,

@@ -1,9 +1,9 @@
-"""Auto-recovery for tweaks GhostShell used to apply that turned out
+"""Auto-recovery for tweaks Vispora used to apply that turned out
 to be actively harmful.
 
 Background
 ──────────
-GhostShell shipped with a wide net of Windows optimizations.  The
+Vispora shipped with a wide net of Windows optimizations.  The
 v3.3.1 pre-stable audit (see beta.7's commit message) identified
 several tweaks that older builds had applied which actively break
 real user workflows:
@@ -25,7 +25,7 @@ real user workflows:
   - SystemResponsiveness=0 → starves the Windows audio service
   - bcdedit useplatformtick yes → forces HPET on modern TSC systems
 
-Users who upgraded from old GhostShell builds still have those
+Users who upgraded from old Vispora builds still have those
 settings in the registry / BCD store.  Apply All no longer applies
 them, but they don't get undone on upgrade.  This module fixes that
 on boot — once.
@@ -113,7 +113,7 @@ def _check_bluetooth_absolute_volume() -> Optional[dict]:
         return {
             "id":             "bluetooth_absolute_volume",
             "label":          "Bluetooth absolute volume re-enabled",
-            "explanation":    "An older GhostShell build disabled this — caused "
+            "explanation":    "An older Vispora build disabled this — caused "
                               "audio stutter and one-channel-only playback on "
                               "modern headsets (AirPods, Sony XM, HyperX QuadCast, etc).",
             "action":         "removed registry value DisableAbsoluteVolume",
@@ -132,7 +132,7 @@ def _check_recoveryenabled() -> Optional[dict]:
             return {
                 "id":          "winre_disabled",
                 "label":       "Windows Recovery Environment re-enabled",
-                "explanation": "An older GhostShell build set `recoveryenabled No` "
+                "explanation": "An older Vispora build set `recoveryenabled No` "
                                "in the boot config.  That prevented you from accessing "
                                "Startup Repair / Reset this PC / System Restore when "
                                "a bad update broke boot — you'd have needed a Windows "
@@ -157,7 +157,7 @@ def _check_ssd_defrag_task() -> Optional[dict]:
         return {
             "id":          "ssd_defrag_disabled",
             "label":       "Weekly SSD TRIM schedule re-enabled",
-            "explanation": "An older GhostShell build disabled the 'ScheduledDefrag' "
+            "explanation": "An older Vispora build disabled the 'ScheduledDefrag' "
                            "task, thinking it was defragging your SSD.  It actually "
                            "runs TRIM/Retrim — the operation SSDs need to maintain "
                            "long-term performance.  Disabling it silently degrades "
@@ -175,7 +175,7 @@ def _check_fso_global() -> Optional[dict]:
         return {
             "id":          "fso_global",
             "label":       "Fullscreen Optimizations restored to default",
-            "explanation": "An older GhostShell build set GameDVR_FSEBehaviorMode=2 "
+            "explanation": "An older Vispora build set GameDVR_FSEBehaviorMode=2 "
                            "(global FSO disable).  That breaks viewport rendering in "
                            "Roblox Studio, Unity Editor, Unreal Editor, and most 3D "
                            "modeling tools — they render at black or wrong scale.",
@@ -193,7 +193,7 @@ def _check_prevent_indexing_outlook() -> Optional[dict]:
         return {
             "id":          "outlook_indexing",
             "label":       "Outlook search re-enabled",
-            "explanation": "An older GhostShell build set PreventIndexingOutlook=1 "
+            "explanation": "An older Vispora build set PreventIndexingOutlook=1 "
                            "with a label claiming 'search indexer auto-throttle'.  "
                            "The actual effect was just to break Outlook's inbox "
                            "search — emails wouldn't show up in search results.",
@@ -211,7 +211,7 @@ def _check_notifications_deny() -> Optional[dict]:
         return {
             "id":          "notifications_deny",
             "label":       "App notifications re-enabled",
-            "explanation": "An older GhostShell build denied LetAppsAccessNotifications.  "
+            "explanation": "An older Vispora build denied LetAppsAccessNotifications.  "
                            "That killed toast notifications for Discord, Steam friends, "
                            "Slack, Teams, OBS, and basically every modern app that "
                            "uses the Windows notification system.",
@@ -227,7 +227,7 @@ def _check_ndu_disabled() -> Optional[dict]:
         return {
             "id":          "ndu_disabled",
             "label":       "Network Data Usage tracking re-enabled",
-            "explanation": "An older GhostShell build disabled the NDU driver, citing "
+            "explanation": "An older Vispora build disabled the NDU driver, citing "
                            "a 'memory leak'.  That leak was a Windows 8 bug Microsoft "
                            "fixed in 2017.  The only thing disabling NDU does now is "
                            "blank Task Manager's per-process Network tab.",
@@ -247,7 +247,7 @@ def _check_memory_placebos() -> list[dict]:
         reverted.append({
             "id":          "paging_executive",
             "label":       "DisablePagingExecutive set back to default",
-            "explanation": "An older GhostShell build set this to 1.  On modern "
+            "explanation": "An older Vispora build set this to 1.  On modern "
                            "Windows with ≥8 GB RAM this is a no-op (the kernel "
                            "memory manager keeps the kernel resident under "
                            "pressure-free RAM regardless).",
@@ -259,7 +259,7 @@ def _check_memory_placebos() -> list[dict]:
         reverted.append({
             "id":          "clear_pagefile_at_shutdown",
             "label":       "ClearPageFileAtShutdown set back to default",
-            "explanation": "An older GhostShell build set this to 1 with a 'perf' "
+            "explanation": "An older Vispora build set this to 1 with a 'perf' "
                            "label.  It's actually a security/forensics setting "
                            "that adds 30-120 seconds to shutdown by zeroing the "
                            "entire pagefile — opposite of a perf tweak.",
@@ -282,7 +282,7 @@ def _check_system_responsiveness() -> Optional[dict]:
         return {
             "id":          "system_responsiveness_zero",
             "label":       "Audio service breathing room restored",
-            "explanation": "An older GhostShell build set SystemResponsiveness=0, "
+            "explanation": "An older Vispora build set SystemResponsiveness=0, "
                            "which dedicated 100% of multimedia bandwidth to "
                            "foreground threads — starving the Windows audio "
                            "service.  Symptoms: Discord crackling, in-game voice "
@@ -302,7 +302,7 @@ def _check_useplatformtick() -> Optional[dict]:
         return {
             "id":          "useplatformtick",
             "label":       "Platform-tick BCD flag removed",
-            "explanation": "An older GhostShell build set `useplatformtick yes` "
+            "explanation": "An older Vispora build set `useplatformtick yes` "
                            "in the boot config.  On Zen2+/Skylake+ systems this "
                            "forces the kernel to use HPET/ACPI for tick interrupts "
                            "instead of TSC — RAISES idle wakeups instead of "
@@ -320,7 +320,7 @@ def _check_hubmode() -> Optional[dict]:
         return {
             "id":          "hubmode",
             "label":       "HubMode orphan policy removed",
-            "explanation": "An older GhostShell build set HubMode=1 to hide Quick "
+            "explanation": "An older Vispora build set HubMode=1 to hide Quick "
                            "Access from File Explorer's nav pane.  Microsoft removed "
                            "honoring of this registry value in Win11 23H2+, so the "
                            "value just sits as an orphan policy — removed cleanly.",

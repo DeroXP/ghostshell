@@ -32,6 +32,12 @@ from typing import Optional
 
 from core.utils import get_logger
 
+# Stamped into dwExtraInfo on every event the gamepad mapper injects, so the
+# hooks below can tell the mapper's own output from the user's input.  Without
+# it a key mapped to itself (or an A↔B swap) fed its output straight back in
+# as a fresh press — phantom key spam, system-wide, until the mapper was off.
+INJECTED_TAG = 0x56535031      # "VSP1"
+
 log = get_logger(__name__)
 
 
@@ -178,6 +184,8 @@ def _kb_callback(nCode, wParam, lParam):
     if nCode == HC_ACTION:
         try:
             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT))[0]
+            if (kb.dwExtraInfo or 0) == INJECTED_TAG:
+                return _user32.CallNextHookEx(None, nCode, wParam, lParam)
             pressed = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
             up = wParam in (WM_KEYUP, WM_SYSKEYUP)
             if pressed or up:
@@ -201,6 +209,8 @@ def _mouse_callback(nCode, wParam, lParam):
     if nCode == HC_ACTION:
         try:
             ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT))[0]
+            if (ms.dwExtraInfo or 0) == INJECTED_TAG:
+                return _user32.CallNextHookEx(None, nCode, wParam, lParam)
             ev = None
             if wParam in (WM_LBUTTONDOWN, WM_LBUTTONUP):
                 ev = {"source": "mouse", "trigger": "M_LEFT",

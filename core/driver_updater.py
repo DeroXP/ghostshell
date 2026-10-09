@@ -305,7 +305,7 @@ def _http_get_json(url: str, timeout: int = 15) -> dict:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GhostShell/2.9.6",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Vispora/2.9.6",
             "Accept":     "application/json,text/javascript,*/*;q=0.1",
         },
     )
@@ -537,7 +537,10 @@ def download_driver() -> dict:
     # below.  A MITM / hijacked / compromised endpoint returning a URL with
     # embedded quotes or semicolons could otherwise inject PowerShell that
     # runs in our elevated context.  Require plain https + URL-safe chars only.
-    if not re.match(r"^https://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+$", url) or '"' in url:
+    # Pinned to NVIDIA's own hosts, and no character that means anything
+    # inside a PowerShell double-quoted string: the previous pattern still
+    # allowed `$`, `(` and `)`, and `$(...)` is evaluated in that context.
+    if not re.fullmatch(r"https://[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.nvidia\.com/[A-Za-z0-9._~/?#@!&*+,;=%-]*", url or ""):
         return {"ok": False, "err": "driver download URL failed validation — refusing"}
     # Derive a SAFE local filename (URL is validated, but the basename still
     # feeds an -OutFile path, so strip it to a plain token defensively).
@@ -671,7 +674,7 @@ def install_driver() -> dict:
     """Launch the downloaded NVIDIA installer the SAME way a user
     double-clicking it in File Explorer would.
 
-    3.4.3-beta.3 FIX — the long-standing "GhostShell-installed drivers
+    3.4.3-beta.3 FIX — the long-standing "Vispora-installed drivers
     error but website-downloaded ones work" bug.
 
     Root cause was NOT the download: the file is byte-for-byte valid
@@ -679,8 +682,8 @@ def install_driver() -> dict:
     code did:
         subprocess.Popen([path],
             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-    GhostShell runs elevated (uac_admin manifest), so the installer
-    inherited GhostShell's already-elevated token in a detached,
+    Vispora runs elevated (uac_admin manifest), so the installer
+    inherited Vispora's already-elevated token in a detached,
     console-less, new-process-group context.  NVIDIA's installer is a
     self-extracting bootstrapper that unpacks to C:\\NVIDIA and then
     re-launches setup.exe plus component sub-installers (Display
@@ -751,7 +754,7 @@ def install_driver() -> dict:
                      daemon=True).start()
 
     return {"ok": True,
-            "msg": "NVIDIA installer launched — GhostShell will confirm once "
+            "msg": "NVIDIA installer launched — Vispora will confirm once "
                    "the new driver is active."}
 
 

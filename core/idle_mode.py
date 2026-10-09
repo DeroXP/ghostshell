@@ -151,16 +151,17 @@ def _engage() -> None:
         restore: dict[str, Any] = {"power_guid": "", "oc": None}
         if s.get("switch_power_plan"):
             restore["power_guid"] = _current_power_guid()
-        if s.get("park_oc"):
-            # Prefer the user's saved profile (what boot re-applies); fall
-            # back to current live offsets if there's no saved profile.
-            prof = gpu_overclock.load_profile()
-            if prof.get("exists"):
-                restore["oc"] = {
-                    "core":  int(prof.get("core_offset_mhz", 0) or 0),
-                    "mem":   int(prof.get("mem_offset_mhz", 0) or 0),
-                    "power": int(prof.get("power_pct", 100) or 100),
-                }
+        # What is on the card RIGHT NOW — not the saved profile.  Restoring
+        # the profile applied an overclock to users who had one saved but
+        # were running stock, and restored nothing at all (leaving the GPU
+        # capped at the idle power limit in every game) to users with no
+        # profile saved or with OC parking switched off.
+        live = gpu_overclock.get_applied_oc()
+        restore["oc"] = {
+            "core":  int(live.get("core", 0) or 0),
+            "mem":   int(live.get("mem", 0) or 0),
+            "power": int(live.get("power", 100) or 100),
+        }
         _state["restore"] = restore
         _state["engaged"] = True
 
@@ -178,12 +179,11 @@ def _engage() -> None:
             core = 0 if s.get("park_oc") else None
             mem  = 0 if s.get("park_oc") else None
             pct  = int(s.get("idle_power_pct", 70))
-            # If not parking OC, keep the user's saved offsets and only
-            # lower the power cap.
+            # If not parking OC, keep the offsets that are applied right
+            # now and only lower the power cap.
             if core is None:
-                prof = gpu_overclock.load_profile()
-                core = int(prof.get("core_offset_mhz", 0) or 0) if prof.get("exists") else 0
-                mem  = int(prof.get("mem_offset_mhz", 0) or 0) if prof.get("exists") else 0
+                core = restore["oc"]["core"]
+                mem  = restore["oc"]["mem"]
             gr = gpu_overclock.apply_oc(core_offset_mhz=core, mem_offset_mhz=mem, power_pct=pct)
             if gr.get("ok"):
                 detail.append(f"GPU power limit → {pct}%"
@@ -277,7 +277,10 @@ def _loop(stop: threading.Event) -> None:
                 with _lock:
                     idle_for = time.time() - _state["last_game_ts"]
                     engaged = _state["engaged"]
-                if not engaged and idle_for >= grace_s:
+                # Never park in the middle of a tuning run: the step being
+                # measured would run at stock / reduced power and be recorded
+                # as a pass for an offset that was never actually under test.
+                if not engaged and idle_for >= grace_s and not gpu_overclock.is_tuning_active():
                     _engage()
 
             if stop.wait(poll):
@@ -347,5 +350,9 @@ def run_on_boot() -> None:
 
 def manual_release() -> dict:
     """Force-release idle mode right now (UI 'wake' button)."""
+    # Restart the grace period too, or the watcher parks again on its very
+    # next poll and the wake never holds.
+    with _lock:
+        _state["last_game_ts"] = time.time()
     _restore_if_engaged("manual wake")
     return {"ok": True}

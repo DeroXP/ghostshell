@@ -7,7 +7,7 @@ user's speakers right now" via FFmpeg's built-in dshow input is to
 install a third-party loopback driver (VB-CABLE, Voicemeeter,
 virtual-audio-capturer, or enable Stereo Mix on hardware that exposes
 it).  This is a terrible first-run experience — users install
-GhostShell, flip on system audio capture, hit Save, and the saved
+Vispora, flip on system audio capture, hit Save, and the saved
 clip has no audio with a vague "install VB-CABLE" message.
 
 The proper solution is **WASAPI loopback** — a native Windows audio

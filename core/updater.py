@@ -1,4 +1,4 @@
-"""GhostShell Auto-Updater (v3+) — checks the Railway-hosted release
+"""Vispora Auto-Updater (v3+) — checks the Railway-hosted release
 server and self-updates.
 
 v3 swap: the data source moved from GitHub releases to a self-hosted
@@ -19,7 +19,7 @@ State machine:
                                                   → install-failed
                                                   → installing  → restart
 
-Server endpoint contract (matches ghostshell-site):
+Server endpoint contract (matches the release-site repo):
   GET /version/<channel>  →
     {
       "available":     bool,
@@ -32,7 +32,7 @@ Server endpoint contract (matches ghostshell-site):
       "download_url":  "https://.../download/<channel>"
     }
 
-The installer writes a small .bat that waits for the running GhostShell
+The installer writes a small .bat that waits for the running Vispora
 process to exit, copies the new exe in place, restarts, then deletes itself.
 """
 import json
@@ -42,25 +42,23 @@ import time
 import zipfile
 import shutil
 import subprocess
+import re
 import threading
+import urllib.request
 from typing import Optional
 
-from config import (APP_VERSION, APPDATA_DIR,
-                    APP_CHANNEL_DEFAULT, UPDATE_SERVER_URL_DEFAULT)
+from config import (APP_NAME, LEGACY_APP_NAME, APP_VERSION, APPDATA_DIR,
+                    APP_CHANNEL_DEFAULT, UPDATE_SERVER_URL_DEFAULT,
+                    UPDATER_EXE_NAME, LEGACY_UPDATER_EXE_NAME,
+                    OWN_PROCESS_NAMES, is_dead_update_server)
 from core.utils import get_logger, atomic_write_json
 import hashlib
 
 log = get_logger("updater")
 
-# v3 — release server moved off GitHub.  The legacy GitHub URLs are kept
-# in comments for archeology; if someone wants to point a self-hosted
-# fork at GitHub releases they can rewrite check_for_update().
-#   GITHUB_REPO         = "DeroXP/ghostshell"
-#   GITHUB_RELEASES_URL = "https://api.github.com/repos/.../releases?per_page=15"
-
 UPDATE_DIR = os.path.join(APPDATA_DIR, "updates")
 UPDATER_DIR = os.path.join(APPDATA_DIR, "updater")        # standalone updater lives here
-UPDATER_EXE = os.path.join(UPDATER_DIR, "GhostShellUpdater.exe")
+UPDATER_EXE = os.path.join(UPDATER_DIR, UPDATER_EXE_NAME)
 # v1.2.0 — sidecar that records which updater version we have on disk
 # so the boot-time refresh check can compare against /version/updater
 # without launching the binary.
@@ -75,13 +73,13 @@ os.makedirs(UPDATER_DIR, exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# install_info.json — written by GhostShell, read by the standalone updater
+# install_info.json — written by the app, read by the standalone updater
 # ═══════════════════════════════════════════════════════════════════════════
 def write_install_info() -> dict:
-    """Persist where GhostShell is installed + which channel + which
+    """Persist where Vispora is installed + which channel + which
     version it is, so the standalone updater can find + replace us.
 
-    Called on every GhostShell startup so the file always tracks the
+    Called on every Vispora startup so the file always tracks the
     current truth (user may have moved the exe between runs)."""
     try:
         info = {
@@ -113,6 +111,23 @@ _updater_install_state = {
 _updater_install_lock = threading.Lock()
 
 
+def _adopt_legacy_updater() -> None:
+    """An updater downloaded before the rename sits in UPDATER_DIR under its
+    old filename.  Take it over under the new one rather than downloading
+    the same ~19 MB again, and never leave the old file behind as an orphan.
+    Best-effort — if the file is busy, the next boot tries again."""
+    legacy = os.path.join(UPDATER_DIR, LEGACY_UPDATER_EXE_NAME)
+    try:
+        if not os.path.isfile(legacy):
+            return
+        if os.path.exists(UPDATER_EXE):
+            os.remove(legacy)
+        else:
+            os.rename(legacy, UPDATER_EXE)
+    except OSError as e:
+        log.debug(f"could not adopt pre-rename updater binary: {e}")
+
+
 def is_updater_installed() -> bool:
     """Updater binary present on disk?  Version freshness handled by
     `ensure_updater_up_to_date_async()` — this one just checks bytes."""
@@ -122,7 +137,7 @@ def is_updater_installed() -> bool:
 def _read_installed_updater_version() -> str:
     """Return the version string for the updater binary on disk, or ''
     when unknown (either not installed or downloaded by an older
-    GhostShell build that didn't write the sidecar)."""
+    build that didn't write the sidecar)."""
     if not os.path.isfile(UPDATER_VERSION_PATH):
         return ""
     try:
@@ -145,6 +160,7 @@ def ensure_updater_installed_async() -> dict:
     with _updater_install_lock:
         if _updater_install_state["running"]:
             return {"ok": True, "running": True}
+        _adopt_legacy_updater()
         if is_updater_installed():
             return {"ok": True, "already_installed": True}
         _updater_install_state.update({"running": True, "downloaded": 0,
@@ -163,7 +179,7 @@ def ensure_updater_up_to_date_async() -> dict:
          ensure_updater_installed_async).
       2. If installed → ping /version/updater and compare against the
          sidecar updater_version.json.  Remote newer → re-download in
-         the background.  Pre-1.2.0 GhostShells didn't write the
+         the background.  Pre-1.2.0 builds didn't write the
          sidecar, so an empty local version triggers a one-time refresh
          on first boot of a 1.2.0+ build.
 
@@ -182,6 +198,7 @@ def ensure_updater_up_to_date_async() -> dict:
     with _updater_install_lock:
         if _updater_install_state["running"]:
             return {"ok": True, "running": True}
+        _adopt_legacy_updater()
     if not is_updater_installed():
         return ensure_updater_installed_async()
     # Already installed — kick off a non-blocking remote-version check
@@ -198,9 +215,8 @@ def _updater_refresh_worker() -> None:
         s = _load_settings()
         base = (s.get("server_url") or UPDATE_SERVER_URL_DEFAULT).rstrip("/")
         url = base + "/version/updater"
-        import urllib.request
         req = urllib.request.Request(url, headers={
-            "User-Agent": f"GhostShell/{APP_VERSION}-updater-refresh"})
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}-updater-refresh"})
         with urllib.request.urlopen(req, timeout=15) as r:
             remote = json.loads(r.read())
     except Exception as e:
@@ -237,9 +253,8 @@ def _updater_refresh_worker() -> None:
 
 
 def _download_updater_worker(remote_version: str = "") -> None:
-    """Stream the standalone updater from Railway to %APPDATA%/GhostShell/
-    updater/GhostShellUpdater.exe.  Hits /download/updater on whatever
-    server_url the user is configured against.
+    """Stream the standalone updater from Railway to UPDATER_EXE.  Hits
+    /download/updater on whatever server_url the user is configured against.
 
     When `remote_version` is passed (refresh path), we also write the
     sidecar file recording what version we just put on disk so future
@@ -249,7 +264,6 @@ def _download_updater_worker(remote_version: str = "") -> None:
         base = (s.get("server_url") or UPDATE_SERVER_URL_DEFAULT).rstrip("/")
         url = base + "/download/updater"
         log.info(f"Auto-installing updater from {url}")
-        import urllib.request
 
         # Fetch the expected SHA-256 first so the downloaded binary can be
         # verified — same fail-closed posture as app-update downloads.  A
@@ -258,7 +272,7 @@ def _download_updater_worker(remote_version: str = "") -> None:
         expected_sha = ""
         try:
             vreq = urllib.request.Request(base + "/version/updater", headers={
-                "User-Agent": f"GhostShell/{APP_VERSION}-updater-bootstrap"})
+                "User-Agent": f"{APP_NAME}/{APP_VERSION}-updater-bootstrap"})
             with urllib.request.urlopen(vreq, timeout=15) as vr:
                 expected_sha = ((json.loads(vr.read()) or {}).get("sha256") or "").lower()
         except Exception as e:
@@ -270,7 +284,7 @@ def _download_updater_worker(remote_version: str = "") -> None:
         os.makedirs(UPDATER_DIR, exist_ok=True)
         tmp = UPDATER_EXE + ".part"
         req = urllib.request.Request(url, headers={
-            "User-Agent": f"GhostShell/{APP_VERSION}-updater-bootstrap"})
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}-updater-bootstrap"})
         h = hashlib.sha256()
         with urllib.request.urlopen(req, timeout=60) as r:
             total = int(r.headers.get("Content-Length", 0) or 0)
@@ -360,13 +374,12 @@ def _load_settings() -> dict:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         merged = {**_DEFAULT_SETTINGS, **(data if isinstance(data, dict) else {})}
-        # One-time migration: the Railway service was renamed and the old
-        # ghostshell-site domain is dead.  A saved server_url pointing at it
-        # would strand this install's update checks forever, so rewrite it
-        # to the new default and persist the fix.
-        from config import UPDATE_SERVER_URL_LEGACY
+        # One-time migration: the Railway service was renamed and its old
+        # domain is dead.  A saved server_url pointing at it would strand
+        # this install's update checks forever, so rewrite it to the new
+        # default and persist the fix.
         saved_url = (merged.get("server_url") or "")
-        if "ghostshell-site.up.railway.app" in saved_url:
+        if is_dead_update_server(saved_url):
             merged["server_url"] = UPDATE_SERVER_URL_DEFAULT
             log.info(f"Migrated saved update-server URL {saved_url!r} → "
                      f"{UPDATE_SERVER_URL_DEFAULT!r} (old Railway domain is dead)")
@@ -395,6 +408,7 @@ def set_settings(auto_check: Optional[bool] = None,
                  server_url: Optional[str] = None,
                  local_update_dir: Optional[str] = None) -> dict:
     s = _load_settings()
+    source_before = (s.get("channel"), s.get("server_url"), s.get("local_update_dir"))
     if auto_check    is not None: s["auto_check"]    = bool(auto_check)
     if auto_download is not None: s["auto_download"] = bool(auto_download)
     if auto_install  is not None: s["auto_install"]  = bool(auto_install)
@@ -416,20 +430,21 @@ def set_settings(auto_check: Optional[bool] = None,
                     "err": f"local_update_dir does not exist or is not a folder: {d}"}
         s["local_update_dir"] = d   # empty string = back to server mode
     _save_settings(s)
+    if (s.get("channel"), s.get("server_url"), s.get("local_update_dir")) != source_before:
+        # What we know (and may have staged) came from the previous channel /
+        # server.  Installing it now could silently downgrade the app, so drop
+        # it and let the next check ask the new source.
+        _update_state["update_available"] = False
+        _update_state["latest_version"] = None
+        _update_state["latest_url"] = None
+        _update_state["latest_sha256"] = None
+        _forget_staged_download()
     log.info(f"Updater settings saved: check={s['auto_check']} "
              f"download={s['auto_download']} install={s['auto_install']} "
              f"channel={s.get('channel', APP_CHANNEL_DEFAULT)} "
              f"server={s.get('server_url', UPDATE_SERVER_URL_DEFAULT)} "
              f"local_dir={s.get('local_update_dir') or '(server mode)'}")
     return {"ok": True, "settings": s}
-
-
-# v3 — channel filtering is done server-side now.  The Railway endpoint
-# serves /version/<channel>, which only returns the release published on
-# that channel.  No client-side filter needed.  Function kept as a stub
-# to avoid breaking any imports, but always returns True.
-def _release_passes_channel_filter(release: dict, channel: str) -> bool:
-    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -509,54 +524,80 @@ def _parse_version(v: str) -> tuple:
     return tuple(parts + [pre_ord])
 
 
-def _ps_download(url: str, dest: str, timeout_s: int = 300) -> bool:
-    """Download via PowerShell — no extra Python deps."""
-    cmd = (
-        '[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; '
-        f'Invoke-WebRequest -Uri "{url}" -OutFile "{dest}" -UseBasicParsing'
-    )
+# Both helpers used to shell out to PowerShell's Invoke-WebRequest with the URL
+# interpolated into the command line.  The URL is not ours to trust — it comes
+# from user-editable settings and from the server's own JSON — and PowerShell
+# expands $(...) inside a double-quoted string, so a crafted server_url or
+# download_url ran arbitrary commands in this elevated process.  urllib has no
+# shell in the loop (and is what the updater bootstrap above already uses).
+_VERSION_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,39}")
+
+
+def _is_http_url(url: str) -> bool:
+    return isinstance(url, str) and url.lower().startswith(("http://", "https://"))
+
+
+def _http_download(url: str, dest: str, timeout_s: int = 60) -> bool:
+    """Stream `url` to `dest` via a .part file, updating the progress state."""
+    if not _is_http_url(url):
+        log.error(f"  Refusing to download from non-HTTP URL: {url!r}")
+        return False
+    tmp = dest + ".part"
     try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-            capture_output=True, text=True, timeout=timeout_s,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except subprocess.TimeoutExpired:
-        log.error("  Download timed out")
-        return False
-    except Exception as e:
-        log.error(f"  Download error: {e}")
-        return False
-    if r.returncode == 0 and os.path.exists(dest) and os.path.getsize(dest) > 0:
+        req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}-Updater"})
+        with urllib.request.urlopen(req, timeout=timeout_s) as r, open(tmp, "wb") as f:
+            total = int(r.headers.get("Content-Length", 0) or 0)
+            done = 0
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    _update_state["progress"] = min(99, done * 100 // total)
+        if os.path.getsize(tmp) == 0:
+            raise OSError("server sent an empty file")
+        os.replace(tmp, dest)
         return True
-    log.error(f"  Download failed (rc={r.returncode}): {r.stderr[:200]}")
-    return False
-
-
-def _ps_get_json(url: str, timeout_s: int = 30) -> Optional[dict]:
-    """GET → JSON via PowerShell."""
-    cmd = (
-        '[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; '
-        f'(Invoke-WebRequest -Uri "{url}" -UseBasicParsing -Headers @{{"User-Agent"="GhostShell-Updater"}}).Content'
-    )
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
-            capture_output=True, text=True, timeout=timeout_s,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-    except subprocess.TimeoutExpired:
-        log.warning("  Update server request timed out")
-        return None
     except Exception as e:
-        log.warning(f"  Update server request error: {e}")
-        return None
-    if r.returncode != 0 or not r.stdout.strip():
+        log.error(f"  Download failed: {e}")
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _http_get_json(url: str, timeout_s: int = 30) -> Optional[dict]:
+    """GET → parsed JSON object, or None on any failure."""
+    if not _is_http_url(url):
+        log.warning(f"  Refusing non-HTTP update server URL: {url!r}")
         return None
     try:
-        return json.loads(r.stdout)
-    except json.JSONDecodeError:
+        req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}-Updater"})
+        with urllib.request.urlopen(req, timeout=timeout_s) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        log.warning(f"  Update server request failed: {e}")
         return None
+    return data if isinstance(data, dict) else None
+
+
+def _forget_staged_download() -> None:
+    _update_state["download_complete"] = False
+    _update_state["pending_install_path"] = None
+    _update_state["progress"] = 0
+
+
+def _keep_staged_download_only_for(version: Optional[str]) -> None:
+    """Forget a staged installer unless it is the build `version` (None =
+    forget whatever is staged).  A check that finds a different latest build
+    — or none — must not leave an older download marked ready, or the
+    auto-installer goes on to install something that is no longer current."""
+    staged = os.path.basename(_update_state.get("pending_install_path") or "")
+    if not version or os.path.splitext(staged)[0] != f"{APP_NAME}_{version}":
+        _forget_staged_download()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -609,6 +650,7 @@ def _check_local_update(local_dir: str, s: dict) -> dict:
     _update_state["latest_sha256"]    = sha256
     _update_state["latest_size"]      = size_bytes
     _update_state["update_available"] = is_newer
+    _keep_staged_download_only_for(_update_state["latest_version"] if is_newer else None)
 
     s["last_check_ts"] = time.time()
     _save_settings(s)
@@ -667,7 +709,7 @@ def check_for_update() -> dict:
         server_url = s.get("server_url", UPDATE_SERVER_URL_DEFAULT).rstrip("/")
         endpoint   = f"{server_url}/version/{channel}"
 
-        data = _ps_get_json(endpoint)
+        data = _http_get_json(endpoint)
         if data is None or not isinstance(data, dict):
             _update_state["error"] = f"Could not reach update server ({server_url})"
             log.warning(f"  update check failed against {endpoint}")
@@ -682,6 +724,7 @@ def check_for_update() -> dict:
 
         if not available or not latest_ver_s:
             log.info(f"  No release published on '{channel}' channel")
+            _keep_staged_download_only_for(None)
             _update_state["update_available"] = False
             _update_state["latest_version"]   = None
             _update_state["latest_url"]       = None
@@ -708,6 +751,7 @@ def check_for_update() -> dict:
         _update_state["latest_sha256"]    = sha256
         _update_state["latest_size"]      = size_bytes
         _update_state["update_available"] = is_newer
+        _keep_staged_download_only_for(_update_state["latest_version"] if is_newer else None)
 
         # Persist last-check timestamp
         s["last_check_ts"] = time.time()
@@ -736,7 +780,7 @@ def check_for_update() -> dict:
 
 
 def _prune_old_cached_installers(keep: str = "") -> int:
-    """Delete every GhostShell_*/Vispora_*.exe / .zip in UPDATE_DIR except
+    """Delete every cached installer (.exe / .zip) in UPDATE_DIR except
     `keep` (a bare filename).  Returns bytes freed.  Best-effort; swallows
     per-file errors (a file might be the one currently being read).
 
@@ -746,16 +790,17 @@ def _prune_old_cached_installers(keep: str = "") -> int:
     used for the in-app 'already downloaded' fast-path — we never need
     more than the current target.
 
-    Checks both the legacy "ghostshell_" prefix and the current
-    "vispora_" prefix (post exe-rename) so any installer cached before
-    the rename still gets cleaned up instead of sitting there forever."""
+    Matches the pre-rename filename prefix as well as the current one, so
+    an installer cached before the rename still gets cleaned up instead of
+    sitting there forever."""
+    prefixes = (f"{APP_NAME.lower()}_", f"{LEGACY_APP_NAME.lower()}_")
     freed = 0
     try:
         if not os.path.isdir(UPDATE_DIR):
             return 0
         for name in os.listdir(UPDATE_DIR):
             low = name.lower()
-            if not (low.startswith("ghostshell_") or low.startswith("vispora_")):
+            if not low.startswith(prefixes):
                 continue
             if not (low.endswith(".exe") or low.endswith(".zip")
                     or low.endswith(".part")):
@@ -792,6 +837,12 @@ def download_update() -> dict:
 
     url = _update_state["latest_url"]
     version = _update_state["latest_version"] or "latest"
+    # `version` comes from the server and becomes part of a filename.
+    if not _VERSION_RE.fullmatch(version):
+        err = f"Update server sent a malformed version string: {version!r}"
+        log.warning(err)
+        _update_state["error"] = err
+        return {"ok": False, "err": err}
     # beta.11 — flipped the default from .zip to .exe.  The Railway
     # release server has always shipped .exe payloads; the old code
     # only saved as .exe when the URL literally ended in `.exe`, which
@@ -804,46 +855,46 @@ def download_update() -> dict:
         ext = ".zip"
     else:
         ext = ".exe"
-    dest = os.path.join(UPDATE_DIR, f"Vispora_{version}{ext}")
+    dest = os.path.join(UPDATE_DIR, f"{APP_NAME}_{version}{ext}")
 
     # 3.4.3 — prune stale cached installers before caching the new one.
     # Each downloaded build is ~44 MB and the old code never removed
     # superseded copies — they only got swept by the integrity scan's
     # 7-day age sweep, so a burst of updates could pile up 500 MB+ in
-    # %APPDATA%/GhostShell/updates.  Now we keep ONLY the version we're
+    # UPDATE_DIR.  Now we keep ONLY the version we're
     # about to cache; everything else (the actual install already
     # happened, and the standalone updater re-downloads on demand) is
     # dead weight.  Best-effort — never blocks the download.
     _prune_old_cached_installers(keep=os.path.basename(dest))
 
-    # Already downloaded?
-    if os.path.exists(dest) and os.path.getsize(dest) > 1024:
-        log.info(f"  Update already downloaded: {dest}")
-        _update_state["download_complete"] = True
-        _update_state["pending_install_path"] = dest
-        _update_state["progress"] = 100
-        return {"ok": True, "path": dest, "cached": True}
+    # Already downloaded?  Skip the transfer, but NOT the SHA-256 check below:
+    # the file may be a truncated leftover, or a same-version rebuild may have
+    # replaced what the server offers since it was cached.
+    cached = os.path.exists(dest) and os.path.getsize(dest) > 1024
 
     _update_state["downloading"] = True
     _update_state["progress"] = 0
     _update_state["download_complete"] = False
-    log.info(f"Downloading {url} -> {dest}")
     try:
-        # beta.11 — local source: "download" = copy the exe from the local
-        # update folder.  The sha-256 verify below still runs on the staged
-        # copy, so a mid-copy modification or truncation is caught the same
-        # way a corrupted network download would be.
-        if url.startswith("local:"):
+        if cached:
+            log.info(f"  Update already downloaded: {dest} — re-verifying")
+            ok = True
+        elif url.startswith("local:"):
+            # beta.11 — local source: "download" = copy the exe from the local
+            # update folder.  The sha-256 verify below still runs on the staged
+            # copy, so a mid-copy modification or truncation is caught the same
+            # way a corrupted network download would be.
             src = url[len("local:"):]
+            log.info(f"Copying {src} -> {dest}")
             try:
-                import shutil
                 shutil.copy2(src, dest)
                 ok = True
             except Exception as e:
                 log.warning(f"  Local update copy failed: {e}")
                 ok = False
         else:
-            ok = _ps_download(url, dest)
+            log.info(f"Downloading {url} -> {dest}")
+            ok = _http_download(url, dest)
     finally:
         _update_state["downloading"] = False
 
@@ -895,7 +946,7 @@ def download_update() -> dict:
     _update_state["pending_install_path"] = dest
     size_mb = os.path.getsize(dest) / (1024 * 1024)
     log.info(f"  Downloaded {size_mb:.1f} MB — ready to install")
-    return {"ok": True, "path": dest, "size_mb": round(size_mb, 1)}
+    return {"ok": True, "path": dest, "size_mb": round(size_mb, 1), "cached": cached}
 
 
 def install_update_now() -> dict:
@@ -923,7 +974,7 @@ def install_update_now() -> dict:
     # Windows PE.
     if _looks_like_exe(path):
         # beta.11 — local mode installs via the self-contained bat swap.  The
-        # standalone GhostShellUpdater re-downloads the build from the HTTP
+        # standalone updater re-downloads the build from the HTTP
         # server itself (ignoring our staged file), which can't work when the
         # update source is a folder on disk / the server is stopped.  The
         # staged file here is already sha-256-verified, so the direct swap is
@@ -953,33 +1004,55 @@ def _looks_like_exe(path: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════
 # Internal: apply an .exe update by spawning a swap script
 # ═══════════════════════════════════════════════════════════════════════════
+# Called just before the process exits to install an update.  os._exit()
+# skips atexit handlers, so anything that has to be undone first (gaming
+# tweaks, a tuning run's offsets, suspended processes) is done through this.
+# app.py registers its own restore routine here at startup.
+_pre_exit_hook = None
+
+
+def set_pre_exit_hook(fn) -> None:
+    global _pre_exit_hook
+    _pre_exit_hook = fn
+
+
+def _exit_for_update() -> None:
+    time.sleep(0.8)          # let the HTTP response flush first
+    log.info("Exiting for update install...")
+    if _pre_exit_hook is not None:
+        try:
+            _pre_exit_hook("update install")
+        except Exception as e:
+            log.warning(f"pre-exit restore failed: {e}")
+    os._exit(0)
+
+
 def _apply_exe_update_async(new_exe: str) -> dict:
-    """Hand off to the standalone GhostShellUpdater app.
+    """Hand off to the standalone updater app.
 
     v3.2.2 rearchitecture: instead of bundling an updater binary
-    INSIDE GhostShell.exe and shelling out to it, GhostShell now
-    auto-downloads a separate full-blown updater app to
-    %APPDATA%/GhostShell/updater/GhostShellUpdater.exe (Flask + pywebview
-    UI, ~30 MB).  At install time we just spawn that updater with the
-    target_dir + channel + version pre-populated via CLI args and
-    install_info.json, then exit.  The updater does everything from
-    there — including downloading the actual new build itself, so
-    GhostShell never needs to touch the .exe payload at all.
+    INSIDE the app exe and shelling out to it, Vispora now
+    auto-downloads a separate full-blown updater app to UPDATER_EXE
+    (Flask + pywebview UI, ~30 MB).  At install time we just spawn that
+    updater with the target_dir + channel + version pre-populated via CLI
+    args and install_info.json, then exit.  The updater does everything
+    from there — including downloading the actual new build itself, so
+    Vispora never needs to touch the .exe payload at all.
 
     Why this is structurally better:
       • The updater has its own UI window so the user can see progress
-        even after GhostShell exits.
-      • The updater is self-contained — it can update GhostShell from
+        even after Vispora exits.
+      • The updater is self-contained — it can update Vispora from
         anywhere, including portable installs, and across moves.
       • install_info.json travels with %APPDATA%, so the updater always
-        knows where the current GhostShell lives.
-      • New GhostShell builds don't ship a stale bundled updater —
+        knows where the current install lives.
+      • New Vispora builds don't ship a stale bundled updater —
         the updater updates ITSELF independently.
 
     The `new_exe` param is now ignored (kept for back-compat) — the
     standalone updater does its own download.
     """
-    log.info("Handing off to standalone GhostShell Updater...")
+    log.info(f"Handing off to standalone {APP_NAME} Updater...")
 
     if not getattr(sys, "frozen", False):
         # Running from source — no in-place swap possible
@@ -1007,12 +1080,12 @@ def _apply_exe_update_async(new_exe: str) -> dict:
             err = get_updater_install_status().get("err") or "unknown"
             return {"ok": False,
                     "err": f"Standalone updater unavailable: {err}.  "
-                           f"Try restarting GhostShell with internet "
+                           f"Try restarting {APP_NAME} with internet "
                            f"available."}
 
     # Refresh install_info.json so the updater has the latest current
     # state (path, channel, version)
-    info = write_install_info()
+    write_install_info()
 
     # Record the version transition for the post-install toast
     s = _load_settings()
@@ -1020,7 +1093,6 @@ def _apply_exe_update_async(new_exe: str) -> dict:
     s["pending_install_version"] = _update_state.get("latest_version") or ""
     _save_settings(s)
 
-    pid = os.getpid()
     current_exe = sys.executable
     channel    = s.get("channel", APP_CHANNEL_DEFAULT)
     server_url = (s.get("server_url") or UPDATE_SERVER_URL_DEFAULT).rstrip("/")
@@ -1053,19 +1125,15 @@ def _apply_exe_update_async(new_exe: str) -> dict:
         log.error(f"  Could not spawn standalone updater: {e}")
         return {"ok": False, "err": f"Could not spawn updater: {e}"}
 
-    log.info("  Standalone updater launched. GhostShell exiting...")
+    log.info(f"  Standalone updater launched. {APP_NAME} exiting...")
     _update_state["installing"] = True
 
     # Give the HTTP response a moment to flush, then die so the updater
     # can swap our exe without a file lock.
-    def _suicide():
-        time.sleep(0.8)
-        log.info("Exiting for update install...")
-        os._exit(0)
-    threading.Thread(target=_suicide, daemon=True).start()
+    threading.Thread(target=_exit_for_update, daemon=True).start()
 
     return {"ok": True,
-            "msg": "GhostShell Updater launching — this window will close and "
+            "msg": f"{APP_NAME} Updater launching — this window will close and "
                    "the updater will handle the rest.",
             "restart_required": True,
             "method": "standalone-updater"}
@@ -1073,7 +1141,7 @@ def _apply_exe_update_async(new_exe: str) -> dict:
 
 def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
     """Legacy fallback: write update.bat and spawn it.  Kept for builds
-    that don't yet have GhostShellUpdater.exe bundled — ie. the user is
+    that don't yet have the standalone updater — ie. the user is
     updating FROM an old build TO a new one, but the old build's bundle
     doesn't include the helper.  Logic is identical to the pre-v3.2.1
     path."""
@@ -1112,7 +1180,7 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
         '@echo off\r\n'
         'setlocal\r\n'
         f'echo STARTED > "{status_path}"\r\n'
-        'echo === GhostShell Update ===\r\n'
+        f'echo === {APP_NAME} Update ===\r\n'
         f'echo Waiting for PID {pid} to exit...\r\n'
         'powershell -NoProfile -Command '
         f'"Wait-Process -Id {pid} -Timeout 60 -ErrorAction SilentlyContinue" >nul 2>nul\r\n'
@@ -1146,7 +1214,7 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
         '  goto try_copy\r\n'
         ')\r\n'
         f'echo FAIL: copy failed after 20 retries > "{status_path}"\r\n'
-        'echo *** Update copy failed — opening existing GhostShell. ***\r\n'
+        f'echo *** Update copy failed — opening existing {APP_NAME}. ***\r\n'
         'goto launch\r\n'
         ':copy_ok\r\n'
         f'echo OK > "{status_path}"\r\n'
@@ -1182,13 +1250,9 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
 
     log.info(f"  Updater script launched (legacy .bat path).")
     _update_state["installing"] = True
-    def _suicide():
-        time.sleep(0.8)
-        log.info("Exiting for update install...")
-        os._exit(0)
-    threading.Thread(target=_suicide, daemon=True).start()
+    threading.Thread(target=_exit_for_update, daemon=True).start()
     return {"ok": True,
-            "msg": "Update installing — GhostShell will restart in a moment.",
+            "msg": f"Update installing — {APP_NAME} will restart in a moment.",
             "restart_required": True,
             "method": "legacy-bat"}
 
@@ -1288,7 +1352,7 @@ def get_update_status() -> dict:
 #
 # Rules (all must pass for auto-install to fire):
 #   • No game in foreground         — would yank the user out mid-match
-#   • GhostShell window not focused — user is actively configuring
+#   • Vispora window not focused    — user is actively configuring
 #   • User input idle for >= 5 min  — keyboard / mouse untouched
 #
 # Manual install (the user clicking "Install now") bypasses this gate —
@@ -1314,8 +1378,11 @@ def _get_user_idle_sec() -> float:
         lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
         if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
             return 0.0
-        tick = ctypes.windll.kernel32.GetTickCount()
-        return max(0.0, (tick - lii.dwTime) / 1000.0)
+        # Both values are DWORD tick counts.  ctypes hands GetTickCount back as
+        # a signed int, which turns negative after 24.9 days of uptime — the
+        # subtraction then clamped to 0 and the user never counted as idle.
+        tick = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
+        return ((tick - lii.dwTime) & 0xFFFFFFFF) / 1000.0
     except Exception:
         return 0.0
 
@@ -1335,13 +1402,11 @@ def _is_game_foreground() -> bool:
         return False
 
 
-def _is_ghostshell_foreground() -> bool:
-    """True if our own window (GhostShell or Vispora, pre/post rename) is
-    in the foreground."""
+def _is_own_window_foreground() -> bool:
+    """True if one of our own windows is in the foreground."""
     try:
         from core.gamepad_mapper import _get_foreground_exe_name
-        exe = (_get_foreground_exe_name() or "").lower()
-        return exe in ("ghostshell.exe", "vispora.exe")
+        return (_get_foreground_exe_name() or "").lower() in OWN_PROCESS_NAMES
     except Exception:
         return False
 
@@ -1352,8 +1417,8 @@ def is_safe_to_install() -> dict:
     reason on defer so the in-app log shows why an update is waiting."""
     if _is_game_foreground():
         return {"safe": False, "reason": "game in foreground"}
-    if _is_ghostshell_foreground():
-        return {"safe": False, "reason": "GhostShell window in foreground"}
+    if _is_own_window_foreground():
+        return {"safe": False, "reason": f"{APP_NAME} window in foreground"}
     idle = _get_user_idle_sec()
     if idle < USER_IDLE_THRESHOLD_SEC:
         return {"safe": False,
@@ -1383,7 +1448,7 @@ def _try_auto_install(quiet: bool = False) -> dict:
     Otherwise returns {ok: False, deferred: True, reason: str} and the
     install will be retried on the next periodic check (or by the
     dedicated safety-gate recheck loop)."""
-    if not _update_state.get("download_complete"):
+    if not _update_state.get("download_complete") or not _update_state.get("update_available"):
         return {"ok": False, "err": "no download to install"}
     s = _load_settings()
     if not s.get("auto_install", False):

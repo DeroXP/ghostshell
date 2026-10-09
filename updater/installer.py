@@ -2,28 +2,28 @@
 
 Two modes:
 
-  • update mode  — GhostShell exists somewhere on disk.  We close any
+  • update mode  — Vispora exists somewhere on disk.  We close any
     running instance, download the new version from the channel
     endpoint, swap the exe, and re-launch.
 
-  • install mode — GhostShell is NOT on disk (or we couldn't find it).
+  • install mode — Vispora is NOT on disk (or we couldn't find it).
     The user picks an install directory; we skip the close step,
     download the channel build, verify, copy to the chosen directory,
     and launch.  Same pipeline minus step 1.
 
 Mode is decided BEFORE the user clicks Install: when the updater
-launches, find_existing_ghostshell() scans common install paths and
-the install_info.json sidecar.  If GhostShell is found anywhere, mode
+launches, find_existing_install() scans common install paths and
+the install_info.json sidecar.  If Vispora is found anywhere, mode
 is "update" with target_exe pre-populated; otherwise "install" and the
 UI shows a directory picker.
 
 Steps (run sequentially, with cancellation checks between each):
-  1. close        — find + close any running GhostShell process
+  1. close        — find + close any running Vispora process
   2. channel      — hit /version/<channel> for the latest build info
   3. download     — pull /download/<channel> with streaming + progress
   4. verify       — SHA-256 against the server-provided hash
   5. install      — backup old exe, copy new exe in place
-  6. launch       — spawn the new GhostShell, exit
+  6. launch       — spawn the new Vispora, exit
 
 Cancellation: every step checks server.is_cancelled() before doing
 expensive work.  Mid-download cancel is supported by checking the flag
@@ -34,12 +34,13 @@ we restore from the backup we made in step 5.
 
 Robustness notes (worth keeping in mind if extending this):
   • The "close" step uses graceful WM_CLOSE first, then falls back to
-    taskkill /F.  Some games hold GhostShell's window handle via the
+    taskkill /F.  Some games hold Vispora's window handle via the
     overlay — graceful close gives them a chance to release cleanly.
   • Download writes to a .part file and atomically renames after the
     SHA passes.  Half-downloads can never end up at the target path.
-  • Backup is timestamped (GhostShell.exe.bak.<ts>) so multiple failed
-    attempts don't overwrite the original.
+  • Backup is timestamped (<exe>.bak.<ts>) so multiple failed attempts
+    don't overwrite the original.  Once an install succeeds, only the
+    backup it just made is kept — older ones are deleted.
   • install_info.json gets rewritten with the new version + path AFTER
     a successful install so a subsequent updater run finds correct
     state even if the user moves the exe.
@@ -50,57 +51,51 @@ import hashlib
 import json
 import os
 import shutil
+import re
 import subprocess
-import sys
 import time
 import urllib.request
 from typing import Optional
 
 from updater import server
+from updater.paths import (APP_NAME, LEGACY_APP_NAME, APP_EXE_NAMES,
+                           UPDATER_DIR, INSTALL_INFO, log as _log)
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────
 
 _CREATE_NO_WINDOW = 0x08000000
 
-# Rename-awareness (Vispora).  The app exe is GhostShell.exe today and will
-# become Vispora.exe in a later release.  This updater (shipped FIRST, while
-# the app is still GhostShell.exe) must understand BOTH names so that, when the
-# app exe is renamed, the already-deployed updater can still find/close/install
-# it.  New name first so an on-disk Vispora.exe wins over a leftover GhostShell.exe.
-APP_EXE_NAMES = ("Vispora.exe", "GhostShell.exe")
-
-
 def pick_app_exe(target_dir: str) -> str:
-    """Return the app-exe path inside target_dir, rename-aware: prefer an
-    existing Vispora.exe, then an existing GhostShell.exe; if neither is on
-    disk yet (fresh install) fall back to GhostShell.exe (the current build's
-    name)."""
+    """Return the app-exe path inside target_dir.  An install that has been
+    updated in place since before the rename still has its exe under the old
+    filename (shortcuts, taskbar pins and the autostart task all point at it),
+    so an existing exe under either name is reused as-is; a fresh install gets
+    Vispora.exe."""
     for name in APP_EXE_NAMES:
         p = os.path.join(target_dir, name)
         if os.path.isfile(p):
             return p
-    return os.path.join(target_dir, "GhostShell.exe")
+    return os.path.join(target_dir, APP_EXE_NAMES[0])
 
 
-# ─── GhostShell discovery (scan PC for existing install) ─────────────
+# ─── Install discovery (scan PC for an existing copy) ────────────────
 
-def find_existing_ghostshell() -> dict:
-    """Locate any installed copy of GhostShell.exe.  Returns:
+def find_existing_install() -> dict:
+    """Locate any installed copy of the app.  Returns:
         {found: bool, path: str, dir: str, source: 'install_info'|'standard'|'',
          channel: str, version: str, candidates: [paths searched]}
 
     Search order, fastest first:
-      1. %APPDATA%/GhostShell/install_info.json — written by GhostShell
+      1. install_info.json in the app's data folder — written by Vispora
          on every launch.  Authoritative when present.  Also gives us
          the user's channel + last known version.
       2. Standard install paths under Program Files, LocalAppData, and
          a couple of common user folders.
 
     We don't do a full disk scan — too slow and intrusive.  If a user
-    keeps GhostShell in a weird place, the UI's directory picker is
+    keeps Vispora in a weird place, the UI's directory picker is
     the escape hatch."""
-    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
     localappdata = os.environ.get("LOCALAPPDATA") or os.path.join(
         os.path.expanduser("~"), "AppData", "Local")
     profile = os.path.expanduser("~")
@@ -108,7 +103,7 @@ def find_existing_ghostshell() -> dict:
     pfx86   = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
 
     # ── 1. install_info.json (canonical) ─────────────────────────
-    info_path = os.path.join(appdata, "GhostShell", "install_info.json")
+    info_path = INSTALL_INFO
     candidates = [f"install_info.json @ {info_path}"]
     if os.path.isfile(info_path):
         try:
@@ -130,24 +125,20 @@ def find_existing_ghostshell() -> dict:
             _log(f"install_info.json parse failed: {e}")
 
     # ── 2. Standard install paths ────────────────────────────────
-    # Rename-aware: probe each location for EITHER Vispora.exe or the legacy
-    # GhostShell.exe (APP_EXE_NAMES), and include the Vispora install dirs too.
-    _dirs = [
-        os.path.join(pf,           "GhostShell"),
-        os.path.join(pfx86,        "GhostShell"),
-        os.path.join(localappdata, "Programs", "GhostShell"),
-        os.path.join(localappdata, "GhostShell"),
-        os.path.join(profile,      "Desktop"),
-        os.path.join(profile,      "Documents", "GhostShell"),
-        os.path.join(profile,      "Downloads"),
-        # v3.2 user dev path
-        os.path.join(profile,      "Documents", "My Games", "ghostshell", "dist"),
-        # Vispora install dirs (post-rename)
-        os.path.join(pf,           "Vispora"),
-        os.path.join(pfx86,        "Vispora"),
-        os.path.join(localappdata, "Programs", "Vispora"),
-        os.path.join(localappdata, "Vispora"),
-        os.path.join(profile,      "Documents", "Vispora"),
+    # Each location is probed under both the current and the pre-rename
+    # folder name, for either exe filename (APP_EXE_NAMES).
+    _dirs = []
+    for _name in (APP_NAME, LEGACY_APP_NAME):
+        _dirs += [
+            os.path.join(pf,           _name),
+            os.path.join(pfx86,        _name),
+            os.path.join(localappdata, "Programs", _name),
+            os.path.join(localappdata, _name),
+            os.path.join(profile,      "Documents", _name),
+        ]
+    _dirs += [
+        os.path.join(profile, "Desktop"),
+        os.path.join(profile, "Downloads"),
     ]
     standard = [os.path.join(_d, _n) for _d in _dirs for _n in APP_EXE_NAMES]
     for p in standard:
@@ -164,7 +155,7 @@ def find_existing_ghostshell() -> dict:
                 "candidates": candidates,
             }
 
-    _log(f"no existing GhostShell found across {len(candidates)} candidates")
+    _log(f"no existing install found across {len(candidates)} candidates")
     return {
         "found":      False,
         "path":       "",
@@ -187,21 +178,13 @@ def default_install_dir() -> str:
     pf = os.environ.get("ProgramFiles", r"C:\Program Files")
     # Probe: can we write to Program Files itself?  If yes we'll be
     # able to create our subdir there.  Otherwise fall back.
-    # Fresh installs get a "Vispora" folder; existing installs in the old
-    # GhostShell folders are still found by find_existing_ghostshell()'s
-    # candidate scan — this default only affects genuinely fresh installs.
+    # This default only affects genuinely fresh installs — an existing one
+    # is found wherever it lives by find_existing_install().
     if os.path.isdir(pf) and os.access(pf, os.W_OK):
-        return os.path.join(pf, "Vispora")
+        return os.path.join(pf, APP_NAME)
     localappdata = os.environ.get("LOCALAPPDATA") or os.path.join(
         os.path.expanduser("~"), "AppData", "Local")
-    return os.path.join(localappdata, "Programs", "Vispora")
-
-
-def _log(msg: str) -> None:
-    try:
-        from updater.main import log
-        log(msg)
-    except Exception: pass
+    return os.path.join(localappdata, "Programs", APP_NAME)
 
 
 def _check_cancelled() -> bool:
@@ -211,17 +194,15 @@ def _check_cancelled() -> bool:
     return False
 
 
-# ─── Step 1: Close running GhostShell ────────────────────────────────
+# ─── Step 1: Close the running app ───────────────────────────────────
 
-def _find_ghostshell_pids(image_name: str = "GhostShell.exe") -> list:
+def _find_app_pids(image_name: str) -> list:
     """Return PIDs of every running process named `image_name`.
 
-    Vispora rename-awareness — this was hardcoded to GhostShell.exe.  It now
-    takes the image name (the basename of --target-exe) so that once the app
-    exe is renamed to Vispora.exe, this updater can STILL find and close the
-    running process before the in-place swap.  Without it, an in-field updater
-    could not terminate a renamed, locked exe and the update would fail —
-    stranding the user on their current build.
+    The caller passes the basename of the exe being replaced rather than a
+    fixed name: an install updated in place since before the rename still
+    runs under its old filename, and a process this can't find is a locked
+    exe the swap would then fail on.
     """
     pids = []
     try:
@@ -234,7 +215,7 @@ def _find_ghostshell_pids(image_name: str = "GhostShell.exe") -> list:
             line = line.strip().strip('"')
             if not line:
                 continue
-            # CSV format: "GhostShell.exe","1234","Console","1","12 K"
+            # CSV format: "Vispora.exe","1234","Console","1","12 K"
             parts = [p.strip('"') for p in line.split('","')]
             if len(parts) >= 2:
                 try: pids.append(int(parts[1]))
@@ -244,20 +225,18 @@ def _find_ghostshell_pids(image_name: str = "GhostShell.exe") -> list:
     return pids
 
 
-def _close_ghostshell(target_exe: str, timeout_s: int = 30) -> dict:
+def _close_app(target_exe: str, timeout_s: int = 30) -> dict:
     """Politely ask the app to close, fall back to taskkill /F.
     Returns {ok, msg}."""
-    # Rename-aware: close the process by the basename of the REAL target exe
-    # (GhostShell.exe today, Vispora.exe after the rename), not a hardcoded name.
-    image = os.path.basename(target_exe) or "GhostShell.exe"
-    pids = _find_ghostshell_pids(image)
+    image = os.path.basename(target_exe) or APP_EXE_NAMES[0]
+    pids = _find_app_pids(image)
     if not pids:
-        _log("no running GhostShell — skipping close step")
+        _log(f"no running {image} — skipping close step")
         return {"ok": True, "msg": "not running", "skipped": True}
 
-    _log(f"GhostShell running, pids={pids}")
+    _log(f"{image} running, pids={pids}")
     server.update_step("close", "active",
-                       f"Closing {len(pids)} GhostShell process(es)…")
+                       f"Closing {len(pids)} {APP_NAME} process(es)…")
 
     # Step A: Graceful close via taskkill (no /F).  This sends WM_CLOSE
     # which webview catches and exits cleanly.
@@ -275,16 +254,16 @@ def _close_ghostshell(target_exe: str, timeout_s: int = 30) -> dict:
     deadline = time.time() + (timeout_s / 2)
     while time.time() < deadline:
         if _check_cancelled(): return {"ok": False, "msg": "cancelled"}
-        remaining = _find_ghostshell_pids(image)
+        remaining = _find_app_pids(image)
         if not remaining:
-            _log("GhostShell exited gracefully")
+            _log(f"{image} exited gracefully")
             return {"ok": True, "msg": f"closed {len(pids)} process(es) gracefully"}
         time.sleep(0.5)
 
     # Step B: Force-close
     _log("graceful close timed out — escalating to taskkill /F")
     server.update_step("close", "active", "Force-closing stuck process…")
-    for pid in _find_ghostshell_pids(image):
+    for pid in _find_app_pids(image):
         try:
             subprocess.run(
                 ["taskkill", "/F", "/PID", str(pid)],
@@ -298,13 +277,13 @@ def _close_ghostshell(target_exe: str, timeout_s: int = 30) -> dict:
     deadline = time.time() + (timeout_s / 2)
     while time.time() < deadline:
         if _check_cancelled(): return {"ok": False, "msg": "cancelled"}
-        if not _find_ghostshell_pids(image):
+        if not _find_app_pids(image):
             return {"ok": True, "msg": "force-closed"}
         time.sleep(0.5)
 
-    remaining = _find_ghostshell_pids(image)
+    remaining = _find_app_pids(image)
     return {"ok": False,
-            "msg": f"could not close GhostShell (pids still alive: {remaining})"}
+            "msg": f"could not close {APP_NAME} (pids still alive: {remaining})"}
 
 
 # ─── Step 2 + 3: Check + download ────────────────────────────────────
@@ -312,7 +291,7 @@ def _close_ghostshell(target_exe: str, timeout_s: int = 30) -> dict:
 def _http_get_json(url: str, timeout: int = 15) -> Optional[dict]:
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": f"GhostShellUpdater/{server.get_state_snapshot()['updater_version']}"})
+            "User-Agent": f"{APP_NAME}Updater/{server.get_state_snapshot()['updater_version']}"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
     except Exception as e:
@@ -349,7 +328,7 @@ def _download(url: str, dest: str, total_hint: int = 0) -> dict:
     downloaded = 0
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": f"GhostShellUpdater/{server.get_state_snapshot()['updater_version']}"})
+            "User-Agent": f"{APP_NAME}Updater/{server.get_state_snapshot()['updater_version']}"})
         with urllib.request.urlopen(req, timeout=60) as r:
             total = int(r.headers.get("Content-Length", 0) or total_hint)
             server.update_progress(0, 0, total, phase="downloading",
@@ -384,6 +363,31 @@ def _download(url: str, dest: str, total_hint: int = 0) -> dict:
 
 
 # ─── Step 5: Install (with backup + rollback) ────────────────────────
+
+def _prune_old_backups(target_exe: str, keep: str) -> None:
+    """Delete the rollback backups earlier updates left next to
+    `target_exe`, keeping only `keep` (the one this run just made).
+
+    Without this every update leaves a full copy of the previous exe
+    behind for good — one dev machine had accumulated 15 of them, ~660 MB.
+    """
+    folder = os.path.dirname(target_exe) or "."
+    is_backup = re.compile(
+        re.escape(os.path.basename(target_exe)) + r"\.bak\.\d+$", re.IGNORECASE).match
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(folder, name)
+        if not is_backup(name) or os.path.normcase(path) == os.path.normcase(keep):
+            continue
+        try:
+            os.remove(path)
+            _log(f"removed old backup {path}")
+        except OSError as e:
+            _log(f"could not remove old backup {path}: {e}")
+
 
 def _install_exe(staged_path: str, target_exe: str) -> dict:
     """Swap the .part file in at target_exe with a backup-and-rollback
@@ -425,6 +429,10 @@ def _install_exe(staged_path: str, target_exe: str) -> dict:
             try: os.remove(staged_path)
             except Exception: pass
             _log(f"installed new exe at {target_exe}")
+            # Only once a fresh backup exists — if this run's backup failed,
+            # the previous one is the only way back.
+            if backup:
+                _prune_old_backups(target_exe, keep=backup)
             return {"ok": True, "msg": f"installed (attempt {attempt+1})",
                     "backup_path": backup}
         except Exception as e:
@@ -461,9 +469,8 @@ def _launch_new(target_exe: str) -> dict:
 
 
 def _update_install_info(target_exe: str, channel: str, version: str) -> None:
-    """Rewrite %APPDATA%/GhostShell/install_info.json with the new state
-    so a future updater run finds it."""
-    from updater.main import INSTALL_INFO
+    """Rewrite install_info.json with the new state so a future updater
+    run finds it."""
     try:
         d = {
             "install_path": target_exe,
@@ -493,16 +500,16 @@ def run_install_pipeline() -> int:
 
     # Sanity: we need both target_exe AND channel before we can install.
     if not st["target_exe"]:
-        server.set_error("No target install path — please pick where GhostShell lives.")
+        server.set_error(f"No target install path — please pick where {APP_NAME} lives.")
         return 2
     if not st["channel"]:
         server.set_error("No release channel — please pick stable or beta.")
         return 2
 
-    # ── Step 1: Close GhostShell (skipped in install mode) ─────
+    # ── Step 1: Close the app (skipped in install mode) ────────
     if _check_cancelled(): return 1
     if mode == "install":
-        # Fresh install — there's no running GhostShell to close.
+        # Fresh install — there's no running app to close.
         # Still ensure the install dir exists, since the user may have
         # typed a path that doesn't yet exist.
         try:
@@ -515,11 +522,11 @@ def run_install_pipeline() -> int:
         server.update_step("close", "skipped",
                             "fresh install — nothing to close")
     else:
-        r = _close_ghostshell(st["target_exe"])
+        r = _close_app(st["target_exe"])
         if not r["ok"]:
             server.update_step("close", "error", r["msg"])
             server.set_error(r["msg"] +
-                             " — please close GhostShell manually and click Retry.")
+                             f" — please close {APP_NAME} manually and click Retry.")
             return 3
         server.update_step("close", "done", r["msg"])
 
@@ -535,15 +542,13 @@ def run_install_pipeline() -> int:
     target_version = info["version"]
     server.update_step("channel", "done",
                        f"Latest on '{st['channel']}': v{target_version}")
-    import threading as _t
     with server._state_lock:
         server._state["target_version"] = target_version
         server._state["channel_check"]  = info
 
     # ── Step 3: Download ────────────────────────────────────────
     if _check_cancelled(): return 1
-    from updater.main import UPDATER_DIR
-    staged = os.path.join(UPDATER_DIR, f"GhostShell-{target_version}.exe")
+    staged = os.path.join(UPDATER_DIR, f"{APP_NAME}-{target_version}.exe")
     server.update_step("download", "active",
                        f"Downloading v{target_version}…")
     dl = _download(info["download_url"], staged,
@@ -600,11 +605,11 @@ def run_install_pipeline() -> int:
         server.set_done()
         return 0
 
-    server.update_step("launch", "active", "Starting new GhostShell…")
+    server.update_step("launch", "active", f"Starting new {APP_NAME}…")
     ln = _launch_new(st["target_exe"])
     if not ln["ok"]:
         server.update_step("launch", "error", ln["err"])
-        server.set_error(f"Install OK but couldn't start the new GhostShell: "
+        server.set_error(f"Install OK but couldn't start the new {APP_NAME}: "
                           f"{ln['err']}.  Launch it manually from "
                           f"{st['target_exe']}.")
         return 8

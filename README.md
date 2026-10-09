@@ -1,38 +1,83 @@
-# GhostShell — Windows 11 Privacy & Performance Suite
+# Vispora
 
-A borderless desktop application for debloating, optimizing, and hardening Windows 11, with an encrypted password vault and a dark hacker-themed UI.
+A Windows 10/11 desktop app for gaming performance, system clean-up and privacy.
+It runs elevated, as a single portable exe: a local Flask backend with a
+borderless WebView2 window on top (pywebview), plus a tray icon.
 
-## Features
+## What it does
 
-- **Debloater** — Remove 40+ bloatware apps, disable telemetry services & scheduled tasks, disable Copilot/Widgets/Cortana, uninstall OneDrive
-- **Hard Optimizer** — Ultimate Performance power plan, CPU priority boost, core parking disable, memory compression off, SSD/NVMe tweaks, Game DVR off, fullscreen optimizations off, GPU scheduling, timer resolution
-- **Network Optimizer** — DNS presets (Cloudflare/Google/Quad9/AdGuard/OpenDNS), Nagle disable, TCP/IP tuning, network throttling off, LSO disable, adapter power management, IPv6 toggle, ping testing
-- **GPU Manager** — NVIDIA detection, clean driver install preparation, telemetry kill, max performance power mode, MSI mode, interrupt priority
-- **Privacy Hardener** — 25+ telemetry registry tweaks, 50+ hosts file blocks, outbound firewall rules, webcam/mic control, Windows Update control, data collection kill
-- **Password Vault** — PIN-protected (4-8 digits), PBKDF2 (600K iterations) key derivation, Fernet (AES-128-CBC) encryption, SQLite storage, search/filter, password generator, encrypted export/import, auto-lock
-- **Temp Cleaner** — User/system temp, prefetch, WU cache, browser caches (Chrome/Firefox/Edge), recycle bin
-- **Full Ghost** — One-click run of all modules in sequence
+**System**
+- **Debloat & optimize** — remove bundled apps, disable telemetry services and
+  tasks, power-plan / scheduler / timer / interrupt tweaks, VBS toggle.
+- **Network** — DNS presets, latency tweaks, per-game QoS, a network-burst monitor.
+- **Privacy** — telemetry policies, hosts-file blocking, outbound firewall rules.
+- **Clean-up** — temp/junk cleaner, a disk-space analyzer, startup manager.
+- **Safety net** — restore points, registry snapshots you can roll back to,
+  a health audit, and automatic recovery from tweaks older builds got wrong.
 
-## Quick Start
+**Gaming**
+- **Game profiles** — detects a running game, applies the gaming profile, and
+  restores the previous state when it exits. Optional background-app pauser,
+  tournament mode and idle mode.
+- **Latency** — a one-click competitive-latency bundle, a read-only Latency
+  Doctor, and per-game advice for the settings only the game itself can change.
+- **GPU** (NVIDIA) — overclocking with stability testing and auto-tune, per-game
+  adaptive tuning, a hard temperature ceiling, crash recovery, driver updates.
+- **Monitoring** — live hardware sensors and frame-time telemetry (PresentMon).
+- **Capture** — instant-replay clips (FFmpeg or OBS), screenshots, stream helper.
+- **Gamepad mapper** — remapping, macros and a virtual controller (ViGEmBus /
+  HidHide). Input remapping can violate a game's anti-cheat rules; that is on you.
+
+**Also**
+- **Password vault** — PIN-protected, PBKDF2 + Fernet, stored locally.
+- **Auto-update** — stable and beta channels, SHA-256-verified downloads,
+  installed by a small standalone updater.
+
+## Run from source
 
 ```bash
 pip install -r requirements.txt
 python app.py
 ```
 
-## Build Single .exe
+Needs Windows and an administrator prompt (the app asks to elevate itself).
+
+## Build
 
 ```bash
 pip install pyinstaller
-pyinstaller build.spec
+pyinstaller build.spec --noconfirm            # dist/Vispora.exe
+pyinstaller updater_helper.spec --noconfirm   # dist/VisporaUpdater.exe
 ```
 
-Output: `dist/GhostShell.exe` — portable, requests admin on launch.
+Release binaries are not kept in this repo; they are published through the
+release server, which serves `version.json` + the exe per channel.
 
-## Safety
+## Layout
 
-- Creates System Restore Point before modifications
-- Backs up registry keys before every change
-- All changes logged to `%APPDATA%/GhostShell/ghostshell.log`
-- Vault encrypted with PBKDF2 + Fernet (AES)
-- Everything runs locally — no data leaves your machine
+| Path | What lives there |
+| --- | --- |
+| `app.py` | Flask routes, window/tray lifecycle, startup sequence |
+| `config.py` | Names, paths and the static tweak lists |
+| `core/` | One module per feature |
+| `static/`, `templates/` | The UI (plain JS/CSS, no build step) |
+| `updater/` | The standalone updater app (its own Flask + pywebview window) |
+| `cloud/` | Optional FastAPI licensing / trial backend — see `cloud/README.md` |
+
+## Data
+
+Everything the app saves lives in `%APPDATA%\Vispora` (settings, vault, logs,
+registry backups, snapshots). Clips go to `Videos\Vispora\Clips`, screenshots
+to `Pictures\Vispora\Screenshots`.
+
+The app was called GhostShell until 3.5.0. The first launch of a current build
+moves `%APPDATA%\GhostShell` to `%APPDATA%\Vispora` and takes over whatever an
+older build left on the system (autostart task, firewall and QoS rules, the
+hosts-file block). An existing `Videos\GhostShell` or `Pictures\GhostShell`
+folder keeps being used as it is — those are the user's own files. The old name
+survives in the code only as `LEGACY_APP_NAME` in `config.py` and
+`updater/paths.py`.
+
+## License
+
+MIT — see `LICENSE`.

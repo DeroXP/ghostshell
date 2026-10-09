@@ -51,7 +51,7 @@
     </div>
 
     <!-- New-install splash — shown only in install mode.  Tells the
-         user the updater couldn't find an existing GhostShell and
+         user the updater couldn't find an existing Vispora and
          it's switched into installer mode. -->
     <div class="install-banner" id="install-banner" style="display:none">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -80,7 +80,7 @@
     </div>
 
     <!-- Install-directory picker — shown when:
-           • mode = install (no existing GhostShell found), OR
+           • mode = install (no existing Vispora found), OR
            • mode = update  but the user clicks "Change…" -->
     <div id="controls-targetdir" class="controls" style="display:none">
         <label for="target-dir-input">Install&nbsp;path</label>
@@ -108,7 +108,7 @@
     <div class="actions">
         <button id="btn-cancel" onclick="onCancel()" class="danger">Cancel</button>
         <button id="btn-start"  onclick="onStart()"  class="primary">Install Update</button>
-        <!-- v1.2.0 — the install pipeline auto-launches GhostShell at step 6,
+        <!-- v1.2.0 — the install pipeline auto-launches Vispora at step 6,
              so we don't surface a manual "Launch" button (clicking it would
              just spawn a second instance).  After phase=done we briefly show
              a success banner + countdown, then auto-close. -->

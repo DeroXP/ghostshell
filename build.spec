@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# GhostShell PyInstaller Build Spec
+# Vispora PyInstaller Build Spec
 # Usage: pyinstaller build.spec
 
 import os
@@ -13,8 +13,12 @@ base_path = os.path.dirname(os.path.abspath(SPEC))
 # whether vgamepad is installed system-wide or in a venv.
 _vgamepad_datas = []
 try:
-    import vgamepad as _vg
-    _vg_dir = os.path.dirname(_vg.__file__)
+    # Located WITHOUT importing it.  vgamepad connects to the ViGEmBus driver
+    # the moment it is imported, so on a build machine without the driver the
+    # import failed, the except below swallowed it, and the build shipped
+    # with no ViGEmClient.dll — virtual-controller mode dead, no warning.
+    import importlib.util as _ilu
+    _vg_dir = os.path.dirname(_ilu.find_spec("vgamepad").origin)
     _vg_win = os.path.join(_vg_dir, 'win')
     if os.path.isdir(_vg_win):
         for _root, _dirs, _files in os.walk(_vg_win):
@@ -52,11 +56,25 @@ except Exception:
     pass
 
 
-# v3.2.2 — the standalone updater (GhostShellUpdater.exe) is NO LONGER
-# bundled inside GhostShell.exe.  GhostShell auto-downloads it from the
-# Railway release server on first run, into %APPDATA%/GhostShell/updater/.
-# Why: lets the updater iterate independently of GhostShell's version,
-# and keeps GhostShell.exe small.  See updater_helper.spec + core/updater.py
+# Say what is missing.  The blocks above fail silently by design (the
+# features are optional at run time), which is the wrong default for a build
+# that is about to be handed to other people.  (PyAudioWPatch's compiled half
+# is a top-level module in current releases, which PyInstaller finds on its
+# own — so an empty sweep above does not mean it is absent.)
+import importlib.util as _ilu
+_optional = ("vgamepad", "pyaudiowpatch", "mss", "obsws_python", "websocket", "pystray", "psutil")
+_missing = [m for m in _optional if _ilu.find_spec(m) is None]
+print(f"build.spec: {len(_vgamepad_datas)} vgamepad data file(s) bundled; "
+      f"optional packages missing on this machine: {', '.join(_missing) or 'none'}")
+if _missing or not _vgamepad_datas:
+    print("build.spec: WARNING - the features that need them will not work in this build")
+
+
+# v3.2.2 — the standalone updater (VisporaUpdater.exe) is NO LONGER
+# bundled inside Vispora.exe.  Vispora auto-downloads it from the
+# Railway release server on first run, into %APPDATA%/Vispora/updater/.
+# Why: lets the updater iterate independently of Vispora's version,
+# and keeps Vispora.exe small.  See updater_helper.spec + core/updater.py
 # (ensure_updater_installed_async).
 
 

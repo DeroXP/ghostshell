@@ -1,6 +1,6 @@
 """Optional-dependency orchestrator (v3.2-beta.7).
 
-GhostShell relies on several third-party tools for features that require
+Vispora relies on several third-party tools for features that require
 either kernel-level work (driver installs) or system-level tracing (ETW).
 Some of these can be auto-downloaded + auto-installed; others need the
 user to grab them from the vendor's site.  This module unifies the
@@ -42,7 +42,7 @@ write a `pending_restart` flag that the UI polls and renders a
 
 State persistence
 ─────────────────
-  %APPDATA%/GhostShell/dependencies_state.json
+  %APPDATA%/Vispora/dependencies_state.json
     { last_check_at, installed_versions, pending_restart, opt_outs[] }
 """
 from __future__ import annotations
@@ -50,7 +50,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import tempfile
 import threading
 import time
 import urllib.request
@@ -86,7 +85,7 @@ HIDHIDE_SVC      = "HidHide"
 # RTSS — Guru3D's URLs aren't stable so we just direct users to the page
 RTSS_PAGE_URL    = "https://www.guru3d.com/files-details/rtss-rivatuner-statistics-server-download.html"
 
-# WebView2 runtime — the Chromium engine that renders GhostShell's UI.
+# WebView2 runtime — the Chromium engine that renders Vispora's UI.
 # Ships with Win11 + most Win10-with-Edge, but absent on LTSC / stripped
 # installs where pywebview silently falls back to the ancient MSHTML
 # engine and the modern UI breaks + loses GPU acceleration.  winget
@@ -96,7 +95,7 @@ WEBVIEW2_PACKAGE_ID = "Microsoft.EdgeWebView2Runtime"
 
 # LibreHardwareMonitor — required for CPU package temp on modern desktops.
 # Windows has no native CPU temp API; the WMI namespace LHM exposes is what
-# every monitoring tool (HWiNFO, GhostShell, Task Manager Beta, etc.) reads.
+# every monitoring tool (HWiNFO, Vispora, Task Manager Beta, etc.) reads.
 # Free + open-source; available via winget.  Unlike RTSS, LHM doesn't
 # overlay anything in-game and doesn't fight Afterburner.
 LHM_PACKAGE_ID   = "LibreHardwareMonitor.LibreHardwareMonitor"
@@ -253,7 +252,7 @@ def _lhm_process_running() -> bool:
 
 def _detect_lhm() -> dict:
     """Three-state probe: installed on disk, WMI namespace registered,
-    process currently running.  GhostShell needs the WMI namespace to
+    process currently running.  Vispora needs the WMI namespace to
     read CPU temp; the binary launches the provider on startup."""
     exe = _find_lhm_exe()
     return {
@@ -370,7 +369,7 @@ def start_lhm() -> dict:
         return {"ok": True, "already_running": True,
                 "wmi_registered": _lhm_wmi_namespace_present()}
     _ensure_lhm_settings_minimized(exe)
-    # Spawn detached so it outlives GhostShell.  Don't use CREATE_NO_WINDOW
+    # Spawn detached so it outlives Vispora.  Don't use CREATE_NO_WINDOW
     # — LHM is a GUI app, it needs to attach to the interactive desktop
     # for the tray icon.  DETACHED_PROCESS unhooks lifetime, which is
     # what we actually care about.
@@ -442,10 +441,10 @@ def install_webview2() -> dict:
             time.sleep(1)
             installed = _detect_webview2_runtime().get("installed")
             return {"ok": True,
-                    # New runtime needs a GhostShell restart to bind to it.
+                    # New runtime needs a Vispora restart to bind to it.
                     "needs_restart": not installed or True,
                     "log_path": log_path,
-                    "message": "WebView2 runtime installed — restart GhostShell "
+                    "message": "WebView2 runtime installed — restart Vispora "
                                "to render with the modern engine"}
         return {"ok": False, "needs_restart": False, "log_path": log_path,
                 "message": f"winget install failed (rc={r.returncode}): "
@@ -566,50 +565,6 @@ def _detect_rtss() -> dict:
     }
 
 
-def start_rtss() -> dict:
-    """Launch RTSS if installed but not running.  Returns whether the
-    shared memory mapping appears within ~6 s — the canonical sign that
-    RTSS has fully started and is ready to be read."""
-    exe_path = _find_rtss_exe()
-    if not exe_path:
-        return {"ok": False, "message": "RTSS not installed"}
-
-    # Check if it's already running before we start a second instance
-    try:
-        from core import frame_telemetry
-        if frame_telemetry._rtss_mapping_exists():
-            return {"ok": True, "already_running": True}
-    except Exception: pass
-
-    # Spawn detached so it survives GhostShell exiting.  CREATE_NEW_CONSOLE
-    # is intentionally NOT set — RTSS attaches to the user's interactive
-    # desktop session (TaskTray + OSD).  Without DETACHED_PROCESS Windows
-    # would tie its lifetime to our subprocess.
-    DETACHED_PROCESS = 0x00000008
-    try:
-        subprocess.Popen(
-            [exe_path],
-            shell=False,
-            cwd=os.path.dirname(exe_path),
-            creationflags=(DETACHED_PROCESS | _CREATE_NO_WINDOW),
-            close_fds=True,
-        )
-    except Exception as e:
-        return {"ok": False, "message": f"Popen failed: {e}"}
-
-    # Wait up to 6 s for the shared memory mapping to come up
-    try:
-        from core import frame_telemetry
-        for _ in range(12):
-            time.sleep(0.5)
-            if frame_telemetry._rtss_mapping_exists():
-                return {"ok": True, "running": True}
-    except Exception: pass
-    return {"ok": True, "running": False,
-            "message": "RTSS launched but shared memory not yet visible "
-                       "(might need user interactive session — restart Windows or login)"}
-
-
 # ─── Download helper ─────────────────────────────────────────────────
 
 def _download(url: str, dest: str, progress_cb: Optional[Callable] = None) -> bool:
@@ -619,7 +574,7 @@ def _download(url: str, dest: str, progress_cb: Optional[Callable] = None) -> bo
     tmp = dest + ".part"
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": "GhostShell-Dependencies/1.0"})
+            "User-Agent": "Vispora-Dependencies/1.0"})
         with urllib.request.urlopen(req, timeout=60) as r:
             total = int(r.headers.get("Content-Length", 0) or 0)
             _set_progress(downloaded=0, total=total)
@@ -778,7 +733,7 @@ def _save_install_log(dep_key: str, command: list, rc, stdout: str, stderr: str)
 
 def _winget_path() -> Optional[str]:
     """Resolve a working winget binary.  PATH lookup works on most
-    interactive sessions, but when GhostShell runs elevated under a
+    interactive sessions, but when Vispora runs elevated under a
     different token the user-scoped WindowsApps path can be missing.
     Falls back to the known absolute paths."""
     # 1. PATH lookup
@@ -907,7 +862,7 @@ def install_ffmpeg() -> dict:
             return {"ok": True, "needs_restart": False,
                     "log_path": log_path,
                     "message": "FFmpeg installed (PATH refresh may need a "
-                               "new shell — restart GhostShell after this "
+                               "new shell — restart Vispora after this "
                                "install batch)"}
         return {"ok": False, "needs_restart": False,
                 "log_path": log_path,
@@ -917,123 +872,6 @@ def install_ffmpeg() -> dict:
         return {"ok": False, "needs_restart": False,
                 "log_path": log_path,
                 "message": "winget install timed out (>15 min)"}
-    except Exception as e:
-        return {"ok": False, "needs_restart": False,
-                "log_path": log_path,
-                "message": str(e)}
-
-
-def install_rtss() -> dict:
-    """Auto-install RTSS (RivaTuner Statistics Server) via winget, then
-    launch it.  v3.2-beta.9 adds:
-      • robust winget binary lookup (PATH + LocalAppData fallback)
-      • full stdout/stderr capture to %APPDATA%/GhostShell/install_logs/
-      • post-install launch of RTSS.exe (autostart doesn't fire in
-        non-interactive admin contexts — we trigger it ourselves)
-      • returns {installed, running, log_path} so the UI can show the
-        right state and offer 'Start RTSS' if needed."""
-    # If RTSS is already running, we're done.  If it's only installed
-    # (file on disk) but not running, still try to start it before
-    # falling through to a re-install.
-    state = _detect_rtss()
-    if state.get("running"):
-        return {"ok": True, "already_installed": True, "running": True,
-                "needs_restart": False,
-                "message": "RTSS already running"}
-    if state.get("installed") and not state.get("running"):
-        # Don't re-install — just launch
-        launch = start_rtss()
-        return {"ok": True, "already_installed": True,
-                "running": launch.get("running", False),
-                "needs_restart": False,
-                "message": launch.get("message")
-                            or ("RTSS launched"
-                                if launch.get("running")
-                                else "RTSS installed; launch attempted but shared memory not yet visible")}
-
-    # Not installed.  Use winget.
-    winget = _winget_path()
-    if not winget:
-        return {"ok": False, "needs_restart": False,
-                "message": "winget not available on this system. Install "
-                           "the App Installer from Microsoft Store, or use "
-                           "the Guru3D download link below."}
-
-    _set_progress(current_step="Installing RTSS via winget (Guru3D.RTSS)…")
-    install_cmd = [
-        winget, "install",
-        "--exact",
-        "--id", "Guru3D.RTSS",
-        "--silent",
-        "--accept-source-agreements",
-        "--accept-package-agreements",
-        "--disable-interactivity",
-        "--scope", "machine",
-    ]
-    log_path = ""
-    try:
-        r = subprocess.run(
-            install_cmd,
-            capture_output=True, text=True,
-            creationflags=_CREATE_NO_WINDOW,
-            timeout=600,
-        )
-        log_path = _save_install_log("rtss-winget", install_cmd, r.returncode,
-                                      r.stdout, r.stderr)
-
-        # winget exit codes (from winget's Common/AppInstallerSharedLib):
-        #   0           = success
-        #   -1978335189 = APPINSTALLER_CLI_ERROR_PACKAGE_ALREADY_INSTALLED
-        #   -1978335212 = APPINSTALLER_CLI_ERROR_NO_APPLICABLE_INSTALLER
-        if r.returncode == -1978335212:
-            # Retry without machine scope
-            install_cmd_user = [
-                winget, "install",
-                "--exact",
-                "--id", "Guru3D.RTSS",
-                "--silent",
-                "--accept-source-agreements",
-                "--accept-package-agreements",
-                "--disable-interactivity",
-            ]
-            r = subprocess.run(
-                install_cmd_user,
-                capture_output=True, text=True,
-                creationflags=_CREATE_NO_WINDOW,
-                timeout=600,
-            )
-            log_path = _save_install_log("rtss-winget-user", install_cmd_user,
-                                          r.returncode, r.stdout, r.stderr)
-
-        if r.returncode == 0 or r.returncode == -1978335189:
-            # Installed.  RTSS's autostart entry only fires at next user
-            # login (HKLM\Run or HKCU\Run depending on scope).  We've
-            # got the user logged in NOW, so just launch it ourselves —
-            # which also confirms the install actually worked.
-            _set_progress(current_step="Starting RTSS…")
-            # Give the filesystem a beat to settle after install
-            time.sleep(1.5)
-            launch = start_rtss()
-            running = launch.get("running", False)
-            if running:
-                return {"ok": True, "needs_restart": False,
-                        "running": True,
-                        "log_path": log_path,
-                        "message": "RTSS installed and started"}
-            return {"ok": True, "needs_restart": False,
-                    "running": False,
-                    "log_path": log_path,
-                    "message": "RTSS installed but the OSD service didn't come up. "
-                               "Click 'Start RTSS' in the diagnostic panel, or "
-                               "restart Windows to trigger its autostart."}
-        return {"ok": False, "needs_restart": False,
-                "log_path": log_path,
-                "message": f"winget install failed (rc={r.returncode}): "
-                           f"{((r.stderr or '') or (r.stdout or ''))[:200]}"}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "needs_restart": False,
-                "log_path": log_path,
-                "message": "winget install timed out (>10 min)"}
     except Exception as e:
         return {"ok": False, "needs_restart": False,
                 "log_path": log_path,
@@ -1110,7 +948,7 @@ DEPENDENCIES = [
     {
         "key":          "hidhide",
         "label":        "HidHide (hide physical controllers from games)",
-        "description":  "Optional helper for the gamepad mapper — hides your physical controller so the game only sees GhostShell's virtual one, avoiding double-input. Signed driver.",
+        "description":  "Optional helper for the gamepad mapper — hides your physical controller so the game only sees Vispora's virtual one, avoiding double-input. Signed driver.",
         "auto_install": True,
         "detect":       lambda: _detect_hidhide().get("installed"),
         "install":      install_hidhide,
@@ -1119,7 +957,7 @@ DEPENDENCIES = [
     {
         "key":          "ffmpeg",
         "label":        "FFmpeg (clipping + screenshot encoding)",
-        "description":  "Used by GhostShell's Capture feature to record gameplay clips and encode them efficiently (NVENC if you have an NVIDIA GPU). Installed silently via winget (Gyan.FFmpeg.Essentials package). Without it, the clipper is unavailable; screenshots still work via mss.",
+        "description":  "Used by Vispora's Capture feature to record gameplay clips and encode them efficiently (NVENC if you have an NVIDIA GPU). Installed silently via winget (Gyan.FFmpeg.Essentials package). Without it, the clipper is unavailable; screenshots still work via mss.",
         "auto_install": True,
         "browser_only": False,
         "detect":       lambda: _detect_ffmpeg().get("installed"),
@@ -1130,7 +968,7 @@ DEPENDENCIES = [
     {
         "key":          "webview2",
         "label":        "WebView2 Runtime (modern UI engine)",
-        "description":  "The Chromium engine that renders GhostShell's interface with GPU acceleration. Ships with Windows 11 and most Windows 10 installs, but is missing on LTSC / stripped builds where the UI would otherwise fall back to the ancient MSHTML engine (no GPU compositing, broken layout). Installed silently via winget (Microsoft.EdgeWebView2Runtime). Requires a GhostShell restart to take effect.",
+        "description":  "The Chromium engine that renders Vispora's interface with GPU acceleration. Ships with Windows 11 and most Windows 10 installs, but is missing on LTSC / stripped builds where the UI would otherwise fall back to the ancient MSHTML engine (no GPU compositing, broken layout). Installed silently via winget (Microsoft.EdgeWebView2Runtime). Requires a Vispora restart to take effect.",
         "auto_install": True,
         "browser_only": False,
         "detect":       lambda: _detect_webview2_runtime().get("installed"),
@@ -1149,7 +987,7 @@ DEPENDENCIES = [
         "browser_url":  "https://github.com/LibreHardwareMonitor/LibreHardwareMonitor",
         "size":         "~3 MB via winget",
     },
-    # beta.15 — RTSS is no longer a managed dependency.  GhostShell hasn't
+    # beta.15 — RTSS is no longer a managed dependency.  Vispora hasn't
     # used RTSS for frame telemetry since beta.5 (replaced by PresentMon
     # 1.x + 2.x), and any auto-install / auto-launch behaviour ended up
     # fighting Afterburner's OC offsets on user systems where both were
@@ -1327,7 +1165,7 @@ def check_on_boot() -> dict:
     v3.2-beta.9 — also runs a "post-install nudge" pass: deps that are
     installed on disk but not active right now (RTSS in particular) get
     launched here.  Without this nudge, a user that installed RTSS via
-    a previous GhostShell boot would see 'not running' forever until
+    a previous Vispora boot would see 'not running' forever until
     they manually started it."""
     from config import APP_NAME
 
@@ -1410,7 +1248,7 @@ def has_pending_restart() -> dict:
     own   = bool(state.get("pending_restart"))
     win   = _windows_pending_reboot()
     info  = {"pending":     own or win,
-             "by_ghostshell": own,
+             "by_vispora": own,
              "by_windows":  win,
              "details":     state.get("pending_restart", {})}
     return info
@@ -1422,7 +1260,7 @@ def request_restart_now() -> dict:
     try:
         subprocess.run(
             ["shutdown", "/r", "/t", "10",
-             "/c", "GhostShell installed driver updates that need a restart."],
+             "/c", "Vispora installed driver updates that need a restart."],
             creationflags=_CREATE_NO_WINDOW,
         )
         # Clear our own pending marker so we don't re-prompt
@@ -1437,7 +1275,7 @@ def request_restart_now() -> dict:
 def cancel_pending_restart() -> dict:
     """User clicked 'I'll restart later'.  Clear our marker so the
     banner stops appearing this session — Windows' own marker will
-    persist and reappear next time GhostShell starts."""
+    persist and reappear next time Vispora starts."""
     state = _load_state()
     state.pop("pending_restart", None)
     state["restart_deferred_at"] = time.time()

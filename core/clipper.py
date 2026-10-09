@@ -5,7 +5,7 @@ Architecture
 A long-running FFmpeg subprocess captures the chosen target continuously
 and writes a rolling ring of 10-second segments to a temp directory.
 When the user saves a clip we concat the last N seconds from the ring
-into a single mp4 in %USERPROFILE%/Videos/GhostShell/Clips/.
+into a single mp4 in %USERPROFILE%/Videos/Vispora/Clips/.
 
 **It is always recording when the toggle is on.** save_clip() does NOT
 start recording — it copies what's already buffered.  Setting "60s
@@ -57,7 +57,7 @@ from ctypes import wintypes
 from datetime import datetime
 from typing import Optional
 
-from config import APPDATA_DIR
+from config import APPDATA_DIR, user_media_dir
 from core.utils import get_logger, atomic_write_json
 
 log = get_logger(__name__)
@@ -65,10 +65,7 @@ log = get_logger(__name__)
 
 # ─── Paths + defaults ───────────────────────────────────────────────
 
-CLIPS_DIR = os.path.join(
-    os.environ.get("USERPROFILE") or os.path.expanduser("~"),
-    "Videos", "GhostShell", "Clips",
-)
+CLIPS_DIR     = user_media_dir("Videos", "Clips")
 BUFFER_DIR    = os.path.join(APPDATA_DIR, "clipper_buffer")
 SETTINGS_PATH = os.path.join(APPDATA_DIR, "clipper_settings.json")
 
@@ -299,13 +296,13 @@ _CREATE_NO_WINDOW            = 0x08000000
 _THREAD_PRIORITY_HIGHEST       = 2
 _THREAD_PRIORITY_TIME_CRITICAL = 15
 
-# Saved priority-class of the GhostShell process before we boosted it,
+# Saved priority-class of the Vispora process before we boosted it,
 # so stop_buffer can restore it cleanly.  None when no boost is active.
 _prev_priority_class: Optional[int] = None
 
 
 def _boost_self_priority(target_class: int = _HIGH_PRIORITY_CLASS) -> Optional[int]:
-    """Bump the running GhostShell process to a higher Windows priority
+    """Bump the running Vispora process to a higher Windows priority
     class so the clipper's ffmpeg subprocess + WASAPI bridge thread
     don't get scheduled away by a fullscreen game.
 
@@ -425,53 +422,6 @@ _audio_cache_data: Optional[dict] = None
 _audio_cache_lock = threading.Lock()
 
 
-def _invalidate_audio_cache() -> None:
-    """Force a re-probe on the next list_audio_devices() call.
-    Wired into Refresh buttons in the UI so plugging in a new mic /
-    enabling Stereo Mix mid-session doesn't require restarting."""
-    global _audio_cache_ts, _audio_cache_data
-    with _audio_cache_lock:
-        _audio_cache_ts = 0.0
-        _audio_cache_data = None
-
-
-def auto_detect_loopback() -> dict:
-    """Find the best system-audio loopback device on this machine.
-
-    Returns {found: bool, name: str, all: [str], matched_token: str}.
-    `name` is the exact dshow device name to pass to `-i audio=<name>`.
-    Empty `name` means no loopback driver is installed — UI should
-    prompt user to install VB-CABLE / Voicemeeter / etc.
-
-    Backed by the same 60-s cache as list_audio_devices() so repeated
-    status polls don't spawn ffmpeg over and over.
-    """
-    info = list_audio_devices()
-    if not info.get("ok"):
-        return {"found": False, "name": "", "all": [],
-                "matched_token": "", "err": info.get("err", "")}
-    audio = info.get("audio") or []
-    names = [d.get("name", "") for d in audio]
-    names_lower = [(n, n.lower()) for n in names]
-    loopback_candidates = []
-    matched_token = ""
-    chosen = ""
-    for token in _LOOPBACK_PRIORITY:
-        for n, nlow in names_lower:
-            if token in nlow:
-                if not chosen:
-                    chosen = n
-                    matched_token = token
-                if n not in loopback_candidates:
-                    loopback_candidates.append(n)
-    return {
-        "found":         bool(chosen),
-        "name":          chosen,
-        "all":           loopback_candidates,
-        "matched_token": matched_token,
-    }
-
-
 def list_audio_devices(force_refresh: bool = False) -> dict:
     """Probe FFmpeg's dshow device list.  Returns {ok, inputs} where
     inputs is a list of {name, kind: 'audio'|'video', alternative_name}.
@@ -560,13 +510,6 @@ _mon_cache_data: Optional[list] = None
 _mon_cache_lock = threading.Lock()
 
 
-def _invalidate_monitor_cache() -> None:
-    global _mon_cache_ts, _mon_cache_data
-    with _mon_cache_lock:
-        _mon_cache_ts = 0.0
-        _mon_cache_data = None
-
-
 def list_monitors(force_refresh: bool = False) -> list:
     """Enumerate all displays via Win32.  Returns
     [{index, x, y, w, h, physical_w, physical_h, primary, name}].
@@ -583,10 +526,10 @@ def list_monitors(force_refresh: bool = False) -> list:
     v3.3.0-beta.5: cached for 30 s.  Monitor topology rarely changes
     at runtime; if the user moves displays around they can re-open
     the Capture page (which can call this with force_refresh=True
-    in future) or restart GhostShell.
+    in future) or restart Vispora.
 
     Order is stable across calls within a session; if the user
-    rearranges displays in Windows Settings, GhostShell needs a
+    rearranges displays in Windows Settings, Vispora needs a
     restart for the changes to flow."""
     global _mon_cache_ts, _mon_cache_data
     now = time.time()
@@ -728,15 +671,6 @@ def _foreground_window_info() -> dict:
     except Exception: return {}
 
 
-def _monitor_for_point(x: int, y: int) -> Optional[dict]:
-    """Pick the monitor that contains (x, y).  Returns None if outside
-    all monitors (rare — desktop fills the virtual screen)."""
-    for m in list_monitors():
-        if m["x"] <= x < m["x"] + m["w"] and m["y"] <= y < m["y"] + m["h"]:
-            return m
-    return None
-
-
 def _resolve_capture_region(target: str) -> dict:
     """Map the configured capture_target setting into a concrete
     capture region or window-title for FFmpeg.  Returns:
@@ -821,63 +755,6 @@ def _resolve_capture_region(target: str) -> dict:
 
 
 # ─── Foreground-watcher: restart FFmpeg when target changes ─────────
-
-def _target_watcher(stop_event: threading.Event):
-    """Run in a thread.  Polls the resolved target every 2 s; if the
-    rect or title materially changed, restart FFmpeg with the new
-    target.  Only does work for the auto-follow + game-window modes;
-    static monitor / desktop targets never change."""
-    last_rect = None
-    last_title = ""
-    while not stop_event.is_set():
-        try:
-            with _state_lock:
-                if not _state["running"]:
-                    return
-                target_cfg = _load_settings().get("capture_target", TARGET_AUTO_FOLLOW)
-
-            if (target_cfg not in (TARGET_AUTO_FOLLOW, TARGET_GAME_WINDOW)
-                    and not target_cfg.startswith(TARGET_MONITOR_PREFIX)):
-                # static target — nothing to watch
-                stop_event.wait(2.0)
-                continue
-            if target_cfg.startswith(TARGET_MONITOR_PREFIX) or target_cfg == TARGET_DESKTOP:
-                stop_event.wait(2.0)
-                continue
-
-            region = _resolve_capture_region(target_cfg)
-            cur_rect  = (region["x"], region["y"], region["w"], region["h"]) \
-                          if region["mode"] == "monitor" else None
-            cur_title = region["title"]
-
-            if last_rect is None and last_title == "":
-                last_rect, last_title = cur_rect, cur_title
-                stop_event.wait(2.0)
-                continue
-
-            changed = False
-            if region["mode"] == "monitor" and cur_rect != last_rect:
-                changed = True
-            if region["mode"] == "title" and cur_title != last_title:
-                changed = True
-
-            if changed:
-                log.info(f"capture target changed → "
-                         f"restarting FFmpeg ({region['source']})")
-                _restart_internal()
-                last_rect, last_title = cur_rect, cur_title
-        except Exception as e:
-            log.debug(f"target watcher tick failed: {e}")
-        stop_event.wait(2.0)
-
-
-def _restart_internal():
-    """Internal: stop current FFmpeg and re-spawn with the same buffer
-    settings.  Used by the watcher when the capture target changes."""
-    stop_buffer()
-    time.sleep(0.5)
-    start_buffer()
-
 
 # ─── Buffer lifecycle ───────────────────────────────────────────────
 
@@ -1100,7 +977,7 @@ def start_buffer() -> dict:
     # When the user has the OBS toggle on AND OBS is connected, the
     # recording pipeline runs INSIDE OBS — we configure the scene +
     # replay buffer over the WebSocket instead of spawning our own
-    # FFmpeg.  GhostShell's _state["running"] still flips True so
+    # FFmpeg.  Vispora's _state["running"] still flips True so
     # the rest of the UI / hotkeys behave the same.
     try:
         from core import obs_backend as _obs
@@ -1173,6 +1050,15 @@ def start_buffer() -> dict:
     target_cfg = settings.get("capture_target", TARGET_AUTO_FOLLOW)
     region = _resolve_capture_region(target_cfg)
 
+    # Every start records into a fresh session folder and nothing used to
+    # remove the previous ones (~90 MB each at default settings, forever).
+    # Only one buffer runs at a time, so whatever is here now is dead.
+    try:
+        for stale in os.listdir(BUFFER_DIR):
+            if stale.startswith("session_"):
+                shutil.rmtree(os.path.join(BUFFER_DIR, stale), ignore_errors=True)
+    except OSError:
+        pass
     seg_dir = os.path.join(BUFFER_DIR, f"session_{int(time.time())}")
     os.makedirs(seg_dir, exist_ok=True)
 
@@ -1225,7 +1111,7 @@ def start_buffer() -> dict:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             # CREATE_NO_WINDOW | HIGH_PRIORITY_CLASS — keeps ffmpeg
-            # ahead of normal background work even when GhostShell's
+            # ahead of normal background work even when Vispora's
             # own priority gets bounced (some AV / cleanup tools
             # reset child process priorities).
             creationflags=_CREATE_NO_WINDOW | _HIGH_PRIORITY_CLASS,
@@ -1374,7 +1260,7 @@ def stop_buffer() -> dict:
                 try: proc.kill()
                 except Exception: pass
     _proc = None
-    # Restore GhostShell's normal priority class now that the realtime
+    # Restore Vispora's normal priority class now that the realtime
     # capture pipeline is done.  Leaving it at HIGH would slow down
     # everything else in Windows (Spotify, browsers, etc).
     _restore_self_priority(_prev_priority_class)
@@ -1627,10 +1513,14 @@ def list_recent(limit: int = 30) -> list:
 def delete_clip(path: str) -> dict:
     if not path: return {"ok": False, "err": "no path"}
     out_dir = _load_settings().get("output_dir") or CLIPS_DIR
-    abs_path = os.path.abspath(path)
-    abs_root = os.path.abspath(out_dir)
-    if not abs_path.startswith(abs_root + os.sep) and abs_path != abs_root:
+    abs_path = os.path.realpath(path)
+    abs_root = os.path.realpath(out_dir)
+    if not abs_path.startswith(abs_root + os.sep):
         return {"ok": False, "err": "path outside clips dir"}
+    # output_dir is a setting, so "inside it" alone proves little — only ever
+    # delete the kind of file the clip list shows.
+    if not abs_path.lower().endswith((".mp4", ".mkv", ".mov")):
+        return {"ok": False, "err": "not a clip file"}
     try:
         os.remove(abs_path)
         return {"ok": True}

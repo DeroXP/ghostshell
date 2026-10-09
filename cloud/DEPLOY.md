@@ -1,4 +1,4 @@
-# Deploying GhostShell-Cloud to Railway
+# Deploying Vispora-Cloud to Railway
 
 This walks through deploying the `cloud/` subdirectory to Railway with a
 managed Postgres database.  Total time: ~10 minutes.
@@ -9,14 +9,14 @@ managed Postgres database.  Total time: ~10 minutes.
 
 - A [Railway](https://railway.app) account (Hobby plan is fine — Phase A
   fits comfortably under the free tier).
-- The GhostShell repo on GitHub.
+- This repo on GitHub.
 
 ---
 
 ## 2.  Create the project
 
 1. Railway dashboard → **New Project** → **Deploy from GitHub repo**.
-2. Pick your `ghostshell` repo.
+2. Pick this repo.
 3. After the initial empty deploy, open the service → **Settings** →
    **Source** → **Root Directory** → set it to `cloud`.
    - This is what tells Railway to build `cloud/` instead of the whole
@@ -66,7 +66,7 @@ First deploy takes ~90s.
 Watch the **Deploy logs** for:
 
 ```
-INFO     Booting GhostShell-Cloud v0.1.0
+INFO     Booting Vispora-Cloud v0.1.0
 INFO     Ready to serve
 INFO     Uvicorn running on http://0.0.0.0:8080
 ```
@@ -85,10 +85,10 @@ Generate a public URL: API service → **Settings** → **Networking** →
 export URL=https://your-service.up.railway.app
 
 curl -s $URL/healthz
-# → {"ok":true,"service":"ghostshell-cloud","version":"0.1.0","db":"ok"}
+# → {"ok":true,"service":"vispora-cloud","version":"0.1.0","db":"ok"}
 
 curl -s $URL/
-# → {"service":"ghostshell-cloud","version":"0.1.0","docs":"/docs",…}
+# → {"service":"vispora-cloud","version":"0.1.0","docs":"/docs",…}
 
 # Register a fake device (use any UUIDv4):
 DID=$(python -c "import uuid; print(uuid.uuid4())")
@@ -104,7 +104,7 @@ If all three succeed, Phase A is live.
 
 ## 7.  Wire it into the client
 
-Once you have the public URL, in GhostShell:
+Once you have the public URL, in Vispora:
 
 > **Settings → Cloud → Cloud URL** → paste the Railway domain → **Save**.
 

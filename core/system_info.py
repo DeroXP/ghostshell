@@ -70,12 +70,18 @@ def _get_gpu_info() -> dict:
     # Try nvidia-smi first — most reliable for NVIDIA
     r2 = run_cmd(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader,nounits"])
     if r2["ok"] and r2["out"]:
-        parts = r2["out"].split(",")
+        # One line per GPU — take the first; a second card's line used to end
+        # up inside the VRAM field and crash the dashboard with a ValueError.
+        parts = r2["out"].splitlines()[0].split(",")
         if len(parts) >= 3:
+            try:
+                vram_gb = round(int(parts[2].strip()) / 1024, 1)
+            except ValueError:
+                vram_gb = 0
             return {
                 "name": parts[0].strip(),
                 "driver": parts[1].strip(),
-                "vram_gb": round(int(parts[2].strip()) / 1024, 1),
+                "vram_gb": vram_gb,
                 "status": "OK",
             }
 

@@ -10,7 +10,7 @@ Overall flow:
   4. reset_oc() → fully revert to stock
   5. run_stability_test() → JS-side WebGL kicks off; Python polls nvidia-smi
   6. auto_overclock() → step up in increments, test stability, save best safe profile
-  7. save/load/apply_profile() → JSON in APPDATA; applied on GhostShell startup
+  7. save/load/apply_profile() → JSON in APPDATA; applied on Vispora startup
 
 Safety rails:
   * Core offset clamped to +250 MHz max (most GPUs stable up to +150 MHz)
@@ -65,7 +65,7 @@ def _clamp(val, lo, hi):
 
 
 # v2.9.3 — detect other OC tools running.
-# Symptom: GhostShell's NVAPI writes return OK but `clocks.max.graphics` /
+# Symptom: Vispora's NVAPI writes return OK but `clocks.max.graphics` /
 # `clocks.max.memory` don't change.  The most common cause is MSI Afterburner
 # (or its RTSS companion, EVGA Precision, ASUS GPU Tweak, etc.) running in
 # the background and re-asserting its own offsets every few seconds.
@@ -153,7 +153,7 @@ def get_oc_diagnostic() -> dict:
 
 def detect_oc_tools_running() -> dict:
     """Scan running processes for known GPU OC / monitoring tools that
-    may override or conflict with GhostShell's NVAPI writes.
+    may override or conflict with Vispora's NVAPI writes.
 
     Returns:
         {'ok': bool, 'tools': [{'exe': 'msiafterburner.exe', 'name': '...'}, ...],
@@ -508,6 +508,13 @@ def read_live_state() -> dict:
     }
 
 
+def _mhz(v) -> str:
+    """Format an offset read back from NVAPI as "+35".  The read-back is None
+    when the driver wouldn't answer; formatting that with :+d raised and
+    turned the whole apply into an HTTP 500."""
+    return f"{v:+d}" if isinstance(v, int) else "?"
+
+
 def verify_oc_applied(
     target_core_offset: int,
     target_mem_offset: int,
@@ -553,7 +560,11 @@ def verify_oc_applied(
 
     expected_core_max = baseline_core_max + int(target_core_offset) if baseline_core_max > 0 else 0
     expected_mem_max = baseline_mem_max + int(target_mem_offset) if baseline_mem_max > 0 else 0
-    expected_power_w = int(round(baseline_power_w * target_power_pct / 100)) if baseline_power_w > 0 else 0
+    check_power = target_power_pct is not None    # None: the caller left the limit alone
+    if not check_power:
+        target_power_pct = 100
+    expected_power_w = (int(round(baseline_power_w * target_power_pct / 100))
+                        if (baseline_power_w > 0 and check_power) else 0)
 
     # ── NVAPI read-back is the PRIMARY source of truth ──────────────────────
     # On Blackwell, nvidia-smi `clocks.max.graphics` and `clocks.max.memory`
@@ -622,7 +633,7 @@ def verify_oc_applied(
     if not core_match and target_core_offset != 0:
         if nvapi_available and not core_nvapi_match:
             warnings.append(
-                f"Core: NVAPI did not store the offset (got {nvapi_core_vf_offset:+d}, want {target_core_offset:+d} MHz). "
+                f"Core: NVAPI did not store the offset (got {_mhz(nvapi_core_vf_offset)}, want {target_core_offset:+d} MHz). "
                 f"Likely cause: another OC tool (Afterburner, RTSS, Precision X1) is overriding it. "
                 f"Close it and try again."
             )
@@ -634,8 +645,8 @@ def verify_oc_applied(
     if not mem_match and target_mem_offset != 0:
         if nvapi_available and not mem_nvapi_match:
             warnings.append(
-                f"Memory: NVAPI did not store the offset (got {nvapi_mem_offset:+d}, want {target_mem_offset:+d} MHz). "
-                f"Likely cause: another OC tool overriding GhostShell."
+                f"Memory: NVAPI did not store the offset (got {_mhz(nvapi_mem_offset)}, want {target_mem_offset:+d} MHz). "
+                f"Likely cause: another OC tool overriding Vispora."
             )
         elif not nvapi_available:
             warnings.append(
@@ -653,7 +664,7 @@ def verify_oc_applied(
                 live = f", live {actual_core_cur} MHz" if actual_core_cur else ""
                 return f"✓ NVAPI offset {nvapi_core_vf_offset:+d} MHz applied{live}"
             return f"✓ max {actual_core_max} MHz"
-        return f"NVAPI offset {nvapi_core_vf_offset if nvapi_core_vf_offset is not None else '?':+d} MHz, expected {target_core_offset:+d} MHz"
+        return f"NVAPI offset {_mhz(nvapi_core_vf_offset)} MHz, expected {target_core_offset:+d} MHz"
 
     def _mem_msg():
         if mem_match:
@@ -661,7 +672,7 @@ def verify_oc_applied(
                 live = f", live {actual_mem_cur} MHz" if actual_mem_cur else ""
                 return f"✓ NVAPI offset {nvapi_mem_offset:+d} MHz applied{live}"
             return f"✓ max {actual_mem_max} MHz"
-        return f"NVAPI offset {nvapi_mem_offset if nvapi_mem_offset is not None else '?':+d} MHz, expected {target_mem_offset:+d} MHz"
+        return f"NVAPI offset {_mhz(nvapi_mem_offset)} MHz, expected {target_mem_offset:+d} MHz"
 
     def _power_msg():
         if power_match:
@@ -706,15 +717,21 @@ def verify_oc_applied(
 # Apply / reset
 # ═══════════════════════════════════════════════════════════════════════════
 
-def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0, power_pct: int = 100) -> dict:
+def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0,
+             power_pct: Optional[int] = 100) -> dict:
     """Apply core/memory clock offsets and power limit.
 
     Args:
         core_offset_mhz: offset added to stock boost clock (0 = stock)
         mem_offset_mhz: offset added to stock memory clock (0 = stock)
-        power_pct: power limit as percentage of default (100 = stock)
+        power_pct: power limit as percentage of default.  100 means "set it
+                   to stock" — NOT "don't care".  Pass None to leave the limit
+                   exactly as it is; callers that only mean to move the clocks
+                   (Adaptive Tuning, crash step-down, tuning probes) must, or
+                   they silently undo a limit the user raised.
 
-    Returns dict with per-step results.
+    Returns dict with per-step results.  `ok` is True only if the clock
+    offsets were actually written.
     """
     cap = detect_gpu_oc_capability()
     if not cap["ok"] or cap["vendor"] != "nvidia":
@@ -723,6 +740,11 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0, power_pct: int =
     # Clamp
     core_offset_mhz = _clamp(int(core_offset_mhz), -500, MAX_CORE_OFFSET_MHZ)
     mem_offset_mhz = _clamp(int(mem_offset_mhz), -1000, MAX_MEM_OFFSET_MHZ)
+    keep_power = power_pct is None
+    if keep_power:
+        # For bookkeeping only (the watchdog's target, the "applied" block
+        # returned below): carry forward whatever limit is already in force.
+        power_pct = get_applied_oc()["power"]
     power_pct = _clamp(int(power_pct), MIN_POWER_PCT, MAX_POWER_PCT)
 
     limits = cap["limits"]
@@ -746,8 +768,8 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0, power_pct: int =
             "ok": False,
             "err": (
                 "Close these tools (and their startup entries) before applying "
-                "OC in GhostShell.  They re-assert their own clock offsets every "
-                "few seconds and will silently override GhostShell's writes."
+                "OC in Vispora.  They re-assert their own clock offsets every "
+                "few seconds and will silently override Vispora's writes."
             ),
         })
         log.warning(f"OC tool conflict detected: {labels}")
@@ -757,7 +779,9 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0, power_pct: int =
     steps.append({"name": "Enable persistence mode", "ok": r["ok"], "out": r.get("out", ""), "err": r.get("err", "")})
 
     # 2. Power limit
-    if stock_power_w > 0 and power_pct != 100:
+    if keep_power:
+        steps.append({"name": "Power limit left unchanged", "ok": True, "err": ""})
+    elif stock_power_w > 0 and power_pct != 100:
         target_w = int(stock_power_w * power_pct / 100)
         if max_power_w > 0:
             target_w = min(target_w, max_power_w)
@@ -772,12 +796,14 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0, power_pct: int =
             steps.append({"name": f"Reset power limit → {stock_power_w}W (default)", "ok": r["ok"], "err": r.get("err", "")})
 
     applied_method = "none"
+    nvapi_usable = False
 
     # 3 & 4. Core + Memory clock offsets — prefer NVAPI because it modifies
     #        the actual clock offset rather than a simple cap.
     if _nvapi is not None:
         nvapi_avail = _nvapi.is_available()
         if nvapi_avail.get("ok"):
+            nvapi_usable = True
             nvapi_result = _nvapi.set_offsets(core_offset_mhz=core_offset_mhz, mem_offset_mhz=mem_offset_mhz)
             if nvapi_result.get("ok"):
                 applied_method = "nvapi"
@@ -800,7 +826,7 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0, power_pct: int =
     verification = verify_oc_applied(
         core_offset_mhz,
         mem_offset_mhz,
-        power_pct,
+        None if keep_power else power_pct,
         stock_core_max_mhz=stock_core_max,
         stock_mem_max_mhz=stock_mem_max,
         stock_power_w=stock_power_w,
@@ -850,15 +876,27 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0, power_pct: int =
     )
     # v3.3.1-beta.4: kick the watchdog so it re-asserts these offsets
     # if the driver / another OC tool drops them.  Even runs when
-    # GhostShell's window is minimized — daemon thread, no UI gating.
+    # Vispora's window is minimized — daemon thread, no UI gating.
     # We activate even if verification failed because the user
     # explicitly requested these offsets; if NVAPI's accepting writes
     # but the boost ceiling didn't move, the watchdog won't fix that
     # particular bug but it also won't make things worse.
     if core_offset_mhz != 0 or mem_offset_mhz != 0 or power_pct != 100:
         _activate_oc_watchdog(core_offset_mhz, mem_offset_mhz, power_pct)
+    else:
+        # Stock was requested.  Without this the watchdog kept its previous
+        # target armed and wrote the old overclock straight back within 5 s.
+        _deactivate_oc_watchdog()
+    # This used to be True no matter what, and callers act on it: Adaptive
+    # Tuning records the offset as applied and climbs on from there.  Without
+    # a usable NVAPI the only thing this call can have changed is the power
+    # limit — fine when stock offsets were what was asked for, a failure
+    # otherwise.
+    offsets_written = (applied_method == "nvapi"
+                       or (core_offset_mhz == 0 and mem_offset_mhz == 0 and not nvapi_usable))
     return {
-        "ok": True,
+        "ok": offsets_written,
+        "err": "" if offsets_written else "Clock offsets were not applied — see the step list",
         "applied": {
             "core_offset_mhz": core_offset_mhz,
             "mem_offset_mhz": mem_offset_mhz,
@@ -935,6 +973,12 @@ def emergency_reset_oc(reason: str = "unspecified") -> dict:
     crash detection probe tick — never blocks more than ~3 seconds total.
     """
     log.warning(f"EMERGENCY RESET requested (reason: {reason})")
+    # Disarm the drift watchdog before touching anything: its whole job is to
+    # re-apply the last requested offsets when they disappear, which is
+    # exactly what this reset is about to make happen.  Left armed, it undid
+    # a temp-ceiling trip or crash recovery on its next 5 s tick.
+    try: _deactivate_oc_watchdog()
+    except Exception: pass
     started = time.time()
     steps = []
     TIME_BUDGET_S = 3.0     # hard wall-clock cap (docstring promise)
@@ -1052,6 +1096,10 @@ def reset_oc() -> dict:
     if cap["vendor"] != "nvidia":
         return {"ok": False, "err": "Reset only supported on NVIDIA", "steps": []}
 
+    # Tell the watchdog to stop re-asserting offsets BEFORE resetting them —
+    # done afterwards, a tick landing mid-reset wrote the old offsets back.
+    _deactivate_oc_watchdog()
+
     steps = []
 
     # NVAPI: aggressive reset — VF curve to 0 AND every P-state freqDelta to 0
@@ -1065,7 +1113,7 @@ def reset_oc() -> dict:
             })
         if not r.get("ok"):
             steps.append({
-                "name": "NVAPI: nothing reset — try restarting GhostShell as Administrator",
+                "name": "NVAPI: nothing reset — try restarting Vispora as Administrator",
                 "ok": False, "err": r.get("err", ""),
             })
 
@@ -1082,9 +1130,32 @@ def reset_oc() -> dict:
         steps.append({"name": f"Reset power limit → {default_w}W", "ok": r["ok"], "err": r.get("err", "")})
 
     log.info("OC fully reset to stock")
-    # v3.3.1-beta.4: tell the watchdog to stop re-asserting offsets.
-    _deactivate_oc_watchdog()
     return {"ok": True, "steps": steps}
+
+
+def get_applied_oc() -> dict:
+    """What this app last applied and is holding: {core, mem, power, active}.
+    Stock (0 / 0 / 100, active False) when it is holding nothing."""
+    with _active_oc_lock:
+        return dict(_active_oc)
+
+
+def is_tuning_active() -> bool:
+    """True while an Auto-OC or Benchmark-Tune run, a stability probe or a
+    stock-vs-OC benchmark is in progress — i.e. while the offsets on the card
+    are an experiment rather than something the user settled on."""
+    return any(bool(sess.get("active")) for sess in
+               (_auto_oc_session, _benchmark_oc_session, _stability_session, _benchmark_state))
+
+
+def _offsets_read_back_as_stock() -> Optional[bool]:
+    """Ask the driver whether both offsets are really back at 0.
+    None when it can't be read (no NVAPI) — then there is nothing to confirm with."""
+    rb = get_current_offsets()
+    if not rb.get("ok"):
+        return None
+    return (abs(int(rb.get("core_offset_mhz") or 0)) <= 5
+            and abs(int(rb.get("mem_offset_mhz") or 0)) <= 15)
 
 
 def _reset_to_stock_hard(attempts: int = 3) -> "tuple[bool, dict]":
@@ -1105,6 +1176,11 @@ def _reset_to_stock_hard(attempts: int = 3) -> "tuple[bool, dict]":
             nvapi_ok = any(s.get("ok") and "NVAPI" in s.get("name", "") for s in steps)
             smi_ok   = any(s.get("ok") and "nvidia-smi" in s.get("name", "").lower() for s in steps)
             landed = bool(nvapi_ok or smi_ok)
+            # "Some step reported ok" is not the same as "the card is at
+            # stock" — a power-only or memory-only step counted.  When the
+            # driver can tell us, believe the read-back instead.
+            if landed and _offsets_read_back_as_stock() is False:
+                landed = False
             detail["attempts"].append({
                 "kind": "reset_oc", "landed": landed,
                 "steps": [{"name": s.get("name"), "ok": s.get("ok")} for s in steps],
@@ -1116,8 +1192,9 @@ def _reset_to_stock_hard(attempts: int = 3) -> "tuple[bool, dict]":
         # Escalate to the emergency path (also drops power) before retrying.
         try:
             er = emergency_reset_oc(reason="reset_to_stock_retry")
-            detail["attempts"].append({"kind": "emergency_reset", "landed": bool(er.get("ok"))})
-            if er.get("ok"):
+            er_landed = bool(er.get("ok")) and _offsets_read_back_as_stock() is not False
+            detail["attempts"].append({"kind": "emergency_reset", "landed": er_landed})
+            if er_landed:
                 return True, detail
         except Exception as e:
             detail["attempts"].append({"kind": "emergency_reset", "landed": False, "err": str(e)[:160]})
@@ -1135,7 +1212,7 @@ def _reset_to_stock_hard(attempts: int = 3) -> "tuple[bool, dict]":
 # Precision X1) can't silently overwrite them, AND so an unexpected driver
 # event (mode-set, crash recovery, p-state reload, full-screen game's HDR
 # toggle) can't quietly drop our offset back to 0.  Runs continuously as a
-# daemon thread — fires even when GhostShell's window is minimized, which
+# daemon thread — fires even when Vispora's window is minimized, which
 # is the whole point of this feature.
 #
 # Drift detection: every 5 s we read `clocks.max.graphics` + `clocks.max.memory`
@@ -1180,7 +1257,33 @@ def _prune_expired_pauses() -> None:
                if exp is not None and now > exp]
     for s in expired:
         del _oc_watchdog_pause_sources[s]
-        log.warning(f"OC watchdog pause source '{s}' auto-expired (orphaned session) — resuming")
+        if s in _TUNING_PAUSE_SOURCES:
+            log.warning(f"OC watchdog pause source '{s}' auto-expired — the tuning run "
+                        f"was abandoned mid-way; resetting to stock")
+            threading.Thread(target=_abandon_orphaned_tuning, args=(s,),
+                             daemon=True, name="oc-orphan-reset").start()
+        else:
+            log.warning(f"OC watchdog pause source '{s}' auto-expired (orphaned session) — resuming")
+
+
+# How long a tuning run may go without asking for its next step before it
+# counts as abandoned.  Each call to *_next() renews the pause, so this only
+# has to outlast the longest single step (a 60 s validation plus settle time).
+_TUNING_STEP_TIMEOUT_S = 10 * 60
+_TUNING_PAUSE_SOURCES = {"auto_oc": "_auto_oc_session", "bench_oc": "_benchmark_oc_session"}
+
+
+def _abandon_orphaned_tuning(source: str) -> None:
+    """The UI driving a tuning run went away without finishing or cancelling
+    it.  Whatever offset it was probing is still on the card, unvalidated —
+    and merely resuming the watchdog would have it ENFORCE that offset (and
+    re-apply it if it crashes).  End the run and go back to stock."""
+    sess = globals().get(_TUNING_PAUSE_SOURCES.get(source, ""))
+    if isinstance(sess, dict):
+        sess["active"] = False
+    ok, _detail = _reset_to_stock_hard(attempts=2)
+    log.warning(f"Abandoned {source} run cleaned up — reset to stock "
+                f"{'confirmed' if ok else 'could NOT be confirmed'}")
 
 
 def _activate_oc_watchdog(core_offset_mhz: int, mem_offset_mhz: int, power_pct: int) -> None:
@@ -1215,7 +1318,7 @@ def _deactivate_oc_watchdog() -> None:
 
 def pause_oc_watchdog(source: str, max_age_s: Optional[float] = None) -> dict:
     """beta.14 — let another subsystem (typically AT) own the offsets
-    temporarily without GhostShell's stock watchdog stepping on them.
+    temporarily without Vispora's stock watchdog stepping on them.
 
     Multiple sources stack — the watchdog only resumes work once every
     pause source has called resume_oc_watchdog().  Source names are
@@ -1253,13 +1356,6 @@ def is_oc_watchdog_paused() -> bool:
     with _oc_watchdog_pause_lock:
         _prune_expired_pauses()
         return bool(_oc_watchdog_pause_sources)
-
-
-def get_oc_watchdog_pause_sources() -> list:
-    """For diagnostics + the watchdog status panel."""
-    with _oc_watchdog_pause_lock:
-        _prune_expired_pauses()
-        return sorted(_oc_watchdog_pause_sources)
 
 
 def _oc_watchdog_loop(stop: threading.Event) -> None:
@@ -1807,7 +1903,14 @@ def end_stability_probe() -> dict:
         ) if sess["samples"] else 0.0,
     }
     log.info(f"Stability probe ended: stable={stable}, max_temp={sess['max_temp']}, fps={avg_fps:.1f}, variance={variance_pct:.0f}%, reason={sess['abort_reason'] or 'OK'}")
+    _last_probe_verdict.clear()
+    _last_probe_verdict.update(verdict)
     return verdict
+
+
+# The most recent end_stability_probe() result.  The tuning state machines
+# read measured FPS from here rather than trusting the client to echo it back.
+_last_probe_verdict: dict = {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1977,6 +2080,10 @@ def auto_oc_start(core_step_mhz: int = 75, mem_step_mhz: int = 250, max_steps: i
         "done": False,
         "best": None,
         "validated": False,
+        # Must be cleared per session: left over from an earlier aborted run,
+        # these made every later run end in "aborted" and discard its result.
+        "aborted": False,
+        "abort_reason": "",
         "stock_core_max": cap.get("limits", {}).get("core_max_mhz", 0),
         "stock_mem_max": cap.get("limits", {}).get("mem_max_mhz", 0),
         # v3.1.1 — session-wide crash hardening
@@ -2289,8 +2396,12 @@ def auto_oc_next(prev_result: dict = None) -> dict:
             # still reports "stable".  Tuning mem by crash point alone
             # overshoots into that error-correction zone — the classic reason
             # auto-OC'd memory measures WORSE than a hand-tuned lower value.
-            _fps   = float(prev_result.get("avg_fps") or 0.0)
-            _valid = bool(prev_result.get("frame_data_valid", _fps > 0)) and _fps > 0
+            # The UI only echoes back stable / reason / kind / max_temp, so
+            # reading FPS from prev_result alone left this gate permanently
+            # blind (fps always 0).  Use the probe's own verdict.
+            _fps   = float(prev_result.get("avg_fps") or _last_probe_verdict.get("avg_fps") or 0.0)
+            _valid = bool(prev_result.get("frame_data_valid",
+                                          _last_probe_verdict.get("frame_data_valid", _fps > 0))) and _fps > 0
             sess.setdefault("mem_perf", []).append({
                 "mem": int(sess["current_mem"]), "fps": _fps,
                 "valid": _valid, "stable": bool(stable),
@@ -2630,12 +2741,18 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                 "log": sess["log"],
             }
 
-    # Step 4: Apply the next test OC and return
+    # Step 4: Apply the next test OC and return.  The power limit is the one
+    # maxed in the pre-step and saved with the result — passing 100 here put
+    # it back to stock, so the saved core/mem/power combination was never
+    # the one that had been tested.
     apply_oc(
         core_offset_mhz=sess["current_core"],
         mem_offset_mhz=sess["current_mem"],
-        power_pct=100,
+        power_pct=sess.get("pre_max_power_pct", 100),
     )
+    # Still being driven — push the abandoned-run deadline out.
+    try: pause_oc_watchdog("auto_oc", max_age_s=_TUNING_STEP_TIMEOUT_S)
+    except Exception: pass
 
     duration = _phase_duration(sess["phase"])
     label = _phase_label(sess)
@@ -2963,6 +3080,9 @@ def benchmark_oc_next(prev_result: Optional[dict] = None) -> dict:
     sess = _benchmark_oc_session
     if not sess["active"]:
         return {"ok": False, "err": "No benchmark session active"}
+    # Still being driven — push the abandoned-run deadline out.
+    try: pause_oc_watchdog("bench_oc", max_age_s=_TUNING_STEP_TIMEOUT_S)
+    except Exception: pass
 
     phase = sess["phase"]
 
@@ -3185,7 +3305,7 @@ def benchmark_oc_next(prev_result: Optional[dict] = None) -> dict:
             sess["core_winner"] = 0
             log.warning("Benchmark-Tune: no stable core offset found, using +0")
         # Apply the winning core offset before starting the memory ladder
-        apply_oc(core_offset_mhz=sess["core_winner"], mem_offset_mhz=0, power_pct=100)
+        apply_oc(core_offset_mhz=sess["core_winner"], mem_offset_mhz=0, power_pct=None)
         sess["phase"]    = "mem_each"
         sess["step_idx"] = 0
         phase = "mem_each"
@@ -3229,7 +3349,7 @@ def benchmark_oc_next(prev_result: Optional[dict] = None) -> dict:
     if sess["phase"] == "final_validate":
         # Apply the combined winner and run a longer validation pass
         apply_oc(core_offset_mhz=sess["core_winner"],
-                 mem_offset_mhz=sess["mem_winner"], power_pct=100)
+                 mem_offset_mhz=sess["mem_winner"], power_pct=None)
         sess["_pending_core"] = sess["core_winner"]
         sess["_pending_mem"]  = sess["mem_winner"]
         return {

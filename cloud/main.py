@@ -1,4 +1,4 @@
-"""GhostShell-Cloud — FastAPI service entry point.
+"""Vispora-Cloud — FastAPI service entry point.
 
 Phase A — anonymous device identity layer:
   • /healthz                          Railway health check
@@ -50,7 +50,7 @@ logging.basicConfig(
     level=settings.log_level.upper(),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-log = logging.getLogger("ghostshell-cloud")
+log = logging.getLogger("vispora-cloud")
 
 # Scrub client IPs out of every log line before they hit stdout / Railway.
 # Installed once at import time so even boot-time logs go through the filter.
@@ -60,7 +60,7 @@ install_privacy_filter()
 # ─── Lifespan: pool + migrations ─────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info(f"Booting GhostShell-Cloud v{settings.version}")
+    log.info(f"Booting Vispora-Cloud v{settings.version}")
     if using_insecure_dev_peppers():
         log.warning("Insecure dev peppers active — set FINGERPRINT_PEPPER, "
                     "EMAIL_PEPPER, LICENSE_KEY_PEPPER, IP_PEPPER before deploy")
@@ -100,7 +100,7 @@ app.include_router(playtime.router)
 
 
 # ─── Global error handler ────────────────────────────────────────────────
-# Mirrors GhostShell client's policy: every error returns clean JSON, never
+# Mirrors Vispora client's policy: every error returns clean JSON, never
 # an HTML stack trace.  Makes the client-side reporter happy.
 @app.exception_handler(Exception)
 async def _err_unhandled(request: Request, exc: Exception):
@@ -120,7 +120,7 @@ async def _err_unhandled(request: Request, exc: Exception):
 @app.get("/")
 async def root() -> dict:
     return {
-        "service": "ghostshell-cloud",
+        "service": "vispora-cloud",
         "version": settings.version,
         "docs":    "/docs",
         "health":  "/healthz",

@@ -1,4 +1,4 @@
-"""WizTree-style disk space analyzer.
+r"""WizTree-style disk space analyzer.
 
 Scans a drive top-to-bottom in a worker thread, builds a folder-size
 tree, and exposes drill-down aggregates the UI can render into a
@@ -49,8 +49,8 @@ Deletion safety
 ---------------
 delete_paths() refuses:
   • Paths inside C:\Windows, C:\Program Files, C:\Program Files (x86)
-  • The currently-running GhostShell exe + its directory
-  • %APPDATA%/GhostShell (use the integrity_scan path for that)
+  • The currently-running Vispora exe + its directory
+  • %APPDATA%/Vispora (use the integrity_scan path for that)
   • Anything > 50 GB total in a single call
   • More than 100 paths in a single call
 Every delete is logged to disk_analyzer_delete_log.json (ring 200).
@@ -62,6 +62,7 @@ from __future__ import annotations
 import heapq
 import json
 import os
+import re
 import string
 import subprocess
 import sys
@@ -106,7 +107,7 @@ _DELETE_MAX_PATHS     = 100
 # the confirm dialog still shows total size before firing.
 
 # Paths we refuse to touch under any circumstances.  beta.20 narrowed
-# this to *core Windows OS dirs* + *GhostShell's own state* + drive
+# this to *core Windows OS dirs* + *Vispora's own state* + drive
 # roots.  Program Files is no longer blocked, so user-installed games
 # (Steam in Program Files\Steam, Riot in C:\Riot Games, etc) can be
 # deleted via the analyzer.
@@ -115,7 +116,7 @@ _DELETE_MAX_PATHS     = 100
 # substring (prefix + sep) get checked.  The contains-prefix check in
 # _is_deny_listed also blocks any parent path that would *wipe* one
 # of these — e.g. selecting C:\Users still trips the deny because it
-# would also delete %APPDATA%/GhostShell.
+# would also delete %APPDATA%/Vispora.
 def _build_deny_prefixes() -> list:
     win = os.environ.get("WINDIR") or r"C:\Windows"
     # Subdirectories of C:\Windows that hold actual OS files.  Most
@@ -136,10 +137,10 @@ def _build_deny_prefixes() -> list:
         # Distribution that DON'T contain any core subdir stay
         # deletable.  Tested: see _deny_v2_smoke.py.
         *(os.path.join(win, sub) for sub in win_core_subs),
-        # GhostShell's own state — we manage this, don't let the user
+        # Vispora's own state — we manage this, don't let the user
         # accidentally nuke their vault / profiles / install_info.
         APPDATA_DIR,
-        # Currently running GhostShell exe — block its dir.
+        # Currently running Vispora exe — block its dir.
         os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else None,
         # PyInstaller _MEI* extraction dir — block it explicitly even
         # though the dir name is randomized.
@@ -742,7 +743,7 @@ def _new_folder_node(path: str, name: str) -> dict:
 
 
 def _long_path(p: str) -> str:
-    """Prepend the long-path prefix when needed.  Windows API accepts
+    r"""Prepend the long-path prefix when needed.  Windows API accepts
     `\\?\C:\very\long\path` and bypasses MAX_PATH=260."""
     if p.startswith("\\\\?\\"):
         return p
@@ -773,6 +774,21 @@ def _get_volume_serial(path: str) -> Optional[int]:
 
 # ─── Deletion (with safety caps) ─────────────────────────────────────
 
+def _canonical(path: str) -> str:
+    r"""realpath() with any `\\?\` / `\\?\UNC\` long-path prefix removed.
+
+    realpath keeps that prefix when its input had one, and a prefixed path
+    matches none of the drive-letter entries in the deny list — so
+    `\\?\C:\Users\me\AppData\Roaming\Vispora` walked straight past it.
+    The scanner itself produces such paths for long directory names."""
+    real = os.path.realpath(path)
+    if real.upper().startswith("\\\\?\\UNC\\"):
+        return "\\\\" + real[8:]
+    if real.startswith("\\\\?\\"):
+        return real[4:]
+    return real
+
+
 def _is_deny_listed(path: str) -> tuple[bool, str]:
     """True if `path` is under any deny prefix, IS a deny prefix, or
     CONTAINS a deny prefix (i.e. deleting `path` would also delete
@@ -783,15 +799,19 @@ def _is_deny_listed(path: str) -> tuple[bool, str]:
 
     beta.19 — added the "contains a deny prefix" check.  Without it,
     selecting C:\\Users in the treemap and clicking Delete would feed
-    shutil.rmtree the whole user dir, taking %APPDATA%/GhostShell and
+    shutil.rmtree the whole user dir, taking %APPDATA%/Vispora and
     every other protected child with it.  The original one-directional
     check only caught the inverse case (paths *inside* a deny zone)."""
     try:
-        real = os.path.realpath(path).lower().rstrip(os.sep)
+        real = _canonical(path).lower().rstrip(os.sep)
     except OSError:
         return True, "path could not be resolved"
     if not real:
         return True, "empty path after resolution"
+    # The deny list is written as drive-letter paths, so anything else can't
+    # be checked against it — and `\\localhost\C$\Windows` is the C: drive.
+    if not re.match(r"^[a-z]:", real):
+        return True, "not a local drive path"
     # Bare drive root — refuse outright.  os.path.splitdrive returns
     # ('C:', '\\') for 'C:\\'; the rstrip above makes it 'c:'.  A real
     # path with depth always has at least one os.sep after the drive.
@@ -866,7 +886,11 @@ def delete_paths(paths: list, to_recycle_bin: bool = False) -> dict:
             rejected.append({"path": p, "reason": f"protected path ({why})"})
             continue
         try:
-            real = os.path.realpath(p)
+            # A junction / symlink is deleted as a LINK (see _hard_delete_one).
+            # Resolving it first, as this used to, handed the delete its
+            # target instead — removing the link removed what it pointed at.
+            is_link = _is_reparse_point(p)
+            real = p if is_link else os.path.realpath(p)
             # Re-check deny on the resolved path too
             denied2, why2 = _is_deny_listed(real)
             if denied2:
@@ -880,7 +904,9 @@ def delete_paths(paths: list, to_recycle_bin: bool = False) -> dict:
             rejected.append({"path": p, "reason": "does not exist"})
             continue
         try:
-            if os.path.isdir(real):
+            if is_link:
+                sz = 0          # only the link goes; its target is not ours to count
+            elif os.path.isdir(real):
                 # beta.20 — size probe with no per-call cap.  We still
                 # cap individual dir-size accounting at 1 TB so a
                 # rogue junction loop doesn't pin us forever; that's
@@ -1040,32 +1066,36 @@ def _recycle_one(real: str) -> None:
     For batched calls the caller could optimize by passing all paths to
     one PowerShell invocation; doing one-by-one keeps the audit log
     accurate (we know exactly which one failed)."""
-    # PowerShell-escape the path
-    escaped = real.replace("'", "''")
+    # The path reaches PowerShell through the environment, never as script
+    # text.  It used to be spliced in between single quotes with only the
+    # ASCII apostrophe doubled — but PowerShell also treats ‘ ’ ‚ ‛ as quote
+    # characters, so a name like "Guns N’ Roses" broke the command, and a
+    # crafted one could run code elevated.
     ps = (
         "$ErrorActionPreference='Stop';"
-        "$shell = New-Object -ComObject Shell.Application;"
         # SHFileOperation with FO_DELETE + FOF_ALLOWUNDO is the proper
         # API; PowerShell wraps it via Visual Basic helpers below.
         "Add-Type -AssemblyName Microsoft.VisualBasic;"
-        f"if ([System.IO.Directory]::Exists('{escaped}')) {{"
-        f"  [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory("
-        f"    '{escaped}',"
-        f"    [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,"
-        f"    [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin"
-        f"  )"
-        f"}} else {{"
-        f"  [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile("
-        f"    '{escaped}',"
-        f"    [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,"
-        f"    [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin"
-        f"  )"
-        f"}}"
+        "$p = $env:VISPORA_RECYCLE_PATH;"
+        "if ([System.IO.Directory]::Exists($p)) {"
+        "  [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory("
+        "    $p,"
+        "    [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,"
+        "    [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin"
+        "  )"
+        "} else {"
+        "  [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile("
+        "    $p,"
+        "    [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,"
+        "    [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin"
+        "  )"
+        "}"
     )
     r = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
         capture_output=True, text=True, timeout=60,
         creationflags=_CREATE_NO_WINDOW,
+        env={**os.environ, "VISPORA_RECYCLE_PATH": real},
     )
     if r.returncode != 0:
         raise RuntimeError(f"recycle failed: {(r.stderr or r.stdout or '').strip()[:200]}")

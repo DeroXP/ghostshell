@@ -1,6 +1,6 @@
 """Frame telemetry — FPS / frametime / 1%-low from running games.
 
-GhostShell needs real frame timing to score whether an OC actually
+Vispora needs real frame timing to score whether an OC actually
 helps the game's presentation layer.  Two sources are supported, in
 order of preference:
 
@@ -9,7 +9,7 @@ Source 1 — PresentMon (PRIMARY, recommended)
 ────────────────────────────────────────────────────────────────────
 Microsoft's official frame-timing tool.  Single ~600 KB CLI (no
 service install needed for v1.x).  Uses Windows ETW directly — no
-third-party tool needs to be running in the background.  GhostShell
+third-party tool needs to be running in the background.  Vispora
 spawns PresentMon as a child process when AT engages on a game and
 kills it when AT disengages.  The user never sees a console window
 (spawned with CREATE_NO_WINDOW).
@@ -20,7 +20,7 @@ ring buffer.
 
 PresentMon is BSD-licensed and auto-downloaded on first use from
 Microsoft's GitHub release page to:
-    %APPDATA%/GhostShell/bin/PresentMon.exe
+    %APPDATA%/Vispora/bin/PresentMon.exe
 The download is opt-in: nothing happens until the user clicks the
 "Enable frame telemetry" button in the AT diagnostic panel.
 
@@ -51,7 +51,6 @@ behaviour) and the UI shows a download button.
 from __future__ import annotations
 
 import ctypes
-import csv as csv_mod
 import os
 import subprocess
 import sys
@@ -62,7 +61,7 @@ from collections import deque
 from ctypes import wintypes
 from typing import Optional
 
-from config import APPDATA_DIR
+from config import APPDATA_DIR, APP_NAME, LEGACY_APP_NAME
 from core.utils import get_logger
 
 log = get_logger("frame_telemetry")
@@ -308,7 +307,7 @@ _samples_lock = threading.Lock()
 
 def install_presentmon() -> dict:
     """Download PresentMon from Microsoft's GitHub release to
-    %APPDATA%/GhostShell/bin/PresentMon.exe.  Non-blocking — kicks off
+    %APPDATA%/Vispora/bin/PresentMon.exe.  Non-blocking — kicks off
     a background thread; poll install_progress() for status."""
     with _state_lock:
         if _state["install_state"] == "downloading":
@@ -350,7 +349,7 @@ def _download_presentmon_worker() -> None:
         log.info(f"Downloading PresentMon from {PRESENTMON_URL}")
         req = urllib.request.Request(
             PRESENTMON_URL,
-            headers={"User-Agent": "GhostShell-FrameTelemetry/1.0"},
+            headers={"User-Agent": f"{APP_NAME}-FrameTelemetry/1.0"},
         )
         with urllib.request.urlopen(req, timeout=60) as resp:
             total = int(resp.headers.get("Content-Length", 0) or 0)
@@ -406,14 +405,20 @@ _CREATE_NO_WINDOW    = 0x08000000     # subprocess flag
 
 _stray_session_cleanup_done = False
 
+# Every PresentMon ETW session we start is named with our own prefix.  Builds
+# from before the rename used the old app name, and a session one of them
+# leaked lives until reboot — so both prefixes count as ours.
+_PM_SESSION_PREFIX = f"{APP_NAME.lower()}_"
+_PM_SESSION_PREFIXES = (_PM_SESSION_PREFIX, f"{LEGACY_APP_NAME.lower()}_")
+
 
 def _cleanup_stray_pm_sessions() -> None:
-    """beta.7 — best-effort: stop leaked 'ghostshell_*' PresentMon ETW sessions
+    """beta.7 — best-effort: stop leaked PresentMon ETW sessions of ours
     left behind by prior runs / older builds.
 
     beta.4/5 launched PresentMon with a UNIQUE per-launch --session_name while
     keeping --stop_existing_session (which only stops a same-named session), so
-    hard-killed captures leaked OS-level ETW sessions (ghostshell_<pid>_<stamp>)
+    hard-killed captures leaked OS-level ETW sessions (<prefix><pid>_<stamp>)
     that ACCUMULATED across a play session until ETW saturated — "N events were
     lost", empty CSVs, frame capture dead system-wide until a reboot.  beta.6's
     fixed session name stops NEW accumulation, but pre-existing leaks persist
@@ -440,7 +445,7 @@ def _cleanup_stray_pm_sessions() -> None:
         stray = []
         for line in r.stdout.splitlines():
             tok = line.split()
-            if tok and tok[0].lower().startswith("ghostshell_"):
+            if tok and tok[0].lower().startswith(_PM_SESSION_PREFIXES):
                 stray.append(tok[0])
         for name in stray:
             try:
@@ -468,7 +473,7 @@ def _start_presentmon(pid: int, prefer_pm2: bool = True) -> Optional[dict]:
     Returns {"proc": Popen, "csv_path": str, "variant": "pm1"|"pm2"}
     on success, None on failure.
     """
-    # beta.7 — clear any leaked ghostshell_* ETW sessions from older builds /
+    # beta.7 — clear any leaked vispora_* ETW sessions from older builds /
     # prior runs before we start capturing, so accumulated leaks can't saturate
     # ETW and kill frame capture.  Once per process, best-effort.
     _cleanup_stray_pm_sessions()
@@ -491,7 +496,7 @@ def _start_presentmon(pid: int, prefer_pm2: bool = True) -> Optional[dict]:
         return None
     csv_path = os.path.join(
         tempfile.gettempdir(),
-        f"ghostshell_pm_{pid}_{int(time.time())}.csv",
+        f"{_PM_SESSION_PREFIX}pm_{pid}_{int(time.time())}.csv",
     )
     cmd = [
         exe,
@@ -554,7 +559,7 @@ def _start_presentmon2(pid: int, cli_path: str) -> Optional[dict]:
     #      --stop_existing_session actually reclaim the previous session each
     #      time, so nothing piles up (see _cleanup_stray_pm_sessions for why a
     #      unique-per-launch name leaked sessions and saturated ETW).
-    session_name = "ghostshell_frametelemetry"
+    session_name = f"{_PM_SESSION_PREFIX}frametelemetry"
     # beta.8 — STREAM via --output_stdout, do NOT write --output_file.  PM 2.x
     # holds its --output_file with an EXCLUSIVE lock while capturing, so the
     # sampler could never open it to tail (every read => "used by another
@@ -857,51 +862,6 @@ def _read_string(addr_int: int, offset: int, max_len: int) -> str:
     s = bytes(buf).split(b"\x00", 1)[0]
     try: return s.decode("latin-1", errors="ignore")
     except Exception: return ""
-
-
-def _scan_rtss_entries() -> list:
-    h, addr = _open_rtss_mapping()
-    if not h or not addr:
-        return []
-    try:
-        base = int(addr)
-        sig  = _read_dword(base, 0)
-        if sig not in (RTSS_SIGNATURE_RTSS, RTSS_SIGNATURE_SSPM):
-            return []
-        entry_size = _read_dword(base, 8)
-        arr_offset = _read_dword(base, 12)
-        arr_size   = _read_dword(base, 16)
-        if entry_size < 64 or entry_size > 4096:
-            return []
-        if arr_size < 1 or arr_size > 256:
-            return []
-        results = []
-        for i in range(arr_size):
-            ebase = base + arr_offset + (i * entry_size)
-            try: pid = _read_dword(ebase, _OFF_PROCESS_ID)
-            except Exception: continue
-            if pid == 0: continue
-            try:
-                name        = _read_string(ebase, _OFF_NAME, _NAME_LEN)
-                ft_us       = _read_dword(ebase, _OFF_FRAMETIME_US)
-                fr_min_dec  = _read_dword(ebase, _OFF_STAT_FR_MIN)
-                fr_avg_dec  = _read_dword(ebase, _OFF_STAT_FR_AVG)
-                fr_max_dec  = _read_dword(ebase, _OFF_STAT_FR_MAX)
-            except Exception: continue
-            if ft_us == 0 and fr_avg_dec == 0: continue
-            results.append({
-                "pid":          pid,
-                "name":         name.lower(),
-                "frametime_ms": ft_us / 1000.0,
-                "fps_min":      fr_min_dec / 10.0,
-                "fps_avg":      fr_avg_dec / 10.0,
-                "fps_max":      fr_max_dec / 10.0,
-            })
-        return results
-    except Exception:
-        return []
-    finally:
-        _close_rtss_mapping(h, addr)
 
 
 def _rtss_mapping_exists() -> bool:

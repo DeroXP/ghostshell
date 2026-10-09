@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════
-   GhostShell — Frontend Controller
+   Vispora — Frontend Controller
    ═══════════════════════════════════════════════════════════════ */
 
 // ─── State ───
@@ -9,6 +9,59 @@ let vaultPin = '';
 let vaultCategory = '';
 let logPollTimer = null;
 let lastLogCount = 0;
+
+// ─── API session token ───
+// Every /api/ call has to carry this run's secret (app.py checks it): the
+// server runs elevated, and without it any other program on the PC could
+// drive it.  The window is opened with the token in the URL fragment; it is
+// moved into sessionStorage (so a reload still has it) and taken out of the
+// address bar.  window.pywebview.api.get_api_token() is the fallback route.
+let _apiToken = (function () {
+    try {
+        var m = /(?:^#|&)t=([A-Za-z0-9_-]+)/.exec(location.hash || '');
+        if (m) {
+            try { sessionStorage.setItem('vsp-api-token', m[1]); } catch (e) {}
+            try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+            return m[1];
+        }
+        return sessionStorage.getItem('vsp-api-token') || '';
+    } catch (e) { return ''; }
+})();
+let _apiTokenPromise = null;
+
+function _ensureApiToken() {
+    if (_apiToken) return Promise.resolve(_apiToken);
+    if (!_apiTokenPromise) {
+        _apiTokenPromise = (async function () {
+            for (var i = 0; i < 50 && !_apiToken; i++) {
+                var api = window.pywebview && window.pywebview.api;
+                if (api && api.get_api_token) {
+                    try { _apiToken = (await api.get_api_token()) || ''; } catch (e) {}
+                    break;
+                }
+                await new Promise(function (r) { setTimeout(r, 100); });
+            }
+            if (_apiToken) { try { sessionStorage.setItem('vsp-api-token', _apiToken); } catch (e) {} }
+            return _apiToken;
+        })();
+    }
+    return _apiTokenPromise;
+}
+
+// Attached to every same-origin /api/ request in this one place, so no call
+// site — present or future — can forget it.
+(function () {
+    var nativeFetch = window.fetch.bind(window);
+    window.fetch = async function (input, init) {
+        var url = typeof input === 'string' ? input : ((input && input.url) || '');
+        if (url.indexOf('/api/') === 0 || url.indexOf(location.origin + '/api/') === 0) {
+            var headers = new Headers((init && init.headers) || {});
+            headers.set('X-Vispora-Token', await _ensureApiToken());
+            init = Object.assign({}, init, { headers: headers });
+        }
+        return nativeFetch(input, init);
+    };
+})();
 
 // ═══════════════════════════════════════════════════════════════
 // v2.9.9.8 — Error Reporter
@@ -89,44 +142,44 @@ const _toastState = {
 function _ensureToastInfra() {
     if (!_toastState.cssInjected) {
         const css = (
-            '#gs-toast-container{position:fixed;right:18px;bottom:18px;display:flex;' +
+            '#vsp-toast-container{position:fixed;right:18px;bottom:18px;display:flex;' +
                 'flex-direction:column-reverse;gap:10px;z-index:99999;pointer-events:none;' +
                 'max-width:380px;font-family:Segoe UI,system-ui,sans-serif}' +
-            '.gs-toast{pointer-events:auto;background:#13131a;border:1px solid #2a2a36;' +
+            '.vsp-toast{pointer-events:auto;background:#13131a;border:1px solid #2a2a36;' +
                 'border-left:3px solid #c4c1ff;border-radius:6px;padding:12px 14px 12px 14px;' +
                 'box-shadow:0 6px 16px rgba(0,0,0,0.45);color:#f5f5f7;font-size:12.5px;' +
                 'line-height:1.5;opacity:0;transform:translateX(20px);' +
                 'transition:opacity 240ms ease,transform 240ms ease;position:relative}' +
-            '.gs-toast.is-shown{opacity:1;transform:translateX(0)}' +
-            '.gs-toast.is-leaving{opacity:0;transform:translateX(20px)}' +
-            '.gs-toast.gs-error{border-left-color:#f0888c;background:#1a1316}' +
-            '.gs-toast.gs-warn{border-left-color:#fbbf24;background:#1a1714}' +
-            '.gs-toast.gs-info{border-left-color:#c4c1ff}' +
-            '.gs-toast .gs-toast-title{font-weight:600;color:#f5f5f7;margin-bottom:4px;' +
+            '.vsp-toast.is-shown{opacity:1;transform:translateX(0)}' +
+            '.vsp-toast.is-leaving{opacity:0;transform:translateX(20px)}' +
+            '.vsp-toast.vsp-error{border-left-color:#f0888c;background:#1a1316}' +
+            '.vsp-toast.vsp-warn{border-left-color:#fbbf24;background:#1a1714}' +
+            '.vsp-toast.vsp-info{border-left-color:#c4c1ff}' +
+            '.vsp-toast .vsp-toast-title{font-weight:600;color:#f5f5f7;margin-bottom:4px;' +
                 'display:flex;align-items:center;gap:6px}' +
-            '.gs-toast.gs-error .gs-toast-title{color:#f0888c}' +
-            '.gs-toast.gs-warn .gs-toast-title{color:#fbbf24}' +
-            '.gs-toast.gs-info .gs-toast-title{color:#c4c1ff}' +
-            '.gs-toast .gs-toast-msg{color:#c0c0c8;font-size:12px}' +
-            '.gs-toast .gs-toast-sub{color:#7a7a82;font-size:11px;margin-top:6px;' +
+            '.vsp-toast.vsp-error .vsp-toast-title{color:#f0888c}' +
+            '.vsp-toast.vsp-warn .vsp-toast-title{color:#fbbf24}' +
+            '.vsp-toast.vsp-info .vsp-toast-title{color:#c4c1ff}' +
+            '.vsp-toast .vsp-toast-msg{color:#c0c0c8;font-size:12px}' +
+            '.vsp-toast .vsp-toast-sub{color:#7a7a82;font-size:11px;margin-top:6px;' +
                 'line-height:1.4;font-style:italic}' +
-            '.gs-toast .gs-toast-close{position:absolute;top:6px;right:8px;background:none;' +
+            '.vsp-toast .vsp-toast-close{position:absolute;top:6px;right:8px;background:none;' +
                 'border:0;color:#7a7a82;cursor:pointer;font-size:16px;padding:0 4px;' +
                 'line-height:1;font-family:inherit}' +
-            '.gs-toast .gs-toast-close:hover{color:#f5f5f7}' +
-            '.gs-toast .gs-toast-icon{width:14px;height:14px;flex-shrink:0}'
+            '.vsp-toast .vsp-toast-close:hover{color:#f5f5f7}' +
+            '.vsp-toast .vsp-toast-icon{width:14px;height:14px;flex-shrink:0}'
         );
         const styleEl = document.createElement('style');
-        styleEl.id = 'gs-toast-styles';
+        styleEl.id = 'vsp-toast-styles';
         styleEl.appendChild(document.createTextNode(css));
         document.head.appendChild(styleEl);
         _toastState.cssInjected = true;
     }
     if (!_toastState.container) {
-        let c = document.getElementById('gs-toast-container');
+        let c = document.getElementById('vsp-toast-container');
         if (!c) {
             c = document.createElement('div');
-            c.id = 'gs-toast-container';
+            c.id = 'vsp-toast-container';
             // Append to body if it exists, else defer to DOMContentLoaded
             if (document.body) document.body.appendChild(c);
             else document.addEventListener('DOMContentLoaded', function(){
@@ -138,7 +191,7 @@ function _ensureToastInfra() {
     return _toastState.container;
 }
 
-function _gsToastEscape(s) {
+function _vspToastEscape(s) {
     if (typeof s !== 'string') s = String(s == null ? '' : s);
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;')
             .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -155,19 +208,19 @@ function _showToast(kind, title, message, opts) {
 
     const c = _ensureToastInfra();
     const node = document.createElement('div');
-    node.className = 'gs-toast gs-' + kind;
+    node.className = 'vsp-toast vsp-' + kind;
     const sub = (kind === 'error' && !opts.suppressDevHint)
-        ? '<div class="gs-toast-sub">Sent to the devs &mdash; we\'re on it.</div>'
+        ? '<div class="vsp-toast-sub">Sent to the devs &mdash; we\'re on it.</div>'
         : '';
     const icon = ({
-        error: '<svg class="gs-toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="9"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>',
-        warn:  '<svg class="gs-toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2L2 21h20L12 2z"/><line x1="12" y1="10" x2="12" y2="14"/><circle cx="12" cy="17.5" r="0.8" fill="currentColor"/></svg>',
-        info:  '<svg class="gs-toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>',
+        error: '<svg class="vsp-toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="9"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>',
+        warn:  '<svg class="vsp-toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2L2 21h20L12 2z"/><line x1="12" y1="10" x2="12" y2="14"/><circle cx="12" cy="17.5" r="0.8" fill="currentColor"/></svg>',
+        info:  '<svg class="vsp-toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>',
     })[kind] || '';
     node.innerHTML =
-        '<button class="gs-toast-close" aria-label="Dismiss">&times;</button>' +
-        '<div class="gs-toast-title">' + icon + '<span>' + _gsToastEscape(title || '') + '</span></div>' +
-        (message ? '<div class="gs-toast-msg">' + _gsToastEscape(message) + '</div>' : '') +
+        '<button class="vsp-toast-close" aria-label="Dismiss">&times;</button>' +
+        '<div class="vsp-toast-title">' + icon + '<span>' + _vspToastEscape(title || '') + '</span></div>' +
+        (message ? '<div class="vsp-toast-msg">' + _vspToastEscape(message) + '</div>' : '') +
         sub;
 
     // Cap at 4 visible: collapse oldest
@@ -177,14 +230,14 @@ function _showToast(kind, title, message, opts) {
     requestAnimationFrame(function(){ node.classList.add('is-shown'); });
 
     const dismiss = function() {
-        if (node._gsDismissed) return;
-        node._gsDismissed = true;
+        if (node._vspDismissed) return;
+        node._vspDismissed = true;
         node.classList.add('is-leaving');
         setTimeout(function(){
             try { node.remove(); } catch (_) {}
         }, 280);
     };
-    node.querySelector('.gs-toast-close').addEventListener('click', dismiss);
+    node.querySelector('.vsp-toast-close').addEventListener('click', dismiss);
 
     const defaults = { error: 10000, warn: 6000, info: 4000 };
     const ms = opts.timeoutMs || defaults[kind] || 6000;
@@ -410,36 +463,6 @@ async function copyErrorDetailsToClipboard(kind, message, detail) {
     }
 }
 
-async function openGithubIssueWithDetails(kind, message, detail) {
-    const body = await _buildIssueBody(kind, message, detail);
-    // GitHub URL-length limit is ~7 KB.  Trim if needed and tell the user
-    // their clipboard has the full content.
-    const title = '[v' + ((window._ocState && window._ocState.appVersion) || '?') + '] ' +
-                  (kind || 'Error') + ': ' + (message || '').slice(0, 80);
-    const params = new URLSearchParams({ title: title, body: body.slice(0, 6000) });
-    const url = _errorReporter.GITHUB_ISSUES_URL + '/new?' + params.toString();
-
-    // Always copy to clipboard too — if the URL got truncated, the full
-    // body is still available for the user to paste.
-    try { await navigator.clipboard.writeText(body); } catch (_) {}
-
-    // Open in default browser.  pywebview has a window.open hook;
-    // fall back to a plain anchor click otherwise.
-    try {
-        if (window.pywebview) {
-            // pywebview opens external links in the system browser
-            window.open(url, '_blank');
-        } else {
-            window.open(url, '_blank');
-        }
-        addLog('Opened GitHub issue form (full body also copied to clipboard).');
-    } catch (e) {
-        addLog('Could not open browser — issue body is on your clipboard. Visit ' +
-               _errorReporter.GITHUB_ISSUES_URL + '/new and paste it.');
-    }
-    closeModal();
-}
-
 // Manual entry point — Settings → "Report a problem" calls this.
 function reportProblemManually() {
     showErrorReportModal('Manual report',
@@ -596,7 +619,7 @@ async function minimizeWindow() {
 
 // v2.9.0 — close-button rework.
 // Pressing the X opens a modal letting the user pick:
-//   1. Quit GhostShell entirely (process exits, all tweaks restored)
+//   1. Quit Vispora entirely (process exits, all tweaks restored)
 //   2. Hide UI + arm Game Mode (auto-applies gaming profile when a game runs)
 //   3. Just hide to tray (legacy behaviour, still available)
 async function closeWindow() {
@@ -1029,8 +1052,8 @@ async function loadSnapshots() {
               s.elapsed_s + 's to capture' +
             '</div>' +
             '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">' +
-              '<button class="btn btn-sm btn-primary" onclick="restoreSnapshot(\'' + escHtml(s.id) + '\', \'' + escHtml(s.name) + '\')">Restore</button>' +
-              '<button class="btn btn-sm btn-danger" onclick="deleteSnapshotById(\'' + escHtml(s.id) + '\', \'' + escHtml(s.name) + '\')">Delete</button>' +
+              '<button class="btn btn-sm btn-primary" onclick="restoreSnapshot(' + jsArg(s.id) + ', ' + jsArg(s.name) + ')">Restore</button>' +
+              '<button class="btn btn-sm btn-danger" onclick="deleteSnapshotById(' + jsArg(s.id) + ', ' + jsArg(s.name) + ')">Delete</button>' +
             '</div>' +
           '</div>';
     });
@@ -1197,12 +1220,10 @@ function _renderDriverSection(driver) {
         }
     }
     if (driver.manual_link) {
-        actionsHtml += '<button class="btn btn-sm" onclick="openExternal(\'' + escAttr(driver.manual_link) +
-            '\')">Open vendor page</button>';
+        actionsHtml += '<button class="btn btn-sm" onclick="openExternal(' + jsArg(driver.manual_link) + ')">Open vendor page</button>';
     }
     if (driver.release_url && !driver.manual_link) {
-        actionsHtml += '<button class="btn btn-sm" onclick="openExternal(\'' + escAttr(driver.release_url) +
-            '\')">Release notes</button>';
+        actionsHtml += '<button class="btn btn-sm" onclick="openExternal(' + jsArg(driver.release_url) + ')">Release notes</button>';
     }
     actsEl.innerHTML = actionsHtml;
 }
@@ -1295,11 +1316,27 @@ function toggleSwitch(el) {
 // ─── Escape HTML ───
 function escHtml(s) {
     if (typeof s !== 'string') s = String(s || '');
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// `&` has to go first.  Left unescaped, the browser decoded any character
+// reference inside the value — a saved password containing "&lt;" or "&#5"
+// came back altered in the edit form, and saving the form made that permanent.
+// A value as a JavaScript string literal that is safe to drop into an inline
+// handler:   'onclick="fn(' + jsArg(x) + ')"'.   JSON.stringify does the JS
+// escaping (quotes, backslashes, line breaks) and escAttr makes the result
+// safe as attribute text.  The pattern this replaces — ' + jsArg(x) + '
+// — only looked safe: the browser decodes &#39; back to ' BEFORE the handler
+// is parsed as JavaScript, so an apostrophe in a snapshot name, a Run-key
+// name or an exe name ended the string (dead button at best, script at worst),
+// and a backslash was silently eaten.
+function jsArg(v) {
+    return escAttr(JSON.stringify(String(v == null ? '' : v)));
 }
 
 function escAttr(s) {
-    return String(s || '').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // ─── Terminal Log Helper ───
@@ -1347,15 +1384,11 @@ function _renderHealthRow(c) {
     var fix = '';
     if (c.fix) {
         if (c.fix.kind === 'navigate') {
-            fix = '<button class="btn btn-sm" onclick="switchPage(\'' + escHtml(c.fix.page) + '\')" '
+            fix = '<button class="btn btn-sm" onclick="switchPage(' + jsArg(c.fix.page) + ')" '
                 + 'style="margin-left:8px;flex-shrink:0">Open ' + escHtml(c.fix.page) + '</button>';
         } else if (c.fix.kind === 'route' && c.fix.method === 'POST') {
-            // escAttr (not just a raw "-only replace) so a single quote or
-            // angle bracket inside c.fix.body can't break out of the
-            // \'...\' string boundary in the onclick attribute below.
-            var bodyJson = escAttr(JSON.stringify(c.fix.body || {}));
             fix = '<button class="btn btn-sm btn-primary" '
-                + 'onclick="_healthFix(\'' + escHtml(c.fix.url) + '\', \'' + bodyJson + '\', this)" '
+                + 'onclick="_healthFix(' + jsArg(c.fix.url) + ', ' + jsArg(JSON.stringify(c.fix.body || {})) + ', this)" '
                 + 'style="margin-left:8px;flex-shrink:0">Fix it</button>';
         }
     }
@@ -1377,9 +1410,7 @@ function _renderHealthRow(c) {
 async function _healthFix(url, bodyJson, btn) {
     if (btn) { btn.disabled = true; btn.textContent = '…'; }
     try {
-        // Reverse escAttr()'s escaping (quotes + angle brackets) before parsing.
-        var body = JSON.parse(bodyJson.replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-                                       .replace(/&lt;/g, '<').replace(/&gt;/g, '>'));
+        var body = JSON.parse(bodyJson);
         var r = await apiPost(url, body);
         addLog('Health fix → ' + url + ' ok=' + (r && r.ok));
     } catch (e) {
@@ -1524,6 +1555,9 @@ async function restoreDebloatServices() {
         var r = await apiPost('/api/debloat/restore-services');
         if (r && r.ok) {
             termWrite('debloat-terminal', '✓ Restored ' + (r.restored || 0) + '/' + (r.total || 0) + ' services');
+            if (r.tasks && r.tasks.restored) {
+                termWrite('debloat-terminal', '✓ Re-enabled ' + r.tasks.restored + ' scheduled task(s)');
+            }
             showInfoToast('Re-enabled ' + (r.restored || 0) + ' of ' + (r.total || 0)
                           + ' disabled service(s).', { title: 'Services restored' });
             loadDebloatScan();
@@ -1537,20 +1571,35 @@ async function restoreDebloatServices() {
     }
 }
 
+// What is selected on the Debloat tab.  `apps` / `services` are null only
+// while the scan has not filled the lists yet ("use the defaults"); once it
+// has, they are exactly what is ticked — an empty list means "none".  (An
+// empty selection used to be sent as null, so unticking everything removed
+// everything.)
+function _debloatSelection() {
+    function picked(listSel, items) {
+        var ids = [];
+        document.querySelectorAll(listSel + ' .check-box.checked').forEach(function(cb) {
+            var idx = parseInt(cb.dataset.index);
+            if (items[idx]) ids.push(items[idx].id);
+        });
+        return ids;
+    }
+    function on(id) { var el = document.getElementById(id); return !el || el.classList.contains('on'); }
+    var haveApps = typeof debloatApps !== 'undefined' && debloatApps && debloatApps.length > 0;
+    var haveSvcs = typeof debloatServices !== 'undefined' && debloatServices && debloatServices.length > 0;
+    return {
+        apps: haveApps ? picked('#debloat-apps', debloatApps) : null,
+        services: haveSvcs ? picked('#debloat-services', debloatServices) : null,
+        tasks: on('toggle-tasks'),
+        features: on('toggle-features'),
+        onedrive: on('toggle-onedrive'),
+    };
+}
+
 async function runDebloat() {
-    var appIds = [];
-    document.querySelectorAll('#debloat-apps .check-box.checked').forEach(function(cb) {
-        var idx = parseInt(cb.dataset.index);
-        if (debloatApps[idx]) appIds.push(debloatApps[idx].id);
-    });
-    var svcIds = [];
-    document.querySelectorAll('#debloat-services .check-box.checked').forEach(function(cb) {
-        var idx = parseInt(cb.dataset.index);
-        if (debloatServices[idx]) svcIds.push(debloatServices[idx].id);
-    });
-    var doFeatures = document.getElementById('toggle-features').classList.contains('on');
-    var doTasks = document.getElementById('toggle-tasks').classList.contains('on');
-    var doOnedrive = document.getElementById('toggle-onedrive').classList.contains('on');
+    var sel = _debloatSelection();
+    var appIds = sel.apps || [], svcIds = sel.services || [];
 
     var term = document.getElementById('debloat-terminal');
     term.innerHTML = '';
@@ -1558,14 +1607,13 @@ async function runDebloat() {
     setProgress('debloat', 10, 'Starting debloat...');
     termWrite('debloat-terminal', 'Removing ' + appIds.length + ' apps, ' + svcIds.length + ' services...');
 
-    var result = await apiPost('/api/debloat/run', {
-        apps: appIds.length > 0 ? appIds : null,
-        services: svcIds.length > 0 ? svcIds : null,
-        tasks: doTasks,
-        features: doFeatures,
-        onedrive: doOnedrive,
-    });
+    var result = await apiPost('/api/debloat/run', sel, { timeoutMs: 20 * 60 * 1000 });   // removal takes minutes; the 60 s default reported "Complete" mid-run
 
+    if (result && result.ok === false) {
+        setProgress('debloat', 0, 'Failed');
+        termWrite('debloat-terminal', '✗ ' + (result.err || 'Request failed'));
+        return;
+    }
     setProgress('debloat', 100, 'Complete');
 
     if (result.apps) {
@@ -1795,11 +1843,11 @@ function smRenderRows(apps) {
     box.innerHTML = apps.map(function(a) {
         var warn = a.exists === false ? ' <span style="color:var(--warning);font-size:11px">(missing)</span>' : '';
         return '<div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid var(--border-faint)">' +
-            '<input type="checkbox" ' + (a.enabled !== false ? 'checked' : '') + ' onchange="smToggle(\'' + a.id + '\',this.checked)" title="enabled">' +
+            '<input type="checkbox" ' + (a.enabled !== false ? 'checked' : '') + ' onchange="smToggle(' + jsArg(a.id) + ',this.checked)" title="enabled">' +
             '<div style="flex:1;min-width:0"><div style="font-size:13px;color:var(--text)">' + escHtml(a.name) + warn + '</div>' +
             '<div style="font-size:11px;color:var(--text-tertiary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + escHtml(a.path) + '</div></div>' +
-            '<span style="font-size:11px;color:var(--text-tertiary);white-space:nowrap">+<input type="number" min="0" max="60" value="' + (a.delay_s || 0) + '" onchange="smSetDelay(\'' + a.id + '\',this.value)" style="width:46px;padding:3px 5px;border-radius:4px;background:var(--bg-input);border:1px solid var(--border);color:var(--text);font-size:11px"> s</span>' +
-            '<button class="btn btn-sm" onclick="smRemove(\'' + a.id + '\')" title="remove" style="padding:4px 9px">✕</button></div>';
+            '<span style="font-size:11px;color:var(--text-tertiary);white-space:nowrap">+<input type="number" min="0" max="60" value="' + (a.delay_s || 0) + '" onchange="smSetDelay(' + jsArg(a.id) + ',this.value)" style="width:46px;padding:3px 5px;border-radius:4px;background:var(--bg-input);border:1px solid var(--border);color:var(--text);font-size:11px"> s</span>' +
+            '<button class="btn btn-sm" onclick="smRemove(' + jsArg(a.id) + ')" title="remove" style="padding:4px 9px">✕</button></div>';
     }).join('');
 }
 async function smSaveSettings() {
@@ -1900,7 +1948,9 @@ async function runOptimize(categories) {
     termWrite('optimize-terminal', 'Starting optimization...');
 
     var payload = categories ? { categories: categories } : {};
-    var result = await apiPost('/api/optimize/run', payload);
+    // A full run is hundreds of commands; the 60 s default gave up on it
+    // while the backend was still working.
+    var result = await apiPost('/api/optimize/run', payload, { timeoutMs: 10 * 60 * 1000 });
 
     Object.keys(result).forEach(function(cat) {
         var val = result[cat];
@@ -1918,13 +1968,17 @@ async function runOptimize(categories) {
 }
 
 async function resetOptimizations() {
-    if (!confirm('Reset ALL optimizations back to Windows defaults?\n\nThis will:\n- Switch to Balanced power plan\n- Restore default CPU scheduling\n- Re-enable visual effects & transparency\n- Re-enable memory compression\n- Restore Game DVR defaults\n- Remove timer tweaks\n- Re-enable Windows Search\n\nContinue?')) return;
+    if (!confirm('Undo ALL Optimizer tweaks?\n\nEvery setting the Optimizer changed goes back to what it was before '
+                 + '(registry, power plan, services, scheduled tasks, boot and network settings, Windows features, '
+                 + 'Defender).\nAnything changed by an older version, which kept no record, goes back to the '
+                 + 'Windows default instead.\n\nThe Network and GPU tabs have their own "Undo tweaks" button.\n'
+                 + 'Re-enabling Windows features can take a few minutes.\n\nContinue?')) return;
 
     var term = document.getElementById('optimize-terminal');
     term.innerHTML = '';
-    termWrite('optimize-terminal', 'Resetting all optimizations to Windows defaults...');
+    termWrite('optimize-terminal', 'Undoing all optimizations...');
 
-    var result = await apiPost('/api/optimize/reset');
+    var result = await apiPost('/api/optimize/reset', {}, { timeoutMs: 20 * 60 * 1000 });
 
     Object.keys(result).forEach(function(cat) {
         var val = result[cat];
@@ -1935,46 +1989,9 @@ async function resetOptimizations() {
             });
         }
     });
-    termWrite('optimize-terminal', '=== All optimizations reset to defaults ===');
+    termWrite('optimize-terminal', '=== All optimizations undone ===');
     termWrite('optimize-terminal', 'A reboot is recommended for all changes to take effect.');
     updateBadge('optimize', false);
-}
-
-async function runHardTweaks() {
-    if (!confirm('HARD TWEAKS\n\nThis applies aggressive changes:\n• Spectre/Meltdown mitigations OFF\n• VBS / Memory Integrity OFF\n• Recall disabled\n• Auto HDR disabled\n• Background apps killed\n• Widgets + Copilot removed\n• Mouse acceleration OFF\n• Xbox services to manual\n• Win10-style context menu restored\n\nAll reversible via "Reset All to Default".\nContinue?')) return;
-    var term = document.getElementById('optimize-terminal');
-    term.innerHTML = '';
-    termWrite('optimize-terminal', 'Applying HARD tweaks (aggressive)...');
-    var result = await apiPost('/api/optimize/hard');
-    (result.results || []).forEach(function(r) {
-        termWrite('optimize-terminal', '  ' + (r.ok !== false ? '✓' : '✗') + ' ' + (r.name || ''));
-    });
-    termWrite('optimize-terminal', '=== Hard tweaks applied (reboot recommended) ===');
-    updateBadge('optimize', true);
-}
-
-async function runLatencyTweaks() {
-    if (!confirm('LATENCY TWEAKS\n\nTargets DPC/ISR latency:\n• HPET disabled\n• Dynamic tick OFF\n• Platform tick ON\n• MSI mode for ALL network + USB devices\n• Power throttling globally OFF\n• DPC watchdog profile OFF\n\nReboot required after. Continue?')) return;
-    var term = document.getElementById('optimize-terminal');
-    term.innerHTML = '';
-    termWrite('optimize-terminal', 'Applying LATENCY tweaks...');
-    var result = await apiPost('/api/optimize/latency');
-    (result.results || []).forEach(function(r) {
-        termWrite('optimize-terminal', '  ' + (r.ok !== false ? '✓' : '✗') + ' ' + (r.name || ''));
-    });
-    termWrite('optimize-terminal', '=== Latency tweaks applied — reboot now ===');
-}
-
-async function runWin11Tweaks() {
-    if (!confirm('WINDOWS 11 DECLUTTER\n\nThis tames the Win11 UX:\n• Taskbar left-aligned\n• Chat + Task View hidden\n• Start recommendations off\n• File Explorer ads off\n• News & Interests off\n• Clipboard history + cloud sync off\n• Web search in Start disabled\n\nContinue?')) return;
-    var term = document.getElementById('optimize-terminal');
-    term.innerHTML = '';
-    termWrite('optimize-terminal', 'Applying Windows 11 declutter...');
-    var result = await apiPost('/api/optimize/win11');
-    (result.results || []).forEach(function(r) {
-        termWrite('optimize-terminal', '  ' + (r.ok !== false ? '✓' : '✗') + ' ' + (r.name || ''));
-    });
-    termWrite('optimize-terminal', '=== Windows 11 declutter applied — sign out to see changes ===');
 }
 
 // ═══ v3 Optimize tab — category-toggle grid + Apply Selected ═══
@@ -2012,11 +2029,17 @@ async function optApplySelected() {
     term.innerHTML = '';
     termWrite('optimize-terminal', 'Applying ' + cats.length + ' selected categories: ' + cats.join(', '));
     // The /api/optimize/run endpoint accepts the categories list
-    var result = await apiPost('/api/optimize/run', { categories: cats });
-    Object.keys(result.results || {}).forEach(function(cat) {
+    var result = await apiPost('/api/optimize/run', { categories: cats }, { timeoutMs: 10 * 60 * 1000 });
+    if (result && result.ok === false) {
+        termWrite('optimize-terminal', '✗ ' + (result.err || 'Request failed'));
+        return;
+    }
+    // The endpoint returns { category: [results] } directly — there is no
+    // "results" wrapper, which this used to read (and so printed nothing).
+    Object.keys(result || {}).forEach(function(cat) {
+        var entries = result[cat];
+        if (!Array.isArray(entries)) return;
         termWrite('optimize-terminal', '── ' + cat.toUpperCase() + ' ──');
-        var entries = result.results[cat];
-        if (!Array.isArray(entries)) entries = [entries];
         entries.forEach(function(r) {
             termWrite('optimize-terminal', '  ' + (r.ok !== false ? '✓' : '✗') + ' ' + (r.name || ''));
         });
@@ -2043,7 +2066,7 @@ async function scanStartup() {
     }
     var html = '';
     items.forEach(function(item) {
-        html += '<div class="check-item"><span style="flex:1">' + escHtml(item.name) + '</span><span style="font-size:10px;color:var(--text-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(item.command) + '</span><button class="btn btn-sm btn-danger" onclick="disableStartup(\'' + escAttr(item.name) + '\',\'' + escAttr(item.location) + '\',this)">Disable</button></div>';
+        html += '<div class="check-item"><span style="flex:1">' + escHtml(item.name) + '</span><span style="font-size:10px;color:var(--text-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(item.command) + '</span><button class="btn btn-sm btn-danger" onclick="disableStartup(' + jsArg(item.name) + ',' + jsArg(item.location) + ',this)">Disable</button></div>';
     });
     container.innerHTML = html;
 }
@@ -2269,7 +2292,7 @@ async function loadNetworkInfo() {
     var html = '';
     Object.keys(presets).forEach(function(key) {
         var p = presets[key];
-        html += '<div class="dns-preset ' + (selectedDnsPreset === key ? 'selected' : '') + '" onclick="selectDnsPreset(\'' + key + '\', this)"><div class="dns-preset-name">' + escHtml(p.name) + '</div><div class="dns-preset-ips">' + escHtml(p.primary) + ' / ' + escHtml(p.secondary) + '</div><div class="dns-preset-desc">' + escHtml(p.desc) + '</div></div>';
+        html += '<div class="dns-preset ' + (selectedDnsPreset === key ? 'selected' : '') + '" onclick="selectDnsPreset(' + jsArg(key) + ', this)"><div class="dns-preset-name">' + escHtml(p.name) + '</div><div class="dns-preset-ips">' + escHtml(p.primary) + ' / ' + escHtml(p.secondary) + '</div><div class="dns-preset-desc">' + escHtml(p.desc) + '</div></div>';
     });
     grid.innerHTML = html;
 }
@@ -2324,6 +2347,27 @@ async function runNetworkOptimize() {
     updateBadge('network', true);
 }
 
+// Undo for the tweaks on a tab that keeps a record of what it changed
+// (Network, GPU): prints what was put back and clears the tab's badge.
+async function _undoTabTweaks(url, terminal, badge, what) {
+    if (!confirm('Undo the ' + what + ' tweaks?\n\nEvery setting they changed goes back to what it was before. '
+                 + 'Tweaks applied by an older version, which kept no record, are left as they are.')) return;
+    termWrite(terminal, 'Undoing ' + what + ' tweaks...');
+    var r = await apiPost(url, {}, { timeoutMs: 5 * 60 * 1000 });
+    if (!r || !r.results) {
+        termWrite(terminal, '✗ Undo failed' + (r && r.err ? ': ' + r.err : ''), 'error');
+        return;
+    }
+    r.results.forEach(function(row) {
+        termWrite(terminal, '  ' + (row.ok !== false ? '✓' : '✗') + ' ' + row.name);
+    });
+    termWrite(terminal, '═══ ' + (r.nothing ? 'Nothing to undo' : 'Tweaks undone') + ' ═══');
+    updateBadge(badge, false);
+}
+
+function undoNetworkTweaks() { return _undoTabTweaks('/api/network/undo', 'network-terminal', 'network', 'Network'); }
+function undoGpuTweaks() { return _undoTabTweaks('/api/gpu/undo', 'gpu-terminal', 'gpu', 'GPU'); }
+
 async function restoreNetworking() {
     if (!confirm('Restore networking to safe defaults?\n\n' +
                  'This will:\n' +
@@ -2353,7 +2397,8 @@ async function restoreNetworking() {
 
 async function runPingTest() {
     termWrite('network-terminal', 'Running ping test (10 pings each)...');
-    var data = await apiGet('/api/network/ping');
+    // 10 pings × 5 hosts takes ~45 s — longer than the default 30 s GET timeout.
+    var data = await apiGet('/api/network/ping', { timeoutMs: 120000 });
     (data.results || []).forEach(function(r) {
         termWrite('network-terminal', '  ' + r.name + ' (' + r.ip + '): avg=' + (r.avg_ms || '?') + 'ms min=' + (r.min_ms || '?') + 'ms max=' + (r.max_ms || '?') + 'ms loss=' + (r.loss_pct || '?') + '%');
     });
@@ -2361,9 +2406,13 @@ async function runPingTest() {
 
 function toggleIPv6(el) {
     el.classList.toggle('on');
-    var enable = el.classList.contains('on');
-    apiPost('/api/network/ipv6', { enable: enable }).then(function(r) {
-        termWrite('network-terminal', r.ok ? '✓ IPv6 ' + (enable ? 'enabled' : 'disabled') : '✗ Failed');
+    // The switch is labelled "Disable IPv6", so ON means disable.  The API's
+    // flag is the opposite (`enable`), and this used to send the switch state
+    // as-is — turning the switch on re-enabled IPv6.
+    var disable = el.classList.contains('on');
+    apiPost('/api/network/ipv6', { enable: !disable }).then(function(r) {
+        if (!r.ok) el.classList.toggle('on');
+        termWrite('network-terminal', r.ok ? '✓ IPv6 ' + (disable ? 'disabled' : 'enabled') : '✗ Failed');
     });
 }
 
@@ -2693,6 +2742,14 @@ function showVaultLocked(pinSet) {
     }
     vaultPin = '';
     updatePinDots();
+    // Locked means nothing from the vault stays on screen or in the DOM:
+    // the list was only being hidden, and an open edit form stayed open.
+    var list = document.getElementById('vault-entries');
+    if (list) list.innerHTML = '';
+    var search = document.getElementById('vault-search');
+    if (search) search.value = '';
+    var mc = document.getElementById('modal-content');
+    if (mc && mc.querySelector('#edit-password, #entry-password, #gen-result')) closeModal();
 }
 
 function showVaultUnlocked() {
@@ -2720,23 +2777,41 @@ function updatePinDots() {
     });
 }
 
+var _pinBusy = false;
+
 async function pinSubmit() {
     if (vaultPin.length < 4) {
         document.getElementById('vault-lock-error').textContent = 'PIN must be at least 4 digits';
         return;
     }
+    // One attempt at a time.  The PIN is only cleared when the answer comes
+    // back, and checking it is deliberately slow — so key-repeat on Enter
+    // used to fire the same wrong PIN over and over and burn through the
+    // attempt limit into a 15-minute lockout.
+    if (_pinBusy) return;
+    _pinBusy = true;
     var errEl = document.getElementById('vault-lock-error');
     errEl.textContent = '';
-
-    var status = await apiGet('/api/vault/status');
     var result;
-    if (status.pin_set) {
-        result = await apiPost('/api/vault/unlock', { pin: vaultPin });
-    } else {
-        result = await apiPost('/api/vault/setup', { pin: vaultPin });
+    try {
+        var status = await apiGet('/api/vault/status');
+        if (status.ok === false) {
+            // Couldn't ask.  Don't guess "no PIN yet" and call setup.
+            errEl.textContent = status.err || 'Could not reach the vault';
+            return;
+        }
+        if (status.pin_set) {
+            result = await apiPost('/api/vault/unlock', { pin: vaultPin });
+        } else {
+            result = await apiPost('/api/vault/setup', { pin: vaultPin });
+        }
+    } finally {
+        _pinBusy = false;
     }
 
     if (result.ok) {
+        vaultPin = '';
+        updatePinDots();
         showVaultUnlocked();
         loadVaultEntries();
     } else {
@@ -2760,6 +2835,9 @@ async function loadVaultEntries() {
     var data = await apiGet('/api/vault/entries?search=' + encodeURIComponent(search) + '&category=' + encodeURIComponent(vaultCategory));
     var el = document.getElementById('vault-entries');
     if (!data.ok) {
+        // The backend auto-locks after a few idle minutes; show the PIN pad
+        // again rather than a dead "Vault is locked" line with no way in.
+        if (/locked/i.test(data.err || '')) { showVaultLocked(true); return; }
         el.innerHTML = '<div style="color:var(--red)">' + escHtml(data.err || 'Error') + '</div>';
         return;
     }
@@ -2774,7 +2852,7 @@ async function loadVaultEntries() {
     }
     var html = '';
     entries.forEach(function(e) {
-        html += '<div class="vault-entry"><div class="vault-entry-icon">' + ((e.service || '?')[0] || '?').toUpperCase() + '</div><div class="vault-entry-info"><div class="vault-entry-service">' + escHtml(e.service) + '</div><div class="vault-entry-user">' + escHtml(e.username) + ' • ' + escHtml(e.password_masked) + '</div></div><span class="vault-cat-chip">' + escHtml(e.category || 'General') + '</span><div class="vault-entry-actions"><button class="btn btn-sm" onclick="copyPassword(\'' + e.id + '\')">Copy</button><button class="btn btn-sm" onclick="openEditEntry(\'' + e.id + '\')">Edit</button><button class="btn btn-sm btn-danger" onclick="deleteVaultEntry(\'' + e.id + '\')">✗</button></div></div>';
+        html += '<div class="vault-entry"><div class="vault-entry-icon">' + ((e.service || '?')[0] || '?').toUpperCase() + '</div><div class="vault-entry-info"><div class="vault-entry-service">' + escHtml(e.service) + '</div><div class="vault-entry-user">' + escHtml(e.username) + ' • ' + escHtml(e.password_masked) + '</div></div><span class="vault-cat-chip">' + escHtml(e.category || 'General') + '</span><div class="vault-entry-actions"><button class="btn btn-sm" onclick="copyPassword(' + jsArg(e.id) + ')">Copy</button><button class="btn btn-sm" onclick="openEditEntry(' + jsArg(e.id) + ')">Edit</button><button class="btn btn-sm btn-danger" onclick="deleteVaultEntry(' + jsArg(e.id) + ')">✗</button></div></div>';
     });
     el.innerHTML = html;
 }
@@ -2799,6 +2877,21 @@ async function copyPassword(id) {
             document.execCommand('copy');
             document.body.removeChild(ta);
         }
+        showInfoToast('Password copied — the clipboard is cleared in 30 seconds.');
+        // Don't leave it on the clipboard for good.  Only clear if it is still
+        // there (reading can be refused; then leave the clipboard alone).
+        var copied = data.password;
+        setTimeout(async function () {
+            try {
+                if ((await navigator.clipboard.readText()) === copied) await navigator.clipboard.writeText('');
+            } catch (e) {}
+        }, 30000);
+    } else if (/locked/i.test(data.err || '')) {
+        // Used to do nothing at all — the user then pasted whatever was on
+        // the clipboard before.
+        showVaultLocked(true);
+    } else {
+        showErrorToast(data.err || 'Could not copy the password');
     }
 }
 
@@ -2843,6 +2936,13 @@ async function openEditEntry(id) {
     (data.entries || []).forEach(function(e) { if (e.id === id) entry = e; });
     if (!entry) return;
     var pwData = await apiGet('/api/vault/entry/' + id + '/password');
+    if (!pwData.ok) {
+        // Opening the form with an empty password field and letting "Update"
+        // save it would overwrite the stored password with nothing.
+        if (/locked/i.test(pwData.err || '')) showVaultLocked(true);
+        else showErrorToast(pwData.err || 'Could not read this entry');
+        return;
+    }
 
     openModal(
         '<div class="modal-title">EDIT ENTRY</div>' +
@@ -2851,7 +2951,7 @@ async function openEditEntry(id) {
         '<div class="form-group"><label class="form-label">Password</label><div style="display:flex;gap:6px"><input type="text" id="edit-password" value="' + escAttr(pwData.password || '') + '"><button class="btn btn-sm" onclick="genForField(\'edit-password\')">Gen</button></div></div>' +
         '<div class="form-row"><div class="form-group"><label class="form-label">URL</label><input type="text" id="edit-url" value="' + escAttr(entry.url || '') + '"></div><div class="form-group"><label class="form-label">Category</label><select id="edit-category">' + ['General','Social','Email','Gaming','Banking','Work'].map(function(c) { return '<option' + (c === entry.category ? ' selected' : '') + '>' + c + '</option>'; }).join('') + '</select></div></div>' +
         '<div class="form-group"><label class="form-label">Notes</label><textarea id="edit-notes" rows="2">' + escHtml(entry.notes || '') + '</textarea></div>' +
-        '<div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="updateEntry(\'' + id + '\')">Update</button></div>'
+        '<div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button><button class="btn btn-primary" onclick="updateEntry(' + jsArg(id) + ')">Update</button></div>'
     );
 }
 
@@ -2864,6 +2964,7 @@ async function updateEntry(id) {
         category: document.getElementById('edit-category').value,
         notes: document.getElementById('edit-notes').value,
     };
+    if (!data.password) { showErrorToast('The password cannot be empty.'); return; }
     var url = '/api/vault/entry/' + id;
     var r = await _apiHandle(url, fetch(url, {
         method: 'PUT',
@@ -2911,17 +3012,28 @@ async function genForField(fieldId) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// FULL GHOST
+// FULL SPECTRUM
 // ═══════════════════════════════════════════════════════════════
-async function runFullGhost() {
-    if (!confirm('⚡ FULL SPECTRUM MODE\n\nThis will run ALL modules:\n• Debloat\n• Optimize\n• Network\n• GPU\n• Privacy\n• Cleaner\n\nCreate a restore point first!\nContinue?')) return;
+async function runFullSpectrum() {
+    // Debloat runs with what is selected on the Debloat tab, the same as its own button.
+    var deb = _debloatSelection();
+    if (!confirm('⚡ FULL SPECTRUM MODE\n\nThis will run ALL modules:\n• Debloat (your Debloat-tab selections'
+                 + (deb.onedrive ? '; this UNINSTALLS OneDrive — switch that off on the Debloat tab to keep it' : '; OneDrive is kept')
+                 + ')\n• Optimize\n• Network\n• GPU\n• Privacy\n• Cleaner\n\nCreate a restore point first!\nContinue?')) return;
 
     switchPage('logs');
     termWrite('full-log', '╔══════════════════════════════════════╗');
     termWrite('full-log', '║   FULL SPECTRUM MODE ACTIVATED       ║');
     termWrite('full-log', '╚══════════════════════════════════════╝');
 
-    await apiPost('/api/full-ghost');
+    // Runs every module back to back, which takes minutes.  With the default
+    // 60 s timeout this printed "COMPLETE" while the backend was mid-debloat.
+    var result = await apiPost('/api/full-spectrum', { debloat: deb }, { timeoutMs: 45 * 60 * 1000 });
+    if (result && result.ok === false) {
+        termWrite('full-log', '');
+        termWrite('full-log', '✗ Full Spectrum did not finish: ' + (result.err || 'request failed'));
+        return;
+    }
 
     termWrite('full-log', '');
     termWrite('full-log', '═══ FULL SPECTRUM COMPLETE ═══');
@@ -2943,7 +3055,7 @@ async function loadFullLog() {
     });
     el.innerHTML = html;
     el.scrollTop = el.scrollHeight;
-    lastLogCount = (data.entries || []).length;
+    lastLogCount = data.total || 0;
 }
 
 // v3.3.1-beta.7: cap terminal DOM growth at 2000 lines.  Previously
@@ -2992,6 +3104,10 @@ function openModal(html) {
 
 function closeModal() {
     document.getElementById('modal-overlay').classList.remove('open');
+    // A vault form holds a password in plain text.  Hiding the overlay left it
+    // sitting in the DOM — through a vault lock, too — until the next modal.
+    var mc = document.getElementById('modal-content');
+    if (mc && mc.querySelector('#edit-password, #entry-password, #gen-result')) mc.innerHTML = '';
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -3211,7 +3327,7 @@ function _renderUpdaterSettingsBlock(s) {
             '<div class="toggle-info"><div class="toggle-name">' + escHtml(label) + '</div>' +
             '<div class="toggle-desc">' + escHtml(desc) + '</div></div>' +
             '<button type="button" class="toggle-switch ' + (on ? 'on' : '') +
-                '" onclick="toggleUpdaterSetting(this, \'' + key + '\')" ' +
+                '" onclick="toggleUpdaterSetting(this, ' + jsArg(key) + ')" ' +
                 'role="switch" aria-checked="' + on + '"></button>' +
             '</div>';
     };
@@ -3410,7 +3526,7 @@ function showPostInstallToast(kind, title, msg) {
 setTimeout(_checkPostInstallState, 500);
 
 // v2.9.9.2 — also check on load whether a recent GPU crash was recorded
-// (e.g. user came back to GhostShell after their screen went black).
+// (e.g. user came back to Vispora after their screen went black).
 // Show the banner so the user knows what happened and that the offsets
 // were already auto-reset to stock.
 async function _checkRecentCrash() {
@@ -3486,6 +3602,9 @@ async function loadBootPrepStatus() {
         label = '<span style="color:var(--accent)">✓ Ready</span> &middot; ' + okCount + '/' + (data.steps || []).length + ' tweaks in ' + dur + 's';
     } else {
         label = '<span style="color:var(--text-dim)">Not yet run this session</span>';
+    }
+    if (data.persistent === false && !data.running) {
+        label += ' &middot; <span style="color:var(--text-dim)">system tweaks off since Reset All (Re-run Prep turns them back on)</span>';
     }
     el.innerHTML = label;
 }
@@ -4372,11 +4491,11 @@ function _renderStickTuningPanel() {
             _stickField(side, 'deadzone_out',   'Outer DZ',     c.deadzone_out  || 1,   '0..1, where the stick is treated as fully pushed',   0.05, 1.0,  0.01) +
             _stickField(side, 'curve_strength', 'Curve N',      c.curve_strength|| 1.5, 'Exponent / steepness for power & expo curves',       0.1,  5.0,  0.05) +
             '<label style="display:block;margin-top:6px"><span style="display:inline-block;min-width:80px">Curve</span>' +
-                '<select onchange="onStickCfgChangeField(\'' + side + '\', \'curve\', this.value)" style="padding:3px 8px;border-radius:4px;background:var(--bg-card,var(--bg-overlay));color:var(--text);border:1px solid var(--border-faint);font-size:12px">' + curveOpts + '</select>' +
+                '<select onchange="onStickCfgChangeField(' + jsArg(side) + ', \'curve\', this.value)" style="padding:3px 8px;border-radius:4px;background:var(--bg-card,var(--bg-overlay));color:var(--text);border:1px solid var(--border-faint);font-size:12px">' + curveOpts + '</select>' +
             '</label>' +
-            '<label style="display:block;margin-top:6px"><input type="checkbox" onchange="onStickCfgChangeField(\'' + side + '\', \'invert_x\', this.checked)"' + (c.invert_x ? ' checked' : '') + ' /> Invert X</label>' +
-            '<label style="display:block;margin-top:2px"><input type="checkbox" onchange="onStickCfgChangeField(\'' + side + '\', \'invert_y\', this.checked)"' + (c.invert_y ? ' checked' : '') + ' /> Invert Y</label>' +
-            '<label style="display:block;margin-top:2px"><input type="checkbox" onchange="onStickCfgChangeField(\'' + side + '\', \'circular_gate\', this.checked)"' + (c.circular_gate ? ' checked' : '') + ' /> Circular gate</label>' +
+            '<label style="display:block;margin-top:6px"><input type="checkbox" onchange="onStickCfgChangeField(' + jsArg(side) + ', \'invert_x\', this.checked)"' + (c.invert_x ? ' checked' : '') + ' /> Invert X</label>' +
+            '<label style="display:block;margin-top:2px"><input type="checkbox" onchange="onStickCfgChangeField(' + jsArg(side) + ', \'invert_y\', this.checked)"' + (c.invert_y ? ' checked' : '') + ' /> Invert Y</label>' +
+            '<label style="display:block;margin-top:2px"><input type="checkbox" onchange="onStickCfgChangeField(' + jsArg(side) + ', \'circular_gate\', this.checked)"' + (c.circular_gate ? ' checked' : '') + ' /> Circular gate</label>' +
         '</div>';
     }).join('');
     wrap.innerHTML = html;
@@ -4386,7 +4505,7 @@ function _stickField(side, key, label, val, tip, min, max, step) {
     return '<label style="display:flex;align-items:center;gap:6px;margin-bottom:4px" title="' + escAttr(tip) + '">' +
         '<span style="display:inline-block;min-width:80px">' + label + '</span>' +
         '<input type="number" step="' + step + '" min="' + min + '" max="' + max + '" value="' + val + '" ' +
-            'onchange="onStickCfgChangeField(\'' + side + '\', \'' + key + '\', parseFloat(this.value))" ' +
+            'onchange="onStickCfgChangeField(' + jsArg(side) + ', ' + jsArg(key) + ', parseFloat(this.value))" ' +
             'style="width:75px;padding:3px 6px;border-radius:4px;background:var(--bg-card,var(--bg-overlay));color:var(--text);border:1px solid var(--border-faint);font-size:12px" />' +
     '</label>';
 }
@@ -4694,7 +4813,7 @@ function _renderMappingRow(m) {
             (s === 'controller' ? 'Controller' : s === 'keyboard' ? 'Keyboard' : 'Mouse') +
             '</option>';
     }).join('');
-    var srcSel = '<select onchange="onMappingSourceChange(\'' + mid + '\', this.value)" ' +
+    var srcSel = '<select onchange="onMappingSourceChange(' + jsArg(mid) + ', this.value)" ' +
         'style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:90px">' +
         srcOpts + '</select>';
 
@@ -4706,13 +4825,13 @@ function _renderMappingRow(m) {
         var opts = btnList.map(function(b){
             return '<option value="' + b + '"' + (trig === b ? ' selected' : '') + '>' + escHtml(b) + '</option>';
         }).join('');
-        trigPicker = '<select onchange="onMappingTriggerChange(\'' + mid + '\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:110px">' +
+        trigPicker = '<select onchange="onMappingTriggerChange(' + jsArg(mid) + ', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:110px">' +
             '<option value="">— pick —</option>' + opts + '</select>';
     } else if (src === 'mouse') {
         var mopts = GPM_MOUSE_TRIGGERS.map(function(b){
             return '<option value="' + b + '"' + (trig === b ? ' selected' : '') + '>' + b + '</option>';
         }).join('');
-        trigPicker = '<select onchange="onMappingTriggerChange(\'' + mid + '\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:120px">' +
+        trigPicker = '<select onchange="onMappingTriggerChange(' + jsArg(mid) + ', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:120px">' +
             '<option value="">— pick —</option>' + mopts + '</select>';
     } else { // keyboard
         // Keyboard has many keys — show captured value as text + capture button
@@ -4729,7 +4848,7 @@ function _renderMappingRow(m) {
                      macro:'Macro', disabled:'Disabled'}[t] || t;
         return '<option value="' + t + '"' + (target === t ? ' selected' : '') + '>' + label + '</option>';
     }).join('');
-    var targetSel = '<select onchange="onMappingTargetChange(\'' + mid + '\', this.value)" ' +
+    var targetSel = '<select onchange="onMappingTargetChange(' + jsArg(mid) + ', this.value)" ' +
         'style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:120px">' +
         targetOpts + '</select>';
 
@@ -4739,12 +4858,12 @@ function _renderMappingRow(m) {
         var keyOpts = GPM_KEY_OPTIONS.map(function(o){
             return '<option value="' + o.vk + '"' + (out.vk === o.vk ? ' selected' : '') + '>' + escHtml(o.label) + '</option>';
         }).join('');
-        details = '<select onchange="onMappingDetailChange(\'' + mid + '\', \'vk\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:100px">' + keyOpts + '</select>';
+        details = '<select onchange="onMappingDetailChange(' + jsArg(mid) + ', \'vk\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:100px">' + keyOpts + '</select>';
     } else if (target === 'mouse_button') {
         var mbOpts = GPM_MOUSE_TRIGGERS.map(function(b){
             return '<option value="' + b + '"' + (out.button === b ? ' selected' : '') + '>' + b + '</option>';
         }).join('');
-        details = '<select onchange="onMappingDetailChange(\'' + mid + '\', \'button\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:120px">' + mbOpts + '</select>';
+        details = '<select onchange="onMappingDetailChange(' + jsArg(mid) + ', \'button\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:120px">' + mbOpts + '</select>';
     } else if (target === 'vbutton') {
         // Prefer available_vbuttons (which includes DS4-only specials
         // like TOUCHPAD / PS); fall back to available_buttons for older
@@ -4755,7 +4874,7 @@ function _renderMappingRow(m) {
             if (b === 'TOUCHPAD' || b === 'PS') label = b + ' (DS4)';
             return '<option value="' + b + '"' + (out.vbutton === b ? ' selected' : '') + '>' + escHtml(label) + '</option>';
         }).join('');
-        details = '<select onchange="onMappingDetailChange(\'' + mid + '\', \'vbutton\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:110px">' + vbOpts + '</select>';
+        details = '<select onchange="onMappingDetailChange(' + jsArg(mid) + ', \'vbutton\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:110px">' + vbOpts + '</select>';
     } else if (target === 'vstick') {
         var stickSide = out.stick || 'left';
         var stickDir  = out.direction || 'up';
@@ -4765,20 +4884,20 @@ function _renderMappingRow(m) {
         var dirOpts = GPM_VSTICK_DIRECTIONS.map(function(d){
             return '<option value="' + d + '"' + (stickDir === d ? ' selected' : '') + '>' + d.charAt(0).toUpperCase() + d.slice(1) + '</option>';
         }).join('');
-        details = '<select onchange="onMappingDetailChange(\'' + mid + '\', \'stick\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">' + sideOpts + '</select>' +
-                  ' <select onchange="onMappingDetailChange(\'' + mid + '\', \'direction\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">' + dirOpts + '</select>';
+        details = '<select onchange="onMappingDetailChange(' + jsArg(mid) + ', \'stick\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">' + sideOpts + '</select>' +
+                  ' <select onchange="onMappingDetailChange(' + jsArg(mid) + ', \'direction\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">' + dirOpts + '</select>';
     } else if (target === 'vtrigger') {
         var trigSide = out.trigger || 'lt';
         var trigVal  = (out.value !== undefined ? out.value : 1.0);
         var tSideOpts = ['lt','rt'].map(function(s){
             return '<option value="' + s + '"' + (trigSide === s ? ' selected' : '') + '>' + s.toUpperCase() + ' (' + (s === 'lt' ? 'L' : 'R') + ' trigger)</option>';
         }).join('');
-        details = '<select onchange="onMappingDetailChange(\'' + mid + '\', \'trigger\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="Which virtual trigger to drive">' + tSideOpts + '</select>' +
+        details = '<select onchange="onMappingDetailChange(' + jsArg(mid) + ', \'trigger\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="Which virtual trigger to drive">' + tSideOpts + '</select>' +
             ' <label style="font-size:11px;color:var(--text-tertiary)" title="0 = released, 1 = fully pulled">value</label>' +
-            '<input type="number" step="0.05" min="0" max="1" value="' + trigVal + '" onchange="onMappingDetailChange(\'' + mid + '\', \'value\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="0.0 = released, 1.0 = fully pulled" />';
+            '<input type="number" step="0.05" min="0" max="1" value="' + escAttr(trigVal) + '" onchange="onMappingDetailChange(' + jsArg(mid) + ', \'value\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="0.0 = released, 1.0 = fully pulled" />';
     } else if (target === 'macro') {
         var stepCount = (out.steps || []).length;
-        details = '<button class="btn btn-sm" onclick="openMappingMacroEditor(\'' + mid + '\')">Edit (' + stepCount + ' step' + (stepCount === 1 ? '' : 's') + ')</button>';
+        details = '<button class="btn btn-sm" onclick="openMappingMacroEditor(' + jsArg(mid) + ')">Edit (' + stepCount + ' step' + (stepCount === 1 ? '' : 's') + ')</button>';
     } else if (target === 'disabled') {
         details = '<span style="color:var(--text-tertiary);font-size:11px;font-style:italic">input silenced</span>';
     }
@@ -4790,7 +4909,7 @@ function _renderMappingRow(m) {
                      turbo:'Turbo', chord:'Chord'}[b] || b;
         return '<option value="' + b + '"' + (behavior === b ? ' selected' : '') + '>' + label + '</option>';
     }).join('');
-    var behaviorSel = '<select onchange="onMappingBehaviorChange(\'' + mid + '\', this.value)" ' +
+    var behaviorSel = '<select onchange="onMappingBehaviorChange(' + jsArg(mid) + ', this.value)" ' +
         'title="Normal=press/release. Toggle=press locks ON, press again releases. Turbo=auto-fire while held at the configured Hz. Chord=fires only while ALSO holding a partner input." ' +
         'style="padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:11px">' +
         behaviorOpts + '</select>';
@@ -4799,7 +4918,7 @@ function _renderMappingRow(m) {
     if (behavior === 'turbo') {
         var thz = parseInt(inp.turbo_hz, 10) || 10;
         behaviorExtra = '<label style="font-size:11px;color:var(--text-tertiary)" title="Auto-press cycles per second (1-60)">Hz</label>' +
-            '<input type="number" min="1" max="60" value="' + thz + '" onchange="onMappingBehaviorField(\'' + mid + '\', \'turbo_hz\', parseInt(this.value, 10))" style="width:48px;padding:3px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:11px" />';
+            '<input type="number" min="1" max="60" value="' + thz + '" onchange="onMappingBehaviorField(' + jsArg(mid) + ', \'turbo_hz\', parseInt(this.value, 10))" style="width:48px;padding:3px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:11px" />';
     } else if (behavior === 'chord') {
         var partner = inp.chord_with || '';
         // Only useful for controller inputs — pick another button as partner
@@ -4807,7 +4926,7 @@ function _renderMappingRow(m) {
             return '<option value="' + b + '"' + (partner === b ? ' selected' : '') + '>' + escHtml(b) + '</option>';
         }).join('');
         behaviorExtra = '<label style="font-size:11px;color:var(--text-tertiary)" title="Mapping fires only when this PARTNER input is also held simultaneously">+</label>' +
-            '<select onchange="onMappingBehaviorField(\'' + mid + '\', \'chord_with\', this.value)" style="padding:3px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:11px">' +
+            '<select onchange="onMappingBehaviorField(' + jsArg(mid) + ', \'chord_with\', this.value)" style="padding:3px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:11px">' +
             '<option value="">— pick —</option>' + partnerOpts + '</select>';
     }
 
@@ -4818,8 +4937,8 @@ function _renderMappingRow(m) {
               targetSel +
               '<div style="flex:1;min-width:140px">' + details + '</div>' +
               behaviorSel + behaviorExtra +
-              '<button class="btn btn-sm" onclick="captureMappingTrigger(\'' + mid + '\')" title="Press a button on any source to assign" style="font-size:11px">capture</button>' +
-              '<button class="btn btn-sm btn-danger" onclick="deleteMapping(\'' + mid + '\')" title="Delete mapping" style="font-size:11px">✕</button>' +
+              '<button class="btn btn-sm" onclick="captureMappingTrigger(' + jsArg(mid) + ')" title="Press a button on any source to assign" style="font-size:11px">capture</button>' +
+              '<button class="btn btn-sm btn-danger" onclick="deleteMapping(' + jsArg(mid) + ')" title="Delete mapping" style="font-size:11px">✕</button>' +
            '</div>';
 }
 
@@ -5015,33 +5134,6 @@ async function _gpmAutoSave() {
     }
 }
 
-function onGpmTypeChanged(btn, newType) {
-    if (!_gpmCurrentProfile) return;
-    if (newType === 'passthrough') {
-        delete _gpmCurrentProfile.buttons[btn];
-    } else if (newType === 'key') {
-        _gpmCurrentProfile.buttons[btn] = {type: 'key', vk: 0x20};   // default Space
-    } else if (newType === 'macro') {
-        _gpmCurrentProfile.buttons[btn] = {type: 'macro', steps: []};
-    } else if (newType === 'disabled') {
-        _gpmCurrentProfile.buttons[btn] = {type: 'disabled'};
-    } else if (newType === 'vbutton') {
-        _gpmCurrentProfile.buttons[btn] = {type: 'vbutton', vbutton: btn};
-    }
-    // Persist + re-render rows from LOCAL state (don't refetch — that
-    // would clobber unsaved edits if the request races the next change)
-    _gpmAutoSave();
-    _gpmRenderBindingsLocal();
-}
-
-function onGpmKeyChanged(btn, vkStr) {
-    if (!_gpmCurrentProfile) return;
-    var vk = parseInt(vkStr, 10);
-    _gpmCurrentProfile.buttons[btn] = {type: 'key', vk: vk};
-    _gpmAutoSave();
-    _gpmRenderSvgLabels();
-}
-
 function onGpmProfileSelect() {
     var sel = document.getElementById('gpm-profile-select');
     if (!sel) return;
@@ -5077,19 +5169,6 @@ async function deleteGpmProfile() {
     var r = await apiDelete('/api/gamepad/profiles/' + encodeURIComponent(_gpmCurrentProfile.name));
     if (!r || !r.ok) { showErrorToast((r && r.err) || 'Failed to delete profile'); return; }
     loadGamepadMapper();
-}
-
-async function saveGpmProfile() {
-    if (!_gpmCurrentProfile) return;
-    // v3.4 — foreground filter and explicit hide_physical removed.
-    // Always-on; HidHide auto-engages with virtual_controller mode.
-    _gpmCurrentProfile.active_only_in_game = false;
-    _gpmCurrentProfile.hide_physical = (_gpmCurrentProfile.remap_mode === 'virtual_controller');
-    var phz = document.getElementById('gpm-poll-hz');
-    if (phz) _gpmCurrentProfile.poll_hz = parseInt(phz.value, 10) || 4000;
-    var r = await apiPost('/api/gamepad/profiles', _gpmCurrentProfile);
-    if (r && r.ok) showInfoToast('Profile saved.');
-    else showErrorToast('Save failed.');
 }
 
 async function toggleGpmMaster(el) {
@@ -5530,53 +5609,6 @@ function _gpmRenderSvgLabels() {
 }
 
 // ─── Capture-button modal ───────────────────────────────────────────
-async function captureGpmButton(btn) {
-    var modal = document.getElementById('gpm-capture-modal');
-    var msg = document.getElementById('gpm-capture-msg');
-    if (modal) modal.style.display = 'flex';
-    if (msg) msg.textContent = 'Press a controller button to assign to "' + btn + '"… (8s)';
-    _gpmCaptureCancelled = false;
-    var r = await apiPost('/api/gamepad/capture-button', {timeout: 8.0});
-    if (modal) modal.style.display = 'none';
-    if (_gpmCaptureCancelled) return;
-    if (!r || !r.ok) {
-        showErrorToast(r && r.err ? r.err : 'Capture failed.');
-        return;
-    }
-    if (r.button === btn) {
-        showWarnToast('Captured — bound the same physical button to itself? Pick a target action above.');
-        return;
-    }
-    // Reassign: physical button r.button → whatever target btn is now
-    if (!_gpmCurrentProfile) return;
-    var existing = _gpmCurrentProfile.buttons[btn] || {type: 'passthrough'};
-    if (existing.type === 'passthrough') {
-        existing = {type: 'key', vk: 0x20};
-    }
-    delete _gpmCurrentProfile.buttons[btn];
-    _gpmCurrentProfile.buttons[r.button] = existing;
-
-    // Also stash the controller's VID/PID for HidHide so "hide physical"
-    // knows which device to cloak.  We pull it from the JS Gamepad API
-    // (running gamepad list).
-    if (!_gpmCurrentProfile.controller_vid_pid) {
-        var pads = navigator.getGamepads ? navigator.getGamepads() : [];
-        for (var i = 0; i < pads.length; i++) {
-            var p = pads[i];
-            if (!p || !p.id) continue;
-            // Look for "(Vendor: xxxx Product: yyyy)" — desktop Chrome format
-            var m = p.id.match(/Vendor:\s*([0-9a-fA-F]{4})\s+Product:\s*([0-9a-fA-F]{4})/);
-            if (m) {
-                _gpmCurrentProfile.controller_vid_pid = 'VID_' + m[1].toUpperCase() + '&PID_' + m[2].toUpperCase();
-                break;
-            }
-        }
-    }
-
-    loadGpmProfileBindings(_gpmCurrentProfile.name);
-    showInfoToast('Reassigned to physical button: ' + r.button);
-}
-
 function cancelGpmCapture() {
     _gpmCaptureCancelled = true;
     var modal = document.getElementById('gpm-capture-modal');
@@ -5584,21 +5616,6 @@ function cancelGpmCapture() {
 }
 
 // ─── Macro editor ───────────────────────────────────────────────────
-function openGpmMacroEditor(btn) {
-    if (!_gpmCurrentProfile) return;
-    _gpmMacroEditorBtn = btn;
-    var binding = _gpmCurrentProfile.buttons[btn];
-    if (!binding || binding.type !== 'macro') {
-        binding = {type: 'macro', steps: []};
-        _gpmCurrentProfile.buttons[btn] = binding;
-    }
-    _gpmMacroEditorSteps = JSON.parse(JSON.stringify(binding.steps || []));
-    document.getElementById('gpm-macro-btn-name').textContent = btn;
-    _renderMacroSteps();
-    var modal = document.getElementById('gpm-macro-modal');
-    if (modal) modal.style.display = 'flex';
-}
-
 // v3.4 — macro steps are now polymorphic: {key:{vk,...}} | {mouse:{button,...}}
 // | {vbutton:{vbutton,...}} | {vstick:{stick, x, y, ...}}.  Legacy
 // {vk, hold_ms, delay_after_ms} is also rendered for back-compat (old
@@ -5685,11 +5702,11 @@ function _renderMacroSteps() {
             // pulls UP.  Snapping is instant unless ramp>0.
             targetSel = '<select onchange="onMacroStepChange(' + i + ', \'stick\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="Which virtual stick to drive">' + sideOpts + '</select>' +
                 ' <label style="font-size:11px;color:var(--text-tertiary)" title="-1 = full left, 0 = center, +1 = full right">x</label>' +
-                '<input type="number" step="0.05" min="-1" max="1" value="' + stickX + '" onchange="onMacroStepChange(' + i + ', \'x\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="-1 = full left, 0 = center, +1 = full right" />' +
+                '<input type="number" step="0.05" min="-1" max="1" value="' + escAttr(stickX) + '" onchange="onMacroStepChange(' + i + ', \'x\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="-1 = full left, 0 = center, +1 = full right" />' +
                 ' <label style="font-size:11px;color:var(--text-tertiary)" title="-1 = full up, 0 = center, +1 = full down">y</label>' +
-                '<input type="number" step="0.05" min="-1" max="1" value="' + stickY + '" onchange="onMacroStepChange(' + i + ', \'y\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="-1 = full up, 0 = center, +1 = full down (use small values like -0.2 for a gentle pull)" />' +
+                '<input type="number" step="0.05" min="-1" max="1" value="' + escAttr(stickY) + '" onchange="onMacroStepChange(' + i + ', \'y\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="-1 = full up, 0 = center, +1 = full down (use small values like -0.2 for a gentle pull)" />' +
                 ' <label style="font-size:11px;color:var(--text-tertiary)" title="ms to smoothly ramp from center to target. 0 = snap instantly. Higher = smoother continuous-pull feel.">ramp</label>' +
-                '<input type="number" min="0" value="' + rampMs + '" onchange="onMacroStepChange(' + i + ', \'ramp_ms\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="ms to smoothly ramp from center to target. 0 = snap instantly. Higher = smoother continuous-pull feel." />';
+                '<input type="number" min="0" value="' + escAttr(rampMs) + '" onchange="onMacroStepChange(' + i + ', \'ramp_ms\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="ms to smoothly ramp from center to target. 0 = snap instantly. Higher = smoother continuous-pull feel." />';
         } else if (kind === 'vtrigger') {
             var trigSide = inner.trigger || 'lt';
             var trigValue = (inner.value !== undefined ? inner.value : 1.0);
@@ -5698,14 +5715,14 @@ function _renderMacroSteps() {
             }).join('');
             targetSel = '<select onchange="onMacroStepChange(' + i + ', \'trigger\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">' + sideOpts + '</select>' +
                 ' <label style="font-size:11px;color:var(--text-tertiary)" title="0 = released, 1 = fully pulled">value</label>' +
-                '<input type="number" step="0.05" min="0" max="1" value="' + trigValue + '" onchange="onMacroStepChange(' + i + ', \'value\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="0.0 = trigger released, 1.0 = trigger fully pulled" />';
+                '<input type="number" step="0.05" min="0" max="1" value="' + escAttr(trigValue) + '" onchange="onMacroStepChange(' + i + ', \'value\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="0.0 = trigger released, 1.0 = trigger fully pulled" />';
         } else if (kind === 'text') {
             var textVal = inner.text || '';
             var perChar = inner.delay_per_char_ms || 0;
             targetSel =
                 '<input type="text" placeholder="text to type" value="' + escAttr(textVal) + '" onchange="onMacroStepChange(' + i + ', \'text\', this.value)" style="flex:1;min-width:120px;padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" />' +
                 ' <label style="font-size:11px;color:var(--text-tertiary)">per-char</label>' +
-                '<input type="number" min="0" value="' + perChar + '" onchange="onMacroStepChange(' + i + ', \'delay_per_char_ms\', this.value)" style="width:50px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" />';
+                '<input type="number" min="0" value="' + escAttr(perChar) + '" onchange="onMacroStepChange(' + i + ', \'delay_per_char_ms\', this.value)" style="width:50px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" />';
         }
 
         // Hold + delay (works for all kinds — read down_ms with hold_ms fallback for legacy)
@@ -5732,10 +5749,10 @@ function _renderMacroSteps() {
                   targetSel +
                   (showDown ?
                     '<label style="font-size:11px;color:var(--text-tertiary)" title="How long to hold this input down before releasing">down</label>' +
-                    '<input type="number" value="' + holdVal + '" onchange="onMacroStepChange(' + i + ', \'down_ms\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" />'
+                    '<input type="number" value="' + escAttr(holdVal) + '" onchange="onMacroStepChange(' + i + ', \'down_ms\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" />'
                     : '') +
                   '<label style="font-size:11px;color:var(--text-tertiary)" title="ms to wait before moving to the next macro step">then wait</label>' +
-                  '<input type="number" value="' + delayVal + '" onchange="onMacroStepChange(' + i + ', \'delay_after_ms\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" />' +
+                  '<input type="number" value="' + escAttr(delayVal) + '" onchange="onMacroStepChange(' + i + ', \'delay_after_ms\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" />' +
                   '<button class="btn btn-sm btn-danger" onclick="removeMacroStep(' + i + ')" style="font-size:11px;padding:2px 6px">×</button>' +
                '</div>';
     }).join('');
@@ -5929,9 +5946,9 @@ async function openRecoilPresetPicker() {
                 ? '<span style="margin-left:6px;padding:1px 6px;background:var(--accent);color:var(--bg);border-radius:3px;font-size:10px;font-weight:600">CAPTURED</span>'
                 : '';
             var deleteBtn = p.is_user
-                ? '<button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteUserRecoilPreset(\'' + escAttr(p.id) + '\')" style="font-size:10px;padding:2px 6px;margin-left:8px" title="Delete this captured preset">✕</button>'
+                ? '<button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteUserRecoilPreset(' + jsArg(p.id) + ')" style="font-size:10px;padding:2px 6px;margin-left:8px" title="Delete this captured preset">✕</button>'
                 : '';
-            return '<div onclick="applyRecoilPreset(\'' + escAttr(p.id) + '\')" style="cursor:pointer;padding:10px 12px;background:var(--bg-overlay);border:1px solid var(--border-faint);border-radius:6px;margin-bottom:6px;transition:background 0.12s" onmouseover="this.style.background=\'var(--bg-elevated)\'" onmouseout="this.style.background=\'var(--bg-overlay)\'">' +
+            return '<div onclick="applyRecoilPreset(' + jsArg(p.id) + ')" style="cursor:pointer;padding:10px 12px;background:var(--bg-overlay);border:1px solid var(--border-faint);border-radius:6px;margin-bottom:6px;transition:background 0.12s" onmouseover="this.style.background=\'var(--bg-elevated)\'" onmouseout="this.style.background=\'var(--bg-overlay)\'">' +
                 '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:4px">' +
                     '<div><b style="color:var(--text-bright);font-size:13px">' + escHtml(p.weapon || p.name) + '</b>' + userBadge + '</div>' +
                     '<div style="display:flex;align-items:center;gap:4px">' +
@@ -6500,7 +6517,7 @@ async function loadPauser() {
                     '<div style="color:var(--text-secondary);font-size:12.5px;margin-top:4px;line-height:1.5">' + escHtml(cat.desc) + '</div>' +
                     '<div style="color:var(--text-tertiary);font-size:11.5px;margin-top:6px;font-family:var(--font-mono,monospace);line-height:1.4">' + exes + '</div>' +
                 '</div>' +
-                '<div class="toggle-switch ' + (on ? 'on' : '') + '" onclick="togglePauserCategory(\'' + catKey + '\', this)"></div>' +
+                '<div class="toggle-switch ' + (on ? 'on' : '') + '" onclick="togglePauserCategory(' + jsArg(catKey) + ', this)"></div>' +
             '</div>';
         }).join('');
         catEl.innerHTML = html || '<div style="color:var(--text-tertiary)">No target categories defined.</div>';
@@ -6788,7 +6805,7 @@ function _renderLibrary() {
                     '</div>' +
                 '</div>' +
                 (exe ?
-                    '<button class="' + btnClass + '" onclick="toggleATForLibraryGame(\'' + exe.replace(/'/g, "\\'") + '\',' + (isOn ? 'false' : 'true') + ')">' + btnLabel + '</button>'
+                    '<button class="' + btnClass + '" onclick="toggleATForLibraryGame(' + jsArg(exe) + ',' + (isOn ? 'false' : 'true') + ')">' + btnLabel + '</button>'
                     : '<span style="color:var(--text-tertiary);font-size:12px">no exe</span>'
                 ) +
             '</div>';
@@ -6848,7 +6865,7 @@ async function enableATForLibrary(enable) {
         exes: exes, enabled: !!enable, only_known: true
     });
     if (r && r.ok) {
-        showErrorToast(verb + 'd AT for ' + r.flipped + ' games.');
+        showInfoToast(verb + 'd AT for ' + r.flipped + ' games.');
         _renderLibrary();
         loadAdaptiveGames();
     } else {
@@ -7061,8 +7078,7 @@ async function _refreshAdaptiveLive() {
         } else if (gs && !gs.enabled) {
             why = 'AT is off for this specific game.';
             fixBtn =
-                '<button class="btn btn-sm btn-primary" onclick="_quickEnableAtForGame(\'' +
-                escHtml(keyShort) + '\')">Enable for this game</button>';
+                '<button class="btn btn-sm btn-primary" onclick="_quickEnableAtForGame(' + jsArg(keyShort) + ')">Enable for this game</button>';
         } else {
             why = 'Tracked. AT will engage on next game launch.';
         }
@@ -7126,7 +7142,7 @@ async function loadAdaptiveGames() {
               + '<span class="live-dot" style="width:6px;height:6px"></span>playing now</span>'
             : '';
         var enabledTog = '<div class="toggle-switch ' + (g.enabled ? 'on' : '') + '" ' +
-                          'onclick="toggleAdaptiveGame(\'' + escHtml(exe) + '\', this)" ' +
+                          'onclick="toggleAdaptiveGame(' + jsArg(exe) + ', this)" ' +
                           'style="margin-left:auto"></div>';
         var mode = g.mode || 'balanced';
         var modeColor =
@@ -7188,25 +7204,25 @@ async function loadAdaptiveGames() {
             '</div>' +
             '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
               '<label style="font-size:11.5px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase">Mode</label>' +
-              '<select onchange="setAdaptiveGameMode(\'' + escHtml(exe) + '\', this.value)" style="width:auto;min-width:130px;padding:5px 28px 5px 10px;font-size:12.5px">' +
+              '<select onchange="setAdaptiveGameMode(' + jsArg(exe) + ', this.value)" style="width:auto;min-width:130px;padding:5px 28px 5px 10px;font-size:12.5px">' +
                 '<option value="balanced"' + (mode === 'balanced' ? ' selected' : '') + '>Balanced</option>' +
                 '<option value="competitive"' + (mode === 'competitive' ? ' selected' : '') + '>Competitive</option>' +
                 '<option value="visual"' + (mode === 'visual' ? ' selected' : '') + '>Visual</option>' +
               '</select>' +
               '<label style="font-size:11.5px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase" title="What this game is FOR. Max FPS = full GPU power + Ultimate power plan, and Adaptive Tuning climbs your OC above baseline for more frames (stability-gated). Low Latency = competitive-latency tweaks for the session (GPU OC left alone, these titles are CPU-bound). Auto = normal adaptive behaviour.">Target</label>' +
-              '<select onchange="setAdaptiveGameTarget(\'' + escHtml(exe) + '\', this.value)" style="width:auto;min-width:130px;padding:5px 28px 5px 10px;font-size:12.5px">' +
+              '<select onchange="setAdaptiveGameTarget(' + jsArg(exe) + ', this.value)" style="width:auto;min-width:130px;padding:5px 28px 5px 10px;font-size:12.5px">' +
                 '<option value="auto"' + (target === 'auto' ? ' selected' : '') + '>Auto</option>' +
                 '<option value="max_fps"' + (target === 'max_fps' ? ' selected' : '') + '>Max FPS</option>' +
                 '<option value="low_latency"' + (target === 'low_latency' ? ' selected' : '') + '>Low Latency</option>' +
                 '<option value="balanced"' + (target === 'balanced' ? ' selected' : '') + '>Balanced</option>' +
               '</select>' +
               (hasBest
-                ? '<button class="btn btn-sm" onclick="applyAdaptiveBest(\'' + escHtml(exe) + '\')">Apply best now</button>'
+                ? '<button class="btn btn-sm" onclick="applyAdaptiveBest(' + jsArg(exe) + ')">Apply best now</button>'
                 : '') +
-              '<button class="btn btn-sm" onclick="reseedAdaptiveGame(\'' + escHtml(exe) + '\')" title="Restart this game\'s exploration from your CURRENT manual OC profile.  Keeps session count + warned offsets — just bumps the floor so AT doesn\'t crawl up from 0.">Reseed from current OC</button>' +
-              '<button class="btn btn-sm" onclick="toggleAtKnobs(\'' + knobsId + '\')">Advanced…</button>' +
-              '<button class="btn btn-sm" onclick="clearAdaptiveBlacklist(\'' + escHtml(exe) + '\')" style="margin-left:auto">Clear blacklist</button>' +
-              '<button class="btn btn-sm btn-danger" onclick="resetAdaptiveGame(\'' + escHtml(exe) + '\')">Reset</button>' +
+              '<button class="btn btn-sm" onclick="reseedAdaptiveGame(' + jsArg(exe) + ')" title="Restart this game\'s exploration from your CURRENT manual OC profile.  Keeps session count + warned offsets — just bumps the floor so AT doesn\'t crawl up from 0.">Reseed from current OC</button>' +
+              '<button class="btn btn-sm" onclick="toggleAtKnobs(' + jsArg(knobsId) + ')">Advanced…</button>' +
+              '<button class="btn btn-sm" onclick="clearAdaptiveBlacklist(' + jsArg(exe) + ')" style="margin-left:auto">Clear blacklist</button>' +
+              '<button class="btn btn-sm btn-danger" onclick="resetAdaptiveGame(' + jsArg(exe) + ')">Reset</button>' +
             '</div>' +
             // Advanced knobs panel — collapsed by default
             '<div id="' + knobsId + '" style="display:none;margin-top:12px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-overlay)">' +
@@ -7216,27 +7232,27 @@ async function loadAdaptiveGames() {
                   '<label style="display:block;margin-bottom:4px;color:var(--text-secondary)" title="AT skips step-ups when GPU temp is at or above this">Thermal limit °C: <span id="' + knobsId + '-thermal-val">' + thermal + '</span></label>' +
                   '<input type="range" min="60" max="95" step="1" value="' + thermal + '" ' +
                     'oninput="document.getElementById(\'' + knobsId + '-thermal-val\').textContent = this.value" ' +
-                    'onchange="setAtKnob(\'' + escHtml(exe) + '\', \'thermal_limit_c\', this.value)" ' +
+                    'onchange="setAtKnob(' + jsArg(exe) + ', \'thermal_limit_c\', this.value)" ' +
                     'style="width:100%">' +
                 '</div>' +
                 '<div>' +
                   '<label style="display:block;margin-bottom:4px;color:var(--text-secondary)" title="AT skips CORE step-ups when GPU power draw is at or above this % of TDP">Power bound %: <span id="' + knobsId + '-power-val">' + powerB + '</span></label>' +
                   '<input type="range" min="50" max="100" step="1" value="' + powerB + '" ' +
                     'oninput="document.getElementById(\'' + knobsId + '-power-val\').textContent = this.value" ' +
-                    'onchange="setAtKnob(\'' + escHtml(exe) + '\', \'power_bound_pct\', this.value)" ' +
+                    'onchange="setAtKnob(' + jsArg(exe) + ', \'power_bound_pct\', this.value)" ' +
                     'style="width:100%">' +
                 '</div>' +
                 '<div>' +
                   '<label style="display:block;margin-bottom:4px;color:var(--text-secondary)" title="Global scaler on step size (hot-streak still compounds on top)">Step multiplier: <span id="' + knobsId + '-mul-val">' + stepMul.toFixed(2) + '</span>×</label>' +
                   '<input type="range" min="0.5" max="2.0" step="0.05" value="' + stepMul + '" ' +
                     'oninput="document.getElementById(\'' + knobsId + '-mul-val\').textContent = parseFloat(this.value).toFixed(2)" ' +
-                    'onchange="setAtKnob(\'' + escHtml(exe) + '\', \'step_multiplier\', this.value)" ' +
+                    'onchange="setAtKnob(' + jsArg(exe) + ', \'step_multiplier\', this.value)" ' +
                     'style="width:100%">' +
                 '</div>' +
               '</div>' +
               '<div style="margin-top:10px;display:flex;align-items:center;gap:8px">' +
                 '<div class="toggle-switch ' + (g.dry_run ? 'on' : '') + '" ' +
-                  'onclick="toggleAtDryRun(\'' + escHtml(exe) + '\', this)" style="transform:scale(0.85);transform-origin:left"></div>' +
+                  'onclick="toggleAtDryRun(' + jsArg(exe) + ', this)" style="transform:scale(0.85);transform-origin:left"></div>' +
                 '<span style="font-size:12.5px;color:var(--text-secondary)" title="When on, AT runs all logic but does NOT push OC changes to the GPU. History still records what AT would have done.">Dry-run (log only, do not apply OC)</span>' +
               '</div>' +
             '</div>' +
@@ -7254,15 +7270,6 @@ async function reseedAdaptiveGame(exe) {
         addLog('Reseeded ' + exe + ' to core+' + r.baseline_core + ' / mem+' + r.baseline_mem);
     } else {
         addLog('Reseed failed: ' + ((r && r.err) || 'unknown'));
-    }
-    loadAdaptiveGames();
-}
-
-async function reseedAdaptiveAll() {
-    if (!confirm('Reseed EVERY tracked game from your current manual OC?\n\nKeeps each game\'s session history + warned offsets but moves all baselines to where your manual OC currently sits.')) return;
-    var r = await apiPost('/api/adaptive/reseed', {});
-    if (r && r.ok) {
-        addLog('Reseeded all games to core+' + r.baseline_core + ' / mem+' + r.baseline_mem);
     }
     loadAdaptiveGames();
 }
@@ -7455,7 +7462,7 @@ async function _refreshAdaptiveDiagnostics() {
                     ? '<span style="color:var(--accent)">known game</span>'
                     : '<span style="color:var(--warning)">not in known list</span>' +
                       ' · <button class="btn btn-sm" style="margin-left:8px;padding:2px 8px;font-size:11px" ' +
-                      'onclick="addThisGameToAt(\'' + escHtml(d.foreground.exe) + '\')">Track this game</button>');
+                      'onclick="addThisGameToAt(' + jsArg(d.foreground.exe) + ')">Track this game</button>');
     } else {
         html += '<span style="color:var(--text-tertiary)">none — game_profiles polls every 3 s</span>';
     }
@@ -7693,15 +7700,15 @@ async function _refreshAdaptiveDiagnostics() {
     // Manual recalibrate button (anchor "this is gameplay" for poor auto-detection)
     if (rt.active_exe) {
         html += '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">' +
-                '<button class="btn btn-sm" onclick="recalibrateGameplay(\'' + escHtml(rt.active_exe) + '\')" ' +
+                '<button class="btn btn-sm" onclick="recalibrateGameplay(' + jsArg(rt.active_exe) + ')" ' +
                 'title="If the classifier got it wrong, anchor the baseline to RIGHT NOW. ' +
                 'Use this when you\'re sure you\'re in actual gameplay so AT learns what your real-play numbers look like.">' +
                 '▶ Anchor as gameplay</button>' +
-                '<button class="btn btn-sm" onclick="markCurrentAsMenu(\'' + escHtml(rt.active_exe) + '\')" ' +
+                '<button class="btn btn-sm" onclick="markCurrentAsMenu(' + jsArg(rt.active_exe) + ')" ' +
                 'title="Teach the classifier that the CURRENT readings are a menu. ' +
                 'AT will recognize this menu instantly the next time you enter it (no waiting on hysteresis).">' +
                 '⏸ Mark as menu</button>' +
-                '<button class="btn btn-sm" onclick="resetGameplayBaseline(\'' + escHtml(rt.active_exe) + '\')">' +
+                '<button class="btn btn-sm" onclick="resetGameplayBaseline(' + jsArg(rt.active_exe) + ')">' +
                 'Reset baseline</button>' +
                 '</div>';
     }
@@ -7719,7 +7726,7 @@ async function _refreshAdaptiveDiagnostics() {
                     ' · util ' + sig.util_lo + '–' + sig.util_hi +
                     '</span>' +
                     '<button class="btn btn-sm" style="padding:1px 6px;font-size:10.5px" ' +
-                    'onclick="removeMenuSignature(\'' + escHtml(rt.active_exe) + '\', ' + i + ')">×</button>' +
+                    'onclick="removeMenuSignature(' + jsArg(rt.active_exe) + ', ' + i + ')">×</button>' +
                     '</div>';
         });
         html += '</div>';
@@ -7781,26 +7788,6 @@ async function removeMenuSignature(exe, index) {
     }
 }
 
-// beta.15 — startRtss kept as a stub so any cached UI fragment that
-// still calls it doesn't blow up.  GhostShell no longer starts RTSS
-// from any path; if a user wants it running they launch it themselves.
-async function startRtss() {
-    showInfoToast('RTSS is no longer auto-launched by Vispora. Start it '
-        + 'yourself from the Start menu if you want it running — Vispora '
-        + 'will still detect it for the OC-tool conflict warning.',
-        { title: 'RTSS auto-launch removed', timeoutMs: 8000 });
-}
-
-async function installDepNow(key) {
-    addLog('Installing ' + key + ' via dependency manager…');
-    var r = await apiPost('/api/dependencies/install', { keys: [key] });
-    if (r && r.ok) {
-        addLog(key + ' install started — watch the banner at the top of the page for progress');
-    } else {
-        addLog(key + ' install failed: ' + ((r && r.err) || 'unknown'));
-    }
-    setTimeout(_refreshAdaptiveDiagnostics, 1500);
-}
 
 async function installPresentMon() {
     addLog('Downloading PresentMon from Microsoft GitHub...');
@@ -8008,7 +7995,7 @@ async function loadCustomGames() {
     }
     var html = '';
     custom.exes.forEach(function(g) {
-        html += '<div class="check-item"><span style="flex:1">' + escHtml(g.name || g.exe) + '</span><span style="font-size:10px;color:var(--text-dim)">' + escHtml(g.exe) + '</span><button class="btn btn-sm btn-danger" onclick="removeCustomGame(\'' + escAttr(g.exe) + '\')">x</button></div>';
+        html += '<div class="check-item"><span style="flex:1">' + escHtml(g.name || g.exe) + '</span><span style="font-size:10px;color:var(--text-dim)">' + escHtml(g.exe) + '</span><button class="btn btn-sm btn-danger" onclick="removeCustomGame(' + jsArg(g.exe) + ')">x</button></div>';
     });
     el.innerHTML = html;
 }
@@ -8405,7 +8392,7 @@ async function loadOcCapability() {
 
     if (!cap.ok || cap.vendor !== 'nvidia') {
         // 3.4.0 — clean "not your GPU" messaging instead of a raw error.
-        // GhostShell's overclocking is NVIDIA-only for now; everything
+        // Vispora's overclocking is NVIDIA-only for now; everything
         // else on this page (telemetry, driver info) still works.
         el.innerHTML =
             '<div style="color:var(--text-secondary)">Overclocking isn\'t available for your GPU.</div>' +
@@ -9599,7 +9586,11 @@ async function startAutoOc() {
     });
 
     var prev = null;
-    var totalIters = maxSteps + 4;  // generous cap
+    // Must not be smaller than the backend's own cap (max_iters + 10, where
+    // max_iters is at least 8): with the old "+ 4" this loop ran out first and
+    // simply stopped, leaving the last probe offset applied and unvalidated.
+    var totalIters = Math.max(8, maxSteps) + 12;
+    var finished = false;
 
     for (var iter = 0; iter < totalIters; iter++) {
         if (!_ocState.autoActive) break;
@@ -9611,6 +9602,7 @@ async function startAutoOc() {
             break;
         }
         if (nxt.done) {
+            finished = true;
             // v2.9.9.7 — handle the case where backend ran out of recovery
             // options (crash at +0 or last-stable also crashed).
             if (nxt.aborted) {
@@ -9695,6 +9687,15 @@ async function startAutoOc() {
             // Do NOT break.  Fall through — next iteration sends `prev`
             // (the crash verdict) to backend, which advances the phase.
         }
+    }
+
+    // Any exit other than "backend said done" or "user pressed Cancel" (which
+    // cancels by itself) leaves a session open with a test offset on the
+    // card.  Tell the backend, so it resets to stock.
+    if (!finished && _ocState.autoActive) {
+        termWrite('gpu-terminal', '⚠ Auto-OC stopped before finishing — resetting to stock', 'error');
+        updateAutoOcStatus('Stopped early — reset to stock');
+        await apiPost('/api/gpu/oc/auto/cancel');
     }
 
     _ocState.autoActive = false;
@@ -9903,7 +9904,7 @@ async function startBenchmarkTune() {
         await apiPost('/api/gpu/oc/apply', {
             core_offset_mhz: nxt.apply_core,
             mem_offset_mhz: nxt.apply_mem,
-            power_pct: 100,
+            power_pct: null,    // leave the limit the run maxed at its start; 100 would reset it to stock
         });
         // v2.9.9.4 — bumped from 1.5s to 3s.  When the previous offset
         // was hammering the GPU at full bore, NVAPI applying a new offset
@@ -10119,7 +10120,7 @@ async function _refreshDependencyBanner() {
     // ── State 2: restart pending ───────────────────────────────────
     if (restart && restart.pending) {
         var sources = [];
-        if (restart.by_ghostshell) sources.push('Vispora drivers');
+        if (restart.by_vispora) sources.push('Vispora drivers');
         if (restart.by_windows)    sources.push('Windows updates');
         banner.style.display = '';
         banner.style.borderLeft = '3px solid var(--warning)';
@@ -10137,7 +10138,7 @@ async function _refreshDependencyBanner() {
     }
 
     // beta.15 — "Install RTSS for broader frame coverage" banner removed.
-    // RTSS is no longer a managed GhostShell dependency (see core/
+    // RTSS is no longer a managed Vispora dependency (see core/
     // dependencies.py).  PresentMon 1.x covers D3D and PresentMon 2.x
     // adds OpenGL + Vulkan, so the historic RTSS recommendation isn't
     // relevant.  The dep-banner only has state 1 (auto deps installing)
@@ -10163,12 +10164,6 @@ async function restartLater() {
         addLog('Restart deferred — will re-prompt on next Vispora launch');
         _refreshDependencyBanner();
     }
-}
-
-function dismissDepBanner() {
-    sessionStorage.setItem('dep-manual-dismissed', '1');
-    var b = document.getElementById('dep-banner');
-    if (b) b.style.display = 'none';
 }
 
 document.addEventListener('DOMContentLoaded', function() {
@@ -10765,7 +10760,7 @@ async function testObsSave() {
 // ─── Stream Helper card (v3.3.1-beta.1+) ─────────────────────────
 // When the master toggle is ON, the legacy Capture controls below
 // (Clipper, audio sources, monitor picker, hotkey settings) collapse
-// to a single status block — GhostShell handles all setup via OBS.
+// to a single status block — Vispora handles all setup via OBS.
 function _renderStreamHelperStatus(d) {
     if (!d) return;
     var s = d.settings || {};
@@ -11192,40 +11187,6 @@ async function clearCaptureHotkey(name) {
     if (r && r.ok) {
         addLog('Hotkey for ' + name + ' cleared');
         loadCaptureStatus();
-    }
-}
-
-async function deleteClip(path) {
-    if (!confirm('Delete ' + path + '?')) return;
-    await apiPost('/api/clipper/delete', { path: path });
-    loadCaptureStatus();
-}
-
-async function deleteScreenshot(path) {
-    if (!confirm('Delete ' + path + '?')) return;
-    await apiPost('/api/screenshot/delete', { path: path });
-    loadCaptureStatus();
-}
-
-async function openInExplorer(path) {
-    // Hand off to the Flask backend which uses explorer /select for
-    // files or os.startfile for folders.  v3.3.0-beta.3: was firing
-    // and forgetting — silent failures gave the impression nothing
-    // was happening.  Now we log success / failure into the in-app
-    // log so the user can see what's going on.
-    if (!path) {
-        addLog('Open failed: no path');
-        return;
-    }
-    try {
-        var r = await apiPost('/api/util/open-path', { path: path });
-        if (r && r.ok) {
-            addLog('Opened ' + path);
-        } else {
-            addLog('Open failed: ' + ((r && r.err) || 'unknown'));
-        }
-    } catch (e) {
-        addLog('Open failed: ' + (e && e.message || e));
     }
 }
 

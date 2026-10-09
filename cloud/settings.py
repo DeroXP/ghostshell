@@ -1,4 +1,4 @@
-"""GhostShell-Cloud — settings loaded from env vars (Railway-friendly)."""
+"""Vispora-Cloud — settings loaded from env vars (Railway-friendly)."""
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -7,7 +7,7 @@ class Settings(BaseSettings):
 
     # Postgres connection — Railway sets this automatically when you attach
     # a Postgres service.  For local dev, copy .env.example to .env.
-    database_url: str = "postgresql://localhost/ghostshell_cloud"
+    database_url: str = "postgresql://localhost/vispora_cloud"
 
     # Server
     port: int = 8000

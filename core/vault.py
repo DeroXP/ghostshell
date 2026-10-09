@@ -234,7 +234,7 @@ def add_entry(service: str, username: str, password: str,
     conn.commit()
     conn.close()
 
-    log.info(f"Vault entry added: {service}")
+    log.info("Vault entry added")
     return {"ok": True, "id": entry_id}
 
 
@@ -332,7 +332,7 @@ def update_entry(entry_id: str, **kwargs) -> dict:
     conn.commit()
     conn.close()
 
-    log.info(f"Vault entry updated: {entry.get('service', entry_id)}")
+    log.info(f"Vault entry updated: {entry_id}")
     return {"ok": True}
 
 

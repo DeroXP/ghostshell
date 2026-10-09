@@ -1,13 +1,32 @@
 """VBS/HVCI Memory Integrity toggle for gaming performance."""
 import json
+from core import reg_originals
 from core.utils import run_ps, run_cmd, get_logger, backup_registry
 
 log = get_logger("vbs")
 
 
+_SCOPE = "vbs"      # reg_originals scope: what the disable_* functions changed
+
+
 def _reg(key, val, data, vtype="REG_DWORD"):
     r = run_cmd(["reg", "add", key, "/v", val, "/t", vtype, "/d", data, "/f"])
     return r["ok"]
+
+
+def _reg_off(key, val, data, vtype="REG_DWORD"):
+    """_reg for the disable paths: notes the prior value first, so enabling
+    again restores it instead of assuming it was 1."""
+    reg_originals.remember(key, val, data, vtype, scope=_SCOPE)
+    return _reg(key, val, data, vtype)
+
+
+_DG_KEY   = r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard"
+_HVCI_KEY = _DG_KEY + r"\Scenarios\HypervisorEnforcedCodeIntegrity"
+
+
+def _is_on(key, val) -> bool:
+    return (reg_originals.read_value(key, val) or {}).get("data") == 1
 
 
 def get_vbs_status() -> dict:
@@ -109,11 +128,11 @@ def disable_hvci() -> dict:
         r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
         "hvci_backup"
     )
-    ok = _reg(
+    ok = _reg_off(
         r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
         "Enabled", "0"
     )
-    ok2 = _reg(
+    ok2 = _reg_off(
         r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
         "Locked", "0"
     )
@@ -124,10 +143,11 @@ def disable_hvci() -> dict:
 def enable_hvci() -> dict:
     """Re-enable Memory Integrity (HVCI)."""
     log.info("Re-enabling Memory Integrity (HVCI)...")
-    ok = _reg(
-        r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
-        "Enabled", "1"
-    )
+    # Put back whatever the disable paths changed (the Locked flag, and VBS /
+    # Credential Guard if "disable VBS" was used) — then make sure the thing
+    # the user actually asked for is on, record or no record.
+    reg_originals.restore_all(_SCOPE)
+    ok = _is_on(_HVCI_KEY, "Enabled") or _reg(_HVCI_KEY, "Enabled", "1")
     log.info(f"  {'✓' if ok else '✗'} HVCI enabled (reboot required)")
     return {"ok": ok, "reboot_required": True}
 
@@ -139,23 +159,27 @@ def disable_vbs() -> dict:
 
     results = []
     # Disable VBS
-    ok1 = _reg(r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard",
-               "EnableVirtualizationBasedSecurity", "0")
+    ok1 = _reg_off(r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard",
+                   "EnableVirtualizationBasedSecurity", "0")
     results.append({"name": "Disable VBS", "ok": ok1})
 
     # Disable HVCI
-    ok2 = _reg(
+    ok2 = _reg_off(
         r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
         "Enabled", "0")
     results.append({"name": "Disable HVCI", "ok": ok2})
 
     # Disable Credential Guard
-    ok3 = _reg(
+    ok3 = _reg_off(
         r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\CredentialGuard",
         "Enabled", "0")
     results.append({"name": "Disable Credential Guard", "ok": ok3})
 
-    # Disable Virtual Machine Platform feature
+    # Disable Virtual Machine Platform feature.  Remember whether it was on:
+    # WSL2 and Docker Desktop need it, and "enable VBS" used to leave it off.
+    st = run_ps("(Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform).State", timeout=90)
+    if st.get("ok") and "enabled" in (st.get("out") or "").lower():
+        reg_originals.note("vm_platform_was_enabled")
     r = run_ps("Disable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -NoRestart -ErrorAction SilentlyContinue")
     results.append({"name": "Disable VM Platform", "ok": r["ok"] or "not found" in r["err"].lower()})
 
@@ -166,9 +190,18 @@ def disable_vbs() -> dict:
 def enable_vbs() -> dict:
     """Re-enable VBS."""
     log.info("Re-enabling VBS...")
-    ok1 = _reg(r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard",
-               "EnableVirtualizationBasedSecurity", "1")
-    ok2 = _reg(
-        r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
-        "Enabled", "1")
+    # Put back what disable_vbs() changed — VBS, HVCI and Credential Guard,
+    # each to its previous value — then make sure VBS and HVCI, which is what
+    # the user asked for, really are on (there is no record to go by when an
+    # older build did the disabling).
+    reg_originals.restore_all(_SCOPE)
+    ok1 = _is_on(_DG_KEY, "EnableVirtualizationBasedSecurity") \
+        or _reg(_DG_KEY, "EnableVirtualizationBasedSecurity", "1")
+    ok2 = _is_on(_HVCI_KEY, "Enabled") or _reg(_HVCI_KEY, "Enabled", "1")
+    if reg_originals.noted("vm_platform_was_enabled"):
+        r = run_ps("Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform "
+                   "-All -NoRestart -ErrorAction SilentlyContinue", timeout=300)
+        if r.get("ok"):
+            reg_originals.forget_notes("vm_platform_was_enabled")
+            log.info("  ✓ Virtual Machine Platform re-enabled")
     return {"ok": ok1 and ok2, "reboot_required": True}

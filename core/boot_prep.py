@@ -4,18 +4,42 @@ Runs in a background thread so it never blocks the UI. All tweaks here are
 either temporary (RAM flush) or idempotent registry settings that Windows can
 undo via 'Reset All' in the Optimizer page.
 """
+import json
 import os
 import time
 import threading
-from core.utils import run_ps, run_cmd, get_logger
+from config import APPDATA_DIR
+from core import reg_originals
+from core.utils import run_ps, run_cmd, get_logger, atomic_write_json
 
 log = get_logger("boot_prep")
 
 _state = {"running": False, "done": False, "started_at": 0, "finished_at": 0, "steps": []}
 
 
+_SETTINGS_PATH = os.path.join(APPDATA_DIR, "boot_prep.json")
+
+
+def _persistent_allowed() -> bool:
+    """May the prep change lasting system settings (registry, power plan)?
+    Reset All turns this off: the prep runs at every launch, and would
+    otherwise re-apply what the user has just asked to have undone."""
+    try:
+        with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            return bool((json.load(f) or {}).get("persistent", True))
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
+def set_persistent_allowed(allowed: bool) -> None:
+    try:
+        atomic_write_json(_SETTINGS_PATH, {"persistent": bool(allowed)})
+    except Exception as e:
+        log.debug(f"could not save boot-prep setting: {e}")
+
+
 def get_status() -> dict:
-    return dict(_state)
+    return dict(_state, persistent=_persistent_allowed())
 
 
 def _step(name: str, fn):
@@ -64,41 +88,38 @@ public class SB {
     return r["ok"] and "OK" in r["out"]
 
 
+def _reg(key: str, val: str, data: str, vtype: str = "REG_DWORD") -> bool:
+    # Recorded like any optimizer tweak, so Reset All can put back whatever
+    # was there before.  These used to be written at every launch with no
+    # record at all.
+    reg_originals.remember(key, val, data, vtype)
+    return run_cmd(["reg", "add", key, "/v", val, "/t", vtype, "/d", data, "/f"])["ok"]
+
+
+_GAMES_TASK = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games"
+_SYSTEM_PROFILE = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+
+
 def _mmcss_gaming_profile() -> bool:
-    """Tell MMCSS the Games task has priority — foundational latency tweak."""
-    run_cmd(["reg", "add",
-             r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games",
-             "/v", "GPU Priority", "/t", "REG_DWORD", "/d", "8", "/f"])
-    run_cmd(["reg", "add",
-             r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games",
-             "/v", "Priority", "/t", "REG_DWORD", "/d", "6", "/f"])
-    run_cmd(["reg", "add",
-             r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games",
-             "/v", "Scheduling Category", "/t", "REG_SZ", "/d", "High", "/f"])
-    run_cmd(["reg", "add",
-             r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games",
-             "/v", "SFIO Priority", "/t", "REG_SZ", "/d", "High", "/f"])
+    """Tell MMCSS the Games task has priority."""
+    _reg(_GAMES_TASK, "GPU Priority", "8")
+    _reg(_GAMES_TASK, "Priority", "6")
+    _reg(_GAMES_TASK, "Scheduling Category", "High", "REG_SZ")
+    _reg(_GAMES_TASK, "SFIO Priority", "High", "REG_SZ")
     return True
 
 
 def _foreground_boost() -> bool:
-    """Boost foreground apps a little — balanced, not the aggressive 0x28 value."""
-    # 0x26 = Short quantum, variable — gaming-friendly but not as aggressive as 0x28
-    run_cmd(["reg", "add", r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl",
-             "/v", "Win32PrioritySeparation", "/t", "REG_DWORD", "/d", "38", "/f"])
-    run_cmd(["reg", "add", r"HKCU\Control Panel\Desktop",
-             "/v", "ForegroundLockTimeout", "/t", "REG_DWORD", "/d", "0", "/f"])
+    """Boost foreground apps a little (0x26: short, variable quanta)."""
+    _reg(r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl", "Win32PrioritySeparation", "38")
+    _reg(r"HKCU\Control Panel\Desktop", "ForegroundLockTimeout", "0")
     return True
 
 
 def _network_throttle_off() -> bool:
-    """Disable the 10-packet-per-ms network throttle — safe, widely recommended."""
-    run_cmd(["reg", "add",
-             r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
-             "/v", "NetworkThrottlingIndex", "/t", "REG_DWORD", "/d", "4294967295", "/f"])
-    run_cmd(["reg", "add",
-             r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
-             "/v", "SystemResponsiveness", "/t", "REG_DWORD", "/d", "10", "/f"])
+    """Disable the 10-packets-per-ms multimedia network throttle."""
+    _reg(_SYSTEM_PROFILE, "NetworkThrottlingIndex", "4294967295")
+    _reg(_SYSTEM_PROFILE, "SystemResponsiveness", "10")
     return True
 
 
@@ -109,6 +130,16 @@ def _flush_dns() -> bool:
 
 def _high_performance_power() -> bool:
     """Switch to High Performance power plan (non-destructive — can be changed back anytime)."""
+    from core import optimizer
+    # Note the plan the user is on BEFORE leaving it.  Nothing used to: by the
+    # time the optimizer recorded "the user's plan" for Reset All to return
+    # to, this step had already replaced it with High Performance.
+    optimizer._capture_power_baseline()
+    if optimizer.active_power_plan().lower() in optimizer._own_power_plans():
+        # Already on a performance plan.  Switching anyway used to drop the
+        # optimizer's Ultimate Performance plan back to High Performance at
+        # every launch.
+        return True
     # Try Ultimate Performance first
     r = run_cmd(["powercfg", "/setactive", "e9a42b02-d5df-448d-aa00-03f14749eb61"], timeout=8)
     if r["ok"]:
@@ -118,10 +149,13 @@ def _high_performance_power() -> bool:
     return r["ok"]
 
 
-def prep_for_gaming_async(on_done=None):
+def prep_for_gaming_async(on_done=None, force=False):
     """Run boot prep in a background thread. Safe to call multiple times — becomes a no-op if already running/done."""
-    if _state["running"] or _state["done"]:
+    if _state["running"] or (_state["done"] and not force):
         return
+    if force:
+        set_persistent_allowed(True)        # asked for by hand ("Re-run Prep")
+    _state["running"] = True                # claimed here, not in the thread: two quick calls ran it twice
 
     def _runner():
         _state["running"] = True
@@ -132,10 +166,13 @@ def prep_for_gaming_async(on_done=None):
             _step("Flush DNS cache", _flush_dns)
             _step("Trim working sets", _flush_working_sets)
             _step("Clear standby list", _clear_standby_list)
-            _step("MMCSS gaming profile", _mmcss_gaming_profile)
-            _step("Foreground boost", _foreground_boost)
-            _step("Network throttle off", _network_throttle_off)
-            _step("High performance power", _high_performance_power)
+            if _persistent_allowed():
+                _step("MMCSS gaming profile", _mmcss_gaming_profile)
+                _step("Foreground boost", _foreground_boost)
+                _step("Network throttle off", _network_throttle_off)
+                _step("High performance power", _high_performance_power)
+            else:
+                log.info("  system tweaks skipped: Reset All was used (Re-run Prep turns them back on)")
         except Exception as e:
             # Belt-and-suspenders: individual steps already catch their own
             # errors via _step(), but if anything here still slips through,

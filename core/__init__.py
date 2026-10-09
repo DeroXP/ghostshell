@@ -1,1 +1,1 @@
-# GhostShell Core Modules
+# Vispora Core Modules

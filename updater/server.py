@@ -7,7 +7,7 @@ Routes:
   POST /api/cancel            → cancel an in-flight install
   POST /api/set-channel       → user picked a channel
   POST /api/set-target-dir    → user picked an install location
-  POST /api/launch-app        → spawn the (just-installed) GhostShell
+  POST /api/launch-app        → spawn the (just-installed) Vispora
   POST /api/quit              → close the updater window
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ import threading
 import time
 from typing import Optional
 
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import Flask, jsonify, render_template, request
 
 # Shared state — populated by main.py's init_state(), mutated by the
 # install pipeline, read by the UI's polling loop.
@@ -32,7 +32,7 @@ _state = {
     "auto_confirm":      False,
     "silent":            False,
     # v1.1.0 — "install" or "update".  Set by main.py based on whether
-    # an existing GhostShell.exe was found.  The UI shows a different
+    # an existing install was found.  The UI shows a different
     # title + install-dir picker in install mode, and the pipeline
     # skips the close step.
     "mode":              "update",
@@ -57,12 +57,12 @@ _install_thread: Optional[threading.Thread] = None
 
 # Standard 5-step pipeline.  Order MUST match the UI's renderer.
 PIPELINE_STEPS = [
-    {"key": "close",     "label": "Closing GhostShell"},
+    {"key": "close",     "label": "Closing Vispora"},
     {"key": "channel",   "label": "Checking release server"},
     {"key": "download",  "label": "Downloading new version"},
     {"key": "verify",    "label": "Verifying integrity"},
     {"key": "install",   "label": "Installing"},
-    {"key": "launch",    "label": "Restarting GhostShell"},
+    {"key": "launch",    "label": "Restarting Vispora"},
 ]
 
 
@@ -225,11 +225,11 @@ def api_set_target_dir():
 
 @app.route("/api/launch-app", methods=["POST"])
 def api_launch_app():
-    """User clicked 'Launch GhostShell' after the install finished."""
+    """User clicked 'Launch Vispora' after the install finished."""
     import subprocess
     target = _state.get("target_exe", "")
     if not target or not os.path.isfile(target):
-        return jsonify({"ok": False, "err": f"GhostShell not found at {target}"})
+        return jsonify({"ok": False, "err": f"Vispora not found at {target}"})
     try:
         subprocess.Popen(
             [target], close_fds=True,
@@ -252,11 +252,11 @@ def api_quit():
 
 @app.route("/api/rescan", methods=["POST"])
 def api_rescan():
-    """Re-run the PC scan for an existing GhostShell.exe.  Useful when
-    the user just moved or installed GhostShell and wants to switch
+    """Re-run the PC scan for an existing install.  Useful when
+    the user just moved or installed Vispora and wants to switch
     from install mode to update mode without restarting the updater."""
     from updater import installer
-    found = installer.find_existing_ghostshell()
+    found = installer.find_existing_install()
     with _state_lock:
         _state["scan_result"] = found
         if found.get("found"):
@@ -294,7 +294,7 @@ def api_browse_folder():
         if not result:
             return jsonify({"ok": True, "cancelled": True, "path": ""})
         picked = result[0] if isinstance(result, (list, tuple)) else result
-        # Update the state with the new path (rename-aware)
+        # Update the state with the new path
         from updater import installer
         with _state_lock:
             _state["target_dir"] = picked

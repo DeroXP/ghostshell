@@ -1,4 +1,4 @@
-"""Zero-knowledge primitives for GhostShell-Cloud.
+"""Zero-knowledge primitives for Vispora-Cloud.
 
 The product promise is: *"We can't see your data."*  This module is the
 load-bearing piece that makes that promise true.
@@ -31,7 +31,6 @@ import hmac
 import logging
 import re
 import secrets
-from typing import Iterable
 
 from settings import settings
 
@@ -43,7 +42,7 @@ def _decode_pepper(name: str, raw: str) -> bytes:
     deterministic-but-unsafe fallback so dev imports don't crash, and
     log a loud warning so it's caught before production deploy.
     """
-    log = logging.getLogger("ghostshell-cloud.security")
+    log = logging.getLogger("vispora-cloud.security")
     if raw:
         try:
             decoded = base64.b64decode(raw, validate=True)
@@ -207,7 +206,7 @@ class PrivacyFilter(logging.Filter):
     Railway's log pipeline.  Applied to:
       • uvicorn.access     — the access log (client IP is positional arg 0)
       • uvicorn.error      — internal errors that may include peer info
-      • ghostshell-cloud.* — our own logger tree, defensive
+      • vispora-cloud.* — our own logger tree, defensive
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -227,10 +226,10 @@ def install_privacy_filter() -> None:
     """Attach PrivacyFilter to every logger that might emit a client IP.
     Called once from main.py on app boot.
     """
-    log = logging.getLogger("ghostshell-cloud")
+    log = logging.getLogger("vispora-cloud")
     f = PrivacyFilter()
     for name in ("uvicorn.access", "uvicorn.error", "uvicorn",
-                 "ghostshell-cloud", "fastapi"):
+                 "vispora-cloud", "fastapi"):
         logging.getLogger(name).addFilter(f)
     log.info("Privacy log filter installed — client IPs will be scrubbed")
     if using_insecure_dev_peppers():

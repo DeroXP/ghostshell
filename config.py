@@ -1,43 +1,124 @@
-"""Vispora Configuration Constants."""
+"""Vispora configuration constants."""
 import os
+import sys
 
 APP_NAME = "Vispora"
-APP_VERSION = "3.5.2"
+APP_VERSION = "3.6.0"
 APP_PORT = 5987
 
-# Vispora rebrand note: the on-disk AppData folder, the update-server host, the
-# update routes, and (for now) the shipped exe filename DELIBERATELY stay named
-# "GhostShell" so the existing installed base keeps auto-updating and keeps its
-# saved data (profiles, license, OC baselines).  Only user-visible branding +
-# the theme changed in this release.  See APPDATA_DIR below.
+# Until 3.5.0 the app shipped as "GhostShell", and installs from that era still
+# carry the old name on disk: the exe filename, the %APPDATA% folder, the
+# autostart task, firewall / QoS rules, the hosts-file marker.  Nothing is
+# created under this name any more — it is kept so the code can recognise what
+# an older build left behind and adopt or remove it.
+LEGACY_APP_NAME = "GhostShell"
 
-# v3 — release channel + update server.  Default flipped to "stable"
-# now that v3.0.0 has shipped as the first stable build.  Beta channel
-# stays available for early-access testers.
+APP_EXE_NAME            = f"{APP_NAME}.exe"
+UPDATER_EXE_NAME        = f"{APP_NAME}Updater.exe"
+LEGACY_APP_EXE_NAME     = f"{LEGACY_APP_NAME}.exe"
+LEGACY_UPDATER_EXE_NAME = f"{LEGACY_APP_NAME}Updater.exe"
+
+# Image names of our own processes, lower-cased — for the "never pause / flag /
+# report ourselves" lists and the "is our own window focused" checks.  An
+# install that was updated in place keeps its original exe filename, so the
+# old names stay in the set.
+OWN_PROCESS_NAMES = frozenset(n.lower() for n in (
+    APP_EXE_NAME, UPDATER_EXE_NAME, LEGACY_APP_EXE_NAME, LEGACY_UPDATER_EXE_NAME))
+
+# Release channel + update server.  "stable" is the default; "beta" stays
+# available for early-access testers.
 APP_CHANNEL_DEFAULT = "stable"
 UPDATE_SERVER_URL_DEFAULT = "https://vispora.up.railway.app"
-# The Railway service was renamed ghostshell-site → vispora (2026-07-01).
-# The old ghostshell-site.up.railway.app domain is DEAD (404) — binaries
-# ≤3.5.0-beta.11 / stable 3.4.3 point at it and can only recover if the
-# old domain is re-added as an alias on Railway or the user updates
-# manually.  core/updater.py migrates any SAVED old server_url on load.
-UPDATE_SERVER_URL_LEGACY = "https://ghostshell-site.up.railway.app"
-UPDATE_CHECK_INTERVAL_SEC = 3600    # check once per hour while running
+# The release server's previous hostname.  It has been dead (404) since the
+# Railway service was renamed on 2026-07-01, so a saved server_url that still
+# points at it would strand that install's update checks forever.
+_DEAD_UPDATE_SERVER_HOST = "ghostshell-site.up.railway.app"
 
-# Paths.  APPDATA_DIR stays "GhostShell" on purpose (see rebrand note up top) —
-# renaming it would strand every existing user's saved data and desync the
-# standalone updater, which independently computes this same path.
-APPDATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "GhostShell")
-UPDATE_STATE_PATH = os.path.join(APPDATA_DIR, "update_state.json")
-PENDING_UPDATE_PATH = os.path.join(APPDATA_DIR, "pending_update.exe")
+
+def is_dead_update_server(url: str) -> bool:
+    """True if `url` points at the retired release-server hostname.  Settings
+    loaders use this to rewrite a stale saved URL to the current default."""
+    return _DEAD_UPDATE_SERVER_HOST in (url or "")
+
+
+# ── Data folder ──────────────────────────────────────────────────────────
+def _is_app_process() -> bool:
+    """True when this interpreter IS the app (the frozen exe, or `python
+    app.py`) rather than a test, tool or REPL that merely imports config."""
+    if getattr(sys, "frozen", False):
+        return True
+    main_file = getattr(sys.modules.get("__main__"), "__file__", "") or ""
+    return os.path.basename(main_file).lower() == "app.py"
+
+
+def _resolve_appdata_dir() -> str:
+    """Return the folder everything the app persists lives in.
+
+    That is %APPDATA%/Vispora.  An install that predates the rename has its
+    data (vault, license, profiles, OC baselines) in %APPDATA%/GhostShell, so
+    the first launch of a renamed build moves that folder across with a single
+    atomic rename — it either lands whole or not at all, never half-copied.
+
+    The rename fails while any other process holds a file open in the old
+    folder (typically the standalone updater that just launched us).  In that
+    case, and for anything that isn't the app itself, keep using the old
+    folder as-is; the next launch tries again.
+
+    The standalone updater resolves the same folder the same way, minus the
+    rename (updater/main.py) — keep the two in step.
+    """
+    root = os.environ.get("APPDATA", os.path.expanduser("~"))
+    current = os.path.join(root, APP_NAME)
+    legacy = os.path.join(root, LEGACY_APP_NAME)
+    if os.path.isdir(current) or not os.path.isdir(legacy):
+        return current
+    if _is_app_process():
+        try:
+            os.rename(legacy, current)
+            return current
+        except OSError:
+            pass
+    return legacy
+
+
+def _adopt_legacy_log(log_path: str) -> None:
+    """Carry the pre-rename log file and its rotated copies over to the new
+    filename so the log history stays in one place.  Best-effort."""
+    folder, name = os.path.split(log_path)
+    legacy_name = name.replace(APP_NAME.lower(), LEGACY_APP_NAME.lower())
+    for suffix in ("", ".1", ".2", ".3"):
+        old = os.path.join(folder, legacy_name + suffix)
+        new = log_path + suffix
+        try:
+            if os.path.isfile(old) and not os.path.exists(new):
+                os.rename(old, new)
+        except OSError:
+            pass
+
+
+APPDATA_DIR = _resolve_appdata_dir()
 VAULT_DB_PATH = os.path.join(APPDATA_DIR, "vault.db")
-LOG_FILE_PATH = os.path.join(APPDATA_DIR, "ghostshell.log")
+LOG_FILE_PATH = os.path.join(APPDATA_DIR, "vispora.log")
 BACKUP_DIR = os.path.join(APPDATA_DIR, "backups")
-PROFILE_DIR = os.path.join(APPDATA_DIR, "profiles")
 
-# Ensure dirs exist
-for d in [APPDATA_DIR, BACKUP_DIR, PROFILE_DIR]:
+for d in [APPDATA_DIR, BACKUP_DIR]:
     os.makedirs(d, exist_ok=True)
+if _is_app_process():
+    _adopt_legacy_log(LOG_FILE_PATH)
+
+
+def user_media_dir(library: str, leaf: str) -> str:
+    """Default save folder for clips / screenshots:
+    <profile>/<library>/Vispora/<leaf>.  A user who already has a
+    <library>/GhostShell folder from before the rename keeps saving there —
+    those are their own files, and quietly moving them (or splitting the
+    collection across two folders) would be worse than an old folder name."""
+    profile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    current = os.path.join(profile, library, APP_NAME)
+    legacy = os.path.join(profile, library, LEGACY_APP_NAME)
+    parent = legacy if (os.path.isdir(legacy) and not os.path.isdir(current)) else current
+    return os.path.join(parent, leaf)
+
 
 # Vault security
 VAULT_PBKDF2_ITERATIONS = 600_000

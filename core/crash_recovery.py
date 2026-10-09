@@ -8,14 +8,14 @@ user quitting normally) by looking at:
     artifacts / hangs are detected)
   • Whether the game exited with active OC offsets
 
-If a crash is detected AND the game had OC offsets active, GhostShell:
+If a crash is detected AND the game had OC offsets active, Vispora:
   1. Adds the failing offset to that game's permanent crash blacklist
   2. Computes a safe step-down — highest known-good offset below the
      failing one (per axis: core / mem)
   3. Optionally re-saves the stepped-down profile + applies it
   4. Fires a Windows toast within ~5 s explaining what happened
 
-Persistent files in `%APPDATA%\\GhostShell\\`:
+Persistent files in `%APPDATA%\\Vispora\\`:
   crash_blacklist.json  — per-game list of failed (core, mem) pairs
   crash_history.json    — chronological log of all detected crashes
 
@@ -228,6 +228,9 @@ def clear_history() -> dict:
 
 
 # ─── Crash classification ────────────────────────────────────────────────
+_EXIT_DETECT_SLACK_S = 5      # the game monitor only polls every ~3 s
+
+
 def detect_crash(exit_ts: Optional[float] = None,
                  lookback_s: int = CRASH_LOOKBACK_S) -> dict:
     """Inspect Windows Event Log + in-app crash flag to decide whether
@@ -246,6 +249,14 @@ def detect_crash(exit_ts: Optional[float] = None,
     """
     # Defer the heavy gpu_overclock import — keeps module load cheap.
     from core import gpu_overclock
+
+    # The window has to reach back past the moment the game died.  This runs
+    # only after the post-exit restore (seconds of reg / powercfg / PowerShell
+    # work on top of the monitor's own poll interval), so "the last N seconds
+    # from now" routinely missed the very TDR that killed the game — and the
+    # crashing offset was then recorded as a clean, stable session.
+    if exit_ts:
+        lookback_s = int(max(0.0, time.time() - float(exit_ts))) + lookback_s + _EXIT_DETECT_SLACK_S
 
     # 1) Windows Event Log TDR / driver crash
     drv = gpu_overclock.check_driver_events(seconds_back=lookback_s)
@@ -307,7 +318,8 @@ def _proven_oc_floor() -> "tuple[int, int]":
 
 # ─── Main entry — called by game_profiles on every game exit ─────────────
 def handle_game_exit(exe: str, display_name: str | None,
-                     active_core: int, active_mem: int) -> dict:
+                     active_core: int, active_mem: int,
+                     exit_ts: Optional[float] = None) -> dict:
     """Process a game-exit event.  Decides if it was a crash, blacklists,
     steps down, notifies.  Idempotent — safe to call on normal exits too
     (it just returns early).
@@ -322,7 +334,7 @@ def handle_game_exit(exe: str, display_name: str | None,
       {'crashed': bool, 'kind': str, 'step_down': {...} or None,
        'blacklisted': bool, 'notification_fired': bool}
     """
-    detection = detect_crash()
+    detection = detect_crash(exit_ts)
     if not detection["crashed"]:
         return {
             "crashed":            False,
@@ -368,7 +380,7 @@ def handle_game_exit(exe: str, display_name: str | None,
             apply_r = gpu_overclock.apply_oc(
                 core_offset_mhz=step_down["core"],
                 mem_offset_mhz=step_down["mem"],
-                power_pct=100,                  # don't touch the power slider
+                power_pct=None,                 # don't touch the power limit
             )
             log.info(
                 f"Crash auto-recovery: transient step-down to core+"
@@ -399,7 +411,7 @@ def handle_game_exit(exe: str, display_name: str | None,
                    f"step-down was needed.")
         else:
             title = f"{name} crashed"
-            msg = ("Detected a driver crash during play.  GhostShell wasn't "
+            msg = ("Detected a driver crash during play.  Vispora wasn't "
                    "applying any OC, so this looks like a game / driver issue.")
         notifier.toast(title, msg, force=True)
         notif_ok = True

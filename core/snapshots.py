@@ -1,11 +1,11 @@
-"""Snapshots & Restore — the undo layer for GhostShell.
+"""Snapshots & Restore — the undo layer for Vispora.
 
 A snapshot is a named, timestamped bundle of registry exports covering
-every path GhostShell ever writes to.  Taking a snapshot is fast (single
+every path Vispora ever writes to.  Taking a snapshot is fast (single
 `reg export` per path).  Restoring re-imports those .reg files, undoing
 any change made between the snapshot and now.
 
-Lives in `%APPDATA%\\GhostShell\\snapshots\\<id>\\`:
+Lives in `%APPDATA%\\Vispora\\snapshots\\<id>\\`:
     meta.json     — name, description, timestamp, scope, file list
     <path>.reg    — one .reg export per registry hive path
 
@@ -21,7 +21,7 @@ Public API:
 Conservative by default: auto-snapshots are kept for the last 10
 events; manual snapshots are kept until the user deletes them.
 
-Scope: 'full' covers every HKLM / HKCU path GhostShell modules touch.
+Scope: 'full' covers every HKLM / HKCU path Vispora modules touch.
 The list is curated below — when adding a new optimizer category, also
 add its registry paths to `_GS_REGISTRY_SCOPE` so they're captured in
 future snapshots.
@@ -42,7 +42,7 @@ log = get_logger("snapshots")
 
 SNAPSHOTS_DIR = os.path.join(APPDATA_DIR, "snapshots")
 
-# ─── Curated GhostShell registry scope ───────────────────────────────────
+# ─── Curated Vispora registry scope ───────────────────────────────────
 # Every path this list covers gets exported on each "full" snapshot.
 # Adding a path here makes it part of all FUTURE snapshots; existing
 # snapshots are unchanged.
@@ -168,7 +168,7 @@ def take_snapshot(name: str, description: str = "",
     Args:
       name:        short user-visible name (e.g. "before hard tweaks")
       description: optional free-text note
-      scope:       'full' uses the curated GhostShell-touched paths.
+      scope:       'full' uses the curated Vispora-touched paths.
                    'custom' uses `paths` argument exclusively.
       paths:       list of (label, key) tuples; required if scope='custom'
       auto:        marks this as an automatic snapshot — eligible for
@@ -272,16 +272,32 @@ def list_snapshots() -> list[dict]:
     return out
 
 
-def get_snapshot(snap_id: str) -> Optional[dict]:
+def _snapshot_dir(snap_id: str) -> Optional[str]:
+    """Resolve a snapshot id to its folder, or None unless the id names a
+    folder directly inside SNAPSHOTS_DIR.
+
+    Ids arrive from the HTTP API.  Joined unchecked, an id of ".." selected
+    the whole data folder and an absolute path selected anything at all —
+    and delete_snapshot() rmtree's what it is given, while restore_snapshot()
+    `reg import`s from it."""
+    if not snap_id or snap_id in (".", "..") or any(c in snap_id for c in '/\\:'):
+        return None
     full = os.path.join(SNAPSHOTS_DIR, snap_id)
-    if not os.path.isdir(full):
+    if os.path.dirname(os.path.realpath(full)) != os.path.realpath(SNAPSHOTS_DIR):
+        return None
+    return full if os.path.isdir(full) else None
+
+
+def get_snapshot(snap_id: str) -> Optional[dict]:
+    full = _snapshot_dir(snap_id)
+    if full is None:
         return None
     return _read_meta(full)
 
 
 def delete_snapshot(snap_id: str) -> dict:
-    full = os.path.join(SNAPSHOTS_DIR, snap_id)
-    if not os.path.isdir(full):
+    full = _snapshot_dir(snap_id)
+    if full is None:
         return {"ok": False, "err": "snapshot not found"}
     try:
         shutil.rmtree(full)
@@ -297,8 +313,8 @@ def restore_snapshot(snap_id: str) -> dict:
     the current registry values for those paths.  Reboot recommended
     after a full restore so kernel-level changes (Memory Mgmt, Session
     Mgr, etc.) re-load from the restored values."""
-    full = os.path.join(SNAPSHOTS_DIR, snap_id)
-    meta = _read_meta(full)
+    full = _snapshot_dir(snap_id)
+    meta = _read_meta(full) if full else None
     if meta is None:
         return {"ok": False, "err": "snapshot not found"}
 

@@ -2,9 +2,13 @@
 import json
 import threading
 import time
-from core.utils import run_ps, run_cmd, get_logger, backup_registry
+from core import reg_originals, sys_state
+from core.utils import run_ps, run_cmd, get_logger
 
 log = get_logger("timer")
+
+_BCD_TIMER_ELEMENTS = ("disabledynamictick", "useplatformclock")
+sys_state.allow("bcd", _BCD_TIMER_ELEMENTS)
 
 # Standby list cleaner state
 _islc_state = {
@@ -18,6 +22,7 @@ _islc_state = {
 
 
 def _reg(key, val, data, vtype="REG_DWORD"):
+    reg_originals.remember(key, val, data, vtype)      # so Reset All can put the real value back
     r = run_cmd(["reg", "add", key, "/v", val, "/t", vtype, "/d", data, "/f"])
     return r["ok"]
 
@@ -164,15 +169,13 @@ def apply_timer_tweaks(disable_dynamic_tick: bool = True,
 
     # Disable dynamic tick — forces consistent timer intervals
     if disable_dynamic_tick:
-        r = run_cmd(["bcdedit", "/set", "disabledynamictick", "yes"])
-        ok = r["ok"]
+        ok = sys_state.set_bcd("disabledynamictick", "yes")     # notes what it was, for the restore below
         log.info(f"  {'✓' if ok else '✗'} Disable dynamic tick")
         results.append({"name": "Disable Dynamic Tick", "ok": ok})
 
     # Disable platform clock (use TSC instead of HPET)
     if disable_platform_clock:
-        r = run_cmd(["bcdedit", "/set", "useplatformclock", "no"])
-        ok = r["ok"]
+        ok = sys_state.set_bcd("useplatformclock", "no")
         log.info(f"  {'✓' if ok else '✗'} Disable platform clock (use TSC)")
         results.append({"name": "Use TSC Timer", "ok": ok})
 
@@ -199,11 +202,15 @@ def restore_timer_defaults() -> list[dict]:
     log.info("Restoring timer defaults...")
     results = []
 
-    r1 = run_cmd(["bcdedit", "/deletevalue", "disabledynamictick"])
-    results.append({"name": "Restore Dynamic Tick", "ok": r1["ok"]})
-
-    r2 = run_cmd(["bcdedit", "/deletevalue", "useplatformclock"])
-    results.append({"name": "Restore Platform Clock", "ok": r2["ok"]})
+    # Back to what each element was before apply_timer_tweaks() changed it;
+    # with nothing on record, to the Windows default — no value at all.
+    for element, label in (("disabledynamictick", "Restore Dynamic Tick"),
+                           ("useplatformclock", "Restore Platform Clock")):
+        if reg_originals.has_state("bcd", element):
+            ok = sys_state.restore_kind("bcd", only=element)["failed"] == 0
+        else:
+            ok = run_cmd(["bcdedit", "/deletevalue", "{current}", element])["ok"]
+        results.append({"name": label, "ok": ok})
 
     r3 = run_ps(
         "Get-PnpDevice | Where-Object {$_.FriendlyName -like '*High Precision*' -or $_.FriendlyName -like '*HPET*'} "

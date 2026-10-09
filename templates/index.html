@@ -152,7 +152,7 @@
                         <div class="section-subtitle">Your hardware, your modules, your control surface — all in one view.</div>
                     </div>
                     <div class="page-header-actions">
-                        <button class="btn btn-cta btn-primary" onclick="runFullGhost()">⚡ Full Spectrum</button>
+                        <button class="btn btn-cta btn-primary" onclick="runFullSpectrum()">⚡ Full Spectrum</button>
                     </div>
                 </div>
             </div>
@@ -245,7 +245,7 @@
                     <div class="action-card-title">Harden</div>
                     <div class="action-card-desc">Block telemetry hosts, lock down privacy, kill data leaks.</div>
                 </div>
-                <div class="action-card featured" onclick="runFullGhost()">
+                <div class="action-card featured" onclick="runFullSpectrum()">
                     <div class="action-card-icon">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
                     </div>
@@ -702,6 +702,7 @@
                     </div>
                     <div class="page-header-actions">
                         <button class="btn" onclick="restoreNetworking()" title="One-click recovery if WiFi disappeared, IPv6 broke things, or DNS won't apply.  Restarts WLAN service, re-enables IPv6, resets adapter bindings.  Reboot recommended.">Restore networking</button>
+                        <button class="btn" onclick="undoNetworkTweaks()" title="Puts each setting the tweaks on this tab changed back to what it was before: registry values, TCP parameters, Teredo, 6to4 and ISATAP, and the game-port QoS rules.  Adapter driver settings are not covered.">Undo tweaks</button>
                         <button class="btn btn-cta btn-primary" onclick="runNetworkOptimize()">Apply All Tweaks</button>
                     </div>
                 </div>
@@ -856,6 +857,7 @@
                         <div class="section-subtitle">Vendor tweaks, clean driver install, and overclocking with multi-signal stability checks.</div>
                     </div>
                     <div class="page-header-actions">
+                        <button class="btn" onclick="undoGpuTweaks()" title="Puts back what the vendor tweaks changed: driver registry values, the telemetry service and the vendor scheduled tasks, each to what it was before.">Undo tweaks</button>
                         <button class="btn btn-cta btn-primary" onclick="runGpuTweaks()">Auto-Detect &amp; Apply</button>
                     </div>
                 </div>
@@ -2741,7 +2743,7 @@
                     </div>
                     <div id="settings-about" style="font-size:13px;color:var(--text-secondary);line-height:1.7">
                         <div style="font-size:18px;font-weight:600;color:var(--text-bright);margin-bottom:4px;letter-spacing:-0.01em">Vispora <span style="color:var(--accent);font-family:var(--font-mono);font-size:14px">v<span id="settings-version">{{ version }}</span></span></div>
-                        <div>Settings are stored in <code style="color:var(--accent);font-size:12px;background:var(--bg-input);padding:2px 6px;border-radius:4px">%APPDATA%\GhostShell\</code></div>
+                        <div>Settings are stored in <code style="color:var(--accent);font-size:12px;background:var(--bg-input);padding:2px 6px;border-radius:4px">{{ appdata_dir }}</code></div>
                     </div>
                 </div>
             </div>

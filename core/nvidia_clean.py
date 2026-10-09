@@ -6,12 +6,35 @@ now handles all three major GPU vendors and dispatches internally based on
 """
 import json
 import os
+from config import APPDATA_DIR
+from core import reg_originals, sys_state
 from core.utils import run_ps, run_cmd, get_logger, backup_registry
 
 log = get_logger("gpu")
 
+# Everything the tweaks on this tab change is noted under this scope before
+# it changes (core/reg_originals.py, core/sys_state.py), and undo_gpu_tweaks()
+# puts it back.  The tab used to have no undo of any kind.
+_SCOPE = "gpu"
+
+_NV_TELEMETRY_SERVICES = ("NvTelemetryContainer",)
+_NV_TASKS = (
+    "NvTmRep_CrashReport1_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}",
+    "NvTmRep_CrashReport2_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}",
+    "NvTmRep_CrashReport3_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}",
+    "NvTmRep_CrashReport4_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}",
+    "NvTmMon_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}",
+    "NvTmRepOnLogon_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}",
+)
+_AMD_TASKS = ("StartDVR", "StartCN", r"\AMD\RadeonSoftwareStartupTask")
+_INTEL_TASKS = (r"\IntelSURQC-Upgrade-86621605-2a0b-4128-8ffc-15514c247132-Logon",)
+
+sys_state.allow("service", _NV_TELEMETRY_SERVICES)
+sys_state.allow("task", _NV_TASKS + _AMD_TASKS + _INTEL_TASKS)
+
 
 def _reg(key, val, data, vtype="REG_DWORD"):
+    reg_originals.remember(key, val, data, vtype, scope=_SCOPE)     # what it was, for undo_gpu_tweaks()
     r = run_cmd(["reg", "add", key, "/v", val, "/t", vtype, "/d", data, "/f"])
     return r["ok"]
 
@@ -184,7 +207,7 @@ def prepare_clean_install() -> dict:
     script_content = """@echo off
 chcp 65001 >nul 2>nul
 echo ============================================
-echo   GhostShell NVIDIA Clean Install Helper
+echo   Vispora NVIDIA Clean Install Helper
 echo ============================================
 echo.
 echo This script will:
@@ -220,8 +243,8 @@ echo   the new NVIDIA driver.
 echo ============================================
 pause
 """
-    script_path = os.path.join(os.environ.get("APPDATA", ""), "GhostShell", "nvidia_clean.bat")
-    os.makedirs(os.path.dirname(script_path), exist_ok=True)
+    script_path = os.path.join(APPDATA_DIR, "nvidia_clean.bat")
+    os.makedirs(APPDATA_DIR, exist_ok=True)
     with open(script_path, "w", encoding="ascii", errors="replace") as f:
         f.write(script_content)
     steps_done.append(f"Created clean install script: {script_path}")
@@ -289,22 +312,12 @@ def apply_nvidia_tweaks() -> list[dict]:
 
     results = []
 
-    telemetry_svcs = ["NvTelemetryContainer"]
-    for svc in telemetry_svcs:
-        run_cmd(["sc", "stop", svc])
-        r2 = run_cmd(["sc", "config", svc, "start=", "disabled"])
-        results.append({"name": f"Disable {svc}", "ok": r2["ok"]})
+    for svc in _NV_TELEMETRY_SERVICES:
+        ok = sys_state.set_service_start(svc, "disabled", stop=True, scope=_SCOPE)
+        results.append({"name": f"Disable {svc}", "ok": ok})
 
-    nv_tasks = [
-        "NvTmRep_CrashReport1_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}",
-        "NvTmRep_CrashReport2_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}",
-        "NvTmRep_CrashReport3_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}",
-        "NvTmRep_CrashReport4_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}",
-        "NvTmMon_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}",
-        "NvTmRepOnLogon_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}",
-    ]
-    for task in nv_tasks:
-        run_cmd(["schtasks", "/Change", "/TN", task, "/Disable"])
+    for task in _NV_TASKS:
+        sys_state.disable_task(task, scope=_SCOPE)
     results.append({"name": "NVIDIA Telemetry Tasks", "ok": True})
 
     nv_class = _find_gpu_class_key("NVIDIA")
@@ -366,13 +379,8 @@ def apply_amd_tweaks() -> list[dict]:
     results.append({"name": "AMD ULPS disabled", "ok": True})
 
     # Tasks AMD installs
-    amd_tasks = [
-        "StartDVR",
-        "StartCN",
-        r"\AMD\RadeonSoftwareStartupTask",
-    ]
-    for task in amd_tasks:
-        run_cmd(["schtasks", "/Change", "/TN", task, "/Disable"])
+    for task in _AMD_TASKS:
+        sys_state.disable_task(task, scope=_SCOPE)
     results.append({"name": "AMD Scheduled Tasks disabled", "ok": True})
 
     # AMD display class — enable Hardware Scheduling + set power to max
@@ -425,14 +433,38 @@ def apply_intel_tweaks() -> list[dict]:
     results = _apply_msi_mode("Intel")
 
     # Intel Graphics Command Center telemetry
-    intel_tasks = [
-        r"\IntelSURQC-Upgrade-86621605-2a0b-4128-8ffc-15514c247132-Logon",
-    ]
-    for task in intel_tasks:
-        run_cmd(["schtasks", "/Change", "/TN", task, "/Disable"])
+    for task in _INTEL_TASKS:
+        sys_state.disable_task(task, scope=_SCOPE)
 
     log.info("Intel GPU tweaks applied")
     return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Undo
+# ═══════════════════════════════════════════════════════════════════════════
+def undo_gpu_tweaks() -> dict:
+    """Put back what the vendor tweaks changed: every registry value to what
+    it was (or gone again, if it did not exist), the telemetry service to its
+    previous start type, and the vendor scheduled tasks that were enabled
+    before switched back on.
+
+    Only what is on record.  Tweaks applied by a version that kept none
+    cannot be told apart from the driver's or the user's own settings."""
+    log.info("Undoing GPU driver tweaks...")
+    reg = reg_originals.restore_all(_SCOPE)
+    rows = []
+    if reg["restored"] or reg["failed"]:
+        rows.append({"name": f"{reg['restored']} registry value(s) restored"
+                             + (f" ({reg['failed']} could not be)" if reg["failed"] else ""),
+                     "ok": reg["failed"] == 0})
+    rows += sys_state.restore_all(_SCOPE)
+    if not rows:
+        return {"ok": True, "nothing": True,
+                "results": [{"name": "Nothing on record to undo — tweaks applied by an earlier "
+                                     "version kept no record", "ok": True}]}
+    rows.append({"name": "Restart the PC so the driver picks the settings up", "ok": True})
+    return {"ok": all(r["ok"] for r in rows), "results": rows}
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -1,6 +1,6 @@
 """Client-side license + trial state machine.
 
-This is the gate between "you can use GhostShell" and "you can't."  It:
+This is the gate between "you can use Vispora" and "you can't."  It:
   • Captures hardware fingerprint inputs on demand (via core.hwfp)
   • Talks to the cloud for activation, validation, and trial state
   • Persists the result to a DPAPI-encrypted cache so we work offline
@@ -189,7 +189,7 @@ def _post(path: str, body: dict, timeout: float) -> dict:
         headers={
             "Accept":       "application/json",
             "Content-Type": "application/json",
-            "User-Agent":   "GhostShell-Client/license",
+            "User-Agent":   "Vispora-Client/license",
         },
     )
     try:

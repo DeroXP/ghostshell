@@ -1,14 +1,44 @@
 """Network latency & adapter optimization."""
 import json
+from config import APP_NAME, LEGACY_APP_NAME
+from core import reg_originals, sys_state
 from core.utils import run_ps, run_cmd, get_logger, backup_registry, is_safe_ps_exe_name
 
 log = get_logger("network")
 
+# Registry values, global TCP parameters and the IPv6-tunnel / heuristics
+# switches this tab changes are noted under this scope before they change;
+# undo_network_tweaks() puts them back.
+_SCOPE = "network"
+sys_state.allow("tcp", ("rsc", "nonsackrttresiliency", "rss"))
+sys_state.allow("ipstack", ("teredo", "6to4", "isatap", "heuristics"))
+
+# Port-range QoS rules made by apply_game_port_qos(): name suffix, ports, protocol.
+_GAME_PORT_RULES = (
+    ("Steam_UDP", "27000-27100", "UDP"),
+    ("Steam_TCP", "27015-27050", "TCP"),
+    ("EA_UDP", "3659", "UDP"),
+    ("Riot_UDP", "5000-5500", "UDP"),
+    ("Epic_UDP", "5200-5300", "UDP"),
+    ("Blizzard_TCP", "1119", "TCP"),
+    ("Generic_Game_UDP", "3000-4999", "UDP"),
+)
+
+
+def qos_policy_filter(kind: str = "") -> str:
+    """PowerShell `Where-Object` condition selecting the QoS policies this app
+    created — they are all named `<App>_<kind>…` — under its current or its
+    pre-rename name, so policies an older build left behind are still found
+    and removed."""
+    return " -or ".join(f'$_.Name -like "{name}_{kind}*"'
+                        for name in (APP_NAME, LEGACY_APP_NAME))
+
 
 def _reg(key, val, data, vtype="REG_DWORD"):
+    reg_originals.remember(key, val, data, vtype, scope=_SCOPE)     # what it was, for undo_network_tweaks()
     r = run_cmd(["reg", "add", key, "/v", val, "/t", vtype, "/d", data, "/f"])
     # 3.4.2 — surface failed writes in the log (callers mostly hardcode
-    # ok:True; GhostShell runs as admin so failures are rare but should
+    # ok:True; Vispora runs as admin so failures are rare but should
     # not vanish silently).
     if not r.get("ok"):
         err = (r.get("err") or r.get("out") or "").strip()[:160]
@@ -304,14 +334,19 @@ def apply_netsh_tweaks() -> list[dict]:
     log.info("Applying global netsh TCP tweaks...")
     results = []
 
+    # Each one is set through sys_state, which notes its previous value first.
+    tcp = sys_state.tcp_globals()
+    stack = sys_state.ip_stack_states()
     tweaks = [
-        ("TCP RSC off (receive seg coalescing)", ["netsh", "int", "tcp", "set", "global", "rsc=disabled"]),
-        ("TCP heuristics disabled", ["netsh", "int", "tcp", "set", "heuristics", "disabled"]),
-        ("TCP non-SACK RTT resiliency off", ["netsh", "int", "tcp", "set", "global", "nonsackrttresiliency=disabled"]),
+        ("TCP RSC off (receive seg coalescing)",
+         lambda: sys_state.set_tcp_global("rsc", "disabled", scope=_SCOPE, current=tcp)),
+        ("TCP heuristics disabled",
+         lambda: sys_state.set_ip_stack_state("heuristics", "disabled", scope=_SCOPE, current=stack)),
+        ("TCP non-SACK RTT resiliency off",
+         lambda: sys_state.set_tcp_global("nonsackrttresiliency", "disabled", scope=_SCOPE, current=tcp)),
     ]
-    for name, cmd in tweaks:
-        r = run_cmd(cmd)
-        ok = r["ok"]
+    for name, apply in tweaks:
+        ok = apply()
         log.info(f"  {'✓' if ok else '✗'} {name}")
         results.append({"name": name, "ok": ok})
 
@@ -332,9 +367,9 @@ def disable_netbios_teredo() -> list[dict]:
     results.append({"name": "NetBIOS over TCP/IP disabled", "ok": True})
 
     # Teredo off
-    run_cmd(["netsh", "interface", "teredo", "set", "state", "disabled"])
-    run_cmd(["netsh", "interface", "6to4", "set", "state", "disabled"])
-    run_cmd(["netsh", "interface", "isatap", "set", "state", "disabled"])
+    stack = sys_state.ip_stack_states()         # what each tunnel is set to now, for the undo
+    for tunnel in ("teredo", "6to4", "isatap"):
+        sys_state.set_ip_stack_state(tunnel, "disabled", scope=_SCOPE, current=stack)
     results.append({"name": "Teredo / 6to4 / ISATAP disabled", "ok": True})
 
     # LLMNR off (speeds up DNS failures; used in name-resolution attacks)
@@ -415,7 +450,7 @@ try {
     results.append({"name": "Per-Ethernet-adapter RSS/RSC/Checksum tuning", "ok": True})
 
     # Enable RSS globally
-    run_cmd(["netsh", "int", "tcp", "set", "global", "rss=enabled"])
+    sys_state.set_tcp_global("rss", "enabled", scope=_SCOPE)
     results.append({"name": "Global RSS enabled", "ok": True})
 
     return results
@@ -428,7 +463,7 @@ def apply_game_port_qos() -> list[dict]:
     results = []
 
     # Classic game port ranges — Valve/Steam, EA/Origin, Blizzard, Riot, Epic, etc.
-    # v3.3.1-beta.7: dropped the `GhostShell_Discord_UDP 50000-65535`
+    # v3.3.1-beta.7: dropped the `<App>_Discord_UDP 50000-65535`
     # rule.  That's 15,535 ports — half the ephemeral-port range —
     # marked Expedited Forwarding (DSCP 46).  On a DSCP-honoring
     # network it'd flag every random UDP socket (game updates,
@@ -436,20 +471,11 @@ def apply_game_port_qos() -> list[dict]:
     # all compete in the EF queue.  Discord's actual voice traffic
     # uses Discord.exe-targeted DSCP via set_per_app_net_priority
     # which is the correct mechanism.
-    port_rules = [
-        ("GhostShell_Steam_UDP", "27000-27100", "UDP"),
-        ("GhostShell_Steam_TCP", "27015-27050", "TCP"),
-        ("GhostShell_EA_UDP", "3659", "UDP"),
-        ("GhostShell_Riot_UDP", "5000-5500", "UDP"),
-        ("GhostShell_Epic_UDP", "5200-5300", "UDP"),
-        ("GhostShell_Blizzard_TCP", "1119", "TCP"),
-        ("GhostShell_Generic_Game_UDP", "3000-4999", "UDP"),
-    ]
+    port_rules = [(f"{APP_NAME}_{suffix}", ports, proto) for suffix, ports, proto in _GAME_PORT_RULES]
 
-    run_ps('Get-NetQosPolicy | Where-Object {$_.Name -like "GhostShell_*"} | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue')
+    clear_per_app_net_priority()
 
     for name, ports, proto in port_rules:
-        port_arg = f"-IPDstPortMatchCondition {ports}" if "-" not in ports else f"-IPDstPortStartMatchCondition {ports.split('-')[0]} -IPDstPortEndMatchCondition {ports.split('-')[1]}"
         # NetQosPolicy accepts ranges only via separate start/end parameters
         if "-" in ports:
             start, end = ports.split("-")
@@ -479,8 +505,10 @@ def set_per_app_net_priority(exe_name: str, dscp: int = 46) -> dict:
     if not is_safe_ps_exe_name(exe_name):
         log.warning(f"per-app net priority skipped — unsafe exe name: {exe_name!r}")
         return {"ok": False, "err": "unsafe exe name", "exe": exe_name}
-    rule_name = f"GhostShell_Prio_{exe_name.replace('.exe', '').replace(' ', '_')}"
-    run_ps(f'Remove-NetQosPolicy -Name "{rule_name}" -Confirm:$false -ErrorAction SilentlyContinue')
+    rule_suffix = f"_Prio_{exe_name.replace('.exe', '').replace(' ', '_')}"
+    rule_name = f"{APP_NAME}{rule_suffix}"
+    run_ps(f'Remove-NetQosPolicy -Name "{rule_name}","{LEGACY_APP_NAME}{rule_suffix}" '
+           f'-Confirm:$false -ErrorAction SilentlyContinue')
     r = run_ps(
         f'New-NetQosPolicy -Name "{rule_name}" '
         f'-AppPathNameMatchCondition "{exe_name}" '
@@ -489,16 +517,11 @@ def set_per_app_net_priority(exe_name: str, dscp: int = 46) -> dict:
     return {"ok": r["ok"], "rule": rule_name, "exe": exe_name, "dscp": dscp}
 
 
-def clear_per_app_net_priority(prefix: str = "GhostShell_") -> dict:
-    """Remove every QoS policy GhostShell created.
-
-    v3.3.1-beta.7: default prefix changed from `GhostShell_Prio_` to
-    `GhostShell_` so this also cleans up the port-range policies
-    created by `apply_game_port_qos` (which use the bare
-    `GhostShell_*` prefix).  Previously only the per-app `_Prio_`
-    rules were removed and the port-range rules leaked.
-    """
-    run_ps(f'Get-NetQosPolicy | Where-Object {{$_.Name -like "{prefix}*"}} | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue')
+def clear_per_app_net_priority() -> dict:
+    """Remove every QoS policy this app created: the per-app `_Prio_` rules,
+    the port-range rules from `apply_game_port_qos`, and the per-game /
+    per-streamer rules from the game profile engine."""
+    run_ps(f'Get-NetQosPolicy | Where-Object {{{qos_policy_filter()}}} | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue')
     return {"ok": True}
 
 
@@ -520,8 +543,9 @@ def restore_networking() -> dict:
 
     # 1. Soften IPv6 to Microsoft's safe default — many networking
     #    issues trace back to DisabledComponents=0xFF.
-    r = _reg(r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters",
-             "DisabledComponents", "0")
+    with reg_originals.suspended():     # a recovery, not a tweak: nothing to undo later
+        r = _reg(r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters",
+                 "DisabledComponents", "0")
     log.info(f"  {'OK' if r else 'FAIL'} IPv6 DisabledComponents -> 0 (full IPv6 enabled)")
     results.append({"name": "IPv6 fully re-enabled", "ok": bool(r)})
 
@@ -592,6 +616,39 @@ try {
             "reboot_recommended": True,
             "msg": "Networking restored.  Reboot for the Winsock reset "
                    "to take full effect — WiFi toggle should be back."}
+
+
+def undo_network_tweaks() -> dict:
+    """Put back what the tweaks on this tab changed, as far as it is on
+    record: registry values, the global TCP parameters, the Teredo, 6to4 and
+    ISATAP states and TCP heuristics, each to exactly what it was.  The
+    game-port QoS rules are deleted.
+
+    This is the gentle counterpart of restore_networking(), which resets the
+    whole network stack to rescue a broken connection.
+
+    NOT covered: the per-adapter driver settings (offloads, flow control,
+    interrupt moderation, wake-on-LAN).  Those go through the adapter's own
+    property pages and are not recorded."""
+    log.info("Undoing network tweaks...")
+    reg = reg_originals.restore_all(_SCOPE)
+    rows = []
+    if reg["restored"] or reg["failed"]:
+        rows.append({"name": f"{reg['restored']} registry value(s) restored"
+                             + (f" ({reg['failed']} could not be)" if reg["failed"] else ""),
+                     "ok": reg["failed"] == 0})
+    rows += sys_state.restore_all(_SCOPE)
+    names = ",".join(f'"{app}_{suffix}"' for app in (APP_NAME, LEGACY_APP_NAME) for suffix, _, _ in _GAME_PORT_RULES)
+    run_ps(f"Remove-NetQosPolicy -Name {names} -Confirm:$false -ErrorAction SilentlyContinue")
+    nothing = not rows
+    if nothing:
+        rows.append({"name": "Nothing on record to undo: tweaks applied by an earlier version kept no record "
+                             "(Restore networking resets the stack to defaults)", "ok": True})
+    rows.append({"name": "Game-port QoS rules deleted", "ok": True})
+    rows.append({"name": "Adapter driver settings (offloads, flow control, power) are not recorded and "
+                         "stay as they are", "ok": True})
+    return {"ok": all(r["ok"] for r in rows), "nothing": nothing, "results": rows,
+            "reboot_recommended": not nothing}
 
 
 def run_full_network_optimize() -> dict:

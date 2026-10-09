@@ -36,7 +36,8 @@ Public API
 
 from __future__ import annotations
 import threading
-from typing import Optional, Any
+import time
+from typing import Optional
 
 from core.utils import get_logger
 from core import xinput_ctypes as xi
@@ -47,21 +48,33 @@ VIGEMBUS_INSTALL_URL = (
     "https://github.com/nefarius/ViGEmBus/releases/latest"
 )
 
-# Lazy-loaded vgamepad module — fail soft so the rest of GhostShell
+# Lazy-loaded vgamepad module — fail soft so the rest of Vispora
 # doesn't crash on systems that never installed it.
 _vg = None
 _vg_import_err: Optional[str] = None
 
 
+_vg_retry_after = 0.0
+
+
 def _load_vg():
-    global _vg, _vg_import_err
-    if _vg is not None or _vg_import_err is not None:
+    """Import vgamepad lazily.  A failure is retried, at most every 10 s:
+    vgamepad connects to the ViGEmBus driver at import, so the import fails
+    until the driver is installed — and caching that failure for the life of
+    the process meant installing the driver from inside the app never took
+    effect until a restart."""
+    global _vg, _vg_import_err, _vg_retry_after
+    if _vg is not None:
         return _vg
+    if _vg_import_err is not None and time.time() < _vg_retry_after:
+        return None
     try:
         import vgamepad as vg
         _vg = vg
+        _vg_import_err = None
     except Exception as e:        # noqa: BLE001
         _vg_import_err = str(e)
+        _vg_retry_after = time.time() + 10.0
         log.debug(f"vgamepad import failed: {e}")
     return _vg
 
@@ -424,7 +437,7 @@ def download_and_install(timeout_sec: int = 180) -> dict:
         import json as _json
         api = "https://api.github.com/repos/nefarius/ViGEmBus/releases/latest"
         req = urllib.request.Request(api, headers={
-            "User-Agent": "GhostShell/3.3 ViGEmBus-installer",
+            "User-Agent": "Vispora/3.3 ViGEmBus-installer",
             "Accept":     "application/vnd.github+json",
         })
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -451,7 +464,7 @@ def download_and_install(timeout_sec: int = 180) -> dict:
         })
         tmp_dir = tempfile.gettempdir()
         out_path = os.path.join(tmp_dir, fname)
-        dreq = urllib.request.Request(url, headers={"User-Agent": "GhostShell/3.3"})
+        dreq = urllib.request.Request(url, headers={"User-Agent": "Vispora/3.3"})
         with urllib.request.urlopen(dreq, timeout=60) as resp, open(out_path, "wb") as f:
             total = int(resp.headers.get("Content-Length", 0)) or size
             chunk = 64 * 1024
@@ -476,7 +489,7 @@ def download_and_install(timeout_sec: int = 180) -> dict:
             "phase":        "installing",
             "progress_pct": 100,
             "msg":          ("Installer window opened — click through it. "
-                             "GhostShell will detect when it's done."),
+                             "Vispora will detect when it's done."),
         })
         if fname.lower().endswith(".msi"):
             cmd = ["msiexec", "/i", out_path, "/qb", "/norestart"]

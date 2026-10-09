@@ -10,7 +10,7 @@ Three target modes:
   • display     — capture the entire monitor that contains the
                   foreground window.
 
-Output: PNG to %USERPROFILE%/Pictures/GhostShell/Screenshots/
+Output: PNG to %USERPROFILE%/Pictures/Vispora/Screenshots/
         named `<game_or_app>_<YYYY-MM-DD>_<HH-MM-SS>.png`
 
 Why this lives in its own module rather than recoil_capture's:
@@ -26,18 +26,14 @@ import threading
 import time
 from ctypes import wintypes
 from datetime import datetime
-from typing import Optional
 
-from config import APPDATA_DIR
+from config import user_media_dir
 from core.utils import get_logger
 
 log = get_logger(__name__)
 
 
-SCREENSHOTS_DIR = os.path.join(
-    os.environ.get("USERPROFILE") or os.path.expanduser("~"),
-    "Pictures", "GhostShell", "Screenshots",
-)
+SCREENSHOTS_DIR = user_media_dir("Pictures", "Screenshots")
 
 # Lazy mss import (it loads native libs that take ~25 ms)
 _mss = None

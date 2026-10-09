@@ -4,15 +4,19 @@ import os
 import time
 from core.utils import run_ps, run_cmd, get_logger, backup_registry, detect_drive_type, atomic_write_json
 from config import APPDATA_DIR
+from core import reg_originals, sys_state
 
 log = get_logger("optimize")
 
 
 def _reg(key: str, value: str, data: str, vtype: str = "REG_DWORD") -> bool:
+    # Note what was there before we change it, so Reset All can put back the
+    # user's real value rather than a guessed default (core/reg_originals.py).
+    reg_originals.remember(key, value, data, vtype)
     r = run_cmd(["reg", "add", key, "/v", value, "/t", vtype, "/d", data, "/f"])
     # 3.4.2 — most callers append {"ok": True} without checking this
-    # return value (GhostShell runs as admin so writes almost always
-    # succeed).  Log the rare failure so it's visible in ghostshell.log
+    # return value (Vispora runs as admin so writes almost always
+    # succeed).  Log the rare failure so it's visible in vispora.log
     # for diagnostics instead of vanishing silently.
     if not r.get("ok"):
         err = (r.get("err") or r.get("out") or "").strip()[:160]
@@ -27,6 +31,153 @@ def _reg(key: str, value: str, data: str, vtype: str = "REG_DWORD") -> bool:
 # it on "undo" / clean uninstall.  Captured BEFORE we change anything,
 # so even a crash leaves the prior GUID on disk for next-launch recovery.
 _POWER_BASELINE_PATH = os.path.join(APPDATA_DIR, "power_baseline.json")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# What this module changes OUTSIDE the registry
+# ───────────────────────────────────────────────────────────────────────────
+# Named once, here, so the apply code, the reset code and the list of things a
+# reset may touch (sys_state.allow) cannot drift apart.  All of these go
+# through core/sys_state.py, which notes each one's previous state before
+# changing it; Reset All puts back exactly that.
+# ═══════════════════════════════════════════════════════════════════════════
+_XBOX_SERVICES = ("XblAuthManager", "XblGameSave", "XboxGipSvc", "XboxNetApiSvc")
+_EDGE_SERVICES = ("edgeupdate", "edgeupdatem", "MicrosoftEdgeElevationService")
+_LEGACY_SERVICES = (
+    ("Print Spooler",                "Spooler"),
+    ("Fax",                           "Fax"),
+    ("Windows Insider Service",       "wisvc"),
+    ("Touch Keyboard / Handwriting",  "TabletInputService"),
+    ("Retail Demo",                   "RetailDemo"),
+    ("Phone Service",                 "PhoneSvc"),
+    ("Windows Mobile Hotspot",        "icssvc"),
+)
+_SMARTCARD_SERVICES = (
+    ("Smart Card",                "SCardSvr"),
+    ("Smart Card Removal Policy", "SCPolicySvc"),
+)
+_OTHER_SERVICES = ("bthserv", "WSearch", "WerSvc", "DiagTrack", "dmwappushservice")
+_TELEMETRY_TASKS = (
+    r"\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser",
+    r"\Microsoft\Windows\Application Experience\ProgramDataUpdater",
+    r"\Microsoft\Windows\Customer Experience Improvement Program\Consolidator",
+    r"\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip",
+    r"\Microsoft\Windows\Customer Experience Improvement Program\KernelCeipTask",
+    r"\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector",
+    r"\Microsoft\Windows\Feedback\Siuf\DmClient",
+    r"\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload",
+    r"\Microsoft\Windows\Windows Error Reporting\QueueReporting",
+)
+_BASE_FEATURES = (
+    "Internet-Explorer-Optional-amd64",
+    "Printing-XPSServices-Features",
+    "Printing-PrintToPDFServices-Features",
+    "FaxServicesClientPackage",
+    "WindowsMediaPlayer",
+    "MediaPlayback",
+    "WorkFolders-Client",
+)
+_VIRTUALISATION_FEATURES = (
+    "Microsoft-Windows-Subsystem-Linux",
+    "VirtualMachinePlatform",
+    "HypervisorPlatform",
+    "Microsoft-Hyper-V-All",
+    "Containers-DisposableClientVM",
+)
+# Boot-entry elements set by the latency and boot categories.
+_BCD_ELEMENTS = ("useplatformclock", "tscsyncpolicy", "disabledynamictick",
+                 "bootmenupolicy", "quietboot", "bootlog")
+_TCP_GLOBAL_TWEAKS = (
+    ("autotuninglevel", "normal"),
+    ("chimney", "disabled"),
+    ("rss", "enabled"),
+    ("ecncapability", "disabled"),
+    ("timestamps", "disabled"),
+    ("initialRto", "2000"),
+    ("nonsackrttresiliency", "disabled"),
+    ("maxsynretransmissions", "2"),
+    ("fastopen", "enabled"),
+    ("hystart", "disabled"),
+)
+_DEFENDER_EXCLUDE_PATHS = (
+    r"C:\Program Files (x86)\Steam",
+    r"C:\Program Files\Steam",
+    r"C:\Program Files\Epic Games",
+    r"C:\Program Files (x86)\Epic Games",
+    r"C:\Program Files (x86)\Battle.net",
+    r"C:\Program Files (x86)\Riot Games",
+    r"C:\Program Files\Ubisoft",
+    r"C:\Program Files (x86)\Ubisoft",
+    r"C:\Program Files\EA Games",
+    r"C:\Program Files\WindowsApps",  # Xbox Game Pass installs
+    r"C:\XboxGames",                   # Xbox Game Pass install root
+    r"C:\Program Files (x86)\GOG Galaxy",
+)
+_DEFENDER_EXCLUDE_PROCESSES = ("steam.exe", "epicgameslauncher.exe", "battle.net.exe",
+                               "riotclientservices.exe", "ubisoftconnect.exe")
+
+sys_state.allow("service", _XBOX_SERVICES + _EDGE_SERVICES + _OTHER_SERVICES
+                + tuple(svc for _, svc in _LEGACY_SERVICES + _SMARTCARD_SERVICES))
+sys_state.allow("task", _TELEMETRY_TASKS)
+sys_state.allow("feature", _BASE_FEATURES + _VIRTUALISATION_FEATURES)
+sys_state.allow("bcd", _BCD_ELEMENTS)
+sys_state.allow("tcp", [param for param, _ in _TCP_GLOBAL_TWEAKS])
+sys_state.allow("fsutil", ["disablelastaccess"])
+sys_state.allow("defender", ["SubmitSamplesConsent", "MAPSReporting",
+                             "ScanScheduleTime", "ScanScheduleQuickScanTime"])
+sys_state.allow("defender-exclusion",
+                [f"ExclusionPath:{p}" for p in _DEFENDER_EXCLUDE_PATHS]
+                + [f"ExclusionProcess:{p}" for p in _DEFENDER_EXCLUDE_PROCESSES])
+
+
+def _service_default(name: str, tweak: str, stock: str, start: bool = False) -> None:
+    """Fixed-default fallback for a service that an older build changed
+    without keeping a record: back to the start type Windows ships it with.
+
+    Only when there is no record (what IS on record is restored exactly by
+    the final pass of Reset All), and only when the service is still set the
+    way the tweak leaves it — any other start type is somebody else's choice
+    and is left alone."""
+    if reg_originals.has_state("service", name):
+        return
+    if tweak == stock or sys_state.service_start(name) != tweak:
+        return
+    run_cmd(["sc", "config", name, "start=", stock])
+    if start:
+        run_cmd(["sc", "start", name])
+
+
+def _bcd_default(bcd, name: str, tweak: str, stock=None) -> None:
+    """The same for one boot-entry element: if it has no record and still
+    reads the way the tweak leaves it, put back the Windows default — `stock`,
+    or no value at all.  `bcd` is one sys_state.bcd_values() reading."""
+    if not bcd or reg_originals.has_state("bcd", name):
+        return
+    cur = bcd.get(name.lower())
+    if cur is None or not sys_state.bcd_same(cur, tweak):
+        return
+    if stock is None:
+        run_cmd(["bcdedit", "/deletevalue", "{current}", name])
+    else:
+        run_cmd(["bcdedit", "/set", "{current}", name, stock])
+
+
+def _enable_msi_mode(device_class: str, working_only: bool = False) -> int:
+    """Switch the devices of one PnP class to message-signalled interrupts.
+    PowerShell only lists the devices; every value is written through _reg,
+    so what it was before is on record.  (This used to be a PowerShell block
+    that wrote the registry itself — invisible to Reset All, so permanent.)"""
+    only = " | Where-Object {$_.Status -eq 'OK'}" if working_only else ""
+    r = run_ps(f"Get-PnpDevice -Class {device_class} -ErrorAction SilentlyContinue{only} "
+               f"| ForEach-Object {{ $_.InstanceId }}")
+    done = 0
+    for dev in ((r.get("out") or "").splitlines() if r.get("ok") else []):
+        dev = dev.strip()
+        if "\\" not in dev or any(c in dev for c in '|"'):
+            continue
+        if _reg(rf"HKLM\SYSTEM\CurrentControlSet\Enum\{dev}\Device Parameters"
+                r"\Interrupt Management\MessageSignaledInterruptProperties", "MSISupported", "1"):
+            done += 1
+    return done
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Pro Mode (v3.3.1-beta.8+)
@@ -79,21 +230,63 @@ def _pro_mode_enabled() -> bool:
     return bool(get_pro_mode().get("enabled"))
 
 
+_STOCK_ULTIMATE_GUID = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+_HIGH_PERF_GUID      = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+_BALANCED_GUID       = "381b4222-f694-41f0-9685-ff5bb260df2e"
+
+
+def _own_power_plans() -> set:
+    """Power plans Vispora itself switches to.  Finding one of these active
+    says nothing about what the user had chosen: the start-up prep moves to
+    High Performance at every launch, so by the time anything asked "what is
+    the user's plan?" the answer was already ours — and that is what got
+    saved as the baseline Reset All goes back to."""
+    own = {_STOCK_ULTIMATE_GUID, _HIGH_PERF_GUID}
+    clone = str(reg_originals.noted("ultimate_plan_guid") or "").lower()
+    if clone:
+        own.add(clone)
+    return own
+
+
+def active_power_plan() -> str:
+    """GUID of the active power plan, or "" if it cannot be read."""
+    r = run_cmd(["powercfg", "/getactivescheme"])
+    for part in (r.get("out") or "").split():
+        if len(part) == 36 and part.count("-") == 4:
+            return part
+    return ""
+
+
+def _read_power_baseline() -> str:
+    """The recorded pre-Vispora plan, or "" when there is none worth trusting."""
+    try:
+        with open(_POWER_BASELINE_PATH, "r", encoding="utf-8") as f:
+            guid = str((json.load(f) or {}).get("guid", "") or "")
+    except (OSError, ValueError):
+        return ""
+    return "" if guid.lower() in _own_power_plans() else guid
+
+
+def _forget_power_baseline() -> None:
+    """After a reset the user is back on their own plan.  Whatever they pick
+    from here on is the next baseline, so the old record must not outlive it."""
+    try:
+        os.remove(_POWER_BASELINE_PATH)
+    except OSError:
+        pass
+
+
 def _capture_power_baseline() -> str:
     """Capture the currently-active power scheme GUID (idempotent — only
     writes the baseline ONCE per install).  Returns the captured GUID
     or "" on failure."""
     try:
-        if os.path.isfile(_POWER_BASELINE_PATH):
-            with open(_POWER_BASELINE_PATH, "r", encoding="utf-8") as f:
-                return (json.load(f) or {}).get("guid", "") or ""
-        r = run_cmd(["powercfg", "/getactivescheme"])
-        guid = ""
-        if r.get("ok") and r.get("out"):
-            for part in r["out"].split():
-                if len(part) == 36 and "-" in part:
-                    guid = part
-                    break
+        guid = _read_power_baseline()
+        if guid:
+            return guid
+        guid = active_power_plan()
+        if guid.lower() in _own_power_plans():
+            return ""           # already on one of ours — not the user's choice
         if guid:
             atomic_write_json(_POWER_BASELINE_PATH, {"guid": guid, "captured_ts": time.time()})
             log.info(f"  ✓ Power scheme baseline captured: {guid}")
@@ -107,14 +300,12 @@ def restore_power_baseline() -> dict:
     """Restore the previously-captured power scheme.  Called by the
     'Undo optimizations' / 'Restore from snapshot' flows and at clean
     uninstall.  Safe no-op when no baseline was captured."""
-    if not os.path.isfile(_POWER_BASELINE_PATH):
+    guid = _read_power_baseline()
+    if not guid:
         return {"ok": False, "err": "no power baseline captured"}
     try:
-        with open(_POWER_BASELINE_PATH, "r", encoding="utf-8") as f:
-            guid = (json.load(f) or {}).get("guid", "")
-        if not guid:
-            return {"ok": False, "err": "baseline file has no GUID"}
-        run_cmd(["powercfg", "/setactive", guid])
+        if not run_cmd(["powercfg", "/setactive", guid]).get("ok"):
+            return {"ok": False, "err": f"recorded plan {guid} no longer exists"}
         log.info(f"  ✓ Power scheme restored to baseline: {guid}")
         return {"ok": True, "guid": guid}
     except Exception as e:
@@ -125,17 +316,26 @@ def apply_ultimate_power_plan() -> dict:
     log.info("Applying Ultimate Performance power plan...")
     # v3 — capture baseline FIRST so we never lose the user's choice.
     _capture_power_baseline()
-    # Unhide ultimate performance plan
-    r = run_cmd(["powercfg", "-duplicatescheme", "e9a42b02-d5df-448d-aa00-03f14749eb61"])
-    guid = ""
-    if r["ok"] and r["out"]:
-        # Output: "Power Scheme GUID: xxxxxxxx-..."
-        for part in r["out"].split():
-            if len(part) == 36 and "-" in part:
-                guid = part
-                break
+    # Reuse the copy we made last time.  `-duplicatescheme` creates a NEW
+    # plan on every call, and this runs at every game start for Max-FPS
+    # targets — the plan list filled up with "Ultimate Performance" clones.
+    guid = str(reg_originals.noted("ultimate_plan_guid") or "")
+    if guid and not run_cmd(["powercfg", "-setactive", guid])["ok"]:
+        reg_originals.forget_notes("ultimate_plan_guid")     # the user deleted it; make a new one
+        guid = ""
+    if not guid:
+        # Unhide ultimate performance plan
+        r = run_cmd(["powercfg", "-duplicatescheme", "e9a42b02-d5df-448d-aa00-03f14749eb61"])
+        if r["ok"] and r["out"]:
+            # Output: "Power Scheme GUID: xxxxxxxx-..."
+            for part in r["out"].split():
+                if len(part) == 36 and "-" in part:
+                    guid = part
+                    break
+        if guid:
+            reg_originals.note("ultimate_plan_guid", guid)
+            run_cmd(["powercfg", "-setactive", guid])
     if guid:
-        run_cmd(["powercfg", "-setactive", guid])
         log.info(f"  ✓ Ultimate Performance plan active (GUID: {guid})")
         return {"ok": True, "guid": guid}
 
@@ -272,7 +472,9 @@ def apply_storage_tweaks() -> list[dict]:
         #     on a 16 GB+ system the cache already fits.
     ]
     for name, cmd in fs_tweaks:
-        r = run_cmd(cmd)
+        # cmd is ["fsutil", "behavior", "set", flag, value] — set through
+        # sys_state, which notes the flag's previous value first.
+        r = {"ok": sys_state.set_fsutil_behavior(cmd[3], int(cmd[4]))}
         log.info(f"  {'✓' if r['ok'] else '✗'} {name}")
         results.append({"name": name, "ok": r["ok"]})
 
@@ -283,8 +485,7 @@ def apply_storage_tweaks() -> list[dict]:
     # day that Start Menu search returns nothing — high support-ticket
     # rate from tools like this when applied by default.
     if _pro_mode_enabled():
-        r = run_cmd(["sc", "config", "WSearch", "start=", "disabled"])
-        run_cmd(["sc", "stop", "WSearch"])
+        r = {"ok": sys_state.set_service_start("WSearch", "disabled", stop=True)}
         log.info(f"  {'✓' if r['ok'] else '✗'} [Pro] Disable Search Indexing")
         results.append({"name": "[Pro] Disable Search Indexing", "ok": r["ok"]})
     else:
@@ -417,10 +618,10 @@ def apply_visual_tweaks() -> list[dict]:
         results.append({"name": name, "ok": ok})
 
     # Apply UserPreferencesMask for all visual effects off
-    r = run_ps(
-        'Set-ItemProperty -Path "HKCU:\\Control Panel\\Desktop" -Name "UserPreferencesMask" '
-        '-Value ([byte[]](0x90,0x12,0x03,0x80,0x10,0x00,0x00,0x00)) -Type Binary'
-    )
+    # (Through _reg rather than PowerShell, so the user's own mask is on
+    # record and Reset All restores it instead of a generic "all on" one.)
+    r = {"ok": _reg(r"HKCU\Control Panel\Desktop", "UserPreferencesMask",
+                    "9012038010000000", "REG_BINARY")}
     log.info(f"  {'✓' if r['ok'] else '✗'} UserPreferencesMask (all effects off)")
     results.append({"name": "UserPreferencesMask", "ok": r["ok"]})
 
@@ -616,10 +817,9 @@ def apply_hard_tweaks() -> list[dict]:
     results.append({"name": "Taskbar search + Bing integration disabled", "ok": True})
 
     # Disable Xbox Live services (unless running an Xbox-required game)
-    xbox_svcs = ["XblAuthManager", "XblGameSave", "XboxGipSvc", "XboxNetApiSvc"]
-    for svc in xbox_svcs:
-        run_cmd(["sc", "stop", svc])
-        run_cmd(["sc", "config", svc, "start=", "manual"])  # manual not disabled — some games hit it
+    for svc in _XBOX_SERVICES:
+        # manual start (sc calls it "demand"), not disabled — some games hit it
+        sys_state.set_service_start(svc, "demand", stop=True)
     results.append({"name": "Xbox services set to manual", "ok": True})
 
     # v3.3.1-beta.8: TDR delay raises gated behind Pro Mode.  Default
@@ -685,17 +885,16 @@ def apply_latency_tweaks() -> list[dict]:
     # other three (useplatformclock no, useplatformtick yes had been
     # removed earlier, tscsyncpolicy enhanced) are safe enough to
     # always apply.
-    bcdedit_safe = [
-        ("bcdedit useplatformclock no", ["bcdedit", "/set", "useplatformclock", "no"]),
-        ("bcdedit tscsyncpolicy enhanced", ["bcdedit", "/set", "tscsyncpolicy", "Enhanced"]),
-    ]
-    for name, cmd in bcdedit_safe:
-        r = run_cmd(cmd)
-        results.append({"name": name, "ok": r["ok"]})
+    bcd = sys_state.bcd_values()    # one read; each element's previous value is noted before it changes
+    for name, element, value in [
+        ("bcdedit useplatformclock no", "useplatformclock", "no"),
+        ("bcdedit tscsyncpolicy enhanced", "tscsyncpolicy", "Enhanced"),
+    ]:
+        results.append({"name": name, "ok": sys_state.set_bcd(element, value, current=bcd)})
 
     if _pro_mode_enabled():
-        r = run_cmd(["bcdedit", "/set", "disabledynamictick", "yes"])
-        results.append({"name": "[Pro] bcdedit disabledynamictick yes", "ok": r["ok"]})
+        ok = sys_state.set_bcd("disabledynamictick", "yes", current=bcd)
+        results.append({"name": "[Pro] bcdedit disabledynamictick yes", "ok": ok})
     else:
         results.append({"name": "disabledynamictick skipped (Pro Mode off)",
                          "ok": True, "skipped": True})
@@ -706,16 +905,7 @@ def apply_latency_tweaks() -> list[dict]:
     results.append({"name": "DPC watchdog profile off", "ok": True})
 
     # Enable MSI mode on all network adapters (reduces interrupt overhead)
-    run_ps("""
-try {
-    Get-PnpDevice -Class Net | ForEach-Object {
-        $id = $_.InstanceId
-        $p = "HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\$id\\Device Parameters\\Interrupt Management\\MessageSignaledInterruptProperties"
-        New-Item -Path $p -Force -ErrorAction SilentlyContinue | Out-Null
-        Set-ItemProperty -Path $p -Name MSISupported -Value 1 -Type DWord -ErrorAction SilentlyContinue
-    }
-} catch {}
-""")
+    _enable_msi_mode("Net")
     results.append({"name": "Network adapters MSI mode enabled", "ok": True})
 
     # v3.3.1-beta.8: blanket USB MSI mode is gated behind Pro Mode.
@@ -726,16 +916,7 @@ try {
     # via LatencyMon — not blanket.  NIC MSI mode above is safe
     # (modern NIC drivers all support MSI properly).
     if _pro_mode_enabled():
-        run_ps("""
-try {
-    Get-PnpDevice -Class USB | Where-Object {$_.Status -eq 'OK'} | ForEach-Object {
-        $id = $_.InstanceId
-        $p = "HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\$id\\Device Parameters\\Interrupt Management\\MessageSignaledInterruptProperties"
-        New-Item -Path $p -Force -ErrorAction SilentlyContinue | Out-Null
-        Set-ItemProperty -Path $p -Name MSISupported -Value 1 -Type DWord -ErrorAction SilentlyContinue
-    }
-} catch {}
-""")
+        _enable_msi_mode("USB", working_only=True)
         results.append({"name": "[Pro] USB controllers MSI mode enabled", "ok": True})
     else:
         results.append({"name": "USB MSI mode skipped (Pro Mode off)",
@@ -887,7 +1068,7 @@ def run_full_optimize(categories: list[str] | None = None) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 def reset_all_optimizations() -> dict:
     """Revert ALL optimizer + kernel + scheduler tweaks back to safe Windows defaults.
-    This is a COMPLETE factory-style reset of every performance tweak GhostShell touches."""
+    This is a COMPLETE factory-style reset of every performance tweak Vispora touches."""
     log.info("=== RESETTING ALL OPTIMIZATIONS TO DEFAULTS ===")
     # v3.1 — auto-snapshot before reset, since reset is destructive
     # (overwrites every tweak the user has accumulated, possibly across
@@ -900,6 +1081,66 @@ def reset_all_optimizations() -> dict:
             log.info(f"Pre-reset snapshot taken: {snap_id}")
     except Exception as e:
         log.debug(f"Pre-reset snapshot failed (continuing anyway): {e}")
+    results = {}
+    # The per-category resets below write stock defaults.  They must not be
+    # recorded as "originals" themselves, and they are not the last word:
+    # once they have run, every value whose real prior state we have on
+    # record is put back to exactly that (reg_originals.restore_all).
+    with reg_originals.suspended():
+        results.update(_run_category_resets())
+
+    restored = reg_originals.restore_all("optimizer")
+    results["originals"] = [{
+        "name": (f"{restored['restored']} setting(s) restored to the exact value they had "
+                 f"before Vispora changed them"),
+        "ok": restored["failed"] == 0,
+    }]
+    # ...and the same for everything that is not a registry value: service
+    # start types, scheduled tasks, boot entries, TCP parameters, Windows
+    # features, Defender preferences and exclusions (core/sys_state.py).
+    results["system"] = sys_state.restore_all("optimizer") or [
+        {"name": "Services, tasks, boot, network, Windows features: nothing on record to restore", "ok": True}]
+
+    # The start-up prep re-applies a handful of these same tweaks, and the
+    # High Performance plan, every time the app opens — so a reset used to
+    # last until the next launch.  It now stays off until asked for again.
+    try:
+        from core import boot_prep
+        boot_prep.set_persistent_allowed(False)
+    except Exception as e:
+        log.debug(f"could not switch off start-up tweaks: {e}")
+    # The game monitor puts a saved "normal" state back when a game closes.
+    # That snapshot predates this reset.
+    try:
+        from core import game_profiles
+        game_profiles.refresh_baseline_after_reset()
+    except Exception as e:
+        log.debug(f"could not refresh the game-monitor baseline: {e}")
+
+    # 3.4.2 — also re-enable any Windows services the debloater disabled.
+    # Previously a "Reset ALL optimizations" left debloated services
+    # (WSearch, Geolocation, etc.) permanently disabled with no undo.
+    # restore_services() puts each back to its recorded original Start
+    # type, or Manual (demand) as a safe fallback.
+    try:
+        from core import debloater
+        results["debloat_services"] = [
+            {"name": f"{r.get('id')} service → {r.get('start') or 'could not be restored'}", "ok": bool(r.get("ok"))}
+            for r in debloater.restore_services().get("results", [])]
+        results["debloat_tasks"] = debloater.restore_scheduled_tasks().get("results", [])
+    except Exception as e:
+        log.warning(f"service restore during reset failed: {e}")
+        results["debloat_services"] = [{"name": "service restore", "ok": False, "err": str(e)}]
+
+    # Restart DWM to apply visual changes immediately
+    run_cmd(["taskkill", "/f", "/im", "dwm.exe"])  # DWM auto-restarts
+    results["dwm"] = [{"name": "DWM restarted (applies visual changes)", "ok": True}]
+
+    log.info("=== ALL OPTIMIZATIONS RESET — REBOOT RECOMMENDED ===")
+    return results
+
+
+def _run_category_resets() -> dict:
     results = {}
     results["power"] = _reset_power_plan()
     results["cpu"] = _reset_cpu_tweaks()
@@ -930,29 +1171,11 @@ def reset_all_optimizations() -> dict:
     results["explorer"]       = _reset_explorer_tweaks()
     results["smartscreen"]    = _reset_smartscreen_tweaks()
     results["lock_screen"]    = _reset_lock_screen_tweaks()
-
-    # 3.4.2 — also re-enable any Windows services the debloater disabled.
-    # Previously a "Reset ALL optimizations" left debloated services
-    # (WSearch, Geolocation, etc.) permanently disabled with no undo.
-    # restore_services() puts each back to its recorded original Start
-    # type, or Manual (demand) as a safe fallback.
-    try:
-        from core import debloater
-        results["debloat_services"] = debloater.restore_services().get("results", [])
-    except Exception as e:
-        log.warning(f"service restore during reset failed: {e}")
-        results["debloat_services"] = [{"name": "service restore", "ok": False, "err": str(e)}]
-
-    # Restart DWM to apply visual changes immediately
-    run_cmd(["taskkill", "/f", "/im", "dwm.exe"])  # DWM auto-restarts
-    results["dwm"] = [{"name": "DWM restarted (applies visual changes)", "ok": True}]
-
-    log.info("=== ALL OPTIMIZATIONS RESET — REBOOT RECOMMENDED ===")
     return results
 
 
 def _reset_power_plan() -> list[dict]:
-    """Restore the user's pre-GhostShell power plan.
+    """Restore the user's pre-Vispora power plan.
 
     v3.3.1-beta.7: previously this hard-coded Balanced as the reset
     target, ignoring `power_baseline.json` captured by
@@ -966,6 +1189,7 @@ def _reset_power_plan() -> list[dict]:
     results = []
     restored = restore_power_baseline()
     if restored.get("ok"):
+        _forget_power_baseline()
         results.append({
             "name": f"Power plan restored to user baseline ({restored.get('guid','')})",
             "ok":   True,
@@ -985,10 +1209,12 @@ def _reset_cpu_tweaks() -> list[dict]:
         ("Win32PrioritySeparation", r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl", "Win32PrioritySeparation", "2"),
         ("SystemResponsiveness", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", "SystemResponsiveness", "20"),
         ("NetworkThrottlingIndex", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", "NetworkThrottlingIndex", "10"),
-        ("GPU Priority (Games)", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "GPU Priority", "0"),
+        ("GPU Priority (Games)", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "GPU Priority", "8"),   # stock is 8, not 0
         ("Scheduling Category", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "Scheduling Category", "Medium"),
         ("Priority (Games)", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "Priority", "2"),
         ("SFIO Priority", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "SFIO Priority", "Normal"),
+        # Set to 0 by the start-up prep; was in no reset list at all.
+        ("ForegroundLockTimeout", r"HKCU\Control Panel\Desktop", "ForegroundLockTimeout", "200000"),
     ]
     for name, key, val, data in tweaks:
         vtype = "REG_SZ" if data in ("Medium", "Normal", "High", "Low") else "REG_DWORD"
@@ -1040,16 +1266,24 @@ def _reset_memory_tweaks() -> list[dict]:
 def _reset_storage_tweaks() -> list[dict]:
     log.info("Resetting storage tweaks...")
     results = []
-    for name, cmd in [
-        ("Last Access Time", ["fsutil", "behavior", "set", "disablelastaccess", "3"]),
-        ("8.3 Filenames", ["fsutil", "behavior", "set", "disable8dot3", "0"]),
-        ("NTFS Memory Usage", ["fsutil", "behavior", "set", "memoryusage", "1"]),
+    # Fixed defaults — for what an older build changed without keeping a
+    # record.  Each is applied only while the flag still reads the way that
+    # tweak left it; whatever IS on record is restored exactly by the final
+    # pass of Reset All.
+    for name, flag, tweak, stock in [
+        # 2 = "let Windows decide", the default (this used to write 3)
+        ("Last Access Time", "disablelastaccess", 1, 2),
+        # 2 = per volume, the default (this used to write 0: "create 8.3
+        # names on every volume", which is not how Windows ships)
+        ("8.3 Filenames", "disable8dot3", 1, 2),
+        ("NTFS Memory Usage", "memoryusage", 2, 1),
     ]:
-        r = run_cmd(cmd)
+        if reg_originals.has_state("fsutil", flag) or sys_state.fsutil_behavior(flag) != tweak:
+            continue
+        r = run_cmd(["fsutil", "behavior", "set", flag, str(stock)])
         results.append({"name": name, "ok": r["ok"]})
 
-    run_cmd(["sc", "config", "WSearch", "start=", "delayed-auto"])
-    run_cmd(["sc", "start", "WSearch"])
+    _service_default("WSearch", tweak="disabled", stock="delayed-auto", start=True)
     results.append({"name": "Windows Search (re-enabled)", "ok": True})
     _reg(r"HKCU\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy", "01", "1")
     results.append({"name": "Storage Sense (re-enabled)", "ok": True})
@@ -1089,9 +1323,9 @@ def _reset_gaming_tweaks() -> list[dict]:
     results.append({"name": "GameDVR Policy (removed)", "ok": True})
 
     # Restore bcdedit timer defaults
-    run_cmd(["bcdedit", "/deletevalue", "useplatformtick"])
-    run_cmd(["bcdedit", "/deletevalue", "disabledynamictick"])
-    run_cmd(["bcdedit", "/deletevalue", "useplatformclock"])
+    bcd = sys_state.bcd_values()
+    for element, tweak in (("useplatformtick", "yes"), ("disabledynamictick", "yes"), ("useplatformclock", "no")):
+        _bcd_default(bcd, element, tweak)
     results.append({"name": "Timer settings (all restored to default)", "ok": True})
 
     # Re-enable HPET if it was disabled
@@ -1137,12 +1371,10 @@ def _reset_gpu_rendering() -> list[dict]:
         _reg(nv_key, val, data)
         results.append({"name": name, "ok": True})
 
-    # Reset per-app GPU preferences (remove any High Performance overrides)
-    run_ps(
-        'Remove-ItemProperty -Path "HKCU:\\Software\\Microsoft\\DirectX\\UserGpuPreferences" '
-        '-Name * -ErrorAction SilentlyContinue'
-    )
-    results.append({"name": "Per-app GPU preferences (cleared)", "ok": True})
+    # (This used to clear EVERY value under DirectX\UserGpuPreferences — the
+    # per-app "which GPU" choices from Windows Settings, none of which this
+    # app ever writes.  On a dual-GPU laptop that sent games back to the
+    # integrated GPU.)
 
     # Ensure DWM is using hardware acceleration (should be default but verify)
     _reg(r"HKCU\Software\Microsoft\Windows\DWM", "DisableHWAcceleration", "0")
@@ -1164,9 +1396,12 @@ def _reset_scheduler_tweaks() -> list[dict]:
     dpp_key = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\DisplayPostProcessing"
     for name, val, data, vtype in [
         ("DPP Background Only", "Background Only", "True", "REG_SZ"),
-        ("DPP GPU Priority", "GPU Priority", "0", "REG_DWORD"),
-        ("DPP Priority", "Priority", "2", "REG_DWORD"),
-        ("DPP Scheduling", "Scheduling Category", "Medium", "REG_SZ"),
+        # Stock values for this task are 8 / 8 / High.  This used to write
+        # 0 / 2 / Medium — a "reset" that left it lower than Windows ships it.
+        ("DPP GPU Priority", "GPU Priority", "8", "REG_DWORD"),
+        ("DPP Priority", "Priority", "8", "REG_DWORD"),
+        ("DPP Scheduling", "Scheduling Category", "High", "REG_SZ"),
+        ("DPP SFIO Priority", "SFIO Priority", "Normal", "REG_SZ"),
     ]:
         _reg(dpp_key, val, data, vtype)
         results.append({"name": name, "ok": True})
@@ -1210,10 +1445,8 @@ def _reset_visual_tweaks() -> list[dict]:
     # This bitmask controls ALL visual effects — animations, shadows, font smoothing,
     # thumbnail previews, etc. The default value enables all effects.
     # Default bytes: 9E 3E 07 80 12 01 00 00 (all effects on)
-    r = run_ps(
-        'Set-ItemProperty -Path "HKCU:\\Control Panel\\Desktop" -Name "UserPreferencesMask" '
-        '-Value ([byte[]](0x9E,0x3E,0x07,0x80,0x12,0x01,0x00,0x00)) -Type Binary'
-    )
+    r = {"ok": _reg(r"HKCU\Control Panel\Desktop", "UserPreferencesMask",
+                    "9E3E078012010000", "REG_BINARY")}
     results.append({"name": "UserPreferencesMask (all effects ON)", "ok": r["ok"]})
 
     # Use SystemParametersInfo to apply visual effects change immediately (no reboot needed)
@@ -1251,12 +1484,23 @@ def _reset_hard_tweaks() -> list[dict]:
     run_cmd(["reg", "delete", base, "/v", "FeatureSettingsOverrideMask", "/f"])
     results.append({"name": "Spectre/Meltdown mitigations restored", "ok": True})
 
-    # Restore VBS / HVCI — set back to 1 (Windows 11 default)
-    _reg(r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard",
-         "EnableVirtualizationBasedSecurity", "1")
-    _reg(r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
-         "Enabled", "1")
-    results.append({"name": "VBS / HVCI restored", "ok": True})
+    # VBS / HVCI.  Where we have the prior values on record, the final pass
+    # of Reset All restores exactly those.  Without a record, only switch
+    # them back on if Pro Mode — the one path through which this app turns
+    # them off — is enabled.  Forcing them to 1 unconditionally switched
+    # Memory Integrity ON for users who never had it and never touched it
+    # here, bypassing Windows' own driver-compatibility check.
+    dg = r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard"
+    hvci = dg + r"\Scenarios\HypervisorEnforcedCodeIntegrity"
+    if reg_originals.has_original(dg, "EnableVirtualizationBasedSecurity") \
+            or reg_originals.has_original(hvci, "Enabled"):
+        results.append({"name": "VBS / HVCI restored to their previous setting", "ok": True})
+    elif _pro_mode_enabled():
+        _reg(dg, "EnableVirtualizationBasedSecurity", "1")
+        _reg(hvci, "Enabled", "1")
+        results.append({"name": "VBS / HVCI re-enabled", "ok": True})
+    else:
+        results.append({"name": "VBS / HVCI left as they are (not changed by Vispora)", "ok": True})
 
     # Remove MPO override
     run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Microsoft\Windows\Dwm", "/v", "OverlayTestMode", "/f"])
@@ -1289,10 +1533,11 @@ def _reset_hard_tweaks() -> list[dict]:
              "/v", "LetAppsRunInBackground", "/f"])
     results.append({"name": "Background apps restored", "ok": True})
 
-    # Re-enable Xbox services
-    for svc in ["XblAuthManager", "XblGameSave", "XboxGipSvc", "XboxNetApiSvc"]:
-        run_cmd(["sc", "config", svc, "start=", "auto"])
-    results.append({"name": "Xbox services restored", "ok": True})
+    # Xbox services.  The tweak sets them to Manual — which is also how
+    # Windows ships them, so there is no default to go back to.  (This used
+    # to set all four to Automatic.)  A start type that WAS different before
+    # is on record and comes back with the final pass of Reset All.
+    results.append({"name": "Xbox services: Manual is the Windows default", "ok": True})
 
     # Widgets/Copilot — remove overrides (use Windows default)
     for key, val in [
@@ -1351,13 +1596,10 @@ def _reset_latency_tweaks() -> list[dict]:
     results.append({"name": "HPET re-enabled", "ok": True})
 
     # Restore bcdedit defaults
-    for cmd in [
-        ["bcdedit", "/deletevalue", "useplatformclock"],
-        ["bcdedit", "/deletevalue", "disabledynamictick"],
-        ["bcdedit", "/deletevalue", "useplatformtick"],
-        ["bcdedit", "/deletevalue", "tscsyncpolicy"],
-    ]:
-        run_cmd(cmd)
+    bcd = sys_state.bcd_values()
+    for element, tweak in (("useplatformclock", "no"), ("disabledynamictick", "yes"),
+                           ("useplatformtick", "yes"), ("tscsyncpolicy", "Enhanced")):
+        _bcd_default(bcd, element, tweak)
     results.append({"name": "bcdedit timers restored", "ok": True})
 
     # Restore power throttling
@@ -1516,7 +1758,7 @@ def apply_search_tweaks() -> list[dict]:
         results.append({"name": name, "ok": True})
 
     # Cortana service to disabled (won't break anything; Win11 uses Search)
-    run_cmd(["sc", "config", "WSearch", "start=", "delayed-auto"])
+    sys_state.set_service_start("WSearch", "delayed-auto")
     results.append({"name": "Search indexer → delayed start", "ok": True})
 
     log.info("Search tweaks applied")
@@ -1535,48 +1777,35 @@ def apply_defender_gaming_tweaks() -> list[dict]:
     log.info("Applying Defender gaming exclusions...")
     results = []
 
+    # What Defender is set to right now — so only exclusions that are not
+    # already there get recorded (and removed again by Reset All), and each
+    # preference's own previous value is what a reset goes back to.
+    prefs = sys_state.defender_prefs()
+
     # Auto-detect common game-install roots and exclude them
-    import os
-    candidate_paths = [
-        r"C:\Program Files (x86)\Steam",
-        r"C:\Program Files\Steam",
-        r"C:\Program Files\Epic Games",
-        r"C:\Program Files (x86)\Epic Games",
-        r"C:\Program Files (x86)\Battle.net",
-        r"C:\Program Files (x86)\Riot Games",
-        r"C:\Program Files\Ubisoft",
-        r"C:\Program Files (x86)\Ubisoft",
-        r"C:\Program Files\EA Games",
-        r"C:\Program Files\WindowsApps",  # Xbox Game Pass installs
-        r"C:\XboxGames",                   # Xbox Game Pass install root
-        r"C:\Program Files (x86)\GOG Galaxy",
-    ]
     excluded = []
-    for path in candidate_paths:
-        if os.path.exists(path):
-            r = run_ps(f'Add-MpPreference -ExclusionPath "{path}" -ErrorAction SilentlyContinue')
-            if r["ok"]:
-                excluded.append(path)
+    for path in _DEFENDER_EXCLUDE_PATHS:
+        if os.path.exists(path) and sys_state.add_defender_exclusion("ExclusionPath", path, current=prefs):
+            excluded.append(path)
     log.info(f"  Defender exclusions added for {len(excluded)} game folders")
     results.append({"name": f"Defender exclusions: {len(excluded)} game folders", "ok": True})
 
     # Common game executable patterns
-    for proc in ["steam.exe", "epicgameslauncher.exe", "battle.net.exe",
-                 "riotclientservices.exe", "ubisoftconnect.exe"]:
-        run_ps(f'Add-MpPreference -ExclusionProcess "{proc}" -ErrorAction SilentlyContinue')
+    for proc in _DEFENDER_EXCLUDE_PROCESSES:
+        sys_state.add_defender_exclusion("ExclusionProcess", proc, current=prefs)
     results.append({"name": "Defender process exclusions added", "ok": True})
 
     # Disable Defender Submit Sample Consent (no auto-upload of files to MS)
-    run_ps('Set-MpPreference -SubmitSamplesConsent NeverSend -ErrorAction SilentlyContinue')
+    sys_state.set_defender_pref("SubmitSamplesConsent", "NeverSend", 2, current=prefs)
     results.append({"name": "Defender sample submission disabled", "ok": True})
 
     # Disable MAPS (cloud-based protection telemetry — keeps signatures local)
-    run_ps('Set-MpPreference -MAPSReporting Disabled -ErrorAction SilentlyContinue')
+    sys_state.set_defender_pref("MAPSReporting", "Disabled", 0, current=prefs)
     results.append({"name": "Defender cloud telemetry disabled", "ok": True})
 
     # Disable scheduled scan during high-load hours (set to 4am only)
-    run_ps('Set-MpPreference -ScanScheduleTime 04:00:00 -ErrorAction SilentlyContinue')
-    run_ps('Set-MpPreference -ScanScheduleQuickScanTime 04:30:00 -ErrorAction SilentlyContinue')
+    sys_state.set_defender_pref("ScanScheduleTime", "04:00:00", "04:00:00", current=prefs)
+    sys_state.set_defender_pref("ScanScheduleQuickScanTime", "04:30:00", "04:30:00", current=prefs)
     results.append({"name": "Defender scans → 4 AM only", "ok": True})
 
     log.info("Defender gaming exclusions applied")
@@ -1607,6 +1836,7 @@ def apply_boot_tweaks() -> list[dict]:
     # ~40% of RAM on disk (e.g. 13 GB on a 32 GB system) which is
     # meaningful on a small SSD but unmeasurable on modern 1 TB+ NVMe.
     if _pro_mode_enabled():
+        reg_originals.note("hibernation_disabled")
         run_cmd(["powercfg", "-h", "off"])
         results.append({"name": "[Pro] Hibernation disabled (frees ~RAM-size on disk)", "ok": True})
     else:
@@ -1614,6 +1844,7 @@ def apply_boot_tweaks() -> list[dict]:
                          "ok": True, "skipped": True})
 
     # bcdedit — Legacy boot menu (no fancy GUI), faster boot
+    bcd = sys_state.bcd_values()
     for name, cmd in [
         ("Boot menu policy: Legacy",   ["bcdedit", "/set", "{current}", "bootmenupolicy", "Legacy"]),
         # v3.3.1-beta.7: replaced `bootux disabled` with `quietboot yes`.
@@ -1629,8 +1860,9 @@ def apply_boot_tweaks() -> list[dict]:
         # — they'd need a Windows installation USB.  No measurable
         # performance benefit; catastrophic on real boot failures.
     ]:
-        r = run_cmd(cmd)
-        results.append({"name": name, "ok": r["ok"]})
+        # cmd is ["bcdedit", "/set", "{current}", element, value] — set
+        # through sys_state, which notes what the element was before.
+        results.append({"name": name, "ok": sys_state.set_bcd(cmd[3], cmd[4], current=bcd)})
 
     # Show verbose status messages on boot (helps diagnose hangs)
     _reg(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
@@ -1663,15 +1895,7 @@ def apply_legacy_tweaks() -> list[dict]:
     # a doc relaunches Spooler).  Same pattern we settled on for DiagTrack.
     # Smart card / Bluetooth services are gated behind hardware detection
     # so we never lock users out of smart-card or BT-keyboard login.
-    services_to_kill = [
-        ("Print Spooler",                "Spooler"),
-        ("Fax",                           "Fax"),
-        ("Windows Insider Service",       "wisvc"),
-        ("Touch Keyboard / Handwriting",  "TabletInputService"),
-        ("Retail Demo",                   "RetailDemo"),
-        ("Phone Service",                 "PhoneSvc"),
-        ("Windows Mobile Hotspot",        "icssvc"),
-    ]
+    services_to_kill = list(_LEGACY_SERVICES)
     # Smart card services — skip if the user has a reader plugged in
     # (PIV / CAC / YubiKey logins depend on these services).
     try:
@@ -1683,10 +1907,7 @@ def apply_legacy_tweaks() -> list[dict]:
     except Exception:
         has_smartcard = True   # fail-CLOSED: leave smart card alone if probe fails
     if not has_smartcard:
-        services_to_kill += [
-            ("Smart Card",                "SCardSvr"),
-            ("Smart Card Removal Policy", "SCPolicySvc"),
-        ]
+        services_to_kill += list(_SMARTCARD_SERVICES)
     else:
         results.append({"name": "Smart card services kept (reader detected)", "ok": True})
     # Bluetooth — skip if a BT HID device (keyboard / mouse) is present;
@@ -1709,8 +1930,7 @@ def apply_legacy_tweaks() -> list[dict]:
     # hang waiting for the service if it's hard-disabled.
 
     for label, svc in services_to_kill:
-        run_cmd(["sc", "stop", svc])
-        ok = run_cmd(["sc", "config", svc, "start=", "demand"])["ok"]  # "demand" = manual
+        ok = sys_state.set_service_start(svc, "demand", stop=True)  # "demand" = manual
         results.append({"name": f"{label} service → manual", "ok": ok})
 
     # Optional Windows features that take CPU + RAM and most gaming PCs
@@ -1722,22 +1942,8 @@ def apply_legacy_tweaks() -> list[dict]:
     # the user has WSL distros installed OR Docker Desktop OR an Android
     # subsystem, we skip those — disabling them silently breaks a working
     # dev environment.
-    base_features = [
-        "Internet-Explorer-Optional-amd64",
-        "Printing-XPSServices-Features",
-        "Printing-PrintToPDFServices-Features",
-        "FaxServicesClientPackage",
-        "WindowsMediaPlayer",
-        "MediaPlayback",
-        "WorkFolders-Client",
-    ]
-    virtualisation_features = [
-        "Microsoft-Windows-Subsystem-Linux",
-        "VirtualMachinePlatform",
-        "HypervisorPlatform",
-        "Microsoft-Hyper-V-All",
-        "Containers-DisposableClientVM",
-    ]
+    base_features = list(_BASE_FEATURES)
+    virtualisation_features = list(_VIRTUALISATION_FEATURES)
     try:
         # Quick probes — if any return non-empty / non-zero, the user
         # is actively using virtualisation and we don't touch these.
@@ -1755,10 +1961,12 @@ def apply_legacy_tweaks() -> list[dict]:
         features_to_remove += virtualisation_features
     else:
         results.append({"name": "Virtualisation features kept (WSL/Docker/WSA detected)", "ok": True})
-    for feat in features_to_remove:
-        run_cmd(["dism", "/online", "/disable-feature",
-                 f"/featurename:{feat}", "/norestart"])
-    results.append({"name": f"Disabled {len(features_to_remove)} optional Windows features", "ok": True})
+    # One DISM query says which of these are on.  Only those are switched
+    # off — and noted, so Reset All can switch exactly those back on (it used
+    # to leave every one of them off for good).
+    n_off = sys_state.disable_features(features_to_remove)
+    results.append({"name": f"Disabled {n_off} optional Windows feature(s) "
+                            f"(of {len(features_to_remove)} checked; the rest were already off)", "ok": True})
 
     log.info("Legacy tweaks applied")
     return results
@@ -1770,9 +1978,19 @@ def apply_legacy_tweaks() -> list[dict]:
 def _reset_audio_tweaks() -> list[dict]:
     log.info("Resetting audio tweaks...")
     audio_task = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Pro Audio"
-    for val in ("GPU Priority", "Priority", "Clock Rate", "Affinity",
-                "SFIO Priority", "Background Only", "Scheduling Category"):
-        run_cmd(["reg", "delete", audio_task, "/v", val, "/f"])
+    # These values ship with Windows.  Deleting them (as this did) stripped
+    # the Pro Audio task on every Reset All, tweak applied or not; write the
+    # stock values instead.
+    for val, data, vtype in (
+        ("Affinity",            "0",     "REG_DWORD"),
+        ("Background Only",     "False", "REG_SZ"),
+        ("Clock Rate",          "10000", "REG_DWORD"),
+        ("GPU Priority",        "8",     "REG_DWORD"),
+        ("Priority",            "1",     "REG_DWORD"),
+        ("Scheduling Category", "High",  "REG_SZ"),
+        ("SFIO Priority",       "Normal", "REG_SZ"),
+    ):
+        _reg(audio_task, val, data, vtype)
     # beta.5: was ControlSet001 (hardcoded) — use the live CurrentControlSet.
     run_cmd(["reg", "delete",
              r"HKLM\SYSTEM\CurrentControlSet\Control\Bluetooth\Audio\AVRCP\CT",
@@ -1815,27 +2033,48 @@ def _reset_search_tweaks() -> list[dict]:
 
 
 def _reset_defender_gaming_tweaks() -> list[dict]:
-    """Note: we don't auto-remove the Defender exclusions on reset because
-    they're conservative gaming-folder excludes the user almost certainly
-    wants to keep.  Reset only undoes the policy bits."""
+    """Preferences and exclusions that are on record are put back by the
+    final pass of Reset All: each preference to its previous value, and
+    exactly the exclusions this app added removed again.
+
+    What an older build changed has no record.  For that, the two policy bits
+    go to their Windows defaults, and the exclusions stay — they cannot be
+    told apart from ones the user added."""
     log.info("Resetting Defender gaming tweaks...")
-    run_ps('Set-MpPreference -SubmitSamplesConsent SendSafeSamples -ErrorAction SilentlyContinue')
-    run_ps('Set-MpPreference -MAPSReporting Advanced -ErrorAction SilentlyContinue')
-    return [{"name": "Defender policy restored (exclusions kept)", "ok": True}]
+    if not reg_originals.has_state("defender", "SubmitSamplesConsent"):
+        run_ps('Set-MpPreference -SubmitSamplesConsent SendSafeSamples -ErrorAction SilentlyContinue')
+    if not reg_originals.has_state("defender", "MAPSReporting"):
+        run_ps('Set-MpPreference -MAPSReporting Advanced -ErrorAction SilentlyContinue')
+    n = len(reg_originals.state_records("defender-exclusion"))
+    return [{"name": (f"Defender policy restored; {n} exclusion(s) added by Vispora will be removed" if n else
+                      "Defender policy restored (no exclusions on record; any added by an earlier version are kept)"),
+             "ok": True}]
 
 
 def _reset_boot_tweaks() -> list[dict]:
     log.info("Resetting boot tweaks...")
-    _reg(r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power",
-         "HiberBootEnabled", "1")
-    run_cmd(["powercfg", "-h", "on"])
-    for cmd in [
-        ["bcdedit", "/deletevalue", "{current}", "bootmenupolicy"],
-        ["bcdedit", "/deletevalue", "bootux"],
-        ["bcdedit", "/deletevalue", "{current}", "bootlog"],
-        ["bcdedit", "/deletevalue", "{current}", "recoveryenabled"],
-    ]:
-        run_cmd(cmd)
+    # Fast Startup and hibernation are only switched back on if this app
+    # switched them off.  Doing it unconditionally re-enabled Fast Startup
+    # and recreated a RAM-sized hiberfil.sys for people who had turned them
+    # off themselves (deliberately, on a dual-boot machine).
+    hb_key = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power"
+    if not reg_originals.has_original(hb_key, "HiberBootEnabled") and _pro_mode_enabled():
+        _reg(hb_key, "HiberBootEnabled", "1")
+    if reg_originals.noted("hibernation_disabled"):
+        run_cmd(["powercfg", "-h", "on"])
+        reg_originals.forget_notes("hibernation_disabled")
+    # Fixed defaults for boot elements an older build changed without a
+    # record, each only while it still reads the way that tweak left it.
+    bcd = sys_state.bcd_values()
+    # Set, not deleted: Windows ships these two present.  Deleting them is
+    # not "the default" — without recoveryenabled the machine no longer falls
+    # back to the recovery environment after failed boots, and this ran for
+    # everyone, whether or not a tweak had ever touched it.
+    _bcd_default(bcd, "bootmenupolicy", "Legacy", stock="Standard")
+    _bcd_default(bcd, "recoveryenabled", "No", stock="Yes")
+    _bcd_default(bcd, "bootux", "disabled")
+    _bcd_default(bcd, "bootlog", "no")
+    _bcd_default(bcd, "quietboot", "yes")       # was never reset at all
     run_cmd(["reg", "delete",
              r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
              "/v", "VerboseStatus", "/f"])
@@ -1844,14 +2083,17 @@ def _reset_boot_tweaks() -> list[dict]:
 
 def _reset_legacy_tweaks() -> list[dict]:
     log.info("Resetting legacy tweaks...")
-    # Re-enable Print Spooler since most users actually need it for a printer
-    run_cmd(["sc", "config", "Spooler", "start=", "auto"])
-    run_cmd(["sc", "start", "Spooler"])
-    # Bluetooth back to manual (in case the user actually has BT devices)
-    run_cmd(["sc", "config", "bthserv", "start=", "manual"])
-    # Geolocation back to manual
-    run_cmd(["sc", "config", "lfsvc", "start=", "manual"])
-    return [{"name": "Common legacy services restored (Print, BT, Geo)", "ok": True}]
+    # Start types that are on record come back with the final pass of Reset
+    # All.  These are the fixed defaults for what an older build changed:
+    # the tweak leaves every one of these services on Manual, and only the
+    # Print Spooler ships as anything else.
+    _service_default("Spooler", tweak="demand", stock="auto", start=True)
+    _service_default("lfsvc", tweak="disabled", stock="demand")     # older builds disabled Geolocation
+    rows = [{"name": "Legacy services restored (previous start types where on record)", "ok": True}]
+    if not reg_originals.has_state("feature"):
+        rows.append({"name": "Windows features: none on record to switch back on (any that an earlier "
+                             "version turned off are under 'Turn Windows features on or off')", "ok": True})
+    return rows
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1866,14 +2108,13 @@ def apply_network_stack_tweaks() -> list[dict]:
     results = []
 
     # Per-NIC: TcpAckFrequency = 1 (no delayed ACK), TCPNoDelay = 1 (Nagle off)
-    run_ps("""
-$ifaces = Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces'
-foreach ($i in $ifaces) {
-    Set-ItemProperty -Path $i.PSPath -Name TcpAckFrequency -Value 1 -Type DWord -ErrorAction SilentlyContinue
-    Set-ItemProperty -Path $i.PSPath -Name TCPNoDelay      -Value 1 -Type DWord -ErrorAction SilentlyContinue
-    Set-ItemProperty -Path $i.PSPath -Name TcpDelAckTicks  -Value 0 -Type DWord -ErrorAction SilentlyContinue
-}
-""")
+    # Written value by value through _reg.  This used to be a PowerShell loop
+    # that set the registry itself, so nothing was on record and the
+    # per-adapter changes survived every reset.
+    ifaces_key = r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+    for iface in reg_originals.subkeys(ifaces_key):
+        for val, data in (("TcpAckFrequency", "1"), ("TCPNoDelay", "1"), ("TcpDelAckTicks", "0")):
+            _reg(rf"{ifaces_key}\{iface}", val, data)
     results.append({"name": "Per-NIC: Nagle off, ACK delay off", "ok": True})
 
     # Global TCP/IP parameters
@@ -1895,21 +2136,11 @@ foreach ($i in $ifaces) {
         ok = _reg(tcpip, val, data)
         results.append({"name": name, "ok": ok})
 
-    # netsh global
-    for name, cmd in [
-        ("netsh: autotuninglevel normal",       ["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"]),
-        ("netsh: chimney disabled",             ["netsh", "int", "tcp", "set", "global", "chimney=disabled"]),
-        ("netsh: rss enabled",                  ["netsh", "int", "tcp", "set", "global", "rss=enabled"]),
-        ("netsh: ecncapability disabled",       ["netsh", "int", "tcp", "set", "global", "ecncapability=disabled"]),
-        ("netsh: timestamps disabled",          ["netsh", "int", "tcp", "set", "global", "timestamps=disabled"]),
-        ("netsh: initialRto 2000",              ["netsh", "int", "tcp", "set", "global", "initialRto=2000"]),
-        ("netsh: nonsackrttresiliency disabled", ["netsh", "int", "tcp", "set", "global", "nonsackrttresiliency=disabled"]),
-        ("netsh: maxsynretransmissions 2",       ["netsh", "int", "tcp", "set", "global", "maxsynretransmissions=2"]),
-        ("netsh: fastopen enabled",              ["netsh", "int", "tcp", "set", "global", "fastopen=enabled"]),
-        ("netsh: hystart disabled",              ["netsh", "int", "tcp", "set", "global", "hystart=disabled"]),
-    ]:
-        r = run_cmd(cmd)
-        results.append({"name": name, "ok": r["ok"]})
+    # netsh global — each parameter's previous value is noted before it changes
+    tcp = sys_state.tcp_globals()
+    for param, value in _TCP_GLOBAL_TWEAKS:
+        results.append({"name": f"netsh: {param} {value}",
+                        "ok": sys_state.set_tcp_global(param, value, current=tcp)})
 
     log.info("Network stack tweaks applied")
     return results
@@ -1954,24 +2185,13 @@ def apply_telemetry_deep_tweaks() -> list[dict]:
         results.append({"name": name, "ok": True})
 
     # Disable known telemetry scheduled tasks
-    tasks = [
-        r"\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser",
-        r"\Microsoft\Windows\Application Experience\ProgramDataUpdater",
-        r"\Microsoft\Windows\Customer Experience Improvement Program\Consolidator",
-        r"\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip",
-        r"\Microsoft\Windows\Customer Experience Improvement Program\KernelCeipTask",
-        r"\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector",
-        r"\Microsoft\Windows\Feedback\Siuf\DmClient",
-        r"\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload",
-        r"\Microsoft\Windows\Windows Error Reporting\QueueReporting",
-    ]
+    tasks = _TELEMETRY_TASKS
     for t in tasks:
-        run_cmd(["schtasks", "/Change", "/TN", t, "/Disable"])
+        sys_state.disable_task(t)       # notes that it was enabled, so Reset All can re-enable it
     results.append({"name": f"Disabled {len(tasks)} telemetry scheduled tasks", "ok": True})
 
     # Error reporting service
-    run_cmd(["sc", "stop", "WerSvc"])
-    run_cmd(["sc", "config", "WerSvc", "start=", "disabled"])
+    sys_state.set_service_start("WerSvc", "disabled", stop=True)
     results.append({"name": "Windows Error Reporting service off", "ok": True})
 
     # DiagTrack (Connected User Experiences and Telemetry).
@@ -1981,13 +2201,11 @@ def apply_telemetry_deep_tweaks() -> list[dict]:
     # it stays off most of the time but can start on demand when the
     # Store/Xbox app actually needs it.  Net telemetry impact is still
     # ~zero in idle steady state.
-    run_cmd(["sc", "stop", "DiagTrack"])
-    run_cmd(["sc", "config", "DiagTrack", "start=", "manual"])
+    sys_state.set_service_start("DiagTrack", "demand", stop=True)
     results.append({"name": "DiagTrack service → manual (was disabled — broke Store/Xbox)", "ok": True})
 
     # dmwappushservice
-    run_cmd(["sc", "stop", "dmwappushservice"])
-    run_cmd(["sc", "config", "dmwappushservice", "start=", "disabled"])
+    sys_state.set_service_start("dmwappushservice", "disabled", stop=True)
     results.append({"name": "WAP Push Message Routing off", "ok": True})
 
     log.info("Deep telemetry tweaks applied")
@@ -2021,9 +2239,8 @@ def apply_edge_tweaks() -> list[dict]:
         results.append({"name": name, "ok": True})
 
     # Edge "Update Service" — running even when Edge isn't open
-    for svc in ("edgeupdate", "edgeupdatem", "MicrosoftEdgeElevationService"):
-        run_cmd(["sc", "stop", svc])
-        run_cmd(["sc", "config", svc, "start=", "manual"])
+    for svc in _EDGE_SERVICES:
+        sys_state.set_service_start(svc, "demand", stop=True)
     results.append({"name": "Edge update services → manual", "ok": True})
 
     log.info("Edge tweaks applied")
@@ -2159,6 +2376,7 @@ def apply_power_advanced_tweaks() -> list[dict]:
         ("Power button → Shutdown",         ["powercfg", "/setacvalueindex", "scheme_current", "4f971e89-eebd-4455-a8de-9e59040e7347", "7648efa3-dd9c-4e3e-b566-50f929386280", "3"]),
     ]
     for name, cmd in cmds:
+        reg_originals.remember_power(cmd[3], cmd[4])    # sub-group, setting — before it changes
         r = run_cmd(cmd)
         results.append({"name": name, "ok": r["ok"]})
 
@@ -2192,7 +2410,7 @@ def apply_app_privacy_tweaks() -> list[dict]:
     #     toast notifications for Discord, Slack, Steam friends, Teams,
     #     OBS, and every other modern app.  Users notice immediately.
     # The user's privacy is still well-served by the other ~17 permissions
-    # below; these five are user/Windows Settings territory, not GhostShell's.
+    # below; these five are user/Windows Settings territory, not Vispora's.
     permissions = [
         "LetAppsAccessLocation",       "LetAppsAccessCamera",
         "LetAppsAccessAccountInfo",
@@ -2356,18 +2574,36 @@ def apply_lock_screen_tweaks() -> list[dict]:
 # ═══════════════════════════════════════════════════════════════════════════
 def _reset_network_stack_tweaks() -> list[dict]:
     log.info("Resetting network stack tweaks...")
-    run_cmd(["netsh", "int", "tcp", "reset"])
-    run_cmd(["netsh", "winsock", "reset"])
-    return [{"name": "TCP/IP stack reset (reboot required)", "ok": True}]
+    if reg_originals.has_state("tcp"):
+        # Each parameter's previous value is on record; the final pass of
+        # Reset All puts those back, which a blanket reset would then undo.
+        return [{"name": "TCP parameters: previous values will be restored", "ok": True}]
+    # No record — changed by an older build, or not at all.  Reset the TCP
+    # parameters only if some still read the way the tweak leaves them.
+    # (`netsh winsock reset` used to run here as well.  Nothing this app does
+    # touches the Winsock catalog, and resetting it removes the providers
+    # that VPN clients and security software install there.)
+    cur = sys_state.tcp_globals() or {}
+    if any(cur.get(k) == v for k, v in (("initialrto", "2000"), ("maxsynretransmissions", "2"),
+                                        ("hystart", "disabled"))):
+        run_cmd(["netsh", "int", "tcp", "reset"])
+        return [{"name": "TCP parameters reset to Windows defaults (reboot required)", "ok": True}]
+    return [{"name": "TCP parameters: none of this app's tweaks present", "ok": True}]
 
 
 def _reset_telemetry_deep_tweaks() -> list[dict]:
     log.info("Resetting deep telemetry tweaks...")
-    # Re-enable services back to default startup types
-    for svc, mode in (("WerSvc", "manual"), ("DiagTrack", "auto"),
-                      ("dmwappushservice", "manual")):
-        run_cmd(["sc", "config", svc, "start=", mode])
-    return [{"name": "Telemetry services restored to defaults", "ok": True}]
+    # Fixed defaults for services an older build changed without a record.
+    # ("manual" is not a start type sc.exe accepts — it is "demand" — so two
+    # of the three commands that used to be here never did anything.)
+    _service_default("WerSvc", tweak="disabled", stock="demand")
+    _service_default("DiagTrack", tweak="demand", stock="auto")
+    _service_default("dmwappushservice", tweak="disabled", stock="demand")
+    rows = [{"name": "Telemetry services restored (previous start types where on record)", "ok": True}]
+    if not reg_originals.has_state("task"):
+        rows.append({"name": "Telemetry scheduled tasks: none on record to re-enable (any that an earlier "
+                             "version disabled can be switched back on in Task Scheduler)", "ok": True})
+    return rows
 
 
 def _reset_edge_tweaks() -> list[dict]:
@@ -2388,8 +2624,10 @@ def _reset_edge_tweaks() -> list[dict]:
               "HardwareAccelerationModeEnabled",
               "ShowMicrosoftRewards"):
         run_cmd(["reg", "delete", edge_key, "/v", v, "/f"])
-    for svc in ("edgeupdate", "edgeupdatem", "MicrosoftEdgeElevationService"):
-        run_cmd(["sc", "config", svc, "start=", "auto"])
+    # Of the three Edge services only edgeupdate ships as anything other
+    # than Manual, which is what the tweak sets.  (This used to set all
+    # three to Automatic.)
+    _service_default("edgeupdate", tweak="demand", stock="delayed-auto")
     return [{"name": "Edge tweak values cleared (subtree preserved), services restored", "ok": True}]
 
 
@@ -2423,10 +2661,16 @@ def _reset_notification_tweaks() -> list[dict]:
 
 def _reset_power_advanced_tweaks() -> list[dict]:
     log.info("Resetting advanced power tweaks...")
-    # Easiest: restore plan defaults via powercfg
-    run_cmd(["powercfg", "-restoredefaultschemes"])
-    run_cmd(["powercfg", "-setactive", "381b4222-f694-41f0-9685-ff5bb260df2e"])  # Balanced
-    return [{"name": "Power schemes restored to defaults", "ok": True}]
+    # The settings this tweak changed are restored, each to the value it had
+    # on the plan it was changed on, by the final pass of Reset All.  This
+    # used to run `powercfg -restoredefaultschemes` and force Balanced, which
+    # DELETED every custom / OEM power plan on the machine — including the
+    # user's own plan that _reset_power_plan() had restored a moment earlier.
+    n = reg_originals.summary()["power"]
+    if n:
+        return [{"name": f"{n} power-plan setting(s) will be restored to their previous values", "ok": True}]
+    return [{"name": "Advanced power settings: no previous values on record — left as they are "
+                     "(Windows: Power Options → Restore default settings for this plan)", "ok": True}]
 
 
 def _reset_app_privacy_tweaks() -> list[dict]:

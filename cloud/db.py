@@ -15,7 +15,7 @@ import asyncpg
 
 from settings import settings
 
-log = logging.getLogger("ghostshell-cloud.db")
+log = logging.getLogger("vispora-cloud.db")
 
 _pool: asyncpg.Pool | None = None
 

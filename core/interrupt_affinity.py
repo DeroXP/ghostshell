@@ -1,7 +1,7 @@
 """Interrupt Affinity & MSI Mode Manager — redistribute interrupts off Core 0."""
 import json
 import os
-from core.utils import run_ps, run_cmd, get_logger, backup_registry
+from core.utils import run_ps, run_cmd, get_logger, backup_registry, is_safe_ps_literal
 
 log = get_logger("irq")
 
@@ -126,6 +126,11 @@ def _force_write_enum_dword(key_path: str, value_name: str, value_data: int) -> 
         ps_path = ps_path[5:]
     if ps_path.startswith("HKEY_LOCAL_MACHINE\\"):
         ps_path = ps_path[19:]
+    # Both end up inside double-quoted strings in the elevated script below.
+    # The key path embeds a device instance id, which arrives from the API
+    # and from enumerated hardware (a USB serial string can hold anything).
+    if not (is_safe_ps_literal(ps_path) and is_safe_ps_literal(value_name)):
+        return False, None, "refused: registry path contains characters unsafe to script"
 
     script = (
         "$ErrorActionPreference = 'Stop'\n"
@@ -230,6 +235,8 @@ def _force_delete_enum_value(key_path: str, value_name: str) -> tuple[bool, str]
     """Delete a value from an HKLM\\Enum subkey via PowerShell with the
     same takeown-then-grant flow, so the deletion actually persists."""
     ps_path = key_path
+    if not (is_safe_ps_literal(key_path) and is_safe_ps_literal(value_name)):
+        return False, "refused: registry path contains characters unsafe to script"
     if ps_path.startswith("HKLM\\"):
         ps_path = ps_path[5:]
     script = (

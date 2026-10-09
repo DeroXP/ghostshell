@@ -21,16 +21,15 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Annotated
 from uuid import UUID
 
 import asyncpg
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from db import get_db
 
-log = logging.getLogger("ghostshell-cloud.devices")
+log = logging.getLogger("vispora-cloud.devices")
 
 router = APIRouter(prefix="/v1/devices", tags=["devices"])
 

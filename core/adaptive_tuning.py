@@ -6,7 +6,7 @@ patterns, different temperatures, and different shader loads.  An OC
 that passed Furmark may crash CS2 in week 2.  An OC that's stable in
 CS2 may blue-screen Warzone.
 
-So instead of one global OC, GhostShell learns *per-game* offsets
+So instead of one global OC, Vispora learns *per-game* offsets
 during play.  Conservative algorithm:
 
   1. Game starts → apply this game's last-known-good offsets
@@ -26,11 +26,11 @@ during play.  Conservative algorithm:
      reads the new state on the next launch and starts from there
 
 State is persisted per-game in:
-    %APPDATA%\\GhostShell\\adaptive_tuning_state.json
+    %APPDATA%\\Vispora\\adaptive_tuning_state.json
 Settings (global + per-game overrides) in:
-    %APPDATA%\\GhostShell\\adaptive_tuning_settings.json
+    %APPDATA%\\Vispora\\adaptive_tuning_settings.json
 Step history (last 200 events across all games) in:
-    %APPDATA%\\GhostShell\\adaptive_tuning_history.json
+    %APPDATA%\\Vispora\\adaptive_tuning_history.json
 
 Public API:
     on_game_start(exe, display_name)   → called by game_profiles
@@ -991,7 +991,7 @@ def clear_runtime_if_orphaned() -> dict:
     """One-shot orphan check.  If the runtime is tracking an exe whose
     process no longer exists, wipe the runtime back to idle.  Called
     from app startup so a previous-run stale state can't survive a
-    GhostShell restart."""
+    Vispora restart."""
     with _lock:
         cur_exe = _runtime.get("active_exe")
     if not cur_exe:
@@ -1185,13 +1185,13 @@ def get_diagnostics() -> dict:
             "level": "info",
             "code":  "no_foreground_game",
             "msg":   "No game detected in the foreground.",
-            "fix":   "Launch a game (windowed/borderless) — GhostShell scans the foreground window every 3 s.",
+            "fix":   "Launch a game (windowed/borderless) — Vispora scans the foreground window every 3 s.",
         })
     elif not fg_known:
         blockers.append({
             "level": "warn",
             "code":  "unknown_game",
-            "msg":   f"{foreground.get('exe')} is not in GhostShell's known-games list.",
+            "msg":   f"{foreground.get('exe')} is not in Vispora's known-games list.",
             "fix":   "Click 'Track this game' (or add it via Game Profiles → Custom Games) so AT can engage on it.",
         })
     elif fg_state and not fg_state.get("enabled"):
@@ -1531,7 +1531,7 @@ def _apply_offsets(exe: str, core: int, mem: int, reason: str) -> bool:
         result = gpu_overclock.apply_oc(
             core_offset_mhz=core,
             mem_offset_mhz=mem,
-            power_pct=100,
+            power_pct=None,       # AT only ever moves the clocks
         )
         ok = bool(result.get("ok"))
         # beta.5 — CRITICAL: AT must NEVER write the user's saved manual OC
@@ -1707,6 +1707,22 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
         else:
             missed_proc_polls = 0
 
+        # The master switch and this game's own toggle were only ever read
+        # at engage, so switching AT off did nothing until the game closed.
+        try:
+            still_on = bool(get_settings().get("enabled_globally")
+                            and get_game_state(exe).get("enabled"))
+        except Exception:
+            still_on = True          # can't tell — don't tear the session down
+        if not still_on:
+            log.info(f"AT switched off mid-session for {exe} — ending session")
+            try:
+                on_game_exit(exe, display_name, was_crash=False,
+                             reason="disabled mid-session")
+            except Exception as e:
+                log.warning(f"AT mid-session shutdown failed: {e}")
+            return
+
         # v3.1.2 — Out-of-band crash detection.  Did a TDR / driver crash
         # / BSOD fire since this AT session started, BUT after the last
         # one we already handled?  If so, force an immediate step-down
@@ -1821,7 +1837,10 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
             with _lock:
                 _at_target_core = int(_runtime.get("current_core", 0))
                 _at_target_mem  = int(_runtime.get("current_mem",  0))
-            _at_check_offset_drift(exe, _at_target_core, _at_target_mem)
+            # In dry-run the "current" offsets are only what AT WOULD have
+            # applied; re-asserting them here wrote them to the GPU for real.
+            if not bool(get_game_state(exe).get("dry_run")):
+                _at_check_offset_drift(exe, _at_target_core, _at_target_mem)
         except Exception as _e:
             log.debug(f"AT drift check failed: {_e}")
 
@@ -2270,9 +2289,14 @@ def _engage(exe: str, display_name: str | None, state: dict) -> dict:
     # there's no reason to have two threads competing to write NVAPI.
     # Paired with resume in on_game_exit / _cleanup_runtime.
     try:
+        from core import gpu_overclock
+        # Remember what was on the card before AT touched it, so the session
+        # can hand back exactly that when it ends (see on_game_exit).
+        with _lock:
+            _runtime["pre_engage_oc"] = gpu_overclock.get_applied_oc()
         gpu_overclock.pause_oc_watchdog("adaptive_tuning")
     except Exception as e:
-        log.debug(f"pause_oc_watchdog failed: {e}")
+        log.warning(f"pause_oc_watchdog failed: {e}")
     apply_ok = (_apply_offsets(exe, engage_core, engage_mem,
                                "engage-baseline" if climb_target else "engage")
                 if (engage_core or engage_mem) else True)
@@ -2399,6 +2423,39 @@ def engage_for_active_game() -> dict:
     return _engage(active["exe"], active.get("display"), state)
 
 
+def _restore_pre_engage_oc(pre: Optional[dict], cur_core: int, cur_mem: int,
+                           dry_run: bool = False) -> None:
+    """Re-apply the offsets that were on the card before this session began.
+    No-op in dry-run (nothing was ever written), when nothing changed, or
+    while the temperature ceiling is in its post-trip cooldown — it reset the
+    card to stock on purpose, and that stands until the user says otherwise."""
+    if not pre or dry_run:
+        return
+    try:
+        core, mem = int(pre.get("core", 0)), int(pre.get("mem", 0))
+        if (core, mem) == (int(cur_core), int(cur_mem)):
+            return
+        from core import gpu_overclock, temp_ceiling
+        if temp_ceiling.get_status().get("cooldown_remaining_s") is not None:
+            log.info("AT: leaving offsets as the temperature ceiling set them (cooldown)")
+            return
+        gpu_overclock.apply_oc(core_offset_mhz=core, mem_offset_mhz=mem, power_pct=None)
+        log.info(f"AT: restored pre-session offsets core+{core}/mem+{mem} "
+                 f"(session ended at core+{cur_core}/mem+{cur_mem})")
+    except Exception as e:
+        log.warning(f"AT: could not restore pre-session offsets: {e}")
+
+
+def end_active_session(reason: str = "") -> dict:
+    """Close whatever session is live — the app is quitting, or AT was
+    switched off.  No-op when idle."""
+    with _lock:
+        exe, name = _runtime["active_exe"], _runtime["active_display"]
+    if not exe:
+        return {"updated": False, "reason": "no active session"}
+    return on_game_exit(exe, name, was_crash=False, reason=reason)
+
+
 def on_game_exit(exe: str, display_name: str | None,
                  was_crash: bool = False, reason: str = "") -> dict:
     """Called by game_profiles when a tracked game exits, OR by the
@@ -2415,6 +2472,7 @@ def on_game_exit(exe: str, display_name: str | None,
         cc = _runtime["current_core"]
         cm = _runtime["current_mem"]
         active_exe = _runtime["active_exe"]
+        pre_engage = _runtime.get("pre_engage_oc")
 
     if active_exe != _norm_exe(exe):
         # The runtime isn't currently tracking this exe — nothing to
@@ -2452,6 +2510,12 @@ def on_game_exit(exe: str, display_name: str | None,
     _update_confidence(state)
     _save_game_state(exe, state)
 
+    # Hand the card back the way AT found it.  AT's working offset is an
+    # experiment for THIS game; left applied after the game closed, the
+    # desktop and every other game ran on it — with the stock watchdog
+    # (resumed further down) then enforcing it.
+    _restore_pre_engage_oc(pre_engage, cc, cm, dry_run=bool(state.get("dry_run")))
+
     # Release perf_monitor consumer
     try:
         from core import perf_monitor
@@ -2472,9 +2536,10 @@ def on_game_exit(exe: str, display_name: str | None,
     # call in _engage.  Best-effort: a missed resume doesn't damage
     # anything (next reset_oc clears the active flag anyway).
     try:
+        from core import gpu_overclock
         gpu_overclock.resume_oc_watchdog("adaptive_tuning")
     except Exception as e:
-        log.debug(f"resume_oc_watchdog failed: {e}")
+        log.warning(f"resume_oc_watchdog failed: {e}")
 
     # v3.2-beta.4 — clear gameplay classifier's target PID so the
     # foreground/CPU samplers stop pointing at a dead process.
@@ -2500,6 +2565,7 @@ def on_game_exit(exe: str, display_name: str | None,
         # beta.5 — clear startup-guard state so it can't leak to the next game.
         _runtime["startup_guard_until"] = 0.0
         _runtime["climb_target"]        = None
+        _runtime["pre_engage_oc"]       = None
 
     log.info(f"AT session ended for {display_name}: "
              f"{'CRASH' if was_crash else 'clean'}, "

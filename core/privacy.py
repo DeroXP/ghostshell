@@ -2,13 +2,21 @@
 import os
 import shutil
 from datetime import datetime
-from config import TELEMETRY_HOSTS, FIREWALL_BLOCK_EXES
+from config import (TELEMETRY_HOSTS, FIREWALL_BLOCK_EXES, BACKUP_DIR,
+                    APP_NAME, LEGACY_APP_NAME)
+from core import sys_state
 from core.utils import run_ps, run_cmd, get_logger, backup_registry, atomic_write_text
 
 log = get_logger("privacy")
 
 HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
-HOSTS_MARKER = "# === GhostShell Telemetry Block ==="
+HOSTS_MARKER = f"# === {APP_NAME} Telemetry Block ==="
+# What builds from before the rename wrote and created.  Anyone who enabled
+# blocking back then still has these in their hosts file / firewall, so they
+# are matched everywhere ours are — but never written.
+_LEGACY_HOSTS_MARKER = f"# === {LEGACY_APP_NAME} Telemetry Block ==="
+_FIREWALL_RULE_PREFIX = f"{APP_NAME}_Block_"
+_LEGACY_FIREWALL_RULE_PREFIX = f"{LEGACY_APP_NAME}_Block_"
 
 
 def _reg(key, val, data, vtype="REG_DWORD"):
@@ -110,19 +118,34 @@ def apply_telemetry_tweaks() -> list[dict]:
 # ═══════════════════════════════════════════════════════════════════════════
 # Hosts File Blocking
 # ═══════════════════════════════════════════════════════════════════════════
+def _strip_hosts_block(content: str) -> tuple[str, bool]:
+    """Remove our block — under the current or the pre-rename marker — from
+    hosts-file text, keeping everything before AND after it.  A block whose
+    closing marker is missing runs to the end of the file.
+    Returns (text, whether a block was found)."""
+    found = False
+    for marker in (HOSTS_MARKER, _LEGACY_HOSTS_MARKER):
+        while marker in content:
+            found = True
+            before, _, rest = content.partition(marker)
+            _, closed, after = rest.partition(marker)
+            content = before.rstrip() + "\n" + (after.lstrip("\r\n") if closed else "")
+    return content, found
+
+
 def get_hosts_status() -> dict:
     """Check current hosts file blocking status."""
     blocked_count = 0
-    ghostshell_active = False
+    active = False
     try:
         with open(HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
-        if HOSTS_MARKER in content:
-            ghostshell_active = True
+        if HOSTS_MARKER in content or _LEGACY_HOSTS_MARKER in content:
+            active = True
             blocked_count = content.count("0.0.0.0 ")
     except Exception:
         pass
-    return {"active": ghostshell_active, "blocked_count": blocked_count}
+    return {"active": active, "blocked_count": blocked_count}
 
 
 def apply_hosts_blocking() -> dict:
@@ -132,8 +155,8 @@ def apply_hosts_blocking() -> dict:
     # Backup hosts file
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup = os.path.join(os.environ.get("APPDATA", ""), "GhostShell", "backups", f"hosts_{ts}.bak")
-        os.makedirs(os.path.dirname(backup), exist_ok=True)
+        backup = os.path.join(BACKUP_DIR, f"hosts_{ts}.bak")
+        os.makedirs(BACKUP_DIR, exist_ok=True)
         shutil.copy2(HOSTS_PATH, backup)
         log.info(f"  ✓ Hosts backup: {backup}")
     except Exception as e:
@@ -146,14 +169,14 @@ def apply_hosts_blocking() -> dict:
     except Exception:
         content = ""
 
-    # Remove existing GhostShell block if present
-    if HOSTS_MARKER in content:
-        parts = content.split(HOSTS_MARKER)
-        content = parts[0].rstrip() + "\n"
+    # Remove our existing block if present.  Only the block itself goes —
+    # this used to truncate the file at the first marker, silently deleting
+    # any entries the user (or another tool) had added below it.
+    content, _ = _strip_hosts_block(content)
 
     # Append new block
     block = f"\n{HOSTS_MARKER}\n"
-    block += f"# Added by GhostShell on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    block += f"# Added by {APP_NAME} on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     block += f"# {len(TELEMETRY_HOSTS)} domains blocked\n"
     for host in TELEMETRY_HOSTS:
         block += f"0.0.0.0 {host}\n"
@@ -175,21 +198,19 @@ def apply_hosts_blocking() -> dict:
 
 
 def remove_hosts_blocking() -> dict:
-    """Remove GhostShell entries from hosts file."""
+    """Remove our entries from the hosts file."""
     log.info("Removing hosts file blocking...")
     try:
         with open(HOSTS_PATH, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
-        if HOSTS_MARKER in content:
-            parts = content.split(HOSTS_MARKER)
-            content = parts[0].rstrip() + "\n"
-            if len(parts) > 2:
-                content += parts[2]  # keep anything after second marker
-            atomic_write_text(HOSTS_PATH, content)
+        content, found = _strip_hosts_block(content)
+        if found:
+            if not atomic_write_text(HOSTS_PATH, content):
+                return {"ok": False, "err": "Could not write hosts file"}
             run_cmd(["ipconfig", "/flushdns"])
             log.info("  ✓ Hosts blocking removed")
             return {"ok": True}
-        log.info("  ⚠ No GhostShell entries found in hosts")
+        log.info(f"  ⚠ No {APP_NAME} entries found in hosts")
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "err": str(e)}
@@ -203,17 +224,18 @@ def apply_firewall_rules() -> list[dict]:
     log.info("Creating firewall rules...")
     results = []
 
+    # Remove our existing rules first (one call covers all of them, including
+    # any created under the pre-rename name) — they are recreated below.
+    remove_firewall_rules()
+
     for exe in FIREWALL_BLOCK_EXES:
         name_part = os.path.basename(exe).replace(".exe", "")
-        rule_name = f"GhostShell_Block_{name_part}"
-
-        # Remove existing rule first
-        run_ps(f'Remove-NetFirewallRule -DisplayName "{rule_name}" -ErrorAction SilentlyContinue')
+        rule_name = f"{_FIREWALL_RULE_PREFIX}{name_part}"
 
         r = run_ps(
             f'New-NetFirewallRule -DisplayName "{rule_name}" -Direction Outbound '
             f'-Action Block -Program "{exe}" -Enabled True -Profile Any '
-            f'-Description "GhostShell: Block telemetry" -ErrorAction Stop'
+            f'-Description "{APP_NAME}: Block telemetry" -ErrorAction Stop'
         )
         ok = r["ok"]
         log.info(f"  {'✓' if ok else '✗'} Block outbound: {name_part}")
@@ -223,9 +245,10 @@ def apply_firewall_rules() -> list[dict]:
 
 
 def remove_firewall_rules() -> dict:
-    """Remove all GhostShell firewall rules."""
-    log.info("Removing GhostShell firewall rules...")
-    r = run_ps('Get-NetFirewallRule -DisplayName "GhostShell_Block_*" | Remove-NetFirewallRule')
+    """Remove every firewall rule we created."""
+    log.info(f"Removing {APP_NAME} firewall rules...")
+    run_ps(f'Get-NetFirewallRule -DisplayName "{_FIREWALL_RULE_PREFIX}*","{_LEGACY_FIREWALL_RULE_PREFIX}*" '
+           f'-ErrorAction SilentlyContinue | Remove-NetFirewallRule')
     return {"ok": True}
 
 
@@ -255,7 +278,7 @@ def toggle_webcam(enable: bool) -> dict:
 
 def restore_store_updates() -> dict:
     """Idempotent v3.1 fix.  Reverts every registry / service change
-    GhostShell ever made that prevents the Microsoft Store / Xbox app
+    Vispora ever made that prevents the Microsoft Store / Xbox app
     from updating.  Called from app boot so users don't have to find
     a button.  Safe to call repeatedly."""
     log.info("Restoring Microsoft Store / Xbox app updates (v3.1 fix)...")
@@ -265,8 +288,19 @@ def restore_store_updates() -> dict:
     #    Store and Xbox app need it to talk to Microsoft's content servers.
     #    Set to manual so it idle/cold most of the time but can start when
     #    Store/Xbox actually needs it.
-    r1 = run_cmd(["sc", "config", "DiagTrack", "start=", "manual"])
-    actions.append(("DiagTrack → manual", r1.get("ok", False)))
+    #
+    #    Only when it IS disabled.  This runs on every launch, and used to
+    #    set all three services below unconditionally — turning a stock
+    #    "automatic" DiagTrack into manual and a stock "manual"
+    #    InstallService into automatic each time the app started, and
+    #    undoing Reset All's own defaults for them at the next launch.
+    def _if_disabled(svc: str, mode: str, label: str) -> None:
+        if sys_state.service_start(svc) != "disabled":
+            return
+        r = run_cmd(["sc", "config", svc, "start=", mode])
+        actions.append((label, r.get("ok", False)))
+
+    _if_disabled("DiagTrack", "demand", "DiagTrack → manual")
     # Don't auto-START — Store will start it on demand.  But if it's
     # currently stopped, that's fine; first Store update click will warm it.
 
@@ -293,20 +327,18 @@ def restore_store_updates() -> dict:
             actions.append((f"Deleted {hive} RemoveWindowsStore", True))
 
     # 5. AppX deployment service — Store can't install/update without this
-    rA = run_cmd(["sc", "config", "AppXSvc", "start=", "manual"])
-    actions.append(("AppXSvc → manual", rA.get("ok", False)))
+    _if_disabled("AppXSvc", "demand", "AppXSvc → manual")
 
     # 6. Microsoft Store Install Service — directly responsible for Store
     #    package updates
-    rI = run_cmd(["sc", "config", "InstallService", "start=", "auto"])
-    actions.append(("InstallService → auto", rI.get("ok", False)))
+    _if_disabled("InstallService", "auto", "InstallService → auto")
 
     log.info(f"  Store/Xbox update restore: {actions}")
     return {"ok": True, "actions": actions}
 
 
 def restore_microphone_access() -> dict:
-    """Idempotent v3.1 fix.  Reverts every registry path GhostShell ever
+    """Idempotent v3.1 fix.  Reverts every registry path Vispora ever
     touched that could have killed mic access on existing installs.
 
     Called from app boot so users don't have to find a button.

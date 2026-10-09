@@ -31,7 +31,7 @@ controls (monitor dropdown, mic dropdown, encoder dropdown, etc)
 collapse into a single status block.  When off, the page reverts
 to the v3.3 manual Capture UI.
 
-Settings live in `%APPDATA%/GhostShell/stream_helper_settings.json`
+Settings live in `%APPDATA%/Vispora/stream_helper_settings.json`
 so they don't entangle with clipper_settings or obs_settings.
 
 This module is the foundation (v3.3.1-beta.1).  Scene setup is
@@ -43,10 +43,9 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
 from typing import Optional
 
-from config import APPDATA_DIR
+from config import APPDATA_DIR, APP_NAME
 from core.utils import get_logger, atomic_write_json
 
 log = get_logger(__name__)
@@ -55,11 +54,11 @@ log = get_logger(__name__)
 # ─── Source names (prefixed so they don't collide with anything the
 #     user has in their own OBS scenes) ────────────────────────────
 
-SH_SCENE_NAME       = "GhostShell Stream Helper"
-SH_GAME_CAPTURE     = "GhostShell Game Capture"
-SH_GAME_AUDIO       = "GhostShell Game Audio"
-SH_DISCORD_AUDIO    = "GhostShell Discord Audio"
-SH_MIC              = "GhostShell Mic"
+SH_SCENE_NAME       = f"{APP_NAME} Stream Helper"
+SH_GAME_CAPTURE     = f"{APP_NAME} Game Capture"
+SH_GAME_AUDIO       = f"{APP_NAME} Game Audio"
+SH_DISCORD_AUDIO    = f"{APP_NAME} Discord Audio"
+SH_MIC              = f"{APP_NAME} Mic"
 
 
 # ─── Settings persistence ───────────────────────────────────────────
@@ -67,7 +66,7 @@ SH_MIC              = "GhostShell Mic"
 _SETTINGS_PATH = os.path.join(APPDATA_DIR, "stream_helper_settings.json")
 
 _DEFAULTS = {
-    # Master toggle.  When True, GhostShell sets up + maintains the
+    # Master toggle.  When True, Vispora sets up + maintains the
     # Stream Helper scene in OBS and the legacy Capture page controls
     # collapse to a status indicator.
     "enabled":             False,
@@ -81,7 +80,7 @@ _DEFAULTS = {
     # "any_fullscreen" to "window".  any_fullscreen would have OBS
     # lock onto any fullscreen app (video players, browsers in
     # fullscreen, etc.) — but the user wants Game Capture to ONLY
-    # engage for games that exist in GhostShell's game profiler.
+    # engage for games that exist in Vispora's game profiler.
     # In "window" mode we push the foreground game's exe into the
     # window matcher; when no known game is in foreground the
     # matcher is empty and OBS captures nothing.
@@ -184,6 +183,9 @@ def setup_scene(active_game_exe: Optional[str] = None) -> dict:
     created = []
     try:
         # 1. Scene ────────────────────────────────────────────────
+        obs_backend.adopt_legacy_names(
+            client, SH_SCENE_NAME,
+            (SH_GAME_CAPTURE, SH_GAME_AUDIO, SH_DISCORD_AUDIO, SH_MIC))
         sl = client.get_scene_list()
         scene_names = [sc["sceneName"] for sc in sl.scenes]
         if SH_SCENE_NAME not in scene_names:
@@ -200,7 +202,7 @@ def setup_scene(active_game_exe: Optional[str] = None) -> dict:
         # v3.3.1-beta.2: gate by game_profiles.  Default mode is now
         # `window` so the matcher controls which app is captured —
         # we only fill it with the foreground game's exe if that
-        # exe is in GhostShell's known-games list (caller checks
+        # exe is in Vispora's known-games list (caller checks
         # via game_profiles.get_foreground_game() before passing
         # active_game_exe).  When the matcher is empty OBS Game
         # Capture finds nothing to hook → no capture happens, which

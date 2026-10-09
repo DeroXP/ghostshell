@@ -1,6 +1,6 @@
 """Phase B — 7-day trial state, keyed by hardware fingerprint.
 
-The trial is the user's only path to evaluating GhostShell before paying
+The trial is the user's only path to evaluating Vispora before paying
 $20.  It's also the prime piracy vector, so the rules are strict but
 honest:
 
@@ -23,7 +23,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 from db import get_db
@@ -31,7 +31,7 @@ from routers.licenses import HardwareBuckets, HardwareInputs
 from security import hash_fingerprint, hash_ip
 from settings import settings
 
-log = logging.getLogger("ghostshell-cloud.trials")
+log = logging.getLogger("vispora-cloud.trials")
 
 router = APIRouter(prefix="/v1/trials", tags=["trials"])
 

@@ -1,8 +1,8 @@
-"""Anonymous device identity for GhostShell-Cloud.
+"""Anonymous device identity for Vispora-Cloud.
 
 The cloud backend never sees a user account, an email, or a real name.  The
 only thing that ties a request to a "device" is a UUID4 that lives in a
-plain text file under %APPDATA%\\GhostShell\\device.id.  If the user nukes
+plain text file under %APPDATA%\\Vispora\\device.id.  If the user nukes
 their AppData, they become a brand-new device — no recovery story, by
 design.
 
@@ -127,7 +127,7 @@ def collect_hardware_fingerprint() -> dict:
       cpu_model    — full processor name
       ram_gb       — int, total physical memory
       os_build     — Windows build number, e.g. "26100"
-      app_version  — current GhostShell version
+      app_version  — current Vispora version
     """
     info = _safe_get_system_info()
     gpu = info.get("gpu") or {}

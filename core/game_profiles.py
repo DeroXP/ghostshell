@@ -11,7 +11,9 @@ import json
 import os
 import time
 import threading
-from config import APPDATA_DIR
+from config import APP_NAME, APPDATA_DIR, OWN_PROCESS_NAMES
+from core import reg_originals
+from core.network_tweaks import qos_policy_filter
 from core.utils import run_ps, run_cmd, get_logger, atomic_write_json, is_safe_ps_exe_name
 
 log = get_logger("profiles")
@@ -368,7 +370,7 @@ _IGNORE_PROCS = {
     "securityhealthservice.exe","securityhealthsystray.exe",
     "widgets.exe","phoneexperiencehost.exe",
     "gamebarpresencewriter.exe","gamebarftserver.exe",
-    "msmpeng.exe","ghostshell.exe","vispora.exe","app.py","flask.exe",
+    "msmpeng.exe",*OWN_PROCESS_NAMES,"app.py","flask.exe",
     "onedrive.exe","teams.exe","outlook.exe",
     "wallpaperengine32.exe","wallpaper32.exe",
 }
@@ -432,10 +434,21 @@ def _capture_baseline() -> dict:
         baseline["net_throttle"] = r["out"].split("0x")[-1].strip().split()[0]
 
     # CPU idle
-    r = run_cmd(["powercfg","/query","SCHEME_CURRENT","SUB_PROCESSOR","IdleDisable"])
-    baseline["cpu_idle_disabled"] = "0x00000001" in r.get("out","")
+    baseline["cpu_idle_disabled"] = _cpu_idle_disabled()
+    baseline["idle_probe"] = "qh"        # this baseline's idle state is a real reading
 
     return baseline
+
+
+def _cpu_idle_disabled() -> bool:
+    """Is processor idle switched off (on AC) in the active power plan?
+
+    IdleDisable is a hidden setting, and `powercfg /query` does not list
+    hidden settings at all — so this used to come back "not disabled" whatever
+    the truth was, and every game exit then switched idle back ON for people
+    who had turned it off on purpose."""
+    cur = reg_originals.query_power("SCHEME_CURRENT", "SUB_PROCESSOR", "IdleDisable")
+    return bool(cur and cur[0] == 1)
 
 
 def _save_baseline(baseline: dict):
@@ -486,11 +499,11 @@ def _apply_gaming_tweaks(pid: int, exe_name: str) -> list[str]:
         run_cmd(["wmic","process","where",f"ProcessId={pid}","CALL","setpriority","128"])
     changes.append("Process priority -> High")
 
-    # 2. CPU affinity to best cores
-    mask = _get_best_affinity()
-    if mask and mask != "0":
-        run_ps(f"try {{ (Get-Process -Id {pid}).ProcessorAffinity=[IntPtr]{mask} }} catch {{}}", timeout=5)
-        changes.append(f"CPU affinity -> 0x{int(mask):x}")
+    # (Step 2 used to pin the game to a "best cores" affinity mask.  On
+    # everything but hybrid Intel that mask was simply all cores — a no-op.
+    # On 12th–14th gen it was the first NumberOfCores *logical* processors,
+    # i.e. roughly half the P-cores: an i5-12400F game got 3 of its 6 cores.
+    # The Windows scheduler already keeps a foreground game on the P-cores.)
 
     # 3. Win32PrioritySeparation -> 0x28 (Short/Fixed)
     run_cmd(["reg","add",r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl",
@@ -523,7 +536,7 @@ def _apply_gaming_tweaks(pid: int, exe_name: str) -> list[str]:
     #    a process/folder named with a quote or semicolon would otherwise
     #    inject into our elevated shell.  Reject → just skip the QoS tag.
     if is_safe_ps_exe_name(exe_name):
-        rule = f"Vispora_Game_{exe_name.replace('.exe','').replace(' ','_')}"
+        rule = f"{APP_NAME}_Game_{exe_name.replace('.exe','').replace(' ','_')}"
         run_ps(f'Remove-NetQosPolicy -Name "{rule}" -Confirm:$false -ErrorAction SilentlyContinue')
         run_ps(f'New-NetQosPolicy -Name "{rule}" -AppPathNameMatchCondition "{exe_name}" '
                f'-DSCPAction 46 -NetworkProfile All -Confirm:$false -ErrorAction SilentlyContinue')
@@ -543,7 +556,7 @@ def _apply_gaming_tweaks(pid: int, exe_name: str) -> list[str]:
         if not is_safe_ps_exe_name(s_exe):
             log.warning(f"  skipped stream QoS for unsafe exe name: {s_exe!r}")
             continue
-        s_rule = f"Vispora_Stream_{s_exe.replace('.exe','').replace(' ','_')}"
+        s_rule = f"{APP_NAME}_Stream_{s_exe.replace('.exe','').replace(' ','_')}"
         run_ps(f'Remove-NetQosPolicy -Name "{s_rule}" -Confirm:$false -ErrorAction SilentlyContinue')
         run_ps(f'New-NetQosPolicy -Name "{s_rule}" -AppPathNameMatchCondition "{s_exe}" '
                f'-DSCPAction 34 -NetworkProfile All -Confirm:$false -ErrorAction SilentlyContinue')
@@ -555,9 +568,9 @@ def _apply_gaming_tweaks(pid: int, exe_name: str) -> list[str]:
 
     _set_gaming_flag()
 
-    # v3.4 — bump GhostShell out of efficiency mode so the mapper /
+    # v3.4 — bump Vispora out of efficiency mode so the mapper /
     # HidHide retry / network monitor / etc. stay responsive while the
-    # game runs at HIGH priority.  Without this, GhostShell sits at
+    # game runs at HIGH priority.  Without this, Vispora sits at
     # Below-Normal + EcoQoS on E-cores and the mapper's 4 kHz polling
     # drops to ~200 Hz.
     try:
@@ -592,6 +605,30 @@ def _apply_gaming_tweaks(pid: int, exe_name: str) -> list[str]:
 # restore_target() can reverse exactly that on exit.  The engine tracks
 # one game at a time, so a single slot is sufficient.
 _target_restore: dict = {}
+_TARGET_RESTORE_FILE = os.path.join(PROFILES_DIR, "target_restore.json")
+
+
+def _save_target_restore(restore: dict) -> None:
+    """Keep what apply_target() changed on disk too.  After a crash or power
+    cut mid-game the in-memory copy is gone — and with it the power plan to
+    go back to, while Competitive Latency stayed switched on for good: the
+    next launch found it "already on" and so never switched it off again."""
+    try:
+        if restore:
+            atomic_write_json(_TARGET_RESTORE_FILE, restore)
+        elif os.path.exists(_TARGET_RESTORE_FILE):
+            os.remove(_TARGET_RESTORE_FILE)
+    except OSError as e:
+        log.debug(f"could not update {_TARGET_RESTORE_FILE}: {e}")
+
+
+def _load_target_restore() -> dict:
+    try:
+        with open(_TARGET_RESTORE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def _active_power_guid() -> str:
@@ -628,6 +665,7 @@ def apply_target(exe: str) -> None:
         target = "auto"
     if target in ("auto", "balanced"):
         _target_restore = {}
+        _save_target_restore({})
         return
     restore = {"target": target, "exe": exe}
     try:
@@ -641,6 +679,7 @@ def apply_target(exe: str) -> None:
                 "mem":   int(prof.get("mem_offset_mhz", 0) or 0) if has else 0,
                 "power": int(prof.get("power_pct", 100) or 100) if has else 100,
             }
+            _save_target_restore(restore)       # on disk before anything changes
             optimizer.apply_ultimate_power_plan()
             gpu_overclock.apply_oc(core_offset_mhz=restore["oc"]["core"],
                                    mem_offset_mhz=restore["oc"]["mem"],
@@ -652,6 +691,7 @@ def apply_target(exe: str) -> None:
             already = bool(competitive_latency.status().get("enabled"))
             restore["we_enabled_latency"] = (not already)
             if not already:
+                _save_target_restore(restore)   # on disk before anything changes
                 competitive_latency.apply()
                 log.info("  Low-Latency target: engaged Competitive Latency for this session")
             else:
@@ -665,6 +705,11 @@ def restore_target() -> None:
     """Reverse whatever apply_target() applied for the just-exited game."""
     global _target_restore
     r, _target_restore = _target_restore, {}
+    recovered = False
+    if not r:
+        r = _load_target_restore()      # the app has been restarted since that game started
+        recovered = bool(r)
+    _save_target_restore({})
     if not r:
         return
     target = r.get("target")
@@ -674,11 +719,15 @@ def restore_target() -> None:
             oc = r.get("oc") or {}
             # Re-apply the saved profile (resets GPU power_pct to the user's
             # normal value) then restore the prior power plan.
-            gpu_overclock.apply_oc(core_offset_mhz=int(oc.get("core", 0)),
-                                   mem_offset_mhz=int(oc.get("mem", 0)),
-                                   power_pct=int(oc.get("power", 100)))
-            guid = r.get("power_guid") or ""
-            if guid:
+            # Not after a restart: the card is back at its own defaults by
+            # then, and whether the saved profile is applied at start-up is
+            # the user's setting — not something to override from here.
+            if not recovered:
+                gpu_overclock.apply_oc(core_offset_mhz=int(oc.get("core", 0)),
+                                       mem_offset_mhz=int(oc.get("mem", 0)),
+                                       power_pct=int(oc.get("power", 100)))
+            guid = str(r.get("power_guid") or "")
+            if len(guid) == 36 and guid.count("-") == 4:
                 run_cmd(["powercfg", "/setactive", guid], timeout=6)
             log.info("  Max-FPS target released: restored saved OC + prior power plan")
         elif target == "low_latency":
@@ -693,6 +742,7 @@ def restore_target() -> None:
 def restore_normal_mode(reason: str = "game exit"):
     """Revert ALL hard tweaks back to the saved baseline — guaranteed normal state."""
     log.info(f"Restoring normal mode (reason: {reason})...")
+    _exit_seen_ts = time.time()      # for crash detection, which runs after all of this
     # beta.13 — reverse any per-game optimization-target posture first
     # (GPU OC / power plan / competitive latency), before the generic tweaks.
     restore_target()
@@ -730,14 +780,13 @@ def restore_normal_mode(reason: str = "game exit"):
         run_cmd(["powercfg","/setactive","SCHEME_CURRENT"])
         log.info("  Restored CPU idle -> enabled")
 
-    # 5. Remove any DSCP game rules — both the current Vispora_ prefix and
-    #    the legacy GhostShell_ prefix so rules created before the rename
-    #    still get cleaned up.
-    run_ps('Get-NetQosPolicy | Where-Object {$_.Name -like "Vispora_Game_*" -or $_.Name -like "GhostShell_Game_*"} | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue')
+    # 5. Remove any DSCP game rules (including ones created under the
+    #    app's pre-rename name).
+    run_ps(f'Get-NetQosPolicy | Where-Object {{{qos_policy_filter("Game_")}}} | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue')
     log.info("  Removed DSCP game rules")
 
     # 5b. Remove streaming DSCP rules & restore streamer process priority to Normal
-    run_ps('Get-NetQosPolicy | Where-Object {$_.Name -like "Vispora_Stream_*" -or $_.Name -like "GhostShell_Stream_*"} | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue')
+    run_ps(f'Get-NetQosPolicy | Where-Object {{{qos_policy_filter("Stream_")}}} | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue')
     streamers = _engine.get("streaming_exes", []) or []
     for s_exe in streamers:
         # Revert any still-running streamer process to Normal priority
@@ -763,7 +812,7 @@ def restore_normal_mode(reason: str = "game exit"):
     _engine["active_oc_mem"]  = 0
     log.info("  Normal mode restored")
 
-    # v3.4 — restore GhostShell efficiency mode now that the game is
+    # v3.4 — restore Vispora efficiency mode now that the game is
     # gone.  Saves laptop battery + lets foreground apps have CPU again.
     # Skipped if the gamepad mapper master switch is still on (the user
     # might still be using mappings without an active game).
@@ -787,7 +836,10 @@ def restore_normal_mode(reason: str = "game exit"):
     try:
         from core import background_pauser
         bp_settings = background_pauser.get_settings()
-        if bp_settings.get("enabled") and bp_settings.get("auto_resume_on_game_exit", True):
+        # Deliberately not gated on the pauser still being enabled: switching
+        # it off mid-game must not strand what it already froze.  resume_now()
+        # is a no-op when nothing is recorded as paused.
+        if bp_settings.get("auto_resume_on_game_exit", True):
             r = background_pauser.resume_now(reason=f"restore_normal: {reason}")
             if r.get("resumed"):
                 log.info(f"  Resumed {len(r['resumed'])} background apps")
@@ -823,6 +875,7 @@ def restore_normal_mode(reason: str = "game exit"):
                     display_name=_prev_game,
                     active_core=_prev_oc_core,
                     active_mem=_prev_oc_mem,
+                    exit_ts=_exit_seen_ts,
                 )
                 was_crash = bool(cr_result.get("crashed"))
             except Exception as e:
@@ -947,7 +1000,7 @@ foreach ($p in $paths) {
         try:
             mb = freed_total / (1024 * 1024)
             _notifier.toast(
-                "GhostShell — PC Refreshed",
+                "Vispora — PC Refreshed",
                 f"Freed {mb:.0f} MB RAM, flushed caches. Ready for the next game.",
             )
         except Exception:
@@ -973,6 +1026,8 @@ def check_and_restore_on_boot():
         baseline = _load_baseline()
         if baseline:
             _verify_normal_state(baseline)
+    if os.path.exists(_TARGET_RESTORE_FILE):
+        restore_target()        # a per-game posture that outlived the session that set it
 
 
 def _verify_normal_state(baseline: dict):
@@ -988,8 +1043,9 @@ def _verify_normal_state(baseline: dict):
             return
 
     # Check CPU idle
-    r2 = run_cmd(["powercfg","/query","SCHEME_CURRENT","SUB_PROCESSOR","IdleDisable"])
-    idle_disabled = "0x00000001" in r2.get("out","")
+    # Only against a baseline whose idle state was really read (see
+    # _cpu_idle_disabled): older ones say "enabled" unconditionally.
+    idle_disabled = baseline.get("idle_probe") == "qh" and _cpu_idle_disabled()
     baseline_idle = baseline.get("cpu_idle_disabled", False)
     if idle_disabled and not baseline_idle:
         log.info("CPU idle is disabled but baseline says enabled — restoring")
@@ -998,6 +1054,12 @@ def _verify_normal_state(baseline: dict):
 
 def recapture_baseline():
     """Manually recapture the baseline (e.g. after user applies permanent tweaks they want to keep)."""
+    if _engine["gaming_mode"] or _is_gaming_flag_set():
+        # What is on the system right now is the gaming profile, not the
+        # user's normal state.  Saving it as the baseline would make every
+        # later "restore" write the gaming values back.
+        log.warning("Baseline recapture refused — a gaming profile is applied")
+        return {"ok": False, "err": "A game profile is active — close the game first."}
     log.info("Recapturing system baseline...")
     baseline = _capture_baseline()
     _save_baseline(baseline)
@@ -1005,23 +1067,18 @@ def recapture_baseline():
     return {"ok": True, "baseline": baseline}
 
 
+def refresh_baseline_after_reset() -> None:
+    """Reset All has just put these values back, so what is on the system now
+    IS the normal state — even with a game open.  Without this, closing that
+    game (or the next start-up check) wrote the pre-reset values back."""
+    baseline = _capture_baseline()
+    _save_baseline(baseline)
+    log.info(f"  Baseline refreshed after reset: {baseline}")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════
-def _get_best_affinity() -> str:
-    r = run_ps("""
-$cpu = Get-CimInstance Win32_Processor; $name = $cpu.Name; $l = $cpu.NumberOfLogicalProcessors; $p = $cpu.NumberOfCores
-$mask = 0
-if ($name -match '12th|13th|14th|Core Ultra|Raptor|Alder') {
-    $t = [Math]::Min($l, $p); for ($i=0; $i -lt $t; $i++) { $mask = $mask -bor (1 -shl $i) }
-} else { for ($i=0; $i -lt $l; $i++) { $mask = $mask -bor (1 -shl $i) } }
-$mask
-""", timeout=5)
-    if r["ok"] and r["out"]:
-        try: return str(int(r["out"].strip()))
-        except ValueError: pass
-    return "0"
-
 
 def _is_game(proc_name: str) -> bool:
     name = proc_name.lower()
@@ -1153,10 +1210,10 @@ def _scan_game_candidates() -> list[dict]:
     return candidates
 
 
-def _monitor_loop():
+def _monitor_loop(gen: int = 0):
     log.info("Game monitor started")
 
-    while _engine["monitoring"]:
+    while _engine["monitoring"] and _engine.get("monitor_gen", 0) == gen:
         try:
             if _engine["gaming_mode"] and _engine["active_pid"]:
                 # Check if the tracked game is still alive.
@@ -1295,6 +1352,9 @@ def _monitor_loop():
             log.warning(f"Monitor error: {e}")
         time.sleep(3)
 
+    if _engine.get("monitor_gen", 0) != gen:
+        log.info("Game monitor thread superseded by a newer one — exiting quietly")
+        return          # the newer thread owns the state; nothing here to clean up
     # Cleanup on stop
     if _engine["gaming_mode"]:
         restore_normal_mode("monitor stopped")
@@ -1320,7 +1380,7 @@ def add_custom_game(exe_name: str, display_name: str = "") -> dict:
     """Add a game to the local custom-games list.
 
     v3.3 — also fires a best-effort POST to the Railway community
-    endpoint so OTHER GhostShell users get this exe in their known
+    endpoint so OTHER Vispora users get this exe in their known
     games list automatically.  Opt-out via the Community settings panel."""
     exe_name = exe_name.lower().strip()
     if not exe_name.endswith(".exe"): exe_name += ".exe"
@@ -1462,7 +1522,13 @@ def auto_enable_on_boot_if_set() -> dict:
 def start_monitoring() -> dict:
     if _engine["monitoring"]: return {"ok": True, "msg": "Already monitoring"}
     _engine["monitoring"] = True
-    t = threading.Thread(target=_monitor_loop, daemon=True)
+    # Each loop gets a generation number and exits when it is no longer the
+    # current one.  Off→on within the loop's 3 s sleep used to leave the old
+    # thread running beside the new one; at the next game launch one could
+    # capture a "baseline" while the other was half-way through applying the
+    # gaming tweaks — and that poisoned baseline was then restored forever.
+    _engine["monitor_gen"] = _engine.get("monitor_gen", 0) + 1
+    t = threading.Thread(target=_monitor_loop, args=(_engine["monitor_gen"],), daemon=True)
     t.start()
     _engine["thread"] = t
     return {"ok": True}

@@ -1,5 +1,5 @@
 -- ─────────────────────────────────────────────────────────────────────────
--- GhostShell-Cloud — v3 Postgres schema
+-- Vispora-Cloud — v3 Postgres schema
 -- ─────────────────────────────────────────────────────────────────────────
 -- Idempotent: every CREATE uses IF NOT EXISTS, every ALTER guards against
 -- already-exists.  Safe to run on every server boot.
@@ -11,7 +11,7 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- ─── Identity ────────────────────────────────────────────────────────────
--- A device is GhostShell's anonymous unit of identity.  No usernames, no
+-- A device is Vispora's anonymous unit of identity.  No usernames, no
 -- emails — just a UUID generated client-side on first run.
 CREATE TABLE IF NOT EXISTS devices (
     id              UUID PRIMARY KEY,

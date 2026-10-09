@@ -1,4 +1,4 @@
-"""GhostShell centralized logging and utility helpers."""
+"""Vispora centralized logging and utility helpers."""
 import logging
 import logging.handlers
 import os
@@ -6,14 +6,22 @@ import time
 import subprocess
 import sys
 import json
+import itertools
+import stat
 from datetime import datetime
 from collections import deque
-from config import LOG_FILE_PATH, APPDATA_DIR, BACKUP_DIR
+from config import LOG_FILE_PATH, APPDATA_DIR, BACKUP_DIR, LEGACY_APP_NAME
+
+_LOGGER_ROOT = "vispora"
 
 # ---------------------------------------------------------------------------
 # In-memory log ring buffer so the UI can stream entries
 # ---------------------------------------------------------------------------
 _LOG_BUFFER: deque = deque(maxlen=2000)
+# Every entry gets a number that only ever goes up, so the UI can ask for
+# "everything after N".  A position in the buffer can't serve as that: once
+# the ring is full, old entries fall off the front and positions shift.
+_LOG_SEQ = itertools.count(1)
 
 
 class _UIHandler(logging.Handler):
@@ -21,9 +29,10 @@ class _UIHandler(logging.Handler):
 
     def emit(self, record):
         entry = {
+            "seq": next(_LOG_SEQ),
             "ts": datetime.fromtimestamp(record.created).strftime("%H:%M:%S"),
             "level": record.levelname,
-            "module": record.name.replace("ghostshell.", ""),
+            "module": record.name.replace(f"{_LOGGER_ROOT}.", ""),
             "msg": self.format(record),
         }
         _LOG_BUFFER.append(entry)
@@ -43,7 +52,7 @@ def clear_log_buffer():
 # v3.2.3 — disk + perf-conscious logging.
 #
 # Before: a plain FileHandler at logging.DEBUG appended forever.  The
-# ghostshell.log file in %APPDATA% grew unbounded — a 1 MB log after a
+# log file in %APPDATA% grew unbounded — a 1 MB log after a
 # casual session, several megabytes for heavy users.  Every poll cycle
 # (perf_monitor at 5 Hz, gamepad at 30 Hz, etc) also wrote a debug
 # entry, contributing to UI lag during high-activity sessions because
@@ -56,11 +65,11 @@ def clear_log_buffer():
 #   * Default level is INFO (was DEBUG).  Pulls a TON of per-tick noise
 #     out of the file + buffer, which translates directly to less I/O
 #     and a smoother UI.  Anyone debugging a real issue can opt in via
-#     GHOSTSHELL_LOG_LEVEL=DEBUG.
+#     VISPORA_LOG_LEVEL=DEBUG.
 os.makedirs(APPDATA_DIR, exist_ok=True)
 
 LOG_MAX_BYTES   = 5 * 1024 * 1024   # 5 MB per file
-LOG_BACKUP_COUNT = 3                 # keep ghostshell.log + .1 + .2 + .3
+LOG_BACKUP_COUNT = 3                 # keep vispora.log + .1 + .2 + .3
 
 _formatter = logging.Formatter("[%(asctime)s] %(levelname)-7s %(name)s  %(message)s", datefmt="%H:%M:%S")
 
@@ -76,22 +85,25 @@ _file_handler.setFormatter(_formatter)
 _ui_handler = _UIHandler()
 _ui_handler.setFormatter(logging.Formatter("%(message)s"))
 
-_root = logging.getLogger("ghostshell")
+_root = logging.getLogger(_LOGGER_ROOT)
 
-# Honor an env override for debugging.  Production default is INFO.
-_level_name = (os.environ.get("GHOSTSHELL_LOG_LEVEL") or "INFO").upper()
+# Honor an env override for debugging.  Production default is INFO.  The
+# variable carried the app's previous name until 3.5; that spelling still works.
+_level_name = (os.environ.get("VISPORA_LOG_LEVEL")
+               or os.environ.get(f"{LEGACY_APP_NAME.upper()}_LOG_LEVEL")
+               or "INFO").upper()
 _root.setLevel(getattr(logging, _level_name, logging.INFO))
 _root.addHandler(_file_handler)
 _root.addHandler(_ui_handler)
 
 
 def get_logger(name: str) -> logging.Logger:
-    return logging.getLogger(f"ghostshell.{name}")
+    return logging.getLogger(f"{_LOGGER_ROOT}.{name}")
 
 
 def set_log_level(level: str) -> dict:
     """Bump the runtime log level — useful when the user wants to
-    diagnose an issue without restarting GhostShell.  Persists nothing —
+    diagnose an issue without restarting Vispora.  Persists nothing —
     the next launch goes back to the default."""
     lvl = (level or "").upper()
     target = getattr(logging, lvl, None)
@@ -167,6 +179,33 @@ def is_safe_ps_exe_name(name: str) -> bool:
     risk.  Reject (don't try to escape) anything else — the callers just
     skip that one policy, which is a graceful degrade, not a failure."""
     return bool(name) and bool(_SAFE_EXE_RE.match(name.strip()))
+
+
+def is_reparse_point(path: str) -> bool:
+    """True for a junction or symlink (or anything else that redirects
+    elsewhere).  Unreadable counts as True: when in doubt, stay out.
+
+    Anything that deletes recursively must check this before descending:
+    os.walk follows junctions, any unprivileged process can plant one in a
+    temp folder, and it can point at Documents or Program Files."""
+    try:
+        return bool(os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except (OSError, AttributeError):
+        return True
+
+
+# Characters that end or escape out of a PowerShell double-quoted string:
+# the quote itself (PowerShell also accepts the typographic “ ” „ as one),
+# the backtick escape, `$` (variable / $(...) expansion) and line breaks.
+_PS_DQ_UNSAFE_RE = _re.compile("[\"`$\r\n\u201c\u201d\u201e]")
+
+
+def is_safe_ps_literal(value) -> bool:
+    """True if `value` can sit inside a PowerShell double-quoted string
+    without being able to break out of it.  Same policy as
+    is_safe_ps_exe_name: reject, don't try to escape — the caller skips
+    that one operation."""
+    return isinstance(value, str) and bool(value) and not _PS_DQ_UNSAFE_RE.search(value)
 
 
 def atomic_write_json(path: str, data) -> bool:
@@ -259,7 +298,7 @@ def backup_registry(key_path: str, filename: str) -> bool:
     return r["ok"]
 
 
-def create_restore_point(description: str = "GhostShell Pre-Modification") -> bool:
+def create_restore_point(description: str = "Vispora Pre-Modification") -> bool:
     """Create a Windows System Restore point."""
     log = get_logger("utils")
     log.info("Creating system restore point...")

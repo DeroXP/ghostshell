@@ -1,11 +1,13 @@
 """Advanced CPU Scheduler & Kernel tweaks for gaming."""
 import json
+from core import reg_originals
 from core.utils import run_ps, run_cmd, get_logger, backup_registry
 
 log = get_logger("scheduler")
 
 
 def _reg(key, val, data, vtype="REG_DWORD"):
+    reg_originals.remember(key, val, data, vtype)      # so Reset All can put the real value back
     r = run_cmd(["reg", "add", key, "/v", val, "/t", vtype, "/d", data, "/f"])
     return r["ok"]
 
@@ -44,11 +46,10 @@ def get_scheduler_status() -> dict:
         result["system_responsiveness"] = int(val, 16)
 
     # CPU idle status
-    r4 = run_ps("powercfg /query SCHEME_CURRENT SUB_PROCESSOR IdleDisable 2>$null | Select-String 'Current AC'")
-    if r4["ok"] and r4["out"]:
-        result["idle_disabled"] = "0x00000001" in r4["out"]
-    else:
-        result["idle_disabled"] = False
+    # (IdleDisable is a hidden setting: `powercfg /query` never lists it, so
+    # this always reported "enabled".  query_power asks with /qh, which does.)
+    cur = reg_originals.query_power("SCHEME_CURRENT", "SUB_PROCESSOR", "IdleDisable")
+    result["idle_disabled"] = bool(cur and cur[0] == 1)
 
     # Check for Intel hybrid CPU
     r5 = run_ps("Get-CimInstance Win32_Processor | Select-Object Name | ConvertTo-Json")
@@ -137,6 +138,8 @@ def toggle_cpu_idle(disable: bool = True) -> dict:
     """Disable/enable CPU idle states during gaming for max clock speeds."""
     log.info(f"{'Disabling' if disable else 'Enabling'} CPU idle...")
     val = "1" if disable else "0"
+    if disable:
+        reg_originals.remember_power("SUB_PROCESSOR", "IdleDisable")    # so Reset All can undo it
     r = run_cmd(["powercfg", "/setacvalueindex", "SCHEME_CURRENT", "SUB_PROCESSOR", "IdleDisable", val])
     run_cmd(["powercfg", "/setactive", "SCHEME_CURRENT"])
     log.info(f"  {'✓' if r['ok'] else '✗'} CPU idle {'disabled' if disable else 'enabled'}")

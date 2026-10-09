@@ -13,7 +13,7 @@ into the same downstream pipeline:
 Method A — screen tracking (continuous)
 ────────────────────────────────────────────────────────────────────
 User aims at a flat wall in their game (windowed mode), starts the
-capture session in GhostShell, then fires a full magazine WITHOUT
+capture session in Vispora, then fires a full magazine WITHOUT
 moving their mouse.  We grab frames at ~120 Hz from the foreground
 window and compute frame-to-frame phase correlation on a small ROI
 around the screen centre to estimate the per-frame camera drift in
@@ -154,7 +154,7 @@ def _get_foreground_window_rect() -> "Optional[tuple[int, int, int, int]]":
 
     `mss` accepts these as `monitor` dicts so this is what feeds the
     capture loop.  We use the foreground window so the user can leave
-    GhostShell open in the background and the capture follows whatever
+    Vispora open in the background and the capture follows whatever
     game window has focus when they hit Start."""
     try:
         import ctypes
@@ -271,7 +271,7 @@ def start_screen_capture(rpm: int = 600,
     into one (dx, dy) per shot — required so the saved preset has the
     right number of steps.
 
-    `auto_fire` (controller users): if True, GhostShell pushes RT through
+    `auto_fire` (controller users): if True, Vispora pushes RT through
     the virtual pad for the duration of the capture so the user doesn't
     need to physically hold their fire trigger.  Requires the active
     profile to be in virtual_controller mode AND the mapper master
@@ -402,7 +402,7 @@ def _screen_capture_runner(session: dict):
             except Exception: pass
         # ALWAYS resume AT — paired with the pause at start_screen_capture.
         # Even on a crashed runner we must release the pause so AT doesn't
-        # stay frozen for the rest of the GhostShell session.
+        # stay frozen for the rest of the Vispora session.
         _resume_at_for_capture("recoil-capture-screen")
         session["active"] = False
         log.info(f"capture {sid} ended — {len(session['deltas'])} samples"
@@ -415,7 +415,7 @@ def _screen_capture_runner(session: dict):
 #
 # User aims at a wall, fires a full mag, and MANUALLY counter-pulls
 # (drags their mouse down or pushes the right stick down) to keep the
-# crosshair on the target.  GhostShell records the inputs they're
+# crosshair on the target.  Vispora records the inputs they're
 # making during the firing window.  Those deltas ARE the compensation
 # pattern — when played back as anti-recoil, they reproduce what the
 # user did manually.
@@ -447,7 +447,7 @@ def start_counter_pull_capture(rpm: int = 600,
       • 'controller_rstick'  — samples right-stick position at the gun's
                                 fire rate
 
-    `auto_fire` (controller users): if True, GhostShell pushes RT through
+    `auto_fire` (controller users): if True, Vispora pushes RT through
     the virtual pad for the duration so the user can focus on the stick
     motion without holding the trigger.  Requires virtual_controller mode.
     """
@@ -1018,7 +1018,7 @@ def get_bullet_hole_state() -> dict:
 # ────────────────────────────────────────────────────────────────────
 #
 # Captured patterns get saved alongside the bundled curated presets.
-# Storage path: %APPDATA%/GhostShell/user_recoil_presets.json
+# Storage path: %APPDATA%/Vispora/user_recoil_presets.json
 # Schema: same as core/recoil_presets.json (so the UI can render them
 # in the same picker without code changes).
 

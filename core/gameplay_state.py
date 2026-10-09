@@ -150,7 +150,7 @@ def set_target(exe: str, pid: Optional[int]) -> None:
 
 def _get_foreground_pid() -> Optional[int]:
     """Return the PID that owns the foreground window, or None.  Used
-    to detect alt-tabs — if the user pulled GhostShell / Chrome / Discord
+    to detect alt-tabs — if the user pulled Vispora / Chrome / Discord
     forward, they aren't actively playing right now."""
     try:
         user32 = ctypes.windll.user32

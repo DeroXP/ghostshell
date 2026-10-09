@@ -101,6 +101,44 @@ def _enumerate_windows() -> list[tuple[int, str, str]]:
     return out
 
 
+# Window classes the "Get an app to open this link" picker is hosted in.
+_PICKER_CLASSES = {"ApplicationFrameWindow", "#32770", "Shell_Flyout",
+                   "Windows.UI.Core.CoreWindow"}
+
+
+def _owner_exe(hwnd: int) -> str:
+    """Lower-cased image name of the process that owns `hwnd`, or ''."""
+    try:
+        pid = wintypes.DWORD(0)
+        _user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        k32 = ctypes.windll.kernel32
+        k32.OpenProcess.restype = wintypes.HANDLE
+        h = k32.OpenProcess(0x1000, False, pid.value)       # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if not k32.QueryFullProcessImageNameW(wintypes.HANDLE(h), 0, buf, ctypes.byref(size)):
+                return ""
+            return buf.value.rsplit("\\", 1)[-1].lower()
+        finally:
+            k32.CloseHandle(wintypes.HANDLE(h))
+    except Exception:
+        return ""
+
+
+def _is_picker_window(hwnd: int, class_name: str) -> bool:
+    """A title match alone is not enough to close a window: a browser tab
+    about this very error, a text file named after it or an Explorer folder
+    all contain the same words — and used to be sent WM_CLOSE once a second.
+    It also has to BE the picker: hosted in one of its window classes, or
+    owned by OpenWith.exe."""
+    return class_name in _PICKER_CLASSES or _owner_exe(hwnd) == "openwith.exe"
+
+
 def _close_window(hwnd: int) -> bool:
     """PostMessage WM_CLOSE — never blocks, never throws if hwnd died."""
     try:
@@ -117,6 +155,7 @@ _thread: Optional[threading.Thread] = None
 _stop = threading.Event()
 _kill_count = 0
 _last_kill_t = 0.0
+_left_alone: set = set()        # hwnds whose title matched but which are not the picker
 
 
 def _matches_target(window_text: str, class_name: str) -> bool:
@@ -143,11 +182,22 @@ def _watchdog_loop():
     while not _stop.is_set():
         try:
             for hwnd, cls, title in _enumerate_windows():
-                if _matches_target(title, cls):
-                    log.info(f"popup-killer: closing '{title}' (cls={cls}, hwnd={hwnd})")
-                    if _close_window(hwnd):
-                        _kill_count += 1
-                        _last_kill_t = time.time()
+                if not _matches_target(title, cls):
+                    continue
+                if not _is_picker_window(hwnd, cls):
+                    # Logged once per window, so a picker hosted in a class
+                    # this list does not know yet can be diagnosed from the log.
+                    if hwnd not in _left_alone:
+                        if len(_left_alone) > 500:
+                            _left_alone.clear()
+                        _left_alone.add(hwnd)
+                        log.debug(f"popup-killer: title matched but not the picker — left alone "
+                                  f"(cls={cls}, owner={_owner_exe(hwnd) or '?'})")
+                    continue
+                log.info(f"popup-killer: closing '{title}' (cls={cls}, hwnd={hwnd})")
+                if _close_window(hwnd):
+                    _kill_count += 1
+                    _last_kill_t = time.time()
         except Exception as e:                      # noqa: BLE001
             log.debug(f"popup-killer tick failed: {e}")
         if _stop.wait(1.0):                # 1 Hz — picker isn't time-critical

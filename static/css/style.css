@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════
-   GhostShell v3 — pure black, restrained accent, dramatic hierarchy
+   Vispora v3 — pure black, restrained accent, dramatic hierarchy
    ═══════════════════════════════════════════════════════════════
    Design rules:
      1. The background is essentially black.  Cards lift with subtle
@@ -872,8 +872,6 @@ body::before {
 .dns-preset-name { font-size: 14.5px; font-weight: 600; color: var(--text-bright); margin-bottom: 4px; letter-spacing: -0.01em; }
 .dns-preset-ips { font-size: 12px; color: var(--text-secondary); font-family: var(--font-mono); }
 .dns-preset-desc { font-size: 12px; color: var(--text-secondary); margin-top: 8px; }
-.dns-preset-latency { font-size: 12px; color: var(--accent); font-weight: 600; margin-top: 8px; font-family: var(--font-mono); }
-
 /* ═══ INPUT FIELDS ═══ */
 input[type="text"], input[type="password"], input[type="number"], textarea, select {
     background: var(--bg-input);
@@ -957,15 +955,6 @@ select option {
 .pin-key:hover { background-image: var(--grad-card-hover); border-color: var(--border-strong); }
 .pin-key:active { transform: translateY(1px); }
 .pin-key.wide { grid-column: span 2; width: auto; }
-.pin-display {
-    text-align: center;
-    font-size: 30px;
-    letter-spacing: 14px;
-    color: var(--accent);
-    margin: 18px 0;
-    min-height: 44px;
-    font-family: var(--font-mono);
-}
 .pin-dots {
     display: flex;
     justify-content: center;
@@ -1075,46 +1064,6 @@ select option {
 /* ═══ ACTION BUTTONS ROW (Dashboard) ═══
    These are the big quick-actions on the dashboard.  More dramatic
    than v2 — bigger padding, gradient hover, subtle "lift" on hover. */
-.action-row {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-    gap: 12px;
-    margin: 0 0 28px;
-}
-.action-btn {
-    padding: 18px 20px;
-    border: 1px solid var(--border);
-    background: var(--bg-elevated);
-    border-radius: var(--radius);
-    cursor: pointer;
-    transition: var(--transition-fast);
-    text-align: left;
-}
-.action-btn:hover {
-    background: var(--bg-hover);
-    border-color: var(--border-strong);
-}
-.action-btn-label {
-    font-size: 14.5px;
-    font-weight: 600;
-    color: var(--text-bright);
-    letter-spacing: -0.015em;
-}
-.action-btn-desc {
-    font-size: 12.5px;
-    color: var(--text-secondary);
-    margin-top: 5px;
-}
-.action-btn.full-ghost {
-    border: 2px solid var(--accent);
-    background: var(--accent-soft);
-}
-.action-btn.full-ghost .action-btn-label {
-    color: var(--accent);
-}
-.action-btn.full-ghost:hover {
-    background: var(--accent-mid);
-}
 
 /* ═══ STATUS BADGES ═══ */
 .status-badge {
@@ -1175,7 +1124,7 @@ input[type="range"]::-moz-range-thumb {
 input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
 
 /* ═══ FILTER CHIPS ═══ */
-.chip-row { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 16px; }
+
 .chip {
     padding: 5px 13px;
     border: 1px solid var(--border-strong);
@@ -1220,27 +1169,6 @@ input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-of
 .warn-box svg { flex-shrink: 0; margin-top: 2px; }
 
 /* ═══ TOOLTIP ═══ */
-.tippy { position: relative; }
-.tippy::after {
-    content: attr(data-tip);
-    position: absolute;
-    bottom: calc(100% + 8px);
-    left: 50%;
-    transform: translateX(-50%);
-    background: var(--bg-overlay);
-    color: var(--text-bright);
-    font-size: 11.5px;
-    padding: 6px 10px;
-    border-radius: var(--radius-sm);
-    white-space: nowrap;
-    opacity: 0;
-    pointer-events: none;
-    transition: opacity 150ms ease;
-    border: 1px solid var(--border-strong);
-    box-shadow: var(--shadow);
-    z-index: 100;
-}
-.tippy:hover::after { opacity: 1; }
 
 /* ═══ GPU OC ═══ */
 .oc-slider-row { margin-bottom: 18px; }
@@ -1457,8 +1385,6 @@ input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-of
     line-height: 1.6;
     max-width: 560px;
 }
-.hero-card-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-
 /* ─── Section divider — small label between groups of cards ───── */
 .section-divider {
     display: flex;
@@ -1490,66 +1416,8 @@ input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-of
 @media (max-width: 900px) {
     .bento-grid.three, .bento-grid.two { grid-template-columns: 1fr; }
 }
-.bento-cell-tall   { grid-row: span 2; }
-.bento-cell-wide   { grid-column: span 2; }
 
 /* ─── Metric tile — bigger, more prominent than .stat-card ────── */
-.metric-tile {
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 18px 20px;
-    transition: var(--transition-fast);
-}
-.metric-tile:hover { border-color: var(--border-strong); }
-.metric-tile-icon {
-    width: 32px; height: 32px;
-    display: flex; align-items: center; justify-content: center;
-    border-radius: var(--radius-sm);
-    background: var(--bg-overlay);
-    color: var(--text-secondary);
-    margin-bottom: 12px;
-}
-.metric-tile-icon svg { width: 16px; height: 16px; }
-.metric-tile-label {
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--text-tertiary);
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    margin-bottom: 6px;
-}
-.metric-tile-value {
-    font-size: 28px;
-    font-weight: 700;
-    color: var(--text-bright);
-    letter-spacing: -0.025em;
-    line-height: 1.1;
-    font-family: var(--font-mono);
-    font-feature-settings: 'tnum';
-}
-.metric-tile-sub {
-    font-size: 12px;
-    color: var(--text-secondary);
-    margin-top: 6px;
-    font-family: var(--font-mono);
-    font-feature-settings: 'tnum';
-}
-.metric-tile-bar {
-    margin-top: 12px;
-    height: 4px;
-    background: rgba(255, 255, 255, 0.04);
-    border-radius: 2px;
-    overflow: hidden;
-}
-.metric-tile-bar-fill {
-    height: 100%;
-    background: var(--accent);
-    border-radius: 2px;
-    transition: width 600ms cubic-bezier(0.32, 0.72, 0, 1);
-}
-.metric-tile-bar-fill.warn { background: var(--warning); }
-.metric-tile-bar-fill.crit { background: var(--danger); }
 
 /* ─── Action card — bigger version of .action-btn for hero rows ── */
 .action-card {
@@ -1602,41 +1470,8 @@ input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-of
 }
 
 /* ─── Info strip — horizontal pill of small key-value items ──── */
-.info-strip {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0;
-    padding: 14px 20px;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    margin-bottom: 16px;
-}
+
 /* info-strip::before removed — flat Win11 surface */
-.info-strip-item {
-    display: flex;
-    flex-direction: column;
-    padding: 0 24px;
-    border-right: 1px solid var(--border-faint);
-    flex: 1;
-    min-width: 140px;
-}
-.info-strip-item:first-child { padding-left: 0; }
-.info-strip-item:last-child  { border-right: none; padding-right: 0; }
-.info-strip-label {
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--text-tertiary);
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    margin-bottom: 4px;
-}
-.info-strip-value {
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--text-bright);
-    letter-spacing: -0.005em;
-}
 
 /* ─── Card with icon + title pattern ──────────────────────────── */
 .card-icon {
@@ -1651,72 +1486,11 @@ input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-of
 .card-icon svg { width: 18px; height: 18px; }
 
 /* ─── Big number display (for cleaner / privacy "X disabled" etc.) ─ */
-.big-number {
-    font-size: 48px;
-    font-weight: 700;
-    color: var(--text-bright);
-    letter-spacing: -0.04em;
-    line-height: 1;
-    font-family: var(--font-mono);
-    font-feature-settings: 'tnum';
-}
-.big-number-unit {
-    font-size: 18px;
-    color: var(--text-secondary);
-    font-weight: 500;
-    letter-spacing: -0.01em;
-    margin-left: 4px;
-}
+
 
 /* ─── Settings list (cleaner alternative to plain rows) ─────── */
-.setting-row {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 14px 0;
-    border-bottom: 1px solid var(--border-faint);
-}
-.setting-row:last-child { border-bottom: none; }
-.setting-row-icon {
-    width: 32px; height: 32px;
-    display: flex; align-items: center; justify-content: center;
-    border-radius: var(--radius-sm);
-    background: var(--bg-overlay);
-    color: var(--text-secondary);
-    flex-shrink: 0;
-}
-.setting-row-icon svg { width: 16px; height: 16px; }
-.setting-row-info { flex: 1; min-width: 0; }
-.setting-row-name {
-    font-size: 14px;
-    font-weight: 500;
-    color: var(--text-bright);
-    letter-spacing: -0.01em;
-    margin-bottom: 2px;
-}
-.setting-row-desc {
-    font-size: 12.5px;
-    color: var(--text-secondary);
-    line-height: 1.5;
-}
 
 /* ─── Sticky action bar — used at bottom of long pages ───────── */
-.sticky-bar {
-    position: sticky;
-    bottom: -16px;
-    margin: 24px -8px -16px;
-    padding: 14px 20px;
-    background: rgba(10, 10, 12, 0.92);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    align-items: center;
-    z-index: 10;
-}
 
 /* ─── Page hero icon — appears next to .section-title ────────── */
 .page-icon {
@@ -1734,22 +1508,6 @@ input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-of
 .page-icon svg { width: 22px; height: 22px; }
 
 /* ─── DNS preset improvements (more visual) ──────────────────── */
-.dns-preset-icon {
-    width: 28px; height: 28px;
-    border-radius: 50%;
-    margin-bottom: 10px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-weight: 700;
-    font-size: 12px;
-    color: var(--bg-base);
-}
-.dns-preset.cloudflare .dns-preset-icon { background: #f48120; }
-.dns-preset.google     .dns-preset-icon { background: #4285f4; color: #fff; }
-.dns-preset.quad9      .dns-preset-icon { background: #762d93; color: #fff; }
-.dns-preset.adguard    .dns-preset-icon { background: #67b279; }
-.dns-preset.opendns    .dns-preset-icon { background: #00b3a4; color: #fff; }
 
 /* ─── Game profile / status display ──────────────────────────── */
 .game-status-card {
@@ -1909,83 +1667,7 @@ input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-of
     text-transform: lowercase;
     letter-spacing: 0.02em;
 }
-.opt-cat-new {
-    font-size: 10px;
-    font-weight: 700;
-    padding: 1px 7px;
-    border-radius: var(--radius-pill);
-    background: var(--accent-soft);
-    color: var(--accent);
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-}
-
 /* ─── Input device priority list (Kernel tab) ───────────────── */
-.input-dev-list {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-}
-.input-dev-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 10px 12px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-elevated);
-    transition: background var(--transition-fast);
-}
-.input-dev-row:hover { background: var(--bg-hover); }
-.input-dev-icon {
-    width: 32px; height: 32px;
-    display: flex; align-items: center; justify-content: center;
-    border-radius: var(--radius-sm);
-    background: var(--bg-overlay);
-    color: var(--accent);
-    flex-shrink: 0;
-    border: 1px solid var(--border);
-}
-.input-dev-icon svg { width: 16px; height: 16px; }
-.input-dev-info {
-    flex: 1;
-    min-width: 0;
-    font-size: 13px;
-    color: var(--text);
-}
-.input-dev-name {
-    font-weight: 500;
-    color: var(--text-bright);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-.input-dev-meta {
-    font-size: 11px;
-    color: var(--text-tertiary);
-    margin-top: 2px;
-    font-family: var(--font-mono);
-}
-.input-dev-row select {
-    width: auto;
-    min-width: 110px;
-    padding: 5px 28px 5px 11px;
-    background-position: right 9px center;
-    font-size: 12.5px;
-}
-.input-dev-pill {
-    font-size: 11px;
-    font-weight: 600;
-    padding: 2px 9px;
-    border-radius: var(--radius-pill);
-    color: var(--text-secondary);
-    background: var(--bg-hover);
-    border: 1px solid var(--border);
-    flex-shrink: 0;
-}
-.input-dev-pill.high   { background: var(--accent-soft);  color: var(--accent); border-color: rgba(196,193,255,0.20); }
-.input-dev-pill.normal { background: rgba(255,255,255,0.04); color: var(--text); }
-.input-dev-pill.low    { background: var(--warning-soft); color: var(--warning); border-color: rgba(240,179,65,0.20); }
 
 /* Sticky action bar with the apply-selected button */
 .opt-action-bar {
@@ -2328,7 +2010,7 @@ body, .nav-item, .toggle-name, .toggle-desc, .card-title, .stat-value,
 
 /* Modals + toasts animate transform+opacity on open/close. */
 .modal, .modal-content,
-#gs-toast-container .gs-toast,
+#vsp-toast-container .vsp-toast,
 .update-toast, .post-install-toast {
     will-change: transform, opacity;
 }

@@ -1,5 +1,4 @@
 """Clean shutdown / restart. Runs fast cleanup passes so the next boot is faster."""
-import os
 import threading
 import time
 from core.utils import run_ps, run_cmd, get_logger
@@ -50,10 +49,6 @@ def _quick_cleanup() -> dict:
     except Exception as e:
         result["steps"].append({"name": "Clear RAM standby", "ok": False, "err": str(e)})
 
-    # 5. Clear event logs (tiny, but keeps boot quick)
-    run_ps("Get-EventLog -List | ForEach-Object { Clear-EventLog -LogName $_.Log -ErrorAction SilentlyContinue }",
-           timeout=15)
-    result["steps"].append({"name": "Clear event logs", "ok": True})
 
     # 6. Flush filesystem buffers to disk so shutdown isn't delayed
     run_ps("try { [System.IO.File]::GetAttributes('C:\\') | Out-Null } catch {}", timeout=5)
@@ -73,7 +68,7 @@ def shutdown(delay_sec: int = 10, clean: bool = True) -> dict:
             _quick_cleanup()
         log.info(f"Issuing shutdown in {delay_sec}s...")
         run_cmd(["shutdown", "/s", "/f", "/t", str(max(1, delay_sec)),
-                 "/c", "GhostShell: cleanup complete — shutting down"], timeout=10)
+                 "/c", "Vispora: cleanup complete — shutting down"], timeout=10)
 
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "action": "shutdown", "delay": delay_sec, "clean": clean}
@@ -88,7 +83,7 @@ def restart(delay_sec: int = 10, clean: bool = True) -> dict:
             _quick_cleanup()
         log.info(f"Issuing restart in {delay_sec}s...")
         run_cmd(["shutdown", "/r", "/f", "/t", str(max(1, delay_sec)),
-                 "/c", "GhostShell: cleanup complete — restarting"], timeout=10)
+                 "/c", "Vispora: cleanup complete — restarting"], timeout=10)
 
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "action": "restart", "delay": delay_sec, "clean": clean}

@@ -16,7 +16,7 @@ Outputs (any of):
 
 Profile schema (v3.4 — new format)
 ----------------------------------
-%APPDATA%/GhostShell/gamepad_profiles.json
+%APPDATA%/Vispora/gamepad_profiles.json
     {
       "profiles": {
           "<name>": {
@@ -59,8 +59,9 @@ from ctypes import wintypes
 from typing import Optional
 
 from core.utils import get_logger, atomic_write_json
-from config import APPDATA_DIR
+from config import APPDATA_DIR, APP_NAME, LEGACY_APP_NAME
 from core import xinput_ctypes as xi
+from core.input_hooks import INJECTED_TAG
 
 log = get_logger(__name__)
 
@@ -203,7 +204,7 @@ def _send_key(vk: int, key_up: bool):
             wScan=scan,
             dwFlags=flags,
             time=0,
-            dwExtraInfo=None,
+            dwExtraInfo=INJECTED_TAG,
         )),
     )
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
@@ -237,7 +238,7 @@ def _send_mouse_button(button: str, key_up: bool):
     inp = _INPUT(
         type=INPUT_MOUSE,
         u=_INPUTUNION(mi=_MOUSEINPUT(
-            dx=0, dy=0, mouseData=data, dwFlags=flag, time=0, dwExtraInfo=None,
+            dx=0, dy=0, mouseData=data, dwFlags=flag, time=0, dwExtraInfo=INJECTED_TAG,
         )),
     )
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
@@ -260,7 +261,7 @@ def _send_unicode_char(c: str):
         u=_INPUTUNION(ki=_KEYBDINPUT(
             wVk=0, wScan=code,
             dwFlags=KEYEVENTF_UNICODE,
-            time=0, dwExtraInfo=None,
+            time=0, dwExtraInfo=INJECTED_TAG,
         )),
     )
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
@@ -276,7 +277,7 @@ def _send_mouse_wheel(direction_up: bool, ticks: int = 1):
         type=INPUT_MOUSE,
         u=_INPUTUNION(mi=_MOUSEINPUT(
             dx=0, dy=0, mouseData=delta & 0xFFFFFFFF,
-            dwFlags=MOUSEEVENTF_WHEEL, time=0, dwExtraInfo=None,
+            dwFlags=MOUSEEVENTF_WHEEL, time=0, dwExtraInfo=INJECTED_TAG,
         )),
     )
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
@@ -293,7 +294,7 @@ def _send_mouse_move(dx: int, dy: int):
         type=INPUT_MOUSE,
         u=_INPUTUNION(mi=_MOUSEINPUT(
             dx=int(dx), dy=int(dy), mouseData=0,
-            dwFlags=MOUSEEVENTF_MOVE, time=0, dwExtraInfo=None,
+            dwFlags=MOUSEEVENTF_MOVE, time=0, dwExtraInfo=INJECTED_TAG,
         )),
     )
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
@@ -377,6 +378,30 @@ DEFAULT_STICK_TUNING = {
 # Per-binding behavior modes (toggle, turbo, chord, layer).  Stored at
 # mapping.input.behavior  alongside the existing source/trigger fields.
 BINDING_BEHAVIORS = ("normal", "toggle", "turbo", "chord")
+
+
+def _strip_nulls(obj):
+    """Drop every dict entry whose value is None or NaN, recursively.
+
+    The UI sends null for a number box the user cleared (parseInt('') is NaN,
+    which JSON turns into null).  The runtime reads those fields as
+    int(x.get("turbo_hz", 10)) — and int(None) raises inside the poll tick,
+    discarding the rest of that tick's events, key-releases included.  With
+    the entry gone, the .get() default applies instead."""
+    if isinstance(obj, dict):
+        return {k: _strip_nulls(v) for k, v in obj.items()
+                if v is not None and not (isinstance(v, float) and v != v)}
+    if isinstance(obj, list):
+        return [_strip_nulls(v) for v in obj]
+    return obj
+
+
+def _safe_mapping_id(value) -> str:
+    """A mapping id is spliced into the UI's HTML; keep it to a plain token.
+    Anything else (a hand-edited or hostile import) gets a fresh id."""
+    s = value if isinstance(value, str) else ""
+    ok = 0 < len(s) <= 64 and all(c.isalnum() or c in "_-" for c in s) and s.isascii()
+    return s if ok else _new_id()
 
 
 def _new_id() -> str:
@@ -481,8 +506,19 @@ def _load_state(use_cache: bool = True) -> dict:
             out["profiles"] = {}
         # Migrate every profile to v3.4 schema on load
         for name, prof in list(out["profiles"].items()):
-            out["profiles"][name] = _migrate_profile(prof)
-    except (OSError, ValueError):
+            out["profiles"][name] = _migrate_profile(_strip_nulls(prof))
+    except OSError:
+        out = dict(DEFAULT_STATE)
+    except ValueError:
+        # Unreadable JSON.  Falling back to defaults is right, but the next
+        # save would then overwrite the file and every profile in it — keep
+        # the damaged copy so the user's work can still be recovered.
+        try:
+            os.replace(PROFILES_PATH, PROFILES_PATH + ".corrupt")
+            log.warning(f"gamepad profiles file was unreadable — kept as "
+                        f"{PROFILES_PATH}.corrupt, starting from defaults")
+        except OSError:
+            pass
         out = dict(DEFAULT_STATE)
     with _state_cache_lock:
         _state_cache = out
@@ -525,27 +561,7 @@ _held_keys: dict[str, set[int]] = {}     # button_name -> {vk1, vk2, ...}
 # Captured-button-press buffer for the UI's "press a button to bind" flow
 _capture_event = threading.Event()
 _capture_value: Optional[str] = None
-
-
-def _is_active_in_foreground() -> bool:
-    """When the active profile has active_only_in_game=True, only emit
-    keys while game_profiles is reporting an active game.  This prevents
-    your controller from typing in Discord while alt-tabbed."""
-    state = _load_state()
-    pname = state.get("active_profile")
-    if not pname:
-        return False
-    profile = state["profiles"].get(pname)
-    if not profile:
-        return False
-    if not profile.get("active_only_in_game", True):
-        return True   # always-on profile
-    try:
-        from core import game_profiles
-        info = game_profiles.get_active_game_info()
-        return bool(info and info.get("exe"))
-    except Exception:
-        return False
+_toggle_hotkey_down = False     # the mapper on/off hotkey is physically held (see _polling_loop)
 
 
 # Active macros, keyed by mapping ID.  Used so a trigger release can
@@ -841,6 +857,7 @@ def _run_macro(steps: list[dict], origin: str,
             iteration = 0
             while True:
                 iteration += 1
+                pass_started = time.perf_counter()
                 interrupted = _run_one_pass()
                 if interrupted:
                     break
@@ -851,6 +868,10 @@ def _run_macro(steps: list[dict], origin: str,
                     break
                 # play_mode == "loop_while_held" → keep going until stop_event
                 if stop_event.is_set():
+                    break
+                # A pass with nothing to wait on (no steps, or all of them
+                # disabled) would otherwise spin this thread flat out.
+                if time.perf_counter() - pass_started < 0.001 and stop_event.wait(0.005):
                     break
             # ── Trigger-held freeze ───────────────────────────────────
             # If anything was Hold ↓-ed and the user is still holding the
@@ -1033,6 +1054,15 @@ def _release_all_outputs():
         elif kind == "mouse":
             try: _send_mouse_button(held["button"], key_up=True)
             except Exception: pass
+    # Macros hold their own keys (a "down" step, a loop-while-held run) in
+    # thread-local state that nothing here can see.  Signal each one; its
+    # `finally` releases what it holds.  They used to be left running, so a
+    # macro started before a disable / profile switch / layer switch kept
+    # injecting until the same trigger was pressed again.
+    with _active_macros_lock:
+        macro_stops = list(_active_macros.values())
+    for ev in macro_stops:
+        ev.set()
     # v3.5 — cancel turbo threads, clear toggle / chord latches, drop
     # held-input tracking (a layer switch should reset everything).
     with _behaviors_lock:
@@ -1118,7 +1148,7 @@ def calibrate_sticks_at_rest(duration_sec: float = 2.0,
     units out of 32 767).  The physical XInput driver smooths most of
     it through the documented per-axis deadzone (7849 for left, 8689
     for right), but some games apply less filtering than that and
-    pick up the residual as drift.  GhostShell's snapshot pipeline
+    pick up the residual as drift.  Vispora's snapshot pipeline
     passes the raw values through verbatim, so any wobble bleeds
     straight to the virtual pad.
 
@@ -1224,7 +1254,7 @@ def measure_latency(samples: int = 50) -> dict:
     held vbutton output keyed to a synthetic mid, busy-wait until the
     next snapshot includes it, record the delta, release it, repeat.
 
-    Returns avg / p99 / max in microseconds.  This measures GhostShell's
+    Returns avg / p99 / max in microseconds.  This measures Vispora's
     internal contribution to latency only — does NOT include ViGEmBus
     queueing or USB delivery delay (which are kernel-side and not
     measurable from userland).  Use as a guide to whether the polling
@@ -1311,7 +1341,7 @@ def measure_latency(samples: int = 50) -> dict:
         "p99_us":      p99,
         "max_us":      deltas_us[-1],
         "min_us":      deltas_us[0],
-        "note":        ("This measures GhostShell's polling-loop contribution "
+        "note":        ("This measures Vispora's polling-loop contribution "
                         "to latency only.  Does not include the ViGEmBus driver "
                         "report delay (~0.5 ms avg for DS4 USB FS) or the game's "
                         "input poll cycle."),
@@ -1558,7 +1588,11 @@ def _dispatch_layer_for_input(profile: dict, source: str, trigger: str,
                 _dispatch_output(mid, out, cur)
         elif behavior == "turbo":
             if pressed:
-                _start_turbo(mid, out, int(inp.get("turbo_hz", 10)))
+                try:
+                    hz = int(inp.get("turbo_hz", 10))
+                except (TypeError, ValueError):
+                    hz = 10
+                _start_turbo(mid, out, hz)
             else:
                 _stop_turbo(mid)
         elif behavior == "chord":
@@ -1580,6 +1614,11 @@ def _process_input(source: str, trigger: str, pressed: bool,
     # 1. Track held-input set so chord re-eval has accurate data
     with _held_inputs_lock:
         if pressed:
+            if source == "keyboard" and (source, trigger) in _held_inputs:
+                # Typematic auto-repeat of a key that is already down, not a
+                # new press.  Treating each repeat as a press flipped toggle
+                # bindings ~30×/s and restarted turbos and macros.
+                return
             _held_inputs.add((source, trigger))
         else:
             _held_inputs.discard((source, trigger))
@@ -1616,11 +1655,14 @@ def _process_transitions(slot: int, now_pressed: set[str], profile: dict,
     except Exception:
         pass
 
-    for btn in just_down:
-        _process_input("controller", btn, True, profile)
-    for btn in just_up:
-        _process_input("controller", btn, False, profile)
+    # Record the new state BEFORE dispatching: if a dispatch raises, the next
+    # tick must not see the same buttons as freshly pressed all over again.
     _prev_buttons[slot] = now_pressed
+    for btn, down in [(b, True) for b in just_down] + [(b, False) for b in just_up]:
+        try:
+            _process_input("controller", btn, down, profile)
+        except Exception as e:
+            log.debug(f"dispatch of controller:{btn} failed: {e}")
 
 
 def _release_all_held():
@@ -1635,6 +1677,11 @@ def _release_all_held():
     _held_keys.clear()
     # v3.4 unified output bookkeeping
     _release_all_outputs()
+    # Not on the alt layer any more either (this is the mapper stopping or
+    # the profile changing — a layer switch calls _release_all_outputs only).
+    global _modifier_held
+    with _modifier_held_lock:
+        _modifier_held = False
 
 
 def _apply_stick_tuning(x: float, y: float, cfg: dict) -> "tuple[float, float]":
@@ -1882,6 +1929,15 @@ _hidhide_last_engage_err: str = ""    # most recent engage failure detail, surfa
 # from games; cleared on disengage so we always restore the user's prior
 # HidHide configuration.
 _hidhide_engaged = False
+_hidhide_lock = threading.RLock()
+# Bumped every time the virtual pad is created or closed, so work queued for
+# one pad (the post-create settle thread) can tell it has been superseded.
+_pad_generation = 0
+# After a failed creation (ViGEmBus missing), don't try again before this.
+_vpad_retry_after = 0.0
+_VPAD_RETRY_BACKOFF_S = 10.0
+# XInput slots occupied by our own virtual X360 pad — never read as input.
+_virtual_slots: set = set()
 _hidhide_prior_state: dict | None = None
 _hidhide_hidden_ours: list[str] = []
 _hidhide_whitelisted_app: str = ""
@@ -1892,13 +1948,18 @@ def _hidhide_engage_if_needed(profile: dict):
     virtual_controller mode.  Without HidHide cloaking the physical
     controller, games would see BOTH the virtual and physical pads at
     once and the physical input would dominate.  We hide the physical
-    from every process EXCEPT GhostShell so the game sees only the
+    from every process EXCEPT Vispora so the game sees only the
     virtual; we still get XInput visibility for state forwarding.
 
     No-op if:
       • HidHide isn't installed (UI surfaces an install button)
       • The active profile isn't in virtual_controller mode
       • Already engaged"""
+    with _hidhide_lock:
+        _hidhide_engage_locked(profile)
+
+
+def _hidhide_engage_locked(profile: dict):
     global _hidhide_engaged, _hidhide_prior_state
     global _hidhide_hidden_ours, _hidhide_whitelisted_app
     if _hidhide_engaged:
@@ -1920,7 +1981,7 @@ def _hidhide_engage_if_needed(profile: dict):
         log.warning("hide_physical=True but no physical controller resolved")
         return
 
-    # Path GhostShell is running from — needed to whitelist ourselves
+    # Path Vispora is running from — needed to whitelist ourselves
     import sys
     app_path = os.path.abspath(sys.executable)
     if "python" in os.path.basename(app_path).lower():
@@ -1933,7 +1994,9 @@ def _hidhide_engage_if_needed(profile: dict):
         _hidhide_engaged = True
         _hidhide_prior_state = r.get("prior_state")
         _hidhide_hidden_ours = r.get("hidden_ours") or []
-        _hidhide_whitelisted_app = app_path
+        # "" when the app was already registered before we engaged — then it
+        # is not ours to un-register on the way out.
+        _hidhide_whitelisted_app = r.get("whitelisted_app", app_path)
         _hidhide_last_engage_err = ""
         log.info(f"HidHide engaged: hid {len(_hidhide_hidden_ours)} device(s)")
     else:
@@ -1948,19 +2011,23 @@ def _hidhide_disengage():
     profile changes.  Always idempotent and safe to call repeatedly."""
     global _hidhide_engaged, _hidhide_prior_state
     global _hidhide_hidden_ours, _hidhide_whitelisted_app
-    if not _hidhide_engaged:
-        return
-    try:
-        from core import hidhide
-        hidhide.disengage(_hidhide_prior_state or {},
-                          _hidhide_hidden_ours,
-                          _hidhide_whitelisted_app)
-    except Exception as e:
-        log.debug(f"HidHide disengage failed: {e}")
-    _hidhide_engaged = False
-    _hidhide_prior_state = None
-    _hidhide_hidden_ours = []
-    _hidhide_whitelisted_app = ""
+    # Same lock as engage: an engage still in flight (it shells out for
+    # seconds) finishes first, and is then undone here — instead of this
+    # seeing "not engaged yet", doing nothing, and the engage landing after.
+    with _hidhide_lock:
+        if not _hidhide_engaged:
+            return
+        try:
+            from core import hidhide
+            hidhide.disengage(_hidhide_prior_state or {},
+                              _hidhide_hidden_ours,
+                              _hidhide_whitelisted_app)
+        except Exception as e:
+            log.debug(f"HidHide disengage failed: {e}")
+        _hidhide_engaged = False
+        _hidhide_prior_state = None
+        _hidhide_hidden_ours = []
+        _hidhide_whitelisted_app = ""
 
 
 def _resolve_physical_controller_ids(profile: dict) -> list[str]:
@@ -2035,6 +2102,7 @@ def _ensure_virtual_pad(remap_mode: str, profile_name: Optional[str],
     active profile's remap_mode + virtual_pad_type.  Also engages /
     disengages HidHide based on the profile's hide_physical flag."""
     global _virtual_pad, _virtual_pad_for_profile, _virtual_pad_type
+    global _pad_generation, _vpad_retry_after, _virtual_slots, _hidhide_last_retry_ts
     want = (remap_mode == "virtual_controller")
     have = _virtual_pad is not None
     desired_pad_type = (profile or {}).get("virtual_pad_type", "x360")
@@ -2045,9 +2113,16 @@ def _ensure_virtual_pad(remap_mode: str, profile_name: Optional[str],
     pad_type_changed = have and (_virtual_pad_type != desired_pad_type)
 
     if want and (not have or profile_changed or pad_type_changed):
+        if not have and time.time() < _vpad_retry_after:
+            # Creation failed moments ago.  Retrying on every tick ran a
+            # PowerShell device scan each time — the loop crawled at ~1 Hz,
+            # and the hook queue overflowed and dropped key-ups meanwhile.
+            return
         if have:
             try: _virtual_pad.close()
             except Exception: pass
+            _pad_generation += 1
+            _virtual_slots = set()
             _hidhide_disengage()
         try:
             from core import virtual_gamepad as vg
@@ -2060,19 +2135,39 @@ def _ensure_virtual_pad(remap_mode: str, profile_name: Optional[str],
                            if d.get("instance_id")}
             except Exception:
                 pre_ids = set()
+            pre_slots = set(xi.get_connected_slots() or [])
             _virtual_pad = vg.create(pad_type=desired_pad_type)
             _virtual_pad_for_profile = profile_name
             _virtual_pad_type = desired_pad_type
+            _pad_generation += 1
+            gen = _pad_generation
             if _virtual_pad:
+                # The settle thread below does the first engage; keep the
+                # inline retry branch from racing it with a second one.
+                _hidhide_last_retry_ts = time.time()
                 log.info(f"virtual {desired_pad_type} pad created for profile '{profile_name}'")
                 # v3 — move the 400 ms enumeration-settle wait + HidHide
                 # engagement to a background thread.  Doing it inline
                 # froze the polling loop for 400 ms (1600 ticks at 4 kHz),
                 # which manifested as a held-input "stick" on the virtual
                 # pad during profile / pad-type switches.
-                def _post_create_settle(pre_ids_snap):
+                def _post_create_settle(pre_ids_snap, pre_slots_snap, gen):
+                    global _virtual_slots
                     try:
                         time.sleep(0.4)
+                        if gen != _pad_generation or _virtual_pad is None:
+                            # Closed or replaced while we slept (mapper
+                            # switched off straight after being switched
+                            # on).  Engaging HidHide now would hide the
+                            # controller with nothing left to un-hide it.
+                            return
+                        # An XInput slot that appeared with the pad IS the
+                        # pad.  Reading it back as a controller re-applied
+                        # every remap to its own output.
+                        try:
+                            _virtual_slots = set(xi.get_connected_slots() or []) - pre_slots_snap
+                        except Exception:
+                            pass
                         try:
                             post_ids = {d.get("instance_id") for d in ia.list_gamepad_class_instance_ids()
                                         if d.get("instance_id")}
@@ -2082,26 +2177,28 @@ def _ensure_virtual_pad(remap_mode: str, profile_name: Optional[str],
                             log.info(f"recorded {len(new_ids)} ViGEmBus instance ID(s)")
                         except Exception as e:
                             log.debug(f"ViGEmBus instance-ID recording failed: {e}")
-                        if profile is not None:
+                        if profile is not None and gen == _pad_generation and _virtual_pad is not None:
                             _hidhide_engage_if_needed(profile)
                     except Exception as e:
                         log.debug(f"post-pad-create settle failed: {e}")
                 threading.Thread(target=_post_create_settle,
-                                 args=(pre_ids,),
+                                 args=(pre_ids, pre_slots, gen),
                                  daemon=True,
                                  name="vpad-post-create").start()
             else:
-                log.warning("virtual pad creation failed — falling back to key emulation")
+                _vpad_retry_after = time.time() + _VPAD_RETRY_BACKOFF_S
+                log.warning("virtual pad creation failed — falling back to key emulation "
+                            f"(next attempt in {_VPAD_RETRY_BACKOFF_S:.0f}s)")
         except Exception as e:
             log.warning(f"virtual pad init failed: {e}")
             _virtual_pad = None
+            _vpad_retry_after = time.time() + _VPAD_RETRY_BACKOFF_S
     elif want and have and not _hidhide_engaged and profile is not None:
         # v3.4 — RETRY engagement.  Initial engage might have failed
         # silently (HidHide not yet installed, controller not yet detected,
         # CLI hiccup).  Throttled to once every 5s so we don't hammer the
         # CLI from the polling loop.  Means the user can install HidHide
         # while the pad is up and have it auto-cloak within 5s.
-        global _hidhide_last_retry_ts
         now = time.time()
         if now - _hidhide_last_retry_ts >= _hidhide_retry_interval:
             _hidhide_last_retry_ts = now
@@ -2112,6 +2209,8 @@ def _ensure_virtual_pad(remap_mode: str, profile_name: Optional[str],
         _virtual_pad = None
         _virtual_pad_for_profile = None
         _virtual_pad_type = None
+        _pad_generation += 1
+        _virtual_slots = set()
         _hidhide_disengage()
         log.info("virtual pad closed (mode is now key_emulation)")
 
@@ -2138,7 +2237,7 @@ def _busy_wait_until(deadline: float):
 def _polling_loop():
     # Single `global` declaration for the entire function — Python won't
     # let us redeclare it after assignments in nested blocks.
-    global _capture_value
+    global _capture_value, _toggle_hotkey_down
     # Bump Windows timer granularity to 1 ms so sleeps in our busy-wait
     # stub don't drift by 15 ms (the default).  Released on exit.
     _set_timer_granularity(1)
@@ -2225,6 +2324,13 @@ def _polling_loop():
                 # gets fed into _process_input() which fires any matching
                 # mappings + populates the capture-button buffer if the
                 # UI is waiting for a bind capture.
+                # Focus left the game with something still held: let go of it.
+                # (This used to hang off `_held_keys`, a dict nothing has
+                # written to since v3.4 — so it never ran, and a key held
+                # across an alt-tab stayed down in whatever got focus.)
+                if not in_foreground_ok and (_held_outputs or _active_macros or _turbo_threads):
+                    _release_all_held()
+
                 try:
                     from core import input_hooks
                     hook_events = input_hooks.drain_events()
@@ -2238,17 +2344,23 @@ def _polling_loop():
                 consumed_evs: set = set()  # event indices to skip in dispatch
                 if toggle_vk:
                     for i, ev in enumerate(hook_events):
-                        if (ev.get("source") == "keyboard"
-                                and ev.get("vk") == toggle_vk
-                                and ev.get("pressed")):
-                            # Toggle enabled flag and persist
+                        if ev.get("source") != "keyboard" or ev.get("vk") != toggle_vk:
+                            continue
+                        consumed_evs.add(i)     # neither edge reaches mapping dispatch
+                        if not ev.get("pressed"):
+                            _toggle_hotkey_down = False
+                        elif not _toggle_hotkey_down:
+                            # First key-down only.  Auto-repeat while the key
+                            # is held used to flip the mapper on and off ~30
+                            # times a second, rewriting the profile file and
+                            # creating / destroying the virtual pad each time.
+                            _toggle_hotkey_down = True
                             try:
                                 set_enabled(not bool(state.get("enabled")))
                                 log.info("mapper toggled via hotkey "
                                          f"VK_0x{toggle_vk:02X}")
                             except Exception as e:
                                 log.debug(f"hotkey toggle failed: {e}")
-                            consumed_evs.add(i)
 
                 for i, ev in enumerate(hook_events):
                     if i in consumed_evs:
@@ -2284,13 +2396,30 @@ def _polling_loop():
                                 src, trig, pressed_now, vk=ev.get("vk"))
                     except Exception:
                         pass
+                    # Mouse movement is data for the recorder above, never a
+                    # trigger: it has no release, so as a binding it re-fired
+                    # on every mouse event and never let go — and every "press
+                    # something to bind" prompt captured it the moment the
+                    # mouse was nudged.
+                    if src == "mouse" and trig == "M_MOVE":
+                        continue
                     # Capture-button shortcut for the bind UI
                     if pressed_now and not _capture_event.is_set():
                         _capture_value = f"{src}:{trig}"
                         _capture_event.set()
                     # Fire any matching mappings (only when in foreground)
                     if in_foreground_ok:
-                        _process_input(src, trig, pressed_now, profile, ev)
+                        try:
+                            _process_input(src, trig, pressed_now, profile, ev)
+                            # A wheel notch is a press with no release event;
+                            # synthesise one, or whatever it is bound to
+                            # stays held for good.
+                            if src == "mouse" and trig in ("M_WHEEL_UP", "M_WHEEL_DOWN"):
+                                _process_input(src, trig, False, profile, ev)
+                        except Exception as e:
+                            # One bad mapping must not drop the rest of this
+                            # batch — the key-ups in it included.
+                            log.debug(f"dispatch of {src}:{trig} failed: {e}")
 
                 # Refresh connected-slot cache periodically.  Avoids polling
                 # 4 slots per tick — at 8 kHz that's >100 µs of pure IOCTL
@@ -2310,10 +2439,22 @@ def _polling_loop():
                 _first_live_slot_this_tick = None
 
                 for slot in slots_to_poll:
+                    if slot in _virtual_slots:
+                        continue        # our own virtual pad, not an input
                     s = xi.get_state(slot)
                     if s is None:
                         if _prev_buttons[slot]:
-                            _prev_buttons[slot].clear()
+                            # The pad vanished (battery died, cable pulled)
+                            # with buttons down.  Dispatch their releases, or
+                            # whatever they were driving — a held key, a turbo,
+                            # a looping macro — carries on forever.
+                            try:
+                                if profile is not None:
+                                    _process_transitions(slot, set(), profile)
+                            except Exception as e:
+                                log.debug(f"release on disconnect failed: {e}")
+                            _prev_buttons[slot] = set()
+                        _prev_triggers[slot] = {"LT": False, "RT": False}
                         last_packets[slot] = -1
                         # Drop stale slot from cache so we re-probe next refresh
                         _slot_cache_ts = 0.0
@@ -2458,6 +2599,13 @@ def start() -> dict:
         return {"ok": True, "msg": "already running"}
     if not xi.is_available():
         return {"ok": False, "err": "XInput DLL not available on this system"}
+    # A previous run that died while HidHide was engaged left the user's
+    # controller hidden from every game.  Undo that before anything else.
+    try:
+        from core import hidhide
+        hidhide.recover_orphaned()
+    except Exception as e:
+        log.debug(f"HidHide orphan recovery failed: {e}")
     _stop.clear()
     _thread = threading.Thread(target=_polling_loop, daemon=True,
                                name="gamepad-mapper")
@@ -2482,6 +2630,18 @@ def stop() -> dict:
     except Exception:
         pass
     return {"ok": True}
+
+
+def shutdown() -> None:
+    """Leave the user's input as we found it before the process exits: stop
+    the poll loop, release every key / button / virtual-stick output we are
+    holding, and undo the HidHide cloak.  Safe to call when nothing is running."""
+    _stop.set()
+    try:
+        _release_all_held()
+    except Exception as e:
+        log.debug(f"release held outputs failed: {e}")
+    _hidhide_disengage()
 
 
 def is_running() -> bool:
@@ -2655,7 +2815,7 @@ _recoil_presets_cache: Optional[list] = None
 
 def get_recoil_presets() -> dict:
     """Load + return the curated recoil-pattern presets, MERGED with any
-    user-captured presets from %APPDATA%/GhostShell/user_recoil_presets.json.
+    user-captured presets from %APPDATA%/Vispora/user_recoil_presets.json.
     User presets are tagged `is_user: true` so the UI can render an Edit
     /Delete control on them but not on the bundled curated ones.
 
@@ -2873,7 +3033,7 @@ def save_profile(name: str, profile: dict) -> dict:
     if not name:
         return {"ok": False, "err": "name required"}
     state = _load_state()
-    profile = dict(profile)
+    profile = _strip_nulls(dict(profile))
     profile["name"] = name
     profile.setdefault("active_only_in_game", True)
     # v3 — drop the legacy `buttons` dict.  The v3.4 migration converts
@@ -2883,6 +3043,11 @@ def save_profile(name: str, profile: dict) -> dict:
     profile.setdefault("mappings", [])
     state["profiles"][name] = profile
     _save_state(state)
+    if state.get("active_profile") == name:
+        # The live profile was just replaced.  Whatever the old version was
+        # holding (a latched toggle, a key) may have no mapping left to
+        # release it.
+        _release_all_held()
     log.info(f"gamepad profile saved: {name}")
     return {"ok": True, "profile": profile}
 
@@ -2891,9 +3056,12 @@ def delete_profile(name: str) -> dict:
     state = _load_state()
     if name in state["profiles"]:
         del state["profiles"][name]
-        if state.get("active_profile") == name:
+        was_active = state.get("active_profile") == name
+        if was_active:
             state["active_profile"] = None
         _save_state(state)
+        if was_active:
+            _release_all_held()
         log.info(f"gamepad profile deleted: {name}")
     return {"ok": True}
 
@@ -2903,6 +3071,9 @@ def delete_profile(name: str) -> dict:
 # ────────────────────────────────────────────────────────────────────
 
 PROFILE_EXPORT_VERSION = 1
+PROFILE_EXPORT_FORMAT = f"{APP_NAME.lower()}-gamepad-profile"
+# Exports made before the app was renamed carry the old tag; still importable.
+_LEGACY_PROFILE_EXPORT_FORMAT = f"{LEGACY_APP_NAME.lower()}-gamepad-profile"
 
 
 def export_profile(name: str) -> dict:
@@ -2913,7 +3084,7 @@ def export_profile(name: str) -> dict:
     if not profile:
         return {"ok": False, "err": f"profile '{name}' not found"}
     blob = {
-        "_format":  "ghostshell-gamepad-profile",
+        "_format":  PROFILE_EXPORT_FORMAT,
         "_version": PROFILE_EXPORT_VERSION,
         "name":     name,
         "profile":  _strip_runtime_fields(profile),
@@ -2943,11 +3114,11 @@ def import_profile(blob: dict, override_name: Optional[str] = None) -> dict:
     """
     if not isinstance(blob, dict):
         return {"ok": False, "err": "import payload must be a JSON object"}
-    if blob.get("_format") != "ghostshell-gamepad-profile":
-        return {"ok": False, "err": "not a GhostShell gamepad profile export"}
+    if blob.get("_format") not in (PROFILE_EXPORT_FORMAT, _LEGACY_PROFILE_EXPORT_FORMAT):
+        return {"ok": False, "err": f"not a {APP_NAME} gamepad profile export"}
     version = blob.get("_version", 0)
     if not isinstance(version, int) or version > PROFILE_EXPORT_VERSION:
-        return {"ok": False, "err": f"export was created by a newer GhostShell "
+        return {"ok": False, "err": f"export was created by a newer {APP_NAME} "
                                     f"(v{version} > supported v{PROFILE_EXPORT_VERSION})"}
     profile_data = blob.get("profile")
     if not isinstance(profile_data, dict):
@@ -2964,7 +3135,7 @@ def import_profile(blob: dict, override_name: Optional[str] = None) -> dict:
 
     # Scrub list-typed fields — drop entries that aren't dicts so the
     # runtime can't trip on `m.get(...)` against a non-dict.
-    sanitized = dict(profile_data)
+    sanitized = _strip_nulls(dict(profile_data))
     dropped = 0
     for key in ("mappings", "alt_mappings"):
         arr = sanitized.get(key)
@@ -2979,8 +3150,7 @@ def import_profile(blob: dict, override_name: Optional[str] = None) -> dict:
                     m["input"] = {}
                 if not isinstance(m.get("output"), dict):
                     m["output"] = {"target": "disabled"}
-                if not m.get("id"):
-                    m["id"] = _new_id()
+                m["id"] = _safe_mapping_id(m.get("id"))
                 cleaned.append(m)
             sanitized[key] = cleaned
         elif arr is not None:
@@ -3044,7 +3214,7 @@ def set_enabled(enabled: bool) -> dict:
     log.info(f"gamepad mapper enabled = {enabled}")
 
     # v3.4 — toggle process priority so the mapper isn't throttled when
-    # actively forwarding state.  Master switch on → bump GhostShell to
+    # actively forwarding state.  Master switch on → bump Vispora to
     # Normal priority + clear EcoQoS so polling stays at 4 kHz.  Master
     # switch off AND no game running → drop back to efficiency.
     try:

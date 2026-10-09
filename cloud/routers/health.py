@@ -9,7 +9,7 @@ import asyncpg
 from db import get_db
 from settings import settings
 
-log = logging.getLogger("ghostshell-cloud.health")
+log = logging.getLogger("vispora-cloud.health")
 
 router = APIRouter(tags=["health"])
 
@@ -29,7 +29,7 @@ async def healthz(db: asyncpg.Connection = Depends(get_db)) -> dict:
 
     return {
         "ok":      True,
-        "service": "ghostshell-cloud",
+        "service": "vispora-cloud",
         "version": settings.version,
         "db":      "ok" if db_ok else "error",
     }

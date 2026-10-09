@@ -6,7 +6,7 @@ real PC* (the customer).
 
 **This module does NOT check `IsHypervisorPresent`, VBS state, or any
 hypervisor-related flag.**  Those are the wrong signals — they flip
-based on whether VBS/HVCI is enabled, which GhostShell's own kernel
+based on whether VBS/HVCI is enabled, which Vispora's own kernel
 tab toggles off as part of its tuning.  A real PC with VBS on, a real
 PC with VBS off, and a real PC with VBS toggled in either direction
 all read identically here.

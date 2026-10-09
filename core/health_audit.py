@@ -5,7 +5,7 @@ Each check returns:
     {
       'id':       short stable id (for UI keys + future fix-action wiring)
       'category': 'display' / 'memory' / 'gpu' / 'power' / 'storage' /
-                  'network' / 'system' / 'ghostshell'
+                  'network' / 'system' / 'vispora'
       'name':     human-readable label
       'severity': 'ok' / 'warn' / 'crit'
       'current':  what the system is reporting right now
@@ -391,9 +391,9 @@ def _check_trim_enabled() -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# SYSTEM / GHOSTSHELL state
+# SYSTEM / VISPORA state
 # ═══════════════════════════════════════════════════════════════════════
-def _check_ghostshell_state() -> list[dict]:
+def _check_vispora_state() -> list[dict]:
     out = []
     # Game mode running?
     try:
@@ -401,14 +401,14 @@ def _check_ghostshell_state() -> list[dict]:
         st = game_profiles.get_engine_status()
         on = bool(st.get("monitoring"))
         out.append({
-            "id": "ghostshell.gamemode", "category": "ghostshell",
+            "id": "vispora.gamemode", "category": "vispora",
             "name": "Game Mode (auto-apply)",
             "severity": "ok" if on else "warn",
             "current": "On" if on else "Off",
             "expected": "On",
             "detail": "Watching for games — applies gaming profile automatically."
                       if on else
-                      "GhostShell isn't watching for game launches.  "
+                      "Vispora isn't watching for game launches.  "
                       "Toggle from the Settings tab or the system tray.",
         })
     except Exception:
@@ -421,7 +421,7 @@ def _check_ghostshell_state() -> list[dict]:
         running = bool(s.get("running"))
         ceiling = s.get("settings", {}).get("ceiling_c", "?")
         out.append({
-            "id": "ghostshell.temp_ceiling", "category": "ghostshell",
+            "id": "vispora.temp_ceiling", "category": "vispora",
             "name": "GPU temp ceiling",
             "severity": "ok" if running else "warn",
             "current": f"{ceiling}°C ({'armed' if running else 'off'})",
@@ -442,7 +442,7 @@ def _check_ghostshell_state() -> list[dict]:
         states = adaptive_tuning.get_game_state()
         enabled_n = sum(1 for v in states.values() if v.get("enabled"))
         out.append({
-            "id": "ghostshell.adaptive", "category": "ghostshell",
+            "id": "vispora.adaptive", "category": "vispora",
             "name": "Adaptive Tuning",
             "severity": "ok" if global_on else "warn",
             "current": (f"On — {enabled_n} game(s) opted in" if global_on
@@ -450,7 +450,7 @@ def _check_ghostshell_state() -> list[dict]:
             "expected": None,
             "detail": "Tunes per-game OC offsets during real play."
                       if global_on else
-                      "Master switch is off — GhostShell isn't learning per-game OC profiles.",
+                      "Master switch is off — Vispora isn't learning per-game OC profiles.",
         })
     except Exception:
         pass
@@ -477,7 +477,7 @@ def audit() -> dict:
                _check_vbs, _check_hw_gpu_scheduling, _check_gpu_driver_age,
                _check_power_plan,
                _check_trim_enabled,
-               _check_ghostshell_state):
+               _check_vispora_state):
         try:
             checks.extend(fn() or [])
         except Exception as e:

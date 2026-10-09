@@ -1,16 +1,16 @@
-"""Twice-daily PC integrity scan — runs in the background while GhostShell
+"""Twice-daily PC integrity scan — runs in the background while Vispora
 is minimized to the tray and no game is active.
 
 The whole module is built around one principle: **failure mode = did
 nothing**.  If any precondition is unclear, any path is suspicious, any
 size is unexpected — we skip rather than delete.  This is not an
 antivirus; it's a maintenance routine that surfaces actionable findings
-to the user and tidies up files GhostShell itself created.
+to the user and tidies up files Vispora itself created.
 
 Three phases per cycle:
 
-  Phase A — GhostShell self-clean (auto-action)
-    Walks %APPDATA%/GhostShell against a hard-coded ALLOW-LIST of glob
+  Phase A — Vispora self-clean (auto-action)
+    Walks %APPDATA%/Vispora against a hard-coded ALLOW-LIST of glob
     patterns + age thresholds.  Anything not on the allow-list is
     ignored regardless of age.  Path traversal protected: the resolved
     real path must startswith APPDATA_DIR or we refuse.
@@ -27,7 +27,7 @@ Three phases per cycle:
     fires when something looks genuinely actionable.
 
 Gating (ALL must hold to start a scan):
-  • GhostShell window not in foreground
+  • Vispora window not in foreground
   • No tracked game running
   • System idle ≥ 30 s
   • System CPU < 30 %
@@ -40,7 +40,7 @@ Robustness guarantees:
   • Hard 5-minute total time budget per cycle (Phase A+B+C combined).
   • Thread runs at BELOW_NORMAL_PRIORITY_CLASS so we don't compete
     with anything the user actually cares about.
-  • Audit log at %APPDATA%/GhostShell/integrity_scan_history.json
+  • Audit log at %APPDATA%/Vispora/integrity_scan_history.json
     (ring buffer, last 100 cycles) — every deletion records
     {path, size, kind, ts}.
   • Settings toggle to disable entirely.
@@ -64,8 +64,9 @@ import time
 import subprocess
 from typing import Optional, Iterable
 
-from config import APPDATA_DIR
-from core.utils import get_logger, atomic_write_json
+from config import (APPDATA_DIR, APP_NAME, LEGACY_APP_NAME, LOG_FILE_PATH,
+                    OWN_PROCESS_NAMES, UPDATER_EXE_NAME, LEGACY_UPDATER_EXE_NAME)
+from core.utils import get_logger, atomic_write_json, is_reparse_point
 
 log = get_logger("integrity_scan")
 
@@ -98,20 +99,25 @@ GATE_RECHECK_SEC = 5 * 60
 # Age is "modified time"; any file younger gets left alone.
 # Anything NOT matched by this list is ignored entirely — no exceptions.
 
+_LOG_NAME = os.path.basename(LOG_FILE_PATH)
+
 _SELF_CLEAN_RULES = [
-    # Rotated GhostShell logs — keep the current one (no number suffix)
+    # Rotated logs — keep the current one (no number suffix)
     # and the most recent rotated one.  Older rotated logs go after 14d.
-    ("ghostshell.log.*", 14, "rotated GhostShell log"),
+    (f"{_LOG_NAME}.*", 14, "rotated log"),
+    # Logs still under the app's pre-rename name.  config.py renames them
+    # across at startup; this sweeps up any it couldn't.
+    (f"{LEGACY_APP_NAME.lower()}.log*", 14, "pre-rename log"),
 
     # Cached old installer downloads.  Once an install has happened the
     # .exe sitting in updates/ is just a stale copy of the old version.
-    # 7 days is well past any sensible re-install window.  Vispora_* is
-    # the current cache prefix post exe-rename; GhostShell_* is kept so
-    # any installer cached before the rename still gets swept up.
-    ("updates/GhostShell_*.exe", 7,  "old cached installer"),
-    ("updates/GhostShell_*.zip", 7,  "old cached source bundle"),
-    ("updates/Vispora_*.exe",    7,  "old cached installer"),
-    ("updates/Vispora_*.zip",    7,  "old cached source bundle"),
+    # 7 days is well past any sensible re-install window.  The pre-rename
+    # filename prefix is matched too, so an installer cached before the
+    # rename still gets swept up.
+    (f"updates/{APP_NAME}_*.exe",        7,  "old cached installer"),
+    (f"updates/{APP_NAME}_*.zip",        7,  "old cached source bundle"),
+    (f"updates/{LEGACY_APP_NAME}_*.exe", 7,  "old cached installer"),
+    (f"updates/{LEGACY_APP_NAME}_*.zip", 7,  "old cached source bundle"),
 
     # Partial downloads that never completed.  1 day is generous — a
     # real download finishes in seconds.
@@ -122,7 +128,7 @@ _SELF_CLEAN_RULES = [
     ("updates/update.bat",                 1,  "old update script"),
     ("updates/last_install.status",        1,  "old install status file"),
 
-    # Updater binary's own log.  GhostShellUpdater is short-lived; its
+    # Updater binary's own log.  The updater is short-lived; its
     # log fills up across many install cycles and 30 days of history is
     # plenty for any post-mortem.
     ("updater/updater.log",       30, "old updater log"),
@@ -155,7 +161,7 @@ _SELF_CLEAN_RULES = [
 # we abort the delete.  Belt-and-suspenders.
 _NEVER_TOUCH_NAMES = {
     "vault.db", "vault.db-journal", "vault.db-wal", "vault.db-shm",
-    "ghostshell.log",                       # current log — only rotated copies are cleanable
+    _LOG_NAME,                              # current log — only rotated copies are cleanable
     "install_info.json", "updater_settings.json",
     "optimizer_pro_settings.json", "autostart_settings.json",
     "background_pauser.json", "clipper_settings.json",
@@ -170,7 +176,7 @@ _NEVER_TOUCH_NAMES = {
     "integrity_scan_settings.json", "integrity_scan_history.json",
     "integrity_scan_status.json",
     # Updater & active binary cache
-    "GhostShellUpdater.exe", "updater_version.json",
+    UPDATER_EXE_NAME, LEGACY_UPDATER_EXE_NAME, "updater_version.json",
     "PresentMon.exe",
     # Recovery / install handoff
     "recovery_report.json",
@@ -178,7 +184,7 @@ _NEVER_TOUCH_NAMES = {
 
 # Directories we never recurse INTO for Phase A.  Files inside these
 # dirs are user data (snapshots, backups, profiles) and don't belong
-# to GhostShell's own scratch space.
+# to Vispora's own scratch space.
 _NEVER_RECURSE_DIRS = {
     "backups", "snapshots", "profiles", "game_profiles", "drivers",
     "bin",            # holds downloaded binaries we still need
@@ -338,16 +344,17 @@ def _get_user_idle_sec() -> float:
         lii.cbSize = ctypes.sizeof(_LII)
         if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
             return 0.0
-        tick = ctypes.windll.kernel32.GetTickCount()
-        return max(0.0, (tick - lii.dwTime) / 1000.0)
+        # DWORD tick counts; see the same probe in core/updater.py.
+        tick = ctypes.windll.kernel32.GetTickCount() & 0xFFFFFFFF
+        return ((tick - lii.dwTime) & 0xFFFFFFFF) / 1000.0
     except Exception:
         return 0.0
 
 
-def _is_ghostshell_foreground() -> bool:
+def _is_own_window_foreground() -> bool:
     try:
         from core.gamepad_mapper import _get_foreground_exe_name
-        return (_get_foreground_exe_name() or "").lower() in ("ghostshell.exe", "vispora.exe")
+        return (_get_foreground_exe_name() or "").lower() in OWN_PROCESS_NAMES
     except Exception:
         return False
 
@@ -393,8 +400,8 @@ def _safe_to_run() -> tuple[bool, str]:
     with a short string on defer."""
     if _is_game_running():
         return False, "game in foreground"
-    if _is_ghostshell_foreground():
-        return False, "GhostShell window in foreground"
+    if _is_own_window_foreground():
+        return False, f"{APP_NAME} window in foreground"
     idle = _get_user_idle_sec()
     if idle < USER_IDLE_THRESHOLD_SEC:
         return False, f"user active ({int(idle)}s idle)"
@@ -404,7 +411,7 @@ def _safe_to_run() -> tuple[bool, str]:
     return True, ""
 
 
-# ─── Phase A: GhostShell self-clean ──────────────────────────────────
+# ─── Phase A: Vispora self-clean ──────────────────────────────────
 
 def _resolve_inside_appdata(path: str) -> Optional[str]:
     """Return the real path iff it resolves inside APPDATA_DIR.
@@ -536,7 +543,7 @@ def _phase_a2_prune_driver_cache(deadline_ts: float) -> dict:
 
     These are ~960 MB each — they blow past Phase A's 200 MB per-file
     safety cap by design, so the generic allow-list can't touch them.
-    This dedicated step targets ONLY drivers/*.exe (a known, GhostShell-
+    This dedicated step targets ONLY drivers/*.exe (a known, Vispora-
     managed, always-large-and-safe pattern) and removes any older than
     30 days.  By then the user has either installed the driver (making
     the installer dead weight) or abandoned it (a re-check re-downloads).
@@ -618,7 +625,7 @@ def _phase_b_temp_cleanup(deadline_ts: float, settings: dict) -> dict:
     seen_real = set()
     candidates = []
     # Hard rule — never clean inside any path under %WINDIR% (typically
-    # C:\Windows).  When GhostShell runs as admin via UAC, %TEMP% can
+    # C:\Windows).  When Vispora runs as admin via UAC, %TEMP% can
     # resolve to C:\Windows\Temp; cleaning that is firmly system-side
     # territory and we keep our hands off.
     win_dir = os.environ.get("WINDIR") or r"C:\Windows"
@@ -651,8 +658,12 @@ def _phase_b_temp_cleanup(deadline_ts: float, settings: dict) -> dict:
             if time.time() > deadline_ts:
                 break
             # Don't recurse into the directory holding the running
-            # GhostShell extraction (_MEI*) — that'd kill us.
-            dirs[:] = [d for d in dirs if not d.startswith("_MEI")]
+            # Vispora extraction (_MEI*) — that'd kill us.
+            # ...nor into junctions / directory symlinks: os.walk follows
+            # them, and one planted under %TEMP% would have us deleting
+            # "old temp files" out of wherever it points.
+            dirs[:] = [d for d in dirs if not d.startswith("_MEI")
+                       and not is_reparse_point(os.path.join(root, d))]
             for fname in files:
                 if time.time() > deadline_ts:
                     break
@@ -821,7 +832,7 @@ def _phase_c_health_probe(deadline_ts: float) -> dict:
     if time.time() > deadline_ts:
         return {"phase": "C", "findings": findings, "notes": notes, "incomplete": True}
 
-    # ---- Top 5 RAM consumers (excluding GhostShell itself) ----
+    # ---- Top 5 RAM consumers (excluding Vispora itself) ----
     try:
         import psutil
         rows = []
@@ -845,7 +856,7 @@ def _phase_c_health_probe(deadline_ts: float) -> dict:
             t for t in top5
             if t["rss_mb"] > 4096
             and t["name"].lower() not in (
-                "ghostshell.exe", "vispora.exe", "chrome.exe", "msedge.exe", "firefox.exe",
+                *OWN_PROCESS_NAMES, "chrome.exe", "msedge.exe", "firefox.exe",
                 "obs64.exe", "discord.exe", "spotify.exe",
             )
         ]

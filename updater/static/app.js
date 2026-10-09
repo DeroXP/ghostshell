@@ -6,7 +6,8 @@ let _pollTimer = null;
 let _lastPhase = null;
 let _autoConfirmed = false;
 let _dirPickerForced = false;   // user clicked "Change…" — keep picker open
-// v1.3.0 — the install pipeline launches GhostShell at step 6.  Once
+let _autoCloseFired = false;    // was never declared: reading it threw, so the window never closed itself
+// v1.3.0 — the install pipeline launches Vispora at step 6.  Once
 // phase=done lands, the updater has nothing left to do — close
 // immediately rather than counting down 3 seconds.  The brief "Update
 // complete" banner still flashes for the ~250ms transition before the
@@ -166,7 +167,7 @@ function renderButtons(st) {
                   || st.phase === 'launching';
 
     if (st.phase === 'done') {
-        // v1.2.0 — pipeline already launched GhostShell at step 6.
+        // v1.2.0 — pipeline already launched Vispora at step 6.
         // Only show the "Close now" button so users who want to dismiss
         // immediately can; the auto-close countdown handles the rest.
         btnStart.style.display  = 'none';
@@ -213,7 +214,7 @@ async function pollStatus() {
     renderButtons(st);
     document.getElementById('progress-fill').style.width = (st.progress || 0) + '%';
 
-    // Auto-confirm: skip the "click Install" gate when GhostShell told
+    // Auto-confirm: skip the "click Install" gate when Vispora told
     // us to install immediately.  Only relevant in update mode — fresh
     // installs always need the user to confirm the directory.
     if (st.auto_confirm && !_autoConfirmed
@@ -224,10 +225,10 @@ async function pollStatus() {
         onStart();
     }
 
-    // v1.3.0 — install pipeline reached step 6 (launch new GhostShell)
+    // v1.3.0 — install pipeline reached step 6 (launch new Vispora)
     // and succeeded.  Tear down the updater immediately — no point
     // counting down with the user staring at a redundant window after
-    // GhostShell has already taken focus.
+    // Vispora has already taken focus.
     if (st.phase === 'done' && !_autoCloseFired) {
         _autoCloseFired = true;
         _closeUpdaterNow();
@@ -278,7 +279,7 @@ async function onCancel() {
     }
 }
 
-// v1.2.0 — onLaunch() removed.  GhostShell is now auto-launched by
+// v1.2.0 — onLaunch() removed.  Vispora is now auto-launched by
 // installer.py step 6, so there's no manual button to wire up.  The
 // /api/launch-app endpoint stays as a fallback for headless scripting
 // but the UI no longer surfaces it.

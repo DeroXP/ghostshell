@@ -1,5 +1,5 @@
 """Game Library Scanner — discover what games are installed across all major
-PC launchers so GhostShell can pre-populate AT profiles and surface them on
+PC launchers so Vispora can pre-populate AT profiles and surface them on
 the dashboard before the user has to launch each title once.
 
 Supported launchers:
@@ -14,7 +14,7 @@ Supported launchers:
 
 Each scanner is best-effort and exception-safe: failure of one launcher
 never blocks discovery via another.  Results are cached in
-%APPDATA%\\GhostShell\\library_cache.json and only re-scanned on demand.
+%APPDATA%\\Vispora\\library_cache.json and only re-scanned on demand.
 
 Each detected game is enriched with:
     title           — display name
@@ -27,7 +27,7 @@ Each detected game is enriched with:
 Public API:
     scan_all(force=False)   -> {"games": [...], "scanned_at": ts}
     get_cached()            -> last cached scan or empty
-    get_known_only()        -> filter to only games GhostShell already
+    get_known_only()        -> filter to only games Vispora already
                                 recognizes (so the dashboard doesn't list
                                 every Unity tool / launcher EXE)
 """
@@ -635,7 +635,7 @@ def get_cached() -> dict:
 
 
 def get_known_only() -> list[dict]:
-    """Filter to titles GhostShell already recognizes (cleaner UI)."""
+    """Filter to titles Vispora already recognizes (cleaner UI)."""
     cached = get_cached()
     return [g for g in cached.get("games", []) if g.get("known")]
 

@@ -4,7 +4,7 @@ __pycache__/
 *.pyo
 
 # PyInstaller build artifacts — release binaries are tracked in the
-# ghostshell-site repo (releases/<channel>/GhostShell.exe), not here.
+# release-site repo (releases/<channel>/Vispora.exe), not here.
 build/
 build_*/
 build-*/

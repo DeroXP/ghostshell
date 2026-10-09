@@ -23,7 +23,7 @@ import ctypes
 import os
 from ctypes import (
     c_int, c_int32, c_uint32, c_void_p, c_char_p,
-    POINTER, byref, Structure, Union, sizeof, WINFUNCTYPE, addressof,
+    POINTER, byref, Structure, Union, sizeof, WINFUNCTYPE,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -538,6 +538,9 @@ def set_core_vf_offset(offset_mhz: int) -> dict:
     Args:
         offset_mhz: signed MHz offset (+200 = +200 MHz OC, 0 = stock)
     """
+    global _this_process_wrote_offsets
+    if offset_mhz:
+        _this_process_wrote_offsets = True    # see _shutdown_cleanup
     avail = is_available()
     if not avail.get("ok"):
         return {"ok": False, "err": avail.get("err", "NVAPI not available")}
@@ -652,6 +655,9 @@ def set_offsets(core_offset_mhz: int = 0, mem_offset_mhz: int = 0) -> dict:
         core_offset_mhz: signed MHz (e.g. +200, -50, 0 = stock)
         mem_offset_mhz:  signed MHz
     """
+    global _this_process_wrote_offsets
+    if core_offset_mhz or mem_offset_mhz:
+        _this_process_wrote_offsets = True    # see _shutdown_cleanup
     avail = is_available()
     if not avail.get("ok"):
         return {"ok": False, "err": avail.get("err", "NVAPI not available")}
@@ -756,16 +762,6 @@ def set_offsets(core_offset_mhz: int = 0, mem_offset_mhz: int = 0) -> dict:
     return result
 
 
-def reset_offsets() -> dict:
-    """Reset core and memory offsets to zero (stock).
-
-    Goes through the same dual-path as set_offsets so a stuck offset
-    from a previous session can be cleared even if the V/F curve and
-    P-state writes have started disagreeing.
-    """
-    return set_offsets(0, 0)
-
-
 def force_reset_all() -> dict:
     """v2.9.1 — aggressive reset for stuck state.
 
@@ -809,39 +805,24 @@ def force_reset_all() -> dict:
     return out
 
 
-def get_gpu_info() -> dict:
-    """Quick test: load NVAPI and report what we find.
-
-    Returns:
-        {'ok': bool, 'gpu_count': int, 'first_handle': int (as int), 'err': str}
-    """
-    avail = is_available()
-    if not avail.get("ok"):
-        return {"ok": False, "err": avail.get("err", "NVAPI unavailable")}
-    if not _nvapi.initialized:
-        return {"ok": False, "err": "NVAPI not initialized"}
-
-    gpus = (c_void_p * NVAPI_MAX_PHYSICAL_GPUS)()
-    count = c_uint32(0)
-    r = _nvapi.fn_enum_gpus(byref(gpus), byref(count))
-    if r != NVAPI_OK:
-        return {"ok": False, "err": _nvapi.error_message(r)}
-    return {
-        "ok": True,
-        "gpu_count": count.value,
-        "first_handle_int": int(gpus[0] or 0),
-    }
-
-
-# v3 — Cleanup at process exit.  CRITICAL: zero the offsets BEFORE
-# unloading the NVAPI library.  Without this, any OC the user had
-# active when they closed GhostShell persists in the live driver until
-# the next reboot — and if GhostShell crashed mid-tune, the user could
-# be left at an offset that just blue-screened their GPU.
+# Cleanup at interpreter exit: a safety net for the process dying on an
+# unhandled error while it holds an overclock (the normal quit paths end in
+# os._exit(), which skips atexit, and do their own restore in app.py).
+#
+# It only acts if THIS process wrote a non-zero offset.  It used to reset
+# unconditionally — so any process that merely imported this module reset the
+# card on its way out.  That included the second instance started when the
+# user launches the exe while Vispora is already in the tray: it hands off to
+# the first and exits, and took the first instance's overclock with it (the
+# "OC offset drift … Re-asserting" seconds after every "handing off" in the log).
 import atexit
+
+_this_process_wrote_offsets = False
 
 
 def _shutdown_cleanup():
+    if not _this_process_wrote_offsets:
+        return
     try:
         force_reset_all()
     except Exception:

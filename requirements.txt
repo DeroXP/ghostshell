@@ -4,6 +4,13 @@ pywebview>=5.0
 pyinstaller>=6.0
 pystray>=0.19
 Pillow>=10.0
-# v3.6 — recoil pattern capture (FFT-based screen tracking + fast capture)
+psutil
+# Recoil-pattern capture (FFT-based screen tracking + fast capture), screenshots
 numpy>=1.26
 mss>=10.0
+# Optional features — each degrades gracefully when its package is missing,
+# but build.spec bundles them, so install them on the machine that builds.
+vgamepad            # virtual controller (needs the ViGEmBus driver)
+PyAudioWPatch       # system-audio capture for clips (WASAPI loopback)
+obsws-python        # OBS Studio backend for clips / stream helper
+websocket-client    # transport used by obsws-python

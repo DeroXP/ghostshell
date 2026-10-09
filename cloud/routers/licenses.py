@@ -4,7 +4,7 @@ public "what we know about you" trust endpoint.
 The flow:
   1. User pays via Stripe → webhook mints a license + emails the key
      (Phase B.3 — landing soon).
-  2. User pastes the key into GhostShell → client calls /activate with
+  2. User pastes the key into Vispora → client calls /activate with
      the raw hardware fingerprint inputs.  Server hashes them with the
      fingerprint pepper and consumes one of 5 slots.
   3. App launches in future → /validate confirms the license is still
@@ -32,15 +32,10 @@ from fastapi import APIRouter, Depends, HTTPException, Path
 from pydantic import BaseModel, Field
 
 from db import get_db
-from security import (
-    hash_fingerprint,
-    hash_license_key,
-    is_valid_license_key_format,
-    normalize_license_key,
-)
+from security import hash_fingerprint, hash_license_key, is_valid_license_key_format
 from settings import settings
 
-log = logging.getLogger("ghostshell-cloud.licenses")
+log = logging.getLogger("vispora-cloud.licenses")
 
 router = APIRouter(prefix="/v1/licenses", tags=["licenses"])
 

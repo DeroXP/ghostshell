@@ -20,13 +20,13 @@ gaming session).
 CRASH SAFETY
 -----------
 We persist the list of suspended PIDs to disk BEFORE freezing them.
-On startup, GhostShell calls `recover_orphans()` which:
+On startup, Vispora calls `recover_orphans()` which:
   1. Reads the persisted PID list
   2. Calls NtResumeProcess on every PID still alive
   3. Wipes the file
 
-So a GhostShell crash mid-game can never leave a browser frozen across
-a reboot — at worst the user has to launch GhostShell once more.
+So a Vispora crash mid-game can never leave a browser frozen across
+a reboot — at worst the user has to launch Vispora once more.
 """
 
 from __future__ import annotations
@@ -35,10 +35,9 @@ import json
 import os
 import time
 from ctypes import wintypes
-from typing import Optional
 
 from core.utils import get_logger, atomic_write_json
-from config import APPDATA_DIR
+from config import APPDATA_DIR, OWN_PROCESS_NAMES
 
 log = get_logger(__name__)
 
@@ -73,7 +72,7 @@ TARGETS: dict[str, dict] = {
             "chrome.exe",
             "msedge.exe",
             # NOTE: msedgewebview2.exe is INTENTIONALLY OMITTED — it hosts
-            # pywebview (GhostShell's own UI), Slack, Teams, the Outlook PWA,
+            # pywebview (Vispora's own UI), Slack, Teams, the Outlook PWA,
             # Notion's app, etc.  Pausing it freezes our own window mid-game.
             "firefox.exe",
             "brave.exe",
@@ -124,8 +123,8 @@ NEVER_PAUSE_EXES = {
     "ubisoftconnect.exe", "uplay.exe", "ea.exe", "eadesktop.exe",
     "origin.exe", "riotclientux.exe", "rockstargameslauncher.exe",
     "galaxyclient.exe", "gog galaxy.exe",
-    # GhostShell / Vispora itself
-    "ghostshell.exe", "vispora.exe", "python.exe", "pythonw.exe",
+    # Vispora itself
+    *OWN_PROCESS_NAMES, "python.exe", "pythonw.exe",
     # Windows core
     "explorer.exe", "winlogon.exe", "csrss.exe", "smss.exe",
     "lsass.exe", "services.exe", "system.exe", "system idle process",
@@ -280,6 +279,47 @@ def _list_target_processes() -> list[dict]:
     return out
 
 
+def _recorded_pids() -> list:
+    """The PIDs we currently hold suspended, as persisted on disk."""
+    return list((_load_json(PAUSED_PIDS_PATH, None) or {}).get("pids") or [])
+
+
+def _write_recorded_pids(pids: list) -> None:
+    if pids:
+        _save_json(PAUSED_PIDS_PATH, {"pids": pids, "started_at": time.time()})
+    else:
+        try:
+            os.remove(PAUSED_PIDS_PATH)
+        except OSError:
+            pass
+
+
+def pause_pid(pid: int, name: str = "", reason: str = "manual") -> bool:
+    """Suspend one specific process and record it alongside the auto-paused
+    ones, so "Resume now" and next-launch orphan recovery cover it too."""
+    pid = int(pid)
+    # Never ourselves, and never anything on the hard-deny list — freezing
+    # dwm.exe or csrss.exe freezes the whole desktop.
+    if pid == os.getpid():
+        return False
+    try:
+        import psutil
+        if psutil.Process(pid).name().lower() in NEVER_PAUSE_EXES:
+            return False
+    except Exception:
+        pass
+    recorded = _recorded_pids()
+    if any(p.get("pid") == pid for p in recorded):
+        return True          # already suspended by us — never stack a second suspend
+    # Persist FIRST so a crash mid-suspend can't strand the process
+    _write_recorded_pids(recorded + [{"pid": pid, "name": name, "rss": 0,
+                                      "ts": time.time(), "reason": reason}])
+    if _suspend_pid(pid):
+        return True
+    _write_recorded_pids(recorded)
+    return False
+
+
 def pause_now(reason: str = "manual") -> dict:
     """Suspend every running process matching an enabled target exe.
 
@@ -295,10 +335,17 @@ def pause_now(reason: str = "manual") -> dict:
 
     min_ram_bytes = int(s.get("min_pause_ram_mb", 50)) * 1024 * 1024
 
+    # A PID already on record is already suspended (auto-pause at game start
+    # followed by a manual "Pause now", or Tournament Mode plus a game).
+    # Suspending it again would raise its suspend count to 2; the single
+    # resume at game exit would then leave it frozen with the record gone.
+    recorded = _recorded_pids()
+    already = {p.get("pid") for p in recorded}
+
     # Persist FIRST so a crash mid-suspend can't strand a process
     persist = []
     for p in procs:
-        if p["rss"] < min_ram_bytes:
+        if p["rss"] < min_ram_bytes or p["pid"] in already:
             continue
         persist.append({"pid": p["pid"], "name": p["name"],
                         "rss": p["rss"], "ts": time.time(),
@@ -307,7 +354,7 @@ def pause_now(reason: str = "manual") -> dict:
         return {"ok": True, "paused": [], "total_freed_mb": 0,
                 "msg": f"no targets above {min_ram_bytes//1024//1024} MB threshold"}
 
-    _save_json(PAUSED_PIDS_PATH, {"pids": persist, "started_at": time.time()})
+    _write_recorded_pids(recorded + persist)
 
     paused: list[dict] = []
     failed: list[dict] = []
@@ -337,6 +384,7 @@ def resume_now(reason: str = "manual") -> dict:
 
     resumed: list[dict] = []
     not_alive: list[dict] = []
+    still_frozen: list[dict] = []
     for p in state["pids"]:
         try:
             if not psutil.pid_exists(p["pid"]):
@@ -344,15 +392,15 @@ def resume_now(reason: str = "manual") -> dict:
                 continue
             if _resume_pid(p["pid"]):
                 resumed.append(p)
+            else:
+                still_frozen.append(p)
         except Exception as e:        # noqa: BLE001
+            still_frozen.append(p)
             log.debug(f"resume_pid({p['pid']}) failed: {e}")
 
-    # Wipe the persisted file regardless — even processes that have already
-    # exited shouldn't sit in the file forever
-    try:
-        os.remove(PAUSED_PIDS_PATH)
-    except OSError:
-        pass
+    # Keep only what is alive and still frozen, so "Resume now" and the
+    # next-launch recovery can try those again.  Everything else is done.
+    _write_recorded_pids(still_frozen)
 
     log.info(f"Background pauser: resumed {len(resumed)} process(es), "
              f"{len(not_alive)} no longer alive, reason={reason}")
@@ -360,7 +408,7 @@ def resume_now(reason: str = "manual") -> dict:
 
 
 def recover_orphans() -> dict:
-    """Called at GhostShell startup.  If a previous run died mid-game and
+    """Called at Vispora startup.  If a previous run died mid-game and
     left processes suspended, resume them now so the user isn't stuck with
     a frozen browser."""
     state = _load_json(PAUSED_PIDS_PATH, None)

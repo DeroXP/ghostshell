@@ -33,9 +33,8 @@ import statistics
 import threading
 import time
 from collections import deque
-from typing import Any, Optional
+from typing import Any
 
-from config import APPDATA_DIR
 from core.utils import get_logger
 
 log = get_logger("perf_monitor")
@@ -63,12 +62,11 @@ _lock = threading.Lock()
 
 
 # ─── Sampling loop ────────────────────────────────────────────────────────
-def _sampler_loop() -> None:
+def _sampler_loop(stop_event: threading.Event) -> None:
     log.info(f"perf_monitor sampler started ({SAMPLE_INTERVAL_S * 1000:.0f}ms cadence)")
     from core import gpu_overclock
 
-    stop_event = _state["stop_event"]
-    while stop_event is not None and not stop_event.is_set():
+    while not stop_event.is_set():
         ts = time.time()
         try:
             s = gpu_overclock.read_live_state()
@@ -95,7 +93,9 @@ def _sampler_loop() -> None:
         stop_event.wait(SAMPLE_INTERVAL_S)
 
     with _lock:
-        _state["running"] = False
+        # A newer sampler may already have replaced this one (stop→start).
+        if _state["stop_event"] is stop_event:
+            _state["running"] = False
     log.info("perf_monitor sampler stopped")
 
 
@@ -108,14 +108,18 @@ def start(consumer: str = "manual") -> dict:
     Use the same string in stop() to release the refcount."""
     with _lock:
         _state["consumers"].add(consumer)
-        if _state["running"]:
+        ev = _state["stop_event"]
+        # Still "running" but already told to stop = a thread on its way
+        # out; treating that as running left a consumer with no sampler.
+        if _state["running"] and ev is not None and not ev.is_set():
             return {"ok": True, "msg": "already running",
                     "consumers": list(_state["consumers"])}
-        _state["stop_event"]  = threading.Event()
+        ev = threading.Event()
+        _state["stop_event"]  = ev
         _state["running"]     = True
         _state["started_at"]  = time.time()
         _state["samples"]     = deque(maxlen=RING_BUFFER_SIZE)
-        t = threading.Thread(target=_sampler_loop, daemon=True,
+        t = threading.Thread(target=_sampler_loop, args=(ev,), daemon=True,
                              name="perf-sampler")
         _state["thread"] = t
         t.start()

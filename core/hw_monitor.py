@@ -6,7 +6,7 @@
     single LibreHardwareMonitor query) silently returned None on
     modern desktops without LHM installed, leaving the tile blank.
     New approach tries LHM, OHM, ACPI in sequence and logs each
-    miss at INFO level so it's clear from ghostshell.log which
+    miss at INFO level so it's clear from vispora.log which
     source paid off (or whether none did).
 
   * RAM standby — Get-Counter was returning 0 on this user's machine
@@ -126,7 +126,7 @@ def _sample_cpu():
         if t is not None: data["temp"], data["temp_source"] = t, "PerfFormatted ThermalZone"
 
     # Surface the source we landed on (or didn't) exactly once so
-    # ghostshell.log records which read path is paying off without
+    # vispora.log records which read path is paying off without
     # noise on every poll.
     global _cpu_temp_source
     if data["temp"] is not None and data.get("temp_source") and data["temp_source"] != _cpu_temp_source:
@@ -136,12 +136,12 @@ def _sample_cpu():
         # 3.3.3: LibreHardwareMonitor is now auto-installed by the
         # dependency manager + auto-launched on boot, so this warning
         # should be rare.  When it does fire, the auto-install probably
-        # hit an error; check ghostshell.log for "lhm-winget" install
+        # hit an error; check vispora.log for "lhm-winget" install
         # output to see why.
         log.warning(
             "CPU temp unavailable — neither LibreHardwareMonitor (auto-installed) "
             "nor any other WMI temp provider returned a sane reading.  "
-            "Check %APPDATA%/GhostShell/install_logs/ for 'lhm-winget' output, "
+            "Check %APPDATA%/Vispora/install_logs/ for 'lhm-winget' output, "
             "or open Settings > Dependencies and click 'Install' on the LHM row."
         )
         _cpu_temp_source = "<none>"
@@ -830,7 +830,7 @@ $sw.Stop()
 
     # Disk sequential write/read (small test)
     r3 = run_ps("""
-$testFile = "$env:TEMP\\ghostshell_bench.tmp"
+$testFile = "$env:TEMP\\vispora_bench.tmp"
 $size = 50MB
 $data = New-Object byte[] $size
 $sw = [System.Diagnostics.Stopwatch]::StartNew()

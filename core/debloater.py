@@ -3,6 +3,7 @@ import json
 import os
 from config import (BLOATWARE_APPS, SERVICES_TO_DISABLE,
                     SCHEDULED_TASKS_TO_DISABLE, APPDATA_DIR)
+from core import sys_state
 from core.utils import run_ps, run_cmd, get_logger, backup_registry, detect_drive_type
 
 log = get_logger("debloat")
@@ -14,6 +15,9 @@ log = get_logger("debloat")
 # 4=disabled.
 _SERVICE_BACKUP_PATH = os.path.join(APPDATA_DIR, "debloat_service_backup.json")
 _START_INT_TO_KEYWORD = {0: "boot", 1: "system", 2: "auto", 3: "demand", 4: "disabled"}
+
+_TASK_SCOPE = "debloat"         # sys_state / reg_originals scope for the tasks disabled here
+sys_state.allow("task", SCHEDULED_TASKS_TO_DISABLE)
 
 
 def _read_service_start(service_id: str):
@@ -115,8 +119,18 @@ def scan_services() -> list[dict]:
 # ---------------------------------------------------------------------------
 # Removal actions
 # ---------------------------------------------------------------------------
+_KNOWN_PACKAGE_IDS = frozenset(a["id"] for a in BLOATWARE_APPS)
+
+
 def remove_app(package_id: str) -> dict:
     """Remove an AppX package for all users."""
+    # The id is spliced into a PowerShell command as a *wildcard* match, so it
+    # must be one of ours: an arbitrary string could carry its own commands,
+    # and even an innocent one like "Microsoft" would match — and remove —
+    # every Microsoft package on the machine.
+    if package_id not in _KNOWN_PACKAGE_IDS:
+        log.warning(f"Refusing to remove unknown package id: {package_id!r}")
+        return {"ok": False, "id": package_id, "err": "unknown package"}
     log.info(f"Removing package: {package_id}")
     r = run_ps(
         f'Get-AppxPackage -AllUsers *{package_id}* | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue'
@@ -220,17 +234,27 @@ def restore_services() -> dict:
 
 
 def disable_scheduled_task(task_path: str) -> dict:
-    """Disable a scheduled task."""
+    """Disable a scheduled task, noting that it was enabled so
+    restore_scheduled_tasks() can switch it back on.  (There used to be no
+    way to undo this.)"""
     log.info(f"Disabling task: {task_path}")
-    r = run_ps(f'Disable-ScheduledTask -TaskName "{task_path}" -ErrorAction SilentlyContinue')
-    # Alternative via schtasks
-    if not r["ok"]:
-        r = run_cmd(["schtasks", "/Change", "/TN", task_path, "/Disable"])
-    if r["ok"]:
+    if sys_state.disable_task(task_path, scope=_TASK_SCOPE):
         log.info(f"  ✓ Disabled task {task_path}")
         return {"ok": True, "task": task_path}
-    log.warning(f"  ✗ Failed task {task_path}: {r['err']}")
-    return {"ok": False, "task": task_path, "err": r["err"]}
+    log.warning(f"  ✗ Failed task {task_path}")
+    return {"ok": False, "task": task_path, "err": "schtasks could not disable it"}
+
+
+def restore_scheduled_tasks() -> dict:
+    """Re-enable the scheduled tasks the debloater disabled — the ones that
+    were enabled before it ran."""
+    r = sys_state.restore_kind("task", scope=_TASK_SCOPE)
+    rows = []
+    if r["restored"] or r["failed"]:
+        rows.append({"name": f"{r['restored']} scheduled task(s) re-enabled"
+                             + (f" ({r['failed']} could not be)" if r["failed"] else ""),
+                     "ok": r["failed"] == 0})
+    return {"ok": r["failed"] == 0, "restored": r["restored"], "failed": r["failed"], "results": rows}
 
 
 def disable_all_scheduled_tasks() -> list[dict]:
@@ -320,7 +344,7 @@ def uninstall_onedrive() -> dict:
 #
 # Fix: register a no-op handler in HKCU\Software\Classes — Windows now
 # silently invokes our stub instead of asking the user.  Per-user override
-# = no admin needed for this specific path, and uninstalling GhostShell
+# = no admin needed for this specific path, and uninstalling Vispora
 # doesn't leave system-wide remnants.
 #
 # Idempotent: re-running just refreshes the same registry values.

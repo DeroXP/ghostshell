@@ -1,19 +1,19 @@
-"""GhostShell start-on-boot management — Scheduled Task edition (v2.9.7).
+"""Vispora start-on-boot management — Scheduled Task edition (v2.9.7).
 
 WHY THE REWRITE
 ---------------
 The earlier (v2.9.5 / v2.9.6) implementation used `HKCU\\…\\Run` to register a
 PowerShell command line that did `Start-Sleep -Seconds N; Start-Process
-GhostShell.exe`.  Two real problems with that:
+Vispora.exe`.  Two real problems with that:
 
   1. A PowerShell process is alive in the user's session for the entire
      delay window.  It's hidden (`-WindowStyle Hidden`) but it shows up
      in Task Manager — and "powershell.exe with no parent app" is the
      exact thing security-conscious users right-click → End Task on.
-     If they kill it, GhostShell never launches.
+     If they kill it, Vispora never launches.
 
   2. Run-key entries inherit the launching user's privileges.  Since
-     GhostShell.exe has `uac_admin=True`, the launch would trigger a
+     Vispora.exe has `uac_admin=True`, the launch would trigger a
      UAC prompt at every login — the kind of thing that trains users
      to click "Yes" on UAC dialogs without reading them.
 
@@ -30,7 +30,7 @@ Implementation:
   * `set_delay()` → re-write the XML with a new <Delay>PTNNs</Delay>.
   * `get_status()` → `schtasks /Query /TN <name>` to confirm registration.
 
-Scheduled task creation requires admin rights, which GhostShell already has
+Scheduled task creation requires admin rights, which Vispora already has
 (`uac_admin=True` in the build spec), so we're not adding any new privilege
 requirement.
 
@@ -39,6 +39,10 @@ MIGRATION
 Any users who enabled autostart on v2.9.5/v2.9.6 have a leftover entry in
 `HKCU\\…\\Run`.  On enable() we always wipe that entry too so the OS
 doesn't end up running both.
+
+Builds from before the app was renamed registered the task under the old
+name (LEGACY_TASK_NAME).  It is replaced by TASK_NAME on the first launch
+of a renamed build, and removed alongside it on disable().
 """
 import json
 import os
@@ -46,16 +50,18 @@ import subprocess
 import sys
 from typing import Optional
 
-from config import APP_NAME, APPDATA_DIR
+from config import APP_NAME, LEGACY_APP_NAME, APPDATA_DIR
 from core.utils import get_logger, atomic_write_json
 
 log = get_logger("autostart")
 
 STARTUP_DELAY_SECONDS_DEFAULT = 30
-TASK_NAME       = "GhostShell-Autostart"
-SETTINGS_PATH   = os.path.join(APPDATA_DIR, "autostart_settings.json")
-LEGACY_RUN_KEY  = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
-LEGACY_VALUE    = APP_NAME
+TASK_NAME        = f"{APP_NAME}-Autostart"
+LEGACY_TASK_NAME = f"{LEGACY_APP_NAME}-Autostart"
+SETTINGS_PATH    = os.path.join(APPDATA_DIR, "autostart_settings.json")
+LEGACY_RUN_KEY   = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+# The Run-key value was named after the app as it was called in v2.9.x.
+LEGACY_VALUE     = LEGACY_APP_NAME
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -134,8 +140,8 @@ def _build_task_xml(exe_path: str, delay_seconds: int) -> str:
         '<?xml version="1.0" encoding="UTF-16"?>\n'
         '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
         '  <RegistrationInfo>\n'
-        '    <Description>GhostShell startup launcher (delayed)</Description>\n'
-        '    <Author>GhostShell</Author>\n'
+        '    <Description>Vispora startup launcher (delayed)</Description>\n'
+        '    <Author>Vispora</Author>\n'
         '    <URI>\\' + TASK_NAME + '</URI>\n'
         '  </RegistrationInfo>\n'
         '  <Triggers>\n'
@@ -187,6 +193,17 @@ def _build_task_xml(exe_path: str, delay_seconds: int) -> str:
     )
 
 
+def _task_exists(name: str) -> bool:
+    return _run(["schtasks", "/Query", "/TN", name])["ok"]
+
+
+def _delete_task(name: str) -> dict:
+    """Delete a scheduled task.  A task that isn't registered counts as success."""
+    r = _run(["schtasks", "/Delete", "/TN", name, "/F"])
+    not_found = "cannot find" in (r["err"] + r["out"]).lower()
+    return {"ok": r["ok"] or not_found, "err": "" if (r["ok"] or not_found) else r["err"]}
+
+
 def _purge_legacy_run_key():
     """One-shot cleanup: remove old v2.9.5/2.9.6 Run-key entry, if any."""
     r = _run(["reg", "query", LEGACY_RUN_KEY, "/v", LEGACY_VALUE])
@@ -203,11 +220,9 @@ def get_status() -> dict:
     settings = _load_settings()
     exe = _current_exe_path()
 
-    # Cross-check: does the task actually exist?
-    task_exists = False
-    q = _run(["schtasks", "/Query", "/TN", TASK_NAME])
-    if q["ok"]:
-        task_exists = True
+    # Cross-check: does the task actually exist?  One registered by a
+    # pre-rename build still launches us at logon, so it counts.
+    task_exists = _task_exists(TASK_NAME) or _task_exists(LEGACY_TASK_NAME)
 
     # Detect if there's a leftover legacy Run-key entry too (UI can warn).
     legacy = _run(["reg", "query", LEGACY_RUN_KEY, "/v", LEGACY_VALUE])
@@ -225,7 +240,7 @@ def get_status() -> dict:
 
 
 def enable(delay_seconds: Optional[int] = None) -> dict:
-    """Register GhostShell as a scheduled task that runs at logon.
+    """Register Vispora as a scheduled task that runs at logon.
 
     Args:
         delay_seconds: how long after login to wait before launching.
@@ -251,7 +266,7 @@ def enable(delay_seconds: Optional[int] = None) -> dict:
     # Write the XML.  schtasks expects UTF-16 LE with BOM.
     import tempfile
     xml = _build_task_xml(exe, delay_seconds)
-    fd, xml_path = tempfile.mkstemp(prefix="ghostshell_autostart_", suffix=".xml",
+    fd, xml_path = tempfile.mkstemp(prefix="vispora_autostart_", suffix=".xml",
                                     dir=APPDATA_DIR)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -272,6 +287,10 @@ def enable(delay_seconds: Optional[int] = None) -> dict:
                 "err": f"schtasks /Create failed (rc={r['rc']}): "
                        f"{(r['err'] or r['out'])[:300]}"}
 
+    # The new task is in place — drop the pre-rename one so the app isn't
+    # launched twice at logon.
+    _delete_task(LEGACY_TASK_NAME)
+
     settings["enabled"] = True
     settings["delay_seconds"] = delay_seconds
     _save_settings(settings)
@@ -287,10 +306,9 @@ def enable(delay_seconds: Optional[int] = None) -> dict:
 
 def disable() -> dict:
     """Remove the scheduled task.  Always succeeds even if not registered."""
-    r = _run(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"])
-    # rc=1 with "cannot find" is fine — nothing to delete
-    not_found = "cannot find" in (r["err"] + r["out"]).lower()
-    success = r["ok"] or not_found
+    r = _delete_task(TASK_NAME)
+    legacy = _delete_task(LEGACY_TASK_NAME)
+    success = r["ok"] and legacy["ok"]
 
     # Also nuke any legacy Run-key entry just in case.
     _purge_legacy_run_key()
@@ -301,7 +319,7 @@ def disable() -> dict:
     log.info("Autostart disabled (scheduled task removed)")
     return {
         "ok":     success,
-        "err":    "" if success else r["err"],
+        "err":    "" if success else (r["err"] or legacy["err"]),
         "method": "scheduled_task",
     }
 
@@ -334,17 +352,19 @@ def migrate_from_legacy_runkey() -> dict:
     if not settings.get("enabled"):
         return {"ok": True, "migrated": False, "reason": "autostart not enabled"}
 
-    status = get_status()
-    if status.get("enabled"):
+    if _task_exists(TASK_NAME):
         # Task already exists — nothing to migrate.  Wipe any leftover
-        # Run-key entry just in case so the OS doesn't double-launch.
+        # Run-key entry or pre-rename task just in case so the OS doesn't
+        # double-launch.
         _purge_legacy_run_key()
+        _delete_task(LEGACY_TASK_NAME)
         return {"ok": True, "migrated": False, "reason": "task already registered"}
 
     if not _current_exe_path():
         return {"ok": True, "migrated": False, "reason": "not frozen exe"}
 
-    log.info("Autostart enabled in settings but no task registered — migrating from legacy Run key")
+    log.info(f"Autostart enabled in settings but task '{TASK_NAME}' isn't "
+             f"registered — migrating from the legacy Run key / pre-rename task")
     r = enable(delay_seconds=settings.get("delay_seconds", STARTUP_DELAY_SECONDS_DEFAULT))
     return {
         "ok":       r.get("ok", False),

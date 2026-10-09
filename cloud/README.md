@@ -1,8 +1,8 @@
-# GhostShell-Cloud
+# Vispora-Cloud
 
-FastAPI backend for GhostShell v3.
+FastAPI backend for Vispora v3.
 
-This service is **completely optional**.  GhostShell works fully offline; the
+This service is **completely optional**.  Vispora works fully offline; the
 cloud only adds:
 
 - Per-game profile sync across devices

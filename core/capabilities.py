@@ -1,7 +1,7 @@
 """Hardware capability detection — single source of truth for what
-GhostShell can and can't do on the machine it's running on.
+Vispora can and can't do on the machine it's running on.
 
-Historically GhostShell assumed an NVIDIA discrete GPU everywhere:
+Historically Vispora assumed an NVIDIA discrete GPU everywhere:
 GPU OC, Adaptive Tuning, the live-dash GPU tiles, and the driver
 updater all read nvidia-smi / NVAPI and went blank or errored on
 AMD / Intel / iGPU / CPU-only systems.  3.4.0 introduces this module

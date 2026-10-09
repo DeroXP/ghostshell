@@ -12,8 +12,8 @@ The ceiling is the safety floor underneath every other GPU feature
 applied — if the user's GPU is overheating from a hot day or a stuck
 fan, a toast notification is still worth firing.
 
-Settings live in `%APPDATA%\\GhostShell\\temp_ceiling_settings.json`.
-Trip events live in `%APPDATA%\\GhostShell\\temp_ceiling_trips.json`
+Settings live in `%APPDATA%\\Vispora\\temp_ceiling_settings.json`.
+Trip events live in `%APPDATA%\\Vispora\\temp_ceiling_trips.json`
 (capped at last 50 entries).
 
 Public API:
@@ -249,13 +249,12 @@ def _do_trip(temp_c: int, settings: dict) -> None:
         )
 
 
-def _watchdog_loop() -> None:
+def _watchdog_loop(stop_event: threading.Event) -> None:
     log.info("temp_ceiling watchdog started")
     # Defer heavy import until thread runs so module load is cheap.
     from core import gpu_overclock
 
-    stop_event = _state["stop_event"]
-    while stop_event is not None and not stop_event.is_set():
+    while not stop_event.is_set():
         try:
             settings = _load()
             if not settings.get("enabled"):
@@ -311,21 +310,31 @@ def _watchdog_loop() -> None:
             time.sleep(1.0)
 
     with _lock:
-        _state["running"] = False
-        _state["above_since"] = None
+        # Only the CURRENT thread's exit means "not running": after a quick
+        # stop→start a newer thread already owns the state.
+        if _state["stop_event"] is stop_event:
+            _state["running"] = False
+            _state["above_since"] = None
     log.info("temp_ceiling watchdog stopped")
 
 
 def start_watchdog() -> dict:
     """Start the watchdog thread.  Idempotent — safe to call repeatedly."""
     with _lock:
-        if _state["running"]:
+        ev = _state["stop_event"]
+        # "running" stays True until a stopping thread has actually exited
+        # (it may be mid nvidia-smi call).  A start arriving in that window
+        # used to return "Already running" — and then the old thread exited,
+        # leaving the ceiling enabled in settings with nothing watching.
+        if _state["running"] and ev is not None and not ev.is_set():
             return {"ok": True, "msg": "Already running"}
-        _state["stop_event"] = threading.Event()
+        ev = threading.Event()
+        _state["stop_event"] = ev
         _state["running"] = True
         _state["above_since"] = None
         t = threading.Thread(
             target=_watchdog_loop,
+            args=(ev,),
             daemon=True,
             name="temp-ceiling-watchdog",
         )

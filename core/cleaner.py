@@ -1,8 +1,8 @@
 """Temp file cleaner, RAM cleaner, and disk junk cleaner."""
 import os
 import json
-import shutil
-from core.utils import run_ps, run_cmd, get_logger
+import re
+from core.utils import run_ps, get_logger, is_reparse_point
 
 log = get_logger("cleaner")
 
@@ -32,9 +32,14 @@ def _is_in_pyinstaller_extract(p: str) -> bool:
 def _safe_rmtree(path: str) -> tuple[int, int]:
     files = 0
     size = 0
-    if not os.path.isdir(path):
+    if not os.path.isdir(path) or is_reparse_point(path):
         return 0, 0
-    for root, dirs, filenames in os.walk(path, topdown=False):
+    subdirs = []
+    for root, dirs, filenames in os.walk(path, topdown=True):
+        # Never descend into a junction or directory symlink — we would empty
+        # whatever it points at, elevated (see utils.is_reparse_point).
+        dirs[:] = [d for d in dirs if not is_reparse_point(os.path.join(root, d))]
+        subdirs.extend(os.path.join(root, d) for d in dirs)
         for f in filenames:
             fp = os.path.join(root, f)
             # Don't delete files inside any PyInstaller bundle's
@@ -49,14 +54,14 @@ def _safe_rmtree(path: str) -> tuple[int, int]:
                 size += s
             except (PermissionError, OSError):
                 pass
-        for d in dirs:
-            dp = os.path.join(root, d)
-            if d.startswith("_MEI") or _is_in_pyinstaller_extract(dp):
-                continue
-            try:
-                os.rmdir(dp)
-            except (PermissionError, OSError):
-                pass
+    # Deepest first, so a folder is already empty by the time it's its turn.
+    for dp in reversed(subdirs):
+        if os.path.basename(dp).startswith("_MEI") or _is_in_pyinstaller_extract(dp):
+            continue
+        try:
+            os.rmdir(dp)
+        except (PermissionError, OSError):
+            pass
     return files, size
 
 
@@ -220,7 +225,9 @@ _JUNK_EXT = {
 }
 
 # Junk filenames
-_JUNK_FILES = {"thumbs.db","desktop.ini","debug.log","error.log"}
+# (desktop.ini used to be listed here.  It is not junk: it holds a folder's
+# custom icon and localised name, and deleting it silently drops both.)
+_JUNK_FILES = {"thumbs.db","debug.log","error.log"}
 
 # Directory names at a drive root that are safe to wipe WHOLE.  3.4.2:
 # exact-match only.  The old code substring-matched ("temp"/"cache"/etc
@@ -271,7 +278,7 @@ def scan_disk_junk(drive_letter: str) -> list[dict]:
             try:
                 if entry.is_file(follow_symlinks=False):
                     ext = os.path.splitext(entry.name)[1].lower()
-                    if ext in _JUNK_EXT or entry.name.lower() in _JUNK_FILES:
+                    if _is_junk(entry.name, ext):
                         _add("Root junk files", entry.stat().st_size)
                 elif entry.is_dir(follow_symlinks=False):
                     dn = entry.name.lower()
@@ -344,7 +351,7 @@ def _scan_shallow_junk(dir_path, categories, parent_name):
         for entry in os.scandir(dir_path):
             if entry.is_file(follow_symlinks=False):
                 ext = os.path.splitext(entry.name)[1].lower()
-                if ext in _JUNK_EXT or entry.name.lower() in _JUNK_FILES:
+                if _is_junk(entry.name, ext):
                     cat = f"Junk in {parent_name}"
                     if cat not in categories:
                         categories[cat] = {"files": 0, "size": 0}
@@ -377,6 +384,16 @@ def _count_files(path):
     return count
 
 
+def _is_junk(name: str, ext: str) -> bool:
+    """A junk-file match that still honours _PROTECTED_EXT — which was
+    defined ("NEVER delete these extensions") and then never checked."""
+    if name.lower() in _JUNK_FILES:
+        return True                 # named outright (thumbs.db) — not an extension match
+    if ext in _PROTECTED_EXT:
+        return False
+    return ext in _JUNK_EXT
+
+
 def clean_disk_junk(drive_letters: list[str]) -> dict:
     """Clean junk from selected drives."""
     log.info(f"=== DISK CLEAN: {', '.join(drive_letters)} ===")
@@ -384,6 +401,11 @@ def clean_disk_junk(drive_letters: list[str]) -> dict:
 
     for letter in drive_letters:
         df = 0; ds = 0
+        # Comes straight from the request; anything but a bare drive ("D:")
+        # would let a caller aim the junk sweep at an arbitrary folder.
+        if not isinstance(letter, str) or not re.fullmatch(r"[A-Za-z]:", letter):
+            log.warning(f"Disk clean: ignoring invalid drive {letter!r}")
+            continue
         is_c = letter.upper().startswith("C")
 
         if is_c:
@@ -396,7 +418,7 @@ def clean_disk_junk(drive_letters: list[str]) -> dict:
                 try:
                     if entry.is_file(follow_symlinks=False):
                         ext = os.path.splitext(entry.name)[1].lower()
-                        if ext in _JUNK_EXT or entry.name.lower() in _JUNK_FILES:
+                        if _is_junk(entry.name, ext):
                             s = entry.stat().st_size
                             os.remove(entry.path); df += 1; ds += s
                     elif entry.is_dir(follow_symlinks=False):
@@ -454,7 +476,7 @@ def _clean_shallow_junk(dir_path) -> tuple[int, int]:
         for entry in os.scandir(dir_path):
             if entry.is_file(follow_symlinks=False):
                 ext = os.path.splitext(entry.name)[1].lower()
-                if ext in _JUNK_EXT or entry.name.lower() in _JUNK_FILES:
+                if _is_junk(entry.name, ext):
                     try:
                         sz = entry.stat().st_size; os.remove(entry.path); f += 1; s += sz
                     except (PermissionError, OSError): pass

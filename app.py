@@ -1,7 +1,9 @@
 """Vispora — Main Flask application with pywebview launcher."""
 import sys
 import os
+import hmac
 import json
+import secrets
 import threading
 import time
 
@@ -25,6 +27,55 @@ log = get_logger("app")
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["SECRET_KEY"] = os.urandom(24).hex()
+
+_LOCAL_HOSTS = frozenset({f"127.0.0.1:{config.APP_PORT}", f"localhost:{config.APP_PORT}"})
+_LOCAL_ORIGINS = frozenset(f"http://{h}" for h in _LOCAL_HOSTS)
+
+# A fresh secret per run that every API call has to present.  The UI gets it
+# in the fragment of the URL its window is opened with (a fragment is never
+# sent to the server, so it can't be fetched back out of us), with the native
+# bridge (WindowJSAPI.get_api_token) as a second route.
+_API_TOKEN = secrets.token_urlsafe(32)
+_API_TOKEN_HEADER = "X-Vispora-Token"
+# The one call a second copy of the app makes to the first, before exiting.
+_TOKEN_EXEMPT_PATHS = frozenset({"/api/window/show"})
+
+
+def _ui_url() -> str:
+    return f"http://127.0.0.1:{config.APP_PORT}/#t={_API_TOKEN}"
+
+
+@app.before_request
+def _reject_foreign_requests():
+    """Only answer our own UI.
+
+    This server runs elevated and its API can wipe the vault, delete files and
+    launch programs.  Binding to 127.0.0.1 keeps other machines out, but not
+    other web pages: any site the user has open can make their browser send
+    requests here.  Three checks close that off —
+      • Host:   must be us.  Defeats DNS rebinding, which reaches this server
+                under an attacker's hostname and makes responses readable.
+      • Origin: when present (every cross-origin POST, including plain form
+                posts), must be us.
+      • Sec-Fetch-Site: when present, an API call must be same-origin, or
+                "none" (typed into the address bar).
+    Those keep the user's browser from being used against us.  They do
+    nothing about another program on this PC, which can send any headers it
+    likes — and an unelevated one calling an elevated API is a privilege
+    escalation.  So every API call must also carry this run's secret token,
+    which only our own window has been given.
+    """
+    if request.host not in _LOCAL_HOSTS:
+        return jsonify({"ok": False, "err": "bad host"}), 403
+    if request.path.startswith("/api/"):
+        origin = request.headers.get("Origin")
+        if origin is not None and origin not in _LOCAL_ORIGINS:
+            return jsonify({"ok": False, "err": "cross-origin request refused"}), 403
+        if request.headers.get("Sec-Fetch-Site", "same-origin") not in ("same-origin", "none"):
+            return jsonify({"ok": False, "err": "cross-origin request refused"}), 403
+        if request.path not in _TOKEN_EXEMPT_PATHS and not hmac.compare_digest(
+                request.headers.get(_API_TOKEN_HEADER, ""), _API_TOKEN):
+            return jsonify({"ok": False, "err": "missing or wrong session token"}), 403
 
 
 def _qint(name: str, default: int) -> int:
@@ -83,7 +134,8 @@ _post_install_state = {"state": "idle"}
 # ═══════════════════════════════════════════════════════════════════════════
 @app.route("/")
 def index():
-    return render_template("index.html", version=config.APP_VERSION)
+    return render_template("index.html", version=config.APP_VERSION,
+                           appdata_dir=config.APPDATA_DIR)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -173,7 +225,10 @@ def api_debloat_restore_services():
     """3.4.2 — re-enable every service the debloater disabled, each
     restored to its recorded original Start type.  Previously there was
     no way to undo a debloat service-disable pass."""
-    return jsonify(debloater.restore_services())
+    result = debloater.restore_services()
+    # The same button also undoes the debloater's scheduled-task pass.
+    result["tasks"] = debloater.restore_scheduled_tasks()
+    return jsonify(result)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -367,6 +422,16 @@ def api_network_restore():
     return jsonify(network_tweaks.restore_networking())
 
 
+@app.route("/api/network/undo", methods=["POST"])
+def api_network_undo():
+    """Put back what the Network tab's tweaks changed, from the record of
+    what each setting was before.  (/api/network/restore is the heavy
+    recovery that resets the whole stack.)"""
+    result = network_tweaks.undo_network_tweaks()
+    _module_status["network"] = False
+    return jsonify(result)
+
+
 @app.route("/api/network/optimize", methods=["POST"])
 def api_network_optimize():
     result = network_tweaks.run_full_network_optimize()
@@ -494,6 +559,15 @@ def api_gpu_tweaks():
     return jsonify(result)
 
 
+@app.route("/api/gpu/undo", methods=["POST"])
+def api_gpu_undo():
+    """Put back what the vendor tweaks changed (registry, telemetry service,
+    scheduled tasks), from the record of what each was before."""
+    result = nvidia_clean.undo_gpu_tweaks()
+    _module_status["gpu"] = False
+    return jsonify(result)
+
+
 @app.route("/api/gpu/nvidia-tweaks", methods=["POST"])
 def api_gpu_nvidia_tweaks():
     """Force NVIDIA-only tweaks (regardless of detected vendor)."""
@@ -538,10 +612,13 @@ def api_gpu_oc_watchdog():
 def api_gpu_oc_apply():
     """Apply core/mem offsets + power limit. Body: {core_offset_mhz, mem_offset_mhz, power_pct}."""
     data = request.get_json(force=True) or {}
+    # power_pct: null means "leave the power limit as it is" (tuning probes);
+    # a number — or the key being absent — sets it, 100 being stock.
+    power_pct = data.get("power_pct", 100)
     return jsonify(gpu_overclock.apply_oc(
         core_offset_mhz=int(data.get("core_offset_mhz", 0)),
         mem_offset_mhz=int(data.get("mem_offset_mhz", 0)),
-        power_pct=int(data.get("power_pct", 100)),
+        power_pct=None if power_pct is None else int(power_pct),
     ))
 
 
@@ -1365,7 +1442,7 @@ def api_cleaner_disk_cancel():
 @app.route("/api/cleaner/disk/delete", methods=["POST"])
 def api_cleaner_disk_delete():
     """Delete selected paths.  Hard-capped at 100 paths and 50 GB per
-    call; refuses anything under Windows / Program Files / GhostShell.
+    call; refuses anything under Windows / Program Files / Vispora.
     Pass `to_recycle_bin: true` to route through Recycle Bin (slower
     but reversible)."""
     try:
@@ -1609,7 +1686,7 @@ def api_util_open_path():
                         the file in its default app), 'open-folder'
                         (folder paths only — opens it in Explorer).
 
-    v3.3.0-beta.12 fix: GhostShell runs with uac_admin=True (manifest
+    v3.3.0-beta.12 fix: Vispora runs with uac_admin=True (manifest
     requests elevation), so subprocess.Popen(['explorer', ...]) fails
     silently — Windows refuses to spawn user-level explorer.exe from
     an admin process and the call just drops.  Use ShellExecuteW
@@ -1840,7 +1917,7 @@ def api_obs_launch():
 
 @app.route("/api/obs/setup-scene", methods=["POST"])
 def api_obs_setup_scene():
-    """Create the GhostShell scene + sources in OBS based on the
+    """Create the Vispora scene + sources in OBS based on the
     current clipper settings (selected monitor, mic on/off,
     system audio on/off).  Idempotent — running it multiple times
     only adds anything missing."""
@@ -1936,7 +2013,7 @@ def api_stream_helper_setup():
 
 @app.route("/api/obs/save-replay", methods=["POST"])
 def api_obs_save_replay():
-    """Trigger SaveReplayBuffer + move the file into Videos/GhostShell/Clips.
+    """Trigger SaveReplayBuffer + move the file into Videos/Vispora/Clips.
     Returns the final clip path."""
     try:
         from core import obs_backend, clipper
@@ -2038,23 +2115,6 @@ def _wire_capture_hotkeys(settings: dict) -> None:
     capture_hotkeys.register_binding("screenshot", ss_hk,   _screenshot_cb)
 
 
-# beta.15 — /api/dependencies/start-rtss removed.  GhostShell no longer
-# launches RTSS from any auto-path.  Old clients that still POST here
-# get a clean 410 GONE so they know to drop the call rather than seeing
-# a 404 + retry loop.  The fallback message tells the user to launch
-# RTSS themselves if they actually want it running.
-@app.route("/api/dependencies/start-rtss", methods=["POST"])
-def api_dependencies_start_rtss_gone():
-    return jsonify({
-        "ok": False,
-        "removed": True,
-        "err": ("RTSS is no longer auto-launched or auto-installed by "
-                "Vispora.  If you want RTSS running, start it from "
-                "the Start menu — Vispora will detect it for the "
-                "OC-tool conflict warning but won't touch it.")
-    }), 410
-
-
 @app.route("/api/adaptive/menu-signature/remove", methods=["POST"])
 def api_adaptive_menu_sig_remove():
     """Body: { exe, index }.  Remove one learned menu signature by index."""
@@ -2095,7 +2155,7 @@ def api_adaptive_game_knobs():
 @app.route("/api/health/audit")
 def api_health_audit():
     """Full read-only system audit — display, RAM, GPU, power, storage,
-    GhostShell state.  Runs in a couple of seconds; safe to poll."""
+    Vispora state.  Runs in a couple of seconds; safe to poll."""
     return jsonify(health_audit.audit())
 
 
@@ -2109,7 +2169,7 @@ def api_snapshots_list():
 @app.route("/api/snapshots", methods=["POST"])
 def api_snapshots_create():
     """Body: { name, description? }.  Take a 'full' snapshot of every
-    GhostShell-touched registry path."""
+    Vispora-touched registry path."""
     data = request.get_json(force=True) or {}
     return jsonify(snapshots.take_snapshot(
         name=data.get("name", "manual"),
@@ -2418,7 +2478,7 @@ def api_gamepad_capture_availability():
 @app.route("/api/gamepad/capture/screen/start", methods=["POST"])
 def api_gamepad_capture_screen_start():
     """Body: { rpm?, max_duration_sec?, capture_hz?, auto_fire? }.
-    `auto_fire` (controller users): if true, GhostShell pushes RT through
+    `auto_fire` (controller users): if true, Vispora pushes RT through
     the virtual pad while capturing so the user doesn't have to physically
     hold their fire trigger.  Requires virtual_controller mode."""
     from core import recoil_capture
@@ -2782,7 +2842,12 @@ def api_vault_lock():
 def api_vault_entries():
     search = request.args.get("search", "")
     category = request.args.get("category", "")
-    return jsonify(vault.get_entries(search, category))
+    result = vault.get_entries(search, category)
+    # The list only ever shows the mask; the cleartext is fetched one entry at
+    # a time (/entry/<id>/password) when the user asks to copy or edit it.
+    for entry in result.get("entries", []):
+        entry.pop("password", None)
+    return jsonify(result)
 
 
 @app.route("/api/vault/entry", methods=["POST"])
@@ -2885,12 +2950,14 @@ def api_cleaner_disk_clean():
 # ═══════════════════════════════════════════════════════════════════════════
 @app.route("/api/logs")
 def api_logs():
+    # `since` is the seq of the newest entry the client already has (0 = send
+    # everything); `total` is the seq to pass next time.  This used to work on
+    # buffer positions, which returned the ENTIRE buffer whenever nothing was
+    # new — the dashboard re-appended up to 2000 lines every 2 seconds.
     since = request.args.get("since", 0, type=int)
     buf = get_log_buffer()
-    # Return entries after index `since`
-    if since > 0 and since < len(buf):
-        buf = buf[since:]
-    return jsonify({"entries": buf, "total": len(get_log_buffer())})
+    entries = [e for e in buf if e["seq"] > since]
+    return jsonify({"entries": entries, "total": buf[-1]["seq"] if buf else since})
 
 
 @app.route("/api/logs/clear", methods=["POST"])
@@ -3116,7 +3183,7 @@ def api_kernel_boost_controller():
 
 @app.route("/api/kernel/reset-input-priorities", methods=["POST"])
 def api_kernel_reset_input_priorities():
-    """Single-button revert: clears any priority override GhostShell set
+    """Single-button revert: clears any priority override Vispora set
     on every keyboard, mouse, and controller it can see."""
     kb = interrupt_affinity.reset_all_keyboards()
     mc = interrupt_affinity.reset_all_mice()
@@ -3263,12 +3330,12 @@ def api_monitor_benchmark():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Full Spectrum (run everything in sequence) — internal route kept as /api/full-ghost
+# Full Spectrum (run everything in sequence)
 # ═══════════════════════════════════════════════════════════════════════════
-@app.route("/api/full-ghost", methods=["POST"])
-def api_full_ghost():
+@app.route("/api/full-spectrum", methods=["POST"])
+def api_full_spectrum():
     log.info("╔══════════════════════════════════════╗")
-    log.info("║     FULL GHOST MODE ACTIVATED        ║")
+    log.info("║     FULL SPECTRUM MODE ACTIVATED     ║")
     log.info("╚══════════════════════════════════════╝")
 
     global _restore_point_created
@@ -3276,8 +3343,19 @@ def api_full_ghost():
         create_restore_point()
         _restore_point_created = True
 
+    data = request.get_json(force=True, silent=True) or {}
+    deb = data.get("debloat") if isinstance(data.get("debloat"), dict) else {}
+
     results = {}
-    results["debloat"] = debloater.run_full_debloat()
+    # The Debloat tab's own selections and switches apply here as well.  This
+    # used to run the debloater with everything on — every listed app removed
+    # and OneDrive uninstalled — whatever had been switched off on that tab.
+    results["debloat"] = debloater.run_full_debloat(
+        deb.get("apps") if isinstance(deb.get("apps"), list) else None,
+        deb.get("services") if isinstance(deb.get("services"), list) else None,
+        do_tasks=bool(deb.get("tasks", True)),
+        do_features=bool(deb.get("features", True)),
+        do_onedrive=bool(deb.get("onedrive", True)))
     _module_status["debloat"] = True
 
     results["optimize"] = optimizer.run_full_optimize()
@@ -3297,11 +3375,15 @@ def api_full_ghost():
 
     # New v2 modules
     results["scheduler"] = scheduler_tweaks.run_full_scheduler_optimize()
-    results["timer"] = timer_manager.apply_timer_tweaks()
+    # Disabling the dynamic tick and the HPET device are Pro Mode tweaks in
+    # the optimizer (battery cost, BSODs on some boards); this call applied
+    # them to everyone regardless.
+    pro = bool(optimizer.get_pro_mode().get("enabled"))
+    results["timer"] = timer_manager.apply_timer_tweaks(disable_dynamic_tick=pro, disable_hpet=pro)
     results["interrupts"] = interrupt_affinity.auto_optimize_interrupts()
 
     log.info("╔══════════════════════════════════════╗")
-    log.info("║    FULL GHOST COMPLETE — REBOOT!     ║")
+    log.info("║   FULL SPECTRUM COMPLETE — REBOOT!   ║")
     log.info("╚══════════════════════════════════════╝")
     return jsonify(results)
 
@@ -3329,7 +3411,7 @@ def api_updater_download():
 
 @app.route("/api/updater/install", methods=["POST"])
 def api_updater_install():
-    """Apply the downloaded update and restart GhostShell.
+    """Apply the downloaded update and restart Vispora.
 
     The Python process exits ~800ms after this returns.  The new exe is
     swapped in by a detached batch script which then relaunches.
@@ -3449,6 +3531,11 @@ class WindowJSAPI:
     frontend — bypasses Flask so the calls still work after the window has
     been hidden and re-shown (WebView2 throttles fetch() in hidden tabs)."""
 
+    def get_api_token(self):
+        """Fallback delivery of the API token for a page that lost the one
+        from its URL fragment.  Only reachable from inside our own window."""
+        return _API_TOKEN
+
     def minimize(self):
         return _win_minimize()
 
@@ -3482,7 +3569,7 @@ def api_window_show():
 # v2.9.0 — close-button rework.
 # The titlebar X used to silently hide-to-tray.  Now the UI presents the
 # user with a choice:
-#     1. "Quit GhostShell"        →  /api/window/quit  (full process exit)
+#     1. "Quit Vispora"        →  /api/window/quit  (full process exit)
 #     2. "Hide + Game Mode"       →  /api/window/close-and-game-mode
 #                                    (hide to tray + arm the game-detection
 #                                     monitor so any launched game gets the
@@ -3491,27 +3578,77 @@ def api_window_show():
 # ─────────────────────────────────────────────────────────────────────────
 @app.route("/api/window/quit", methods=["POST"])
 def api_window_quit():
-    """Fully shut down GhostShell.
+    """Fully shut down Vispora.
 
     Restores any active gaming-mode tweaks first so the system is not
     left in a half-modified state, then schedules os._exit() so the
     HTTP response can be flushed before the process dies.
     """
     log.info("Quit requested by user — shutting down")
-    try:
-        # Roll back any active gaming tweaks before the process disappears.
-        status = game_profiles.get_engine_status()
-        if status.get("gaming_mode"):
-            game_profiles.restore_normal_mode("user quit")
-        game_profiles.stop_monitoring()
-    except Exception as e:
-        log.warning(f"Error restoring state during quit: {e}")
+    _restore_system_before_exit("user quit")
 
     def _suicide():
         time.sleep(0.5)
         os._exit(0)
     threading.Thread(target=_suicide, daemon=True).start()
     return jsonify({"ok": True, "msg": "Goodbye"})
+
+
+def _restore_system_before_exit(reason: str) -> None:
+    """Undo what must not outlive the process.  Every quit path ends in
+    os._exit(), which skips atexit handlers and `finally` blocks, so this has
+    to be called explicitly — the tray's Quit used to skip all of it."""
+    try:
+        # Roll back any active gaming tweaks; this also resumes whatever the
+        # Background Pauser suspended.
+        if game_profiles.get_engine_status().get("gaming_mode"):
+            game_profiles.restore_normal_mode(reason)
+        game_profiles.stop_monitoring()
+    except Exception as e:
+        log.warning(f"Error restoring state during quit: {e}")
+    try:
+        # A tuning run that is still in progress has an untested offset on
+        # the card.  With the app gone nothing watches it — no watchdog, no
+        # temperature ceiling, no crash recovery — so it must not stay.
+        # (An overclock the user applied and is simply using is left alone.)
+        if gpu_overclock.is_tuning_active():
+            gpu_overclock._reset_to_stock_hard(attempts=1)
+        # Likewise an Adaptive Tuning session: close it, which hands the card
+        # back the way AT found it.  restore_normal_mode() above only does
+        # that for a real game exit, not for the app quitting mid-game.
+        adaptive_tuning.end_active_session(reason)
+    except Exception as e:
+        log.warning(f"GPU state restore during quit failed: {e}")
+    try:
+        # Idle Mode parks the overclock and lowers the GPU power limit.  Its
+        # "engaged" flag lives in memory, so if the app exits while parked
+        # nothing ever lifts the cap again — the card stayed power-limited
+        # in every game until the user re-applied a profile by hand.
+        idle_mode.manual_release()
+    except Exception as e:
+        log.debug(f"idle mode release during quit failed: {e}")
+    try:
+        from core import frame_telemetry
+        frame_telemetry.stop_tracking()       # don't orphan PresentMon
+    except Exception as e:
+        log.debug(f"frame telemetry stop during quit failed: {e}")
+    try:
+        # Otherwise the FFmpeg child keeps capturing, at high priority,
+        # until the user logs off.
+        from core import clipper
+        clipper.stop_buffer()
+    except Exception as e:
+        log.debug(f"clip buffer stop during quit failed: {e}")
+    try:
+        # Release held keys and un-hide the physical controller (HidHide's
+        # blacklist persists across reboots if we leave it engaged).
+        gamepad_mapper.shutdown()
+    except Exception as e:
+        log.debug(f"gamepad mapper shutdown during quit failed: {e}")
+
+
+# The update installer exits the process too; it must go through the same restore.
+updater.set_pre_exit_hook(_restore_system_before_exit)
 
 
 @app.route("/api/window/close-and-game-mode", methods=["POST"])
@@ -3664,7 +3801,9 @@ def api_boot_prep_status():
 
 @app.route("/api/boot-prep/run", methods=["POST"])
 def api_boot_prep_run():
-    boot_prep.prep_for_gaming_async()
+    # force: the button is "Re-run Prep" — this used to be a silent no-op,
+    # because the prep had already run once at start-up.
+    boot_prep.prep_for_gaming_async(force=True)
     return jsonify({"ok": True, "msg": "Boot prep started"})
 
 
@@ -3677,7 +3816,7 @@ def start_flask():
 
 def _set_efficiency_mode():
     """Set this process to efficiency mode (low priority + EcoQoS).
-    Used when GhostShell is idle (no game running, no mapper firing) so
+    Used when Vispora is idle (no game running, no mapper firing) so
     it stays out of the way of foreground work + saves laptop battery."""
     if sys.platform != "win32":
         return
@@ -3710,11 +3849,11 @@ def _set_efficiency_mode():
 
 def _set_responsive_mode():
     """Drop efficiency throttling — set Normal priority + clear EcoQoS.
-    Called when GhostShell needs to keep up with real work: a game is
+    Called when Vispora needs to keep up with real work: a game is
     running (mapper is forwarding state), tournament mode is on, the
     network monitor is alerting on a burst, etc.
 
-    Without this, GhostShell stays in Below-Normal/EcoQoS while the
+    Without this, Vispora stays in Below-Normal/EcoQoS while the
     game runs at HIGH priority on P-cores — UI lags, mapper polling
     drops from 4 kHz target to 200 Hz actual, HidHide retry timer
     stalls.  Calling this restores the process to Normal priority on
@@ -3984,14 +4123,14 @@ def _create_tray_icon(show_window_func, quit_func):
 
 
 def _focus_running_instance() -> bool:
-    """If another GhostShell process owns the Flask port, ask it to show
+    """If another Vispora process owns the Flask port, ask it to show
     its window and bring it to the foreground.  Returns True if we
     successfully handed off to the existing instance.
 
     v2.9.6 — second-launch handling.  Without this, double-clicking the
     .exe while it's already running in the tray spawns a brand-new
     Python+webview process that fights the original for the Flask port
-    (and the user gets two ghostshells).  Now the second launch just
+    (and the user gets two copies running).  Now the second launch just
     pings the original via /api/window/show and exits.
     """
     import urllib.request, json
@@ -4006,7 +4145,7 @@ def _focus_running_instance() -> bool:
                 data = json.loads(body)
             except Exception:
                 data = {}
-            log.info(f"Existing GhostShell instance focused (HTTP {resp.status})")
+            log.info(f"Existing Vispora instance focused (HTTP {resp.status})")
             return bool(data.get("ok"))
     except Exception as e:
         log.debug(f"No reachable existing instance: {e}")
@@ -4020,10 +4159,10 @@ _single_instance_mutex_handle = None
 
 
 def _acquire_single_instance_lock() -> bool:
-    """Try to claim the global GhostShell mutex.
+    """Try to claim the global Vispora mutex.
 
     Returns True on success (we are the canonical instance).
-    Returns False if another GhostShell already owns it — caller should
+    Returns False if another Vispora already owns it — caller should
     hand off to that instance via _focus_running_instance() and exit.
     """
     global _single_instance_mutex_handle
@@ -4066,11 +4205,11 @@ def main():
     global _webview_window
 
     # v2.9.6 — single-instance check.
-    # If GhostShell is already running, hand off to it and exit silently.
+    # If Vispora is already running, hand off to it and exit silently.
     # Done BEFORE the admin elevation prompt so the user doesn't get a
     # UAC popup just to be told "already running".
     if not _acquire_single_instance_lock():
-        log.info("Another GhostShell instance is running — handing off")
+        log.info("Another Vispora instance is running — handing off")
         if _focus_running_instance():
             sys.exit(0)
         # If the existing instance didn't respond, it may be hung — the
@@ -4119,13 +4258,13 @@ def main():
     except Exception as e:
         log.warning(f"Post-install state check failed: {e}")
 
-    # Set efficiency mode so GhostShell itself is lightweight
+    # Set efficiency mode so Vispora itself is lightweight
     _set_efficiency_mode()
 
     # v3.1 fix — restore microphone access if it was killed by an earlier
-    # GhostShell version's bulk privacy tweak.  Idempotent + safe: only ever
+    # Vispora version's bulk privacy tweak.  Idempotent + safe: only ever
     # PERMITS the mic, never blocks it.  Called on every launch so users
-    # whose mic was broken simply have to open GhostShell once more.
+    # whose mic was broken simply have to open Vispora once more.
     try:
         restore = privacy.restore_microphone_access()
         log.info(f"Mic-restore boot pass: {restore}")
@@ -4133,7 +4272,7 @@ def main():
         log.debug(f"Mic-restore failed: {e}")
 
     # v3.1 fix — restore Microsoft Store / Xbox app update functionality.
-    # Earlier GhostShell versions disabled DiagTrack and denied
+    # Earlier Vispora versions disabled DiagTrack and denied
     # LetAppsRunInBackground, which broke the Store update flow.  Safe +
     # idempotent: re-enables only what Store/Xbox need to fetch updates.
     try:
@@ -4284,7 +4423,7 @@ def main():
     # every 1 s and emergency-resets the OC if it sustains above the
     # user-set ceiling (default 83°C / 5 s sustain).  Safety net under
     # every other GPU feature.  Settings live in
-    # %APPDATA%/GhostShell/temp_ceiling_settings.json and are loaded
+    # %APPDATA%/Vispora/temp_ceiling_settings.json and are loaded
     # by the watchdog itself, so no parameters are needed here.
     def _start_temp_ceiling():
         try:
@@ -4401,7 +4540,7 @@ def main():
             except Exception as e:
                 log.debug(f"stream helper boot start failed: {e}")
             # v3.3.1-beta.9 — scan registry/BCD for tweaks older
-            # GhostShell builds applied that we now know were bad
+            # Vispora builds applied that we now know were bad
             # (DisableAbsoluteVolume, recoveryenabled No, ScheduledDefrag
             # disabled, FSO=2, etc.).  Anything found gets reverted +
             # written to a recovery report the UI shows as an
@@ -4438,7 +4577,7 @@ def main():
 
     # beta.16 — twice-daily PC integrity scan.  Runs in its own
     # BELOW_NORMAL-priority thread; gates on user-idle + no game +
-    # GhostShell not in foreground.  See core/integrity_scan.py for
+    # Vispora not in foreground.  See core/integrity_scan.py for
     # the full safety model (allow-list patterns, path-traversal
     # protection, per-file try/except, 5-minute time budget).
     def _boot_integrity_scan():
@@ -4455,7 +4594,8 @@ def main():
         _win_show()
 
     def quit_app():
-        log.info("GhostShell shutting down")
+        log.info("Vispora shutting down")
+        _restore_system_before_exit("tray quit")
         os._exit(0)
 
     try:
@@ -4491,7 +4631,7 @@ def main():
         # systems where its auto-detection is shaky.
         _webview_window = webview.create_window(
             config.APP_NAME,
-            f"http://127.0.0.1:{config.APP_PORT}",
+            _ui_url(),
             width=1320,
             height=860,
             frameless=True,
@@ -4523,7 +4663,7 @@ def main():
     except ImportError:
         log.warning("pywebview not installed — opening in browser mode")
         import webbrowser
-        webbrowser.open(f"http://127.0.0.1:{config.APP_PORT}")
+        webbrowser.open(_ui_url())
         # Run tray icon on main thread (blocking)
         _create_tray_icon(lambda: None, quit_app)
 

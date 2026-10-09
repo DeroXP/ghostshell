@@ -33,6 +33,7 @@ import time
 from collections import deque
 from typing import Optional
 
+from config import OWN_PROCESS_NAMES
 from core.utils import get_logger
 
 log = get_logger(__name__)
@@ -52,10 +53,10 @@ BURST_BYTES_PER_SEC = 5 * 1024 * 1024
 BURST_CONSECUTIVE   = 3
 
 # Process names that are NEVER flagged (safe-list — these are legitimate
-# during gameplay or are GhostShell itself / system services that the
+# during gameplay or are Vispora itself / system services that the
 # user can't reasonably pause).
 NEVER_FLAG = {
-    "ghostshell.exe", "vispora.exe", "python.exe", "pythonw.exe",
+    *OWN_PROCESS_NAMES, "python.exe", "pythonw.exe",
     "system", "system idle process",
     "svchost.exe",                    # too generic, false-positives
     "discord.exe", "discordcanary.exe", "discordptb.exe",
@@ -286,12 +287,11 @@ def get_top_processes(limit: int = 15) -> list[dict]:
 
 
 def pause_process(pid: int) -> dict:
-    """Suspend a process via the existing background_pauser ctypes
-    helper.  Returns immediately — no rollback timer; the user uses
-    /api/pauser/resume_now or the explicit resume button to undo."""
+    """Suspend a process via the background pauser, which records it so the
+    pauser's "Resume now" (and next-launch recovery) can thaw it again."""
     try:
         from core import background_pauser
-        ok = background_pauser._suspend_pid(int(pid))
+        ok = background_pauser.pause_pid(int(pid), reason="network burst")
         if ok:
             log.info(f"net_monitor: paused PID {pid}")
             return {"ok": True, "pid": int(pid)}

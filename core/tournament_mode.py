@@ -13,10 +13,10 @@ When ON:
 
 When OFF:
   - Every change above is rolled back from the saved baseline.
-  - Even if GhostShell crashes mid-tournament, the boot-time check
+  - Even if Vispora crashes mid-tournament, the boot-time check
     `recover_if_stale()` catches a stuck enabled-state and reverts.
 
-Persistence file: %APPDATA%\\GhostShell\\tournament_mode.json
+Persistence file: %APPDATA%\\Vispora\\tournament_mode.json
     {
       "enabled": bool,
       "started_at": ts,
@@ -165,7 +165,7 @@ def _launch_onedrive() -> bool:
     if not exe:
         return False
     try:
-        # Detached so it survives GhostShell exiting
+        # Detached so it survives Vispora exiting
         import subprocess
         subprocess.Popen([exe, "/background"], close_fds=True,
                          creationflags=0x00000008)  # DETACHED_PROCESS
@@ -436,7 +436,7 @@ def extend_timer(extra_min: int) -> dict:
 # ────────────────────────────────────────────────────────────────────
 
 def recover_if_stale() -> dict:
-    """Call at GhostShell startup.  Detects:
+    """Call at Vispora startup.  Detects:
       a) enabled=true with expired timer  → disable+restore
       b) enabled=true with no expiry but started >24h ago → disable+restore
       c) enabled=true and timer still valid → restart timer thread"""
