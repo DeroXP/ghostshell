@@ -1,0 +1,6 @@
+# Review is requested from these owners automatically when a PR touches the
+# matching paths.  Branch protection can require a code-owner approval, which
+# turns this file into an enforced gate for the backend and the CI itself.
+/cloud/        @DeroXP
+/.github/      @DeroXP
+/SECURITY.md   @DeroXP

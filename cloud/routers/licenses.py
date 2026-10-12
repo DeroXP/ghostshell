@@ -21,10 +21,11 @@ Zero-knowledge invariant:
     can call it with any license_id and see literally everything the
     server knows.
 """
+
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 
 import asyncpg
@@ -44,78 +45,82 @@ router = APIRouter(prefix="/v1/licenses", tags=["licenses"])
 class HardwareInputs(BaseModel):
     """Raw hardware fingerprint inputs.  These hit the server briefly
     and are HMAC'd inline; never stored, never logged."""
-    cpu_id:           str = Field(..., min_length=1, max_length=128)
+
+    cpu_id: str = Field(..., min_length=1, max_length=128)
     motherboard_uuid: str = Field(..., min_length=1, max_length=128)
-    disk_serial:      str = Field(..., min_length=1, max_length=128)
+    disk_serial: str = Field(..., min_length=1, max_length=128)
 
 
 class HardwareBuckets(BaseModel):
     """Non-identifying bucket info — safe to store as plaintext.
     'rtx 5070 ti' tells us nothing about the user."""
+
     gpu_model_norm: str | None = Field(None, max_length=64)
-    cpu_family:     str | None = Field(None, max_length=32)
-    ram_gb_bucket:  str | None = Field(None, max_length=8)
+    cpu_family: str | None = Field(None, max_length=32)
+    ram_gb_bucket: str | None = Field(None, max_length=8)
 
 
 class ActivateRequest(BaseModel):
     license_key: str
-    hardware:    HardwareInputs
-    buckets:     HardwareBuckets = Field(default_factory=HardwareBuckets)
+    hardware: HardwareInputs
+    buckets: HardwareBuckets = Field(default_factory=HardwareBuckets)
     app_version: str | None = Field(None, max_length=16)
 
 
 class ValidateRequest(BaseModel):
     license_key: str
-    hardware:    HardwareInputs
+    hardware: HardwareInputs
 
 
 class DeactivateRequest(BaseModel):
     license_key: str
-    slot_no:     int = Field(..., ge=1, le=20)
+    slot_no: int = Field(..., ge=1, le=20)
 
 
 class SlotView(BaseModel):
     """Public-safe slot info — no identifiers, just hardware buckets."""
-    slot_no:        int
+
+    slot_no: int
     gpu_model_norm: str | None
-    cpu_family:     str | None
-    ram_gb_bucket:  str | None
-    activated_at:   datetime
-    last_seen:      datetime
+    cpu_family: str | None
+    ram_gb_bucket: str | None
+    activated_at: datetime
+    last_seen: datetime
 
 
 class ActivateResponse(BaseModel):
-    ok:           bool = True
-    license_id:   int
-    slot_no:      int
-    slots_used:   int
-    slots_max:    int
-    status:       str
-    is_new_slot:  bool
+    ok: bool = True
+    license_id: int
+    slot_no: int
+    slots_used: int
+    slots_max: int
+    status: str
+    is_new_slot: bool
 
 
 class ValidateResponse(BaseModel):
-    ok:           bool = True
-    license_id:   int
-    slot_no:      int
-    status:       str
-    last_seen:    datetime
-    refunded_at:  datetime | None = None
-    revoked_at:   datetime | None = None
+    ok: bool = True
+    license_id: int
+    slot_no: int
+    status: str
+    last_seen: datetime
+    refunded_at: datetime | None = None
+    revoked_at: datetime | None = None
 
 
 class PublicLicenseView(BaseModel):
     """Returned by the public endpoint.  This is the *complete* server-side
     record — there is no other table containing data about this license."""
-    license_id:   int
-    status:       str
-    paid_at:      datetime
-    refunded_at:  datetime | None
-    revoked_at:   datetime | None
-    slots_used:   int
-    slots_max:    int
-    slots:        list[SlotView]
-    note:         str = (
+
+    license_id: int
+    status: str
+    paid_at: datetime
+    refunded_at: datetime | None
+    revoked_at: datetime | None
+    slots_used: int
+    slots_max: int
+    slots: list[SlotView]
+    note: str = (
         "This is the complete server-side record for this license. "
         "We have no other data — no email, no IP, no raw hardware IDs."
     )
@@ -123,7 +128,8 @@ class PublicLicenseView(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 async def _find_license_by_key(
-    db: asyncpg.Connection, key: str,
+    db: asyncpg.Connection,
+    key: str,
 ) -> asyncpg.Record | None:
     if not is_valid_license_key_format(key):
         return None
@@ -154,14 +160,14 @@ async def _next_free_slot(db: asyncpg.Connection, license_id: int) -> int:
     for n in range(1, settings.license_max_devices + 1):
         if n not in used:
             return n
-    return 0   # caller checked count first; should not reach
+    return 0  # caller checked count first; should not reach
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
 @router.post("/activate", response_model=ActivateResponse)
 async def activate(
-    req:  ActivateRequest,
-    db:   asyncpg.Connection = Depends(get_db),
+    req: ActivateRequest,
+    db: asyncpg.Connection = Depends(get_db),
 ):
     """Bind a license key to the current hardware, consuming a slot.
 
@@ -185,22 +191,29 @@ async def activate(
         """SELECT slot_no FROM license_devices
             WHERE license_id = $1 AND device_fp_hash = $2
               AND deactivated_at IS NULL""",
-        lic["id"], fp_hash,
+        lic["id"],
+        fp_hash,
     )
     if existing:
         await db.execute(
             "UPDATE license_devices SET last_seen = now() WHERE id = (SELECT id "
             "FROM license_devices WHERE license_id=$1 AND device_fp_hash=$2 "
             "AND deactivated_at IS NULL)",
-            lic["id"], fp_hash,
+            lic["id"],
+            fp_hash,
         )
         slots_used = await _count_active_slots(db, lic["id"])
-        log.info(f"License {lic['id']} re-activated on existing slot "
-                 f"{existing['slot_no']} ({slots_used}/{settings.license_max_devices})")
+        log.info(
+            f"License {lic['id']} re-activated on existing slot "
+            f"{existing['slot_no']} ({slots_used}/{settings.license_max_devices})"
+        )
         return ActivateResponse(
-            license_id=lic["id"], slot_no=existing["slot_no"],
-            slots_used=slots_used, slots_max=settings.license_max_devices,
-            status=lic["status"], is_new_slot=False,
+            license_id=lic["id"],
+            slot_no=existing["slot_no"],
+            slots_used=slots_used,
+            slots_max=settings.license_max_devices,
+            status=lic["status"],
+            is_new_slot=False,
         )
 
     # Need a new slot.
@@ -219,8 +232,11 @@ async def activate(
                    gpu_model_norm, cpu_family, ram_gb_bucket,
                    activated_at, last_seen)
                VALUES ($1, $2, $3, $4, $5, $6, now(), now())""",
-            lic["id"], slot, fp_hash,
-            req.buckets.gpu_model_norm, req.buckets.cpu_family,
+            lic["id"],
+            slot,
+            fp_hash,
+            req.buckets.gpu_model_norm,
+            req.buckets.cpu_family,
             req.buckets.ram_gb_bucket,
         )
     except asyncpg.UniqueViolationError:
@@ -234,21 +250,26 @@ async def activate(
             409,
             f"all {settings.license_max_devices} device slots in use — "
             "deactivate one from your portal first",
-        )
-    log.info(f"License {lic['id']} activated on new slot {slot} "
-             f"({used + 1}/{settings.license_max_devices}) "
-             f"gpu={req.buckets.gpu_model_norm!r}")
+        ) from None
+    log.info(
+        f"License {lic['id']} activated on new slot {slot} "
+        f"({used + 1}/{settings.license_max_devices}) "
+        f"gpu={req.buckets.gpu_model_norm!r}"
+    )
     return ActivateResponse(
-        license_id=lic["id"], slot_no=slot,
-        slots_used=used + 1, slots_max=settings.license_max_devices,
-        status=lic["status"], is_new_slot=True,
+        license_id=lic["id"],
+        slot_no=slot,
+        slots_used=used + 1,
+        slots_max=settings.license_max_devices,
+        status=lic["status"],
+        is_new_slot=True,
     )
 
 
 @router.post("/validate", response_model=ValidateResponse)
 async def validate(
-    req:  ValidateRequest,
-    db:   asyncpg.Connection = Depends(get_db),
+    req: ValidateRequest,
+    db: asyncpg.Connection = Depends(get_db),
 ):
     """Heartbeat check.  Called on every app launch + every 6 hours
     while running.  Used to detect refund / revoke states so the client
@@ -267,31 +288,35 @@ async def validate(
         """SELECT slot_no FROM license_devices
             WHERE license_id = $1 AND device_fp_hash = $2
               AND deactivated_at IS NULL""",
-        lic["id"], fp_hash,
+        lic["id"],
+        fp_hash,
     )
     if slot_row is None:
         raise HTTPException(
             403,
-            "this hardware is not activated against this license — "
-            "call /activate first",
+            "this hardware is not activated against this license — call /activate first",
         )
 
     await db.execute(
         """UPDATE license_devices SET last_seen = now()
             WHERE license_id = $1 AND device_fp_hash = $2""",
-        lic["id"], fp_hash,
+        lic["id"],
+        fp_hash,
     )
     return ValidateResponse(
-        license_id=lic["id"], slot_no=slot_row["slot_no"],
-        status=lic["status"], last_seen=datetime.utcnow(),
-        refunded_at=lic["refunded_at"], revoked_at=lic["revoked_at"],
+        license_id=lic["id"],
+        slot_no=slot_row["slot_no"],
+        status=lic["status"],
+        last_seen=datetime.now(UTC),
+        refunded_at=lic["refunded_at"],
+        revoked_at=lic["revoked_at"],
     )
 
 
 @router.post("/deactivate")
 async def deactivate(
-    req:  DeactivateRequest,
-    db:   asyncpg.Connection = Depends(get_db),
+    req: DeactivateRequest,
+    db: asyncpg.Connection = Depends(get_db),
 ):
     """Free a slot.  The license key itself is the credential — anyone
     holding the key can manage its slots.  This is intentional: it's
@@ -304,28 +329,31 @@ async def deactivate(
     res = await db.execute(
         """DELETE FROM license_devices
             WHERE license_id = $1 AND slot_no = $2 AND deactivated_at IS NULL""",
-        lic["id"], req.slot_no,
+        lic["id"],
+        req.slot_no,
     )
     # asyncpg returns "DELETE n"; we want to know if anything actually went away.
     if res.endswith(" 0"):
         raise HTTPException(404, f"slot {req.slot_no} is not active")
 
     used = await _count_active_slots(db, lic["id"])
-    log.info(f"License {lic['id']} slot {req.slot_no} deactivated "
-             f"({used}/{settings.license_max_devices})")
+    log.info(
+        f"License {lic['id']} slot {req.slot_no} deactivated "
+        f"({used}/{settings.license_max_devices})"
+    )
     return {
-        "ok":         True,
+        "ok": True,
         "license_id": lic["id"],
-        "slot_no":    req.slot_no,
+        "slot_no": req.slot_no,
         "slots_used": used,
-        "slots_max":  settings.license_max_devices,
+        "slots_max": settings.license_max_devices,
     }
 
 
 @router.get("/{license_id}/public", response_model=PublicLicenseView)
 async def public_view(
     license_id: Annotated[int, Path(ge=1)],
-    db:         asyncpg.Connection = Depends(get_db),
+    db: asyncpg.Connection = Depends(get_db),
 ):
     """The trust-pitch endpoint.  Anyone can hit this with any license
     ID and see *everything* the server knows about that license.
@@ -359,8 +387,12 @@ async def public_view(
     )
     slots = [SlotView(**dict(r)) for r in rows]
     return PublicLicenseView(
-        license_id=lic["id"], status=lic["status"], paid_at=lic["paid_at"],
-        refunded_at=lic["refunded_at"], revoked_at=lic["revoked_at"],
-        slots_used=len(slots), slots_max=settings.license_max_devices,
+        license_id=lic["id"],
+        status=lic["status"],
+        paid_at=lic["paid_at"],
+        refunded_at=lic["refunded_at"],
+        revoked_at=lic["revoked_at"],
+        slots_used=len(slots),
+        slots_max=settings.license_max_devices,
         slots=slots,
     )

@@ -1,5 +1,8 @@
 # Vispora
 
+[![cloud-ci](https://github.com/DeroXP/ghostshell/actions/workflows/cloud-ci.yml/badge.svg)](https://github.com/DeroXP/ghostshell/actions/workflows/cloud-ci.yml)
+[![codeql](https://github.com/DeroXP/ghostshell/actions/workflows/codeql.yml/badge.svg)](https://github.com/DeroXP/ghostshell/actions/workflows/codeql.yml)
+
 A Windows 10/11 desktop app for gaming performance, system clean-up and privacy.
 It runs elevated, as a single portable exe: a local Flask backend with a
 borderless WebView2 window on top (pywebview), plus a tray icon.
@@ -62,7 +65,8 @@ release server, which serves `version.json` + the exe per channel.
 | `core/` | One module per feature |
 | `static/`, `templates/` | The UI (plain JS/CSS, no build step) |
 | `updater/` | The standalone updater app (its own Flask + pywebview window) |
-| `cloud/` | Optional FastAPI licensing / trial backend — see `cloud/README.md` |
+| `cloud/` | The Railway-deployed backend (licensing, trials, device registry) and the framework for extending it — see `cloud/README.md` and `cloud/DEPLOY.md` |
+| `.github/` | CI for `cloud/` (lint, tests on Postgres, dependency audit, image build), CodeQL, Dependabot, code owners |
 
 ## Data
 
@@ -77,6 +81,11 @@ hosts-file block). An existing `Videos\GhostShell` or `Pictures\GhostShell`
 folder keeps being used as it is — those are the user's own files. The old name
 survives in the code only as `LEGACY_APP_NAME` in `config.py` and
 `updater/paths.py`.
+
+## Security
+
+See `SECURITY.md` for how to report a vulnerability and what the backend
+stores.
 
 ## License
 

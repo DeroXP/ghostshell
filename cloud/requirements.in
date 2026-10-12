@@ -1,0 +1,8 @@
+# Direct runtime dependencies.  Edit THIS file, then `make compile` to regenerate
+# requirements.txt (fully pinned, with hashes) — never edit requirements.txt by hand.
+fastapi==0.143.0
+uvicorn[standard]==0.54.0     # [standard] pulls uvloop + httptools: the fast event loop / HTTP parser
+asyncpg==0.32.0
+pydantic==2.14.1
+pydantic-settings==2.15.0
+orjson==3.13.0                # default JSON response class; several× faster than the stdlib encoder

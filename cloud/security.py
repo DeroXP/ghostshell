@@ -23,6 +23,7 @@ What we DON'T do:
     server hashes them.  This means the pepper never leaks to the
     client and we control the hash function.
 """
+
 from __future__ import annotations
 
 import base64
@@ -53,15 +54,17 @@ def _decode_pepper(name: str, raw: str) -> bytes:
             log.error(f"{name} is not valid base64 — generate a real one")
     # Dev-only fallback.  In production this gets caught by the
     # startup check in main.py, which refuses to boot.
-    log.warning(f"{name} is unset — using INSECURE deterministic fallback. "
-                f"Set this env var before deploying!")
+    log.warning(
+        f"{name} is unset — using INSECURE deterministic fallback. "
+        f"Set this env var before deploying!"
+    )
     return hashlib.sha256(f"INSECURE-DEV-{name}".encode()).digest()
 
 
 _FINGERPRINT_PEPPER = _decode_pepper("FINGERPRINT_PEPPER", settings.fingerprint_pepper)
-_EMAIL_PEPPER       = _decode_pepper("EMAIL_PEPPER",       settings.email_pepper)
+_EMAIL_PEPPER = _decode_pepper("EMAIL_PEPPER", settings.email_pepper)
 _LICENSE_KEY_PEPPER = _decode_pepper("LICENSE_KEY_PEPPER", settings.license_key_pepper)
-_IP_PEPPER          = _decode_pepper("IP_PEPPER",          settings.ip_pepper)
+_IP_PEPPER = _decode_pepper("IP_PEPPER", settings.ip_pepper)
 
 
 def using_insecure_dev_peppers() -> bool:
@@ -82,11 +85,13 @@ def hash_fingerprint(cpu_id: str, board_uuid: str, disk_serial: str) -> bytes:
     Irreversible: an attacker with full DB access cannot recover any of
     the three inputs without knowing FINGERPRINT_PEPPER.
     """
-    payload = b"\x00".join([
-        (cpu_id      or "").strip().encode("utf-8"),
-        (board_uuid  or "").strip().lower().encode("utf-8"),
-        (disk_serial or "").strip().encode("utf-8"),
-    ])
+    payload = b"\x00".join(
+        [
+            (cpu_id or "").strip().encode("utf-8"),
+            (board_uuid or "").strip().lower().encode("utf-8"),
+            (disk_serial or "").strip().encode("utf-8"),
+        ]
+    )
     return hmac.new(_FINGERPRINT_PEPPER, payload, hashlib.sha256).digest()
 
 
@@ -118,9 +123,9 @@ def hash_ip(ip: str) -> bytes:
 # when the user reads / types the key from a receipt or installer name.
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
-KEY_GROUPS         = 4
+KEY_GROUPS = 4
 KEY_CHARS_PER_GROUP = 5
-KEY_LEN_RAW         = KEY_GROUPS * KEY_CHARS_PER_GROUP   # 20 chars
+KEY_LEN_RAW = KEY_GROUPS * KEY_CHARS_PER_GROUP  # 20 chars
 # 20 * 5 bits = 100 bits of entropy.  At 1 trillion guesses/sec, brute-forcing
 # the key space takes ~40 quadrillion years.  This is fine.
 
@@ -131,8 +136,7 @@ def generate_license_key() -> str:
     using the Crockford Base32 alphabet (no I/L/O/U).
     """
     raw = "".join(secrets.choice(_CROCKFORD) for _ in range(KEY_LEN_RAW))
-    groups = [raw[i:i + KEY_CHARS_PER_GROUP]
-              for i in range(0, KEY_LEN_RAW, KEY_CHARS_PER_GROUP)]
+    groups = [raw[i : i + KEY_CHARS_PER_GROUP] for i in range(0, KEY_LEN_RAW, KEY_CHARS_PER_GROUP)]
     return "-".join(groups)
 
 
@@ -141,9 +145,7 @@ def normalize_license_key(key: str) -> str:
     common Crockford look-alikes (I→1, L→1, O→0, U→V) before validation.
     """
     cleaned = re.sub(r"[\s\-_]+", "", (key or "").upper())
-    cleaned = (cleaned
-               .replace("I", "1").replace("L", "1")
-               .replace("O", "0").replace("U", "V"))
+    cleaned = cleaned.replace("I", "1").replace("L", "1").replace("O", "0").replace("U", "V")
     return cleaned
 
 
@@ -185,8 +187,8 @@ _IP_PORT_RE = re.compile(
     r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|[a-f0-9:]+):\d{1,5}\b",
     re.IGNORECASE,
 )
-_IPV4_RE   = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
-_IPV6_RE   = re.compile(r"\b(?:[a-f0-9]{1,4}:){2,7}[a-f0-9]{1,4}\b", re.IGNORECASE)
+_IPV4_RE = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
+_IPV6_RE = re.compile(r"\b(?:[a-f0-9]{1,4}:){2,7}[a-f0-9]{1,4}\b", re.IGNORECASE)
 
 
 def _scrub_value(v: object) -> object:
@@ -228,8 +230,7 @@ def install_privacy_filter() -> None:
     """
     log = logging.getLogger("vispora-cloud")
     f = PrivacyFilter()
-    for name in ("uvicorn.access", "uvicorn.error", "uvicorn",
-                 "vispora-cloud", "fastapi"):
+    for name in ("uvicorn.access", "uvicorn.error", "uvicorn", "vispora-cloud", "fastapi"):
         logging.getLogger(name).addFilter(f)
     log.info("Privacy log filter installed — client IPs will be scrubbed")
     if using_insecure_dev_peppers():
@@ -246,8 +247,7 @@ def _print_fresh_peppers() -> None:
     """Helper — invoke as `python -m security` to print four fresh
     base64-encoded 32-byte peppers ready to paste into Railway env vars.
     """
-    for name in ("FINGERPRINT_PEPPER", "EMAIL_PEPPER",
-                 "LICENSE_KEY_PEPPER", "IP_PEPPER"):
+    for name in ("FINGERPRINT_PEPPER", "EMAIL_PEPPER", "LICENSE_KEY_PEPPER", "IP_PEPPER"):
         print(f"{name}={base64.b64encode(secrets.token_bytes(32)).decode()}")
 
 

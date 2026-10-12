@@ -17,16 +17,18 @@ If a trial fingerprint later converts to a paid license, we remember
 that too (`trials.converted_to`) so the recommender can correlate
 "users who tried then bought" stats without ever seeing identities.
 """
+
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import asyncpg
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 from db import get_db
+from middleware import request_client_ip
 from routers.licenses import HardwareBuckets, HardwareInputs
 from security import hash_fingerprint, hash_ip
 from settings import settings
@@ -38,8 +40,8 @@ router = APIRouter(prefix="/v1/trials", tags=["trials"])
 
 # ── Schemas ───────────────────────────────────────────────────────────────
 class TrialStartRequest(BaseModel):
-    hardware:    HardwareInputs
-    buckets:     HardwareBuckets = Field(default_factory=HardwareBuckets)
+    hardware: HardwareInputs
+    buckets: HardwareBuckets = Field(default_factory=HardwareBuckets)
     app_version: str | None = Field(None, max_length=16)
     # Client-side VM detection result.  The server may still reject the
     # trial if its own checks disagree.
@@ -51,13 +53,13 @@ class TrialStatusRequest(BaseModel):
 
 
 class TrialResponse(BaseModel):
-    ok:               bool
-    state:            str               # "active" | "expired" | "blocked" | "converted"
-    started_at:       datetime | None = None
-    expires_at:       datetime | None = None
-    seconds_left:     int     | None = None
-    converted_to_id:  int     | None = None
-    block_reason:     str     | None = None
+    ok: bool
+    state: str  # "active" | "expired" | "blocked" | "converted"
+    started_at: datetime | None = None
+    expires_at: datetime | None = None
+    seconds_left: int | None = None
+    converted_to_id: int | None = None
+    block_reason: str | None = None
 
 
 # ── VPN check (stub) ─────────────────────────────────────────────────────
@@ -80,9 +82,9 @@ async def _is_vpn_or_datacenter(client_ip: str) -> tuple[bool, str]:
 # ── Endpoints ─────────────────────────────────────────────────────────────
 @router.post("/start", response_model=TrialResponse)
 async def start_trial(
-    req:     TrialStartRequest,
+    req: TrialStartRequest,
     request: Request,
-    db:      asyncpg.Connection = Depends(get_db),
+    db: asyncpg.Connection = Depends(get_db),
 ):
     """Start a 7-day trial bound to this hardware fingerprint.
 
@@ -109,28 +111,31 @@ async def start_trial(
     if existing:
         if existing["converted_to"]:
             return TrialResponse(
-                ok=True, state="converted",
+                ok=True,
+                state="converted",
                 started_at=existing["started_at"],
                 expires_at=existing["expires_at"],
                 converted_to_id=existing["converted_to"],
             )
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if now < existing["expires_at"]:
             seconds_left = int((existing["expires_at"] - now).total_seconds())
             return TrialResponse(
-                ok=True, state="active",
+                ok=True,
+                state="active",
                 started_at=existing["started_at"],
                 expires_at=existing["expires_at"],
                 seconds_left=seconds_left,
             )
         return TrialResponse(
-            ok=False, state="expired",
+            ok=False,
+            state="expired",
             started_at=existing["started_at"],
             expires_at=existing["expires_at"],
         )
 
     # First-time fingerprint.  Run anti-abuse checks before starting.
-    client_ip = (request.client.host if request.client else "0.0.0.0") or "0.0.0.0"
+    client_ip = request_client_ip(request)
     is_blocked, vpn_reason = await _is_vpn_or_datacenter(client_ip)
 
     block_reason: str | None = None
@@ -140,14 +145,13 @@ async def start_trial(
         block_reason = "virtual_machine"
 
     if block_reason:
-        log.info(f"Trial blocked: {block_reason} "
-                 f"(buckets gpu={req.buckets.gpu_model_norm!r})")
+        log.info(f"Trial blocked: {block_reason} (buckets gpu={req.buckets.gpu_model_norm!r})")
         return TrialResponse(ok=False, state="blocked", block_reason=block_reason)
 
     # Mint the trial.
-    started_at = datetime.now(timezone.utc)
+    started_at = datetime.now(UTC)
     expires_at = started_at + timedelta(days=settings.trial_duration_days)
-    ip_hash    = hash_ip(client_ip)
+    ip_hash = hash_ip(client_ip)
 
     await db.execute(
         """INSERT INTO trials
@@ -155,16 +159,25 @@ async def start_trial(
                gpu_model_norm, cpu_family, ram_gb_bucket, app_version,
                ip_hash, vpn_flag, vm_flag)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)""",
-        fp_hash, started_at, expires_at,
-        req.buckets.gpu_model_norm, req.buckets.cpu_family,
-        req.buckets.ram_gb_bucket, req.app_version,
-        ip_hash, is_blocked, req.vm_detected,
+        fp_hash,
+        started_at,
+        expires_at,
+        req.buckets.gpu_model_norm,
+        req.buckets.cpu_family,
+        req.buckets.ram_gb_bucket,
+        req.app_version,
+        ip_hash,
+        is_blocked,
+        req.vm_detected,
     )
-    log.info(f"Trial started ({settings.trial_duration_days} days, "
-             f"gpu={req.buckets.gpu_model_norm!r})")
+    log.info(
+        f"Trial started ({settings.trial_duration_days} days, gpu={req.buckets.gpu_model_norm!r})"
+    )
     return TrialResponse(
-        ok=True, state="active",
-        started_at=started_at, expires_at=expires_at,
+        ok=True,
+        state="active",
+        started_at=started_at,
+        expires_at=expires_at,
         seconds_left=settings.trial_duration_days * 86400,
     )
 
@@ -172,7 +185,7 @@ async def start_trial(
 @router.post("/status", response_model=TrialResponse)
 async def trial_status(
     req: TrialStatusRequest,
-    db:  asyncpg.Connection = Depends(get_db),
+    db: asyncpg.Connection = Depends(get_db),
 ):
     """Look up the trial state for the current hardware without starting
     one.  Called from the app on every launch to decide whether to show
@@ -194,19 +207,25 @@ async def trial_status(
 
     if row["converted_to"]:
         return TrialResponse(
-            ok=True, state="converted",
-            started_at=row["started_at"], expires_at=row["expires_at"],
+            ok=True,
+            state="converted",
+            started_at=row["started_at"],
+            expires_at=row["expires_at"],
             converted_to_id=row["converted_to"],
         )
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if now < row["expires_at"]:
         seconds_left = int((row["expires_at"] - now).total_seconds())
         return TrialResponse(
-            ok=True, state="active",
-            started_at=row["started_at"], expires_at=row["expires_at"],
+            ok=True,
+            state="active",
+            started_at=row["started_at"],
+            expires_at=row["expires_at"],
             seconds_left=seconds_left,
         )
     return TrialResponse(
-        ok=False, state="expired",
-        started_at=row["started_at"], expires_at=row["expires_at"],
+        ok=False,
+        state="expired",
+        started_at=row["started_at"],
+        expires_at=row["expires_at"],
     )

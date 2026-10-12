@@ -1,0 +1,33 @@
+# Keeps the three supply chains of the backend current:
+#   • Python packages in cloud/ (pip-compile'd with hashes — Dependabot
+#     regenerates requirements*.txt from requirements*.in, hashes included)
+#   • GitHub Actions pinned by SHA in .github/workflows/
+#   • The python base image digest in cloud/Dockerfile
+# Minor and patch bumps are grouped into one PR per ecosystem per week so the
+# noise stays low; majors arrive individually.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /cloud
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      python-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /cloud
+    schedule:
+      interval: weekly
+      day: monday
