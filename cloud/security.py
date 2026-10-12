@@ -61,6 +61,11 @@ def _decode_pepper(name: str, raw: str) -> bytes:
     return hashlib.sha256(f"INSECURE-DEV-{name}".encode()).digest()
 
 
+if __name__ == "__main__":
+    # `python -m security` (make peppers) only mints new values; the "pepper is
+    # unset" warnings the decode below would print are noise in that mode.
+    logging.disable(logging.WARNING)
+
 _FINGERPRINT_PEPPER = _decode_pepper("FINGERPRINT_PEPPER", settings.fingerprint_pepper)
 _EMAIL_PEPPER = _decode_pepper("EMAIL_PEPPER", settings.email_pepper)
 _LICENSE_KEY_PEPPER = _decode_pepper("LICENSE_KEY_PEPPER", settings.license_key_pepper)
