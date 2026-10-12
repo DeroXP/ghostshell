@@ -40,7 +40,8 @@ defaults:
 env:
   PYTHON_VERSION: "3.13"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  PIP_NO_CACHE_DIR: "1"
+  # Do NOT set PIP_NO_CACHE_DIR here: setup-python's `cache: pip` runs
+  # `pip cache dir`, which errors out when the cache is disabled.
 
 jobs:
   lint:
