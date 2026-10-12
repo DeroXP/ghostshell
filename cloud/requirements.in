@@ -1,7 +1,9 @@
 # Direct runtime dependencies.  Edit THIS file, then `make compile` to regenerate
 # requirements.txt (fully pinned, with hashes) — never edit requirements.txt by hand.
 fastapi==0.143.0
-uvicorn[standard]==0.54.0     # [standard] pulls uvloop + httptools: the fast event loop / HTTP parser
+uvicorn==0.54.0
+httptools==0.9.0                       # fast HTTP parser (uvicorn picks it up automatically)
+uvloop==0.23.0 ; sys_platform != "win32"   # fast event loop; no Windows build exists, so Windows dev boxes skip it
 asyncpg==0.32.0
 pydantic==2.14.1
 pydantic-settings==2.15.0

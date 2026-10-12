@@ -64,6 +64,21 @@ cp .env.example .env    # DATABASE_URL already points at that Postgres
 make dev                # http://localhost:8000/docs
 ```
 
+On **Windows (PowerShell)** there is no `make`; the equivalents are:
+
+```powershell
+cd cloud
+python -m venv .venv
+.venv\Scripts\pip install --require-hashes -r requirements.txt -r requirements-dev.txt
+.venv\Scripts\python -m security          # = make peppers
+.venv\Scripts\uvicorn main:app --reload   # = make dev   (DATABASE_URL from .env)
+.venv\Scripts\pytest                      # = make test
+.venv\Scripts\ruff check .                # = make lint
+```
+
+(`uvloop` has no Windows build and is skipped there automatically; the
+server falls back to asyncio's default loop, which is fine for development.)
+
 Without Docker, any Postgres will do — point `DATABASE_URL` in `.env` at it.
 Peppers may stay empty locally; the service logs a warning and uses
 deterministic dev values.  `make help` lists every target.

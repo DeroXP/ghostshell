@@ -42,8 +42,15 @@ Service → **Variables**.  Required:
 | `LICENSE_KEY_PEPPER` | "" |
 | `IP_PEPPER` | "" |
 
-Run `make peppers` (or `python -m security`) **locally**, paste the four
-values, and store them in a password manager — see *Rotating a pepper* below.
+Generate them **locally** with `make peppers` (Windows: `.venv\Scripts\python -m security`
+after installing the requirements), or, with nothing installed at all:
+
+```bash
+python -c "import base64,secrets; [print(f'{n}={base64.b64encode(secrets.token_bytes(32)).decode()}') for n in ('FINGERPRINT_PEPPER','EMAIL_PEPPER','LICENSE_KEY_PEPPER','IP_PEPPER')]"
+```
+
+Paste the four lines into the **Raw Editor** of the Variables tab, and store
+them in a password manager — see *Rotating a pepper* below.
 Railway can **seal** a variable so its value is never shown in the UI again;
 do that for the peppers.  Never commit them.
 
