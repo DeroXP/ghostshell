@@ -22,6 +22,7 @@ Usage examples:
 
 Run this from the cloud/ directory so settings.py finds .env.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -46,7 +47,7 @@ async def _conn() -> asyncpg.Connection:
 async def cmd_mint(args: argparse.Namespace) -> int:
     """Create a fresh license without going through Stripe."""
     key = generate_license_key()
-    key_hash   = hash_license_key(key)
+    key_hash = hash_license_key(key)
     email_hash = hash_email(args.email) if args.email else None
 
     db = await _conn()
@@ -56,7 +57,10 @@ async def cmd_mint(args: argparse.Namespace) -> int:
                   (key_hash, email_hash, status, currency, amount_cents)
                VALUES ($1, $2, 'active', $3, $4)
                RETURNING id, paid_at""",
-            key_hash, email_hash, args.currency, args.amount_cents,
+            key_hash,
+            email_hash,
+            args.currency,
+            args.amount_cents,
         )
     finally:
         await db.close()
@@ -94,8 +98,11 @@ async def cmd_list(args: argparse.Namespace) -> int:
     print(f"{'id':<5} {'status':<10} {'slots':<7} {'amount':<10} paid_at")
     print("-" * 60)
     for r in rows:
-        amt = (f"{(r['amount_cents'] or 0) / 100:.2f} {r['currency'] or '?'}"
-               if r['amount_cents'] else "(unset)")
+        amt = (
+            f"{(r['amount_cents'] or 0) / 100:.2f} {r['currency'] or '?'}"
+            if r["amount_cents"]
+            else "(unset)"
+        )
         slots = f"{r['slots_used']}/{settings.license_max_devices}"
         print(f"{r['id']:<5} {r['status']:<10} {slots:<7} {amt:<10} {r['paid_at']}")
     return 0
@@ -129,7 +136,9 @@ async def cmd_show(args: argparse.Namespace) -> int:
     print(f"  status:     {lic['status']}")
     print(f"  paid_at:    {lic['paid_at']}")
     print(f"  refunded:   {lic['refunded_at']}")
-    print(f"  revoked:    {lic['revoked_at']} {('(' + lic['revoke_reason'] + ')') if lic['revoke_reason'] else ''}")
+    print(
+        f"  revoked:    {lic['revoked_at']} {('(' + lic['revoke_reason'] + ')') if lic['revoke_reason'] else ''}"
+    )
     print(f"  amount:     {(lic['amount_cents'] or 0) / 100:.2f} {lic['currency'] or '?'}")
     print()
     if not devs:
@@ -139,11 +148,13 @@ async def cmd_show(args: argparse.Namespace) -> int:
     print("  " + "-" * 75)
     for d in devs:
         suffix = "" if d["deactivated_at"] is None else " (deactivated)"
-        print(f"  {d['slot_no']:<5} "
-              f"{(d['gpu_model_norm'] or '-'):<25} "
-              f"{(d['cpu_family'] or '-'):<20} "
-              f"{(d['ram_gb_bucket'] or '-'):<6} "
-              f"{d['last_seen']}{suffix}")
+        print(
+            f"  {d['slot_no']:<5} "
+            f"{(d['gpu_model_norm'] or '-'):<25} "
+            f"{(d['cpu_family'] or '-'):<20} "
+            f"{(d['ram_gb_bucket'] or '-'):<6} "
+            f"{d['last_seen']}{suffix}"
+        )
     return 0
 
 
@@ -156,13 +167,13 @@ async def cmd_revoke(args: argparse.Namespace) -> int:
                       revoked_at = NOW(),
                       revoke_reason = $2
                 WHERE id = $1 AND status = 'active'""",
-            args.license_id, args.reason,
+            args.license_id,
+            args.reason,
         )
     finally:
         await db.close()
     if result.endswith(" 0"):
-        print(f"License {args.license_id} not found or not active",
-              file=sys.stderr)
+        print(f"License {args.license_id} not found or not active", file=sys.stderr)
         return 1
     print(f"License {args.license_id} revoked: {args.reason}")
     return 0
@@ -181,8 +192,7 @@ async def cmd_refund(args: argparse.Namespace) -> int:
     finally:
         await db.close()
     if result.endswith(" 0"):
-        print(f"License {args.license_id} not found or not active",
-              file=sys.stderr)
+        print(f"License {args.license_id} not found or not active", file=sys.stderr)
         return 1
     print(f"License {args.license_id} marked as refunded")
     return 0
@@ -208,7 +218,8 @@ async def cmd_forget_trial(args: argparse.Namespace) -> int:
     db = await _conn()
     try:
         result = await db.execute(
-            "DELETE FROM trials WHERE device_fp_hash = $1", fp_bytes,
+            "DELETE FROM trials WHERE device_fp_hash = $1",
+            fp_bytes,
         )
     finally:
         await db.close()
@@ -249,8 +260,7 @@ def main() -> int:
     sp.add_argument("license_id", type=int)
     sp.set_defaults(fn=cmd_refund)
 
-    sp = sub.add_parser("forget-trial",
-                        help="delete a trial row by device_fp_hash hex")
+    sp = sub.add_parser("forget-trial", help="delete a trial row by device_fp_hash hex")
     sp.add_argument("fp_hex", help="64-char hex string")
     sp.set_defaults(fn=cmd_forget_trial)
 

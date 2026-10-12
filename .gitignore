@@ -23,3 +23,10 @@ dist-*/
 # Local env / secrets — never commit credentials
 .env
 *.env
+
+# Python tooling
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

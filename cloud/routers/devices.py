@@ -15,11 +15,11 @@ What we DO store:
 
 What we don't store:
   • Anything that ties back to a real-world identity.  The IP address is
-    hashed (SHA256) and used only for abuse rate-limiting, never logged.
+    stored only as a peppered HMAC, used for abuse rate-limiting, never logged.
 """
+
 from __future__ import annotations
 
-import hashlib
 import logging
 from uuid import UUID
 
@@ -28,6 +28,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from db import get_db
+from middleware import request_client_ip
+from security import hash_ip
 
 log = logging.getLogger("vispora-cloud.devices")
 
@@ -36,35 +38,35 @@ router = APIRouter(prefix="/v1/devices", tags=["devices"])
 
 # ── Schemas ───────────────────────────────────────────────────────────────
 class HardwareFingerprint(BaseModel):
-    gpu_model:   str | None = None
-    cpu_family:  str | None = None
-    cpu_model:   str | None = None
-    ram_gb:      int | None = None
-    os_build:    str | None = None
+    gpu_model: str | None = None
+    cpu_family: str | None = None
+    cpu_model: str | None = None
+    ram_gb: int | None = None
+    os_build: str | None = None
     app_version: str | None = None
 
 
 class DeviceSettings(BaseModel):
     telemetry_opt_in: bool = False
-    sync_opt_in:      bool = False
-    news_opt_in:      bool = True
-    update_channel:   str  = "stable"
+    sync_opt_in: bool = False
+    news_opt_in: bool = True
+    update_channel: str = "stable"
 
 
 class RegisterRequest(BaseModel):
-    device_id:   UUID
-    hardware:    HardwareFingerprint = Field(default_factory=HardwareFingerprint)
+    device_id: UUID
+    hardware: HardwareFingerprint = Field(default_factory=HardwareFingerprint)
 
 
 class RegisterResponse(BaseModel):
-    ok:        bool   = True
+    ok: bool = True
     device_id: UUID
-    is_new:    bool
-    settings:  DeviceSettings
+    is_new: bool
+    settings: DeviceSettings
 
 
 class HeartbeatRequest(BaseModel):
-    hardware:    HardwareFingerprint | None = None
+    hardware: HardwareFingerprint | None = None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -76,7 +78,7 @@ def _norm_gpu_model(name: str | None) -> str | None:
     n = name.lower().strip()
     for prefix in ("nvidia ", "amd ", "intel ", "geforce "):
         if n.startswith(prefix):
-            n = n[len(prefix):]
+            n = n[len(prefix) :]
     return n.strip()
 
 
@@ -93,15 +95,13 @@ def _ram_bucket(gb: int | None) -> str | None:
 
 
 def _ip_hash(req: Request) -> str:
-    """Hash the client IP for rate-limiting.  Never store the raw IP."""
-    ip = (req.client.host if req.client else "0.0.0.0") or "0.0.0.0"
-    return hashlib.sha256(ip.encode()).hexdigest()[:16]
+    """Peppered HMAC of the client IP, hex-encoded, for abuse rate-limiting
+    only.  The raw IP never reaches the database or the logs."""
+    return hash_ip(request_client_ip(req)).hex()
 
 
 async def _device_exists(db: asyncpg.Connection, device_id: UUID) -> bool:
-    return await db.fetchval(
-        "SELECT EXISTS(SELECT 1 FROM devices WHERE id = $1)", device_id
-    )
+    return await db.fetchval("SELECT EXISTS(SELECT 1 FROM devices WHERE id = $1)", device_id)
 
 
 async def _get_settings(db: asyncpg.Connection, device_id: UUID) -> DeviceSettings:
@@ -130,7 +130,7 @@ async def register_device(
     """
     hw = req.hardware
     is_new = not await _device_exists(db, req.device_id)
-    ip_h   = _ip_hash(request)
+    ip_h = _ip_hash(request)
 
     # Both writes must land together: if the process dies/times out between
     # them, `is_new` would come back False on retry (the devices row already
@@ -157,9 +157,16 @@ async def register_device(
                 last_ip_hash   = EXCLUDED.last_ip_hash,
                 last_seen      = NOW()
             """,
-            req.device_id, hw.gpu_model, _norm_gpu_model(hw.gpu_model),
-            hw.cpu_family, hw.cpu_model, hw.ram_gb,
-            _ram_bucket(hw.ram_gb), hw.os_build, hw.app_version, ip_h,
+            req.device_id,
+            hw.gpu_model,
+            _norm_gpu_model(hw.gpu_model),
+            hw.cpu_family,
+            hw.cpu_model,
+            hw.ram_gb,
+            _ram_bucket(hw.ram_gb),
+            hw.os_build,
+            hw.app_version,
+            ip_h,
         )
         if is_new:
             await db.execute(
@@ -168,8 +175,8 @@ async def register_device(
             )
 
     settings_row = await _get_settings(db, req.device_id)
-    log.info(f"Device {'registered' if is_new else 'refreshed'}: {req.device_id} "
-             f"gpu={hw.gpu_model!r} cpu={hw.cpu_family!r} ram={hw.ram_gb}gb")
+    # Hardware details live in the row; a log line needs only the event.
+    log.info("Device %s", "registered" if is_new else "refreshed")
     return RegisterResponse(device_id=req.device_id, is_new=is_new, settings=settings_row)
 
 
@@ -206,9 +213,15 @@ async def heartbeat(
                 last_seen      = NOW()
             WHERE id = $1
             """,
-            device_id, hw.gpu_model, _norm_gpu_model(hw.gpu_model),
-            hw.cpu_family, hw.cpu_model, hw.ram_gb,
-            _ram_bucket(hw.ram_gb), hw.os_build, hw.app_version,
+            device_id,
+            hw.gpu_model,
+            _norm_gpu_model(hw.gpu_model),
+            hw.cpu_family,
+            hw.cpu_model,
+            hw.ram_gb,
+            _ram_bucket(hw.ram_gb),
+            hw.os_build,
+            hw.app_version,
         )
     else:
         await db.execute("UPDATE devices SET last_seen = NOW() WHERE id = $1", device_id)
@@ -247,7 +260,10 @@ async def put_device_settings(
             update_channel   = EXCLUDED.update_channel,
             updated_at       = NOW()
         """,
-        device_id, body.telemetry_opt_in, body.sync_opt_in,
-        body.news_opt_in, body.update_channel,
+        device_id,
+        body.telemetry_opt_in,
+        body.sync_opt_in,
+        body.news_opt_in,
+        body.update_channel,
     )
     return body

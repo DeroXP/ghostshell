@@ -1,0 +1,34 @@
+# Local development stack.  `make db-up` starts just the database; `docker
+# compose up --build` runs the API in the same image Railway will build.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vispora
+      POSTGRES_PASSWORD: vispora
+      POSTGRES_DB: vispora
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vispora -d vispora"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql://vispora:vispora@db:5432/vispora
+      LOG_FORMAT: text
+      PORT: "8000"
+    ports:
+      - "127.0.0.1:8000:8000"
+
+volumes:
+  pgdata: {}

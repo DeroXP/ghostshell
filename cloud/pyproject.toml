@@ -1,0 +1,44 @@
+# Tool configuration only — cloud/ is deployed as a flat directory, not
+# installed as a package.
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = [".venv", "venv"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes
+  "I",        # isort
+  "B",        # bugbear — likely bugs
+  "UP",       # pyupgrade — modern syntax for the pinned Python
+  "S",        # flake8-bandit — the security rule set
+  "ASYNC",    # blocking calls inside async code
+  "C4",       # comprehension clean-ups
+  "RUF",      # ruff's own checks
+]
+ignore = [
+  "E501",     # line length is the formatter's job
+  "RUF012",   # mutable class attribute defaults — pydantic models use them on purpose
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency injection is spelled as a call in a default argument.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Path", "fastapi.Query", "fastapi.Header", "fastapi.Body"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+  "S101",     # assert is the point of a test
+  "S105", "S106", "S108",  # literal "passwords"/tmp paths in fixtures
+]
+
+[tool.ruff.format]
+quote-style = "double"
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q -ra --strict-markers --strict-config"
+xfail_strict = true
