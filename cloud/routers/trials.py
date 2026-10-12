@@ -145,7 +145,7 @@ async def start_trial(
         block_reason = "virtual_machine"
 
     if block_reason:
-        log.info(f"Trial blocked: {block_reason} (buckets gpu={req.buckets.gpu_model_norm!r})")
+        log.info("Trial blocked: %s", block_reason)
         return TrialResponse(ok=False, state="blocked", block_reason=block_reason)
 
     # Mint the trial.
@@ -170,9 +170,7 @@ async def start_trial(
         is_blocked,
         req.vm_detected,
     )
-    log.info(
-        f"Trial started ({settings.trial_duration_days} days, gpu={req.buckets.gpu_model_norm!r})"
-    )
+    log.info("Trial started (%d days)", settings.trial_duration_days)
     return TrialResponse(
         ok=True,
         state="active",

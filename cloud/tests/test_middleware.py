@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from main import create_app
-from middleware import client_ip
+from middleware import API_CSP, DOCS_CSP, client_ip
 from settings import settings
 
 STATUS_PATH = "/v1/profiles/_status"  # a real route that needs no database
@@ -45,7 +45,7 @@ def test_security_headers_on_api_responses(client):
     assert h["x-frame-options"] == "DENY"
     assert h["referrer-policy"] == "no-referrer"
     assert h["cache-control"] == "no-store"
-    assert h["content-security-policy"].startswith("default-src 'none'")
+    assert h["content-security-policy"] == API_CSP.decode()
     assert h["strict-transport-security"].startswith("max-age=")
     assert "permissions-policy" in h
     assert "server" not in h  # TestClient never adds one; uvicorn runs with --no-server-header
@@ -61,7 +61,7 @@ def test_security_headers_on_error_responses_too(client):
 def test_docs_page_gets_a_renderable_csp(client):
     r = client.get("/docs")
     assert r.status_code == 200
-    assert "cdn.jsdelivr.net" in r.headers["content-security-policy"]
+    assert r.headers["content-security-policy"] == DOCS_CSP.decode()
 
 
 def test_hsts_can_be_disabled(monkeypatch):

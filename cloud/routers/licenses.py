@@ -252,9 +252,11 @@ async def activate(
             "deactivate one from your portal first",
         ) from None
     log.info(
-        f"License {lic['id']} activated on new slot {slot} "
-        f"({used + 1}/{settings.license_max_devices}) "
-        f"gpu={req.buckets.gpu_model_norm!r}"
+        "License %d activated on new slot %d (%d/%d)",
+        lic["id"],
+        slot,
+        used + 1,
+        settings.license_max_devices,
     )
     return ActivateResponse(
         license_id=lic["id"],
@@ -326,20 +328,23 @@ async def deactivate(
     if lic is None:
         raise HTTPException(404, "license key not found")
 
-    res = await db.execute(
+    freed = await db.fetchrow(
         """DELETE FROM license_devices
-            WHERE license_id = $1 AND slot_no = $2 AND deactivated_at IS NULL""",
+            WHERE license_id = $1 AND slot_no = $2 AND deactivated_at IS NULL
+        RETURNING slot_no""",
         lic["id"],
         req.slot_no,
     )
-    # asyncpg returns "DELETE n"; we want to know if anything actually went away.
-    if res.endswith(" 0"):
+    if freed is None:
         raise HTTPException(404, f"slot {req.slot_no} is not active")
 
     used = await _count_active_slots(db, lic["id"])
     log.info(
-        f"License {lic['id']} slot {req.slot_no} deactivated "
-        f"({used}/{settings.license_max_devices})"
+        "License %d slot %d deactivated (%d/%d)",
+        lic["id"],
+        freed["slot_no"],
+        used,
+        settings.license_max_devices,
     )
     return {
         "ok": True,

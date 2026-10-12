@@ -143,9 +143,9 @@ class RequestIDMiddleware:
 
 
 # ─── Security headers ────────────────────────────────────────────────────
-_API_CSP = b"default-src 'none'; frame-ancestors 'none'"
+API_CSP = b"default-src 'none'; frame-ancestors 'none'"
 # Swagger UI / ReDoc load their assets from jsdelivr and use inline scripts.
-_DOCS_CSP = (
+DOCS_CSP = (
     b"default-src 'self'; "
     b"script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
     b"style-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
@@ -181,8 +181,8 @@ class SecurityHeadersMiddleware:
                     f"max-age={hsts_max_age}; includeSubDomains".encode(),
                 )
             )
-        self.api_headers = [*base, (b"content-security-policy", _API_CSP)]
-        self.docs_headers = [*base, (b"content-security-policy", _DOCS_CSP)]
+        self.api_headers = [*base, (b"content-security-policy", API_CSP)]
+        self.docs_headers = [*base, (b"content-security-policy", DOCS_CSP)]
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":

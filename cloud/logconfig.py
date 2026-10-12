@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import re
 import sys
 import time
 
@@ -58,6 +59,22 @@ class JsonFormatter(logging.Formatter):
 
 
 _TEXT_FORMAT = "%(asctime)s %(levelname)-7s %(name)s [%(request_id)s] %(message)s"
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+class TextFormatter(logging.Formatter):
+    """Plain-text lines for local development.
+
+    Control characters in the rendered message are escaped (`\\x0a` for a
+    newline, and so on), so a value that reaches a log call unsanitised can
+    never forge a second log line.  Exception tracebacks are appended by the
+    base class after this step and keep their newlines.  JSON output needs
+    no such guard: orjson escapes control characters itself.
+    """
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        record.message = _CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}", record.message)
+        return super().formatMessage(record)
 
 
 def configure_logging(level: str, *, json_logs: bool) -> None:
@@ -67,7 +84,7 @@ def configure_logging(level: str, *, json_logs: bool) -> None:
         root.removeHandler(h)
 
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(JsonFormatter() if json_logs else logging.Formatter(_TEXT_FORMAT))
+    handler.setFormatter(JsonFormatter() if json_logs else TextFormatter(_TEXT_FORMAT))
     handler.addFilter(RequestIdFilter())
     handler.addFilter(PrivacyFilter())
     root.addHandler(handler)

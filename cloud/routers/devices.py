@@ -175,10 +175,8 @@ async def register_device(
             )
 
     settings_row = await _get_settings(db, req.device_id)
-    log.info(
-        f"Device {'registered' if is_new else 'refreshed'}: {req.device_id} "
-        f"gpu={hw.gpu_model!r} cpu={hw.cpu_family!r} ram={hw.ram_gb}gb"
-    )
+    # Hardware details live in the row; a log line needs only the event.
+    log.info("Device %s", "registered" if is_new else "refreshed")
     return RegisterResponse(device_id=req.device_id, is_new=is_new, settings=settings_row)
 
 
