@@ -47,7 +47,7 @@ _tls = threading.local()   # .suspended: set, per thread, while a reset is runni
 ABSENT = "ABSENT"
 
 # Scopes that are applied when a game starts and undone when it closes.
-_TRANSIENT_SCOPES = ("competitive",)
+_TRANSIENT_SCOPES = ("competitive", "gamemode")
 
 
 def _is_suspended() -> bool:
@@ -234,16 +234,18 @@ _POWER_ALIASES = {
 }
 
 
-def remember_power(sub: str, setting: str, scope: str = "optimizer") -> None:
-    """Call before changing a setting on the ACTIVE power plan."""
+def remember_power(sub: str, setting: str, scope: str = "optimizer") -> bool:
+    """Call before changing a setting on the ACTIVE power plan.  True when its
+    previous value is on record afterwards (now, or from an earlier call) —
+    i.e. when the change about to be made can be undone."""
     if _is_suspended():
-        return
+        return False
     try:
         sub = _POWER_ALIASES.get(sub.lower(), sub.lower())
         setting = _POWER_ALIASES.get(setting.lower(), setting.lower())
         scheme = _active_scheme()
         if not scheme:
-            return
+            return False
         tail = f"{scheme}|{sub}|{setting}".lower()
         ident = f"{scope}||{tail}"
         with _lock:
@@ -251,14 +253,25 @@ def remember_power(sub: str, setting: str, scope: str = "optimizer") -> None:
             if _take_over_transient(power, scope, tail):
                 _save()
             if ident in power:
-                return
+                return True
             cur = query_power(scheme, sub, setting)
             if cur is None:
-                return
+                return False
             power[ident] = {"ac": cur[0], "dc": cur[1]}
             _save()
+            return True
     except Exception as e:
         log.debug(f"could not record power setting {sub}/{setting}: {e}")
+        return False
+
+
+def has_power(sub: str, setting: str, scope: str = "optimizer") -> bool:
+    """Is this power setting on record for `scope`, on any plan?"""
+    sub = _POWER_ALIASES.get(sub.lower(), sub.lower())
+    setting = _POWER_ALIASES.get(setting.lower(), setting.lower())
+    prefix, tail = f"{scope}||", f"|{sub}|{setting}"
+    with _lock:
+        return any(i.startswith(prefix) and i.endswith(tail) for i in _load()["power"])
 
 
 # ── notes ─────────────────────────────────────────────────────────────

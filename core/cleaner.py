@@ -396,7 +396,7 @@ def _is_junk(name: str, ext: str) -> bool:
 
 def clean_disk_junk(drive_letters: list[str]) -> dict:
     """Clean junk from selected drives."""
-    log.info(f"=== DISK CLEAN: {', '.join(drive_letters)} ===")
+    log.info(f"=== DISK CLEAN: {', '.join(map(str, drive_letters))} ===")   # (may hold non-strings: checked below)
     total_files = 0; total_size = 0; results = []
 
     for letter in drive_letters:

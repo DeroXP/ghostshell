@@ -1561,12 +1561,14 @@
                 </div>
                 <div style="font-size:13px;color:var(--text);margin-top:12px;line-height:1.8">
                     <span style="color:var(--accent);font-weight:600">1.</span> Process priority → High<br>
-                    <span style="color:var(--accent);font-weight:600">2.</span> CPU affinity locked to P-Cores (hybrid CPUs) or all cores<br>
-                    <span style="color:var(--accent);font-weight:600">3.</span> Win32PrioritySeparation = 0x28 (Short/Fixed — lowest input lag)<br>
-                    <span style="color:var(--accent);font-weight:600">4.</span> CPU idle states disabled (max clock speeds)<br>
-                    <span style="color:var(--accent);font-weight:600">5.</span> DSCP 46 network priority for the game<br>
-                    <span style="color:var(--accent);font-weight:600">6.</span> SystemResponsiveness = 10 (foreground priority, audio-safe)<br>
-                    <span style="color:var(--accent);font-weight:600">7.</span> Network throttling disabled
+                    <span style="color:var(--accent);font-weight:600">2.</span> Every CPU core made available to the game — P-cores and E-cores, any core restriction lifted (Windows still puts the heaviest threads on the P-cores)<br>
+                    <span style="color:var(--accent);font-weight:600">3.</span> Core parking off — no core is put to sleep while the game runs<br>
+                    <span style="color:var(--accent);font-weight:600">4.</span> Game exempt from Windows power throttling (never moved to efficiency mode)<br>
+                    <span style="color:var(--accent);font-weight:600">5.</span> Win32PrioritySeparation = 0x28 (Short/Fixed — lowest input lag)<br>
+                    <span style="color:var(--accent);font-weight:600">6.</span> CPU idle states disabled (max clock speeds)<br>
+                    <span style="color:var(--accent);font-weight:600">7.</span> DSCP 46 network priority for the game<br>
+                    <span style="color:var(--accent);font-weight:600">8.</span> SystemResponsiveness = 10 (foreground priority, audio-safe)<br>
+                    <span style="color:var(--accent);font-weight:600">9.</span> Network throttling disabled
                 </div>
                 <div style="font-size:13px;color:var(--text);margin-top:18px;padding-top:14px;border-top:1px solid var(--border-faint);line-height:1.7">
                     <b style="color:var(--text-bright)">When the game exits</b>, everything above is reverted AND a PC refresh runs automatically:<br>
@@ -2661,7 +2663,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h4"/><path d="M14 12h.01"/><path d="M18 12h.01"/></svg>
                         Game Mode
                     </div>
-                    <div class="card-section-desc">When game mode is on, Vispora watches for any game from the ~280-entry database and applies the gaming profile automatically (priority, P-core affinity, OC, network QoS, foreground-priority). Reverts everything when the game exits.</div>
+                    <div class="card-section-desc">When game mode is on, Vispora watches for any game from the ~280-entry database and applies the gaming profile automatically (priority, every CPU core, OC, network QoS, foreground-priority). Reverts everything when the game exits.</div>
                     <div id="settings-gamemode-rows">
                         <div style="font-size:13px;color:var(--text-secondary);padding:8px 0">Loading…</div>
                     </div>

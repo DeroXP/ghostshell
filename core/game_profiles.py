@@ -12,7 +12,7 @@ import os
 import time
 import threading
 from config import APP_NAME, APPDATA_DIR, OWN_PROCESS_NAMES
-from core import reg_originals
+from core import process_tuning, reg_originals
 from core.network_tweaks import qos_policy_filter
 from core.utils import run_ps, run_cmd, get_logger, atomic_write_json, is_safe_ps_exe_name
 
@@ -33,6 +33,17 @@ os.makedirs(PROFILES_DIR, exist_ok=True)
 
 BASELINE_FILE = os.path.join(PROFILES_DIR, "normal_baseline.json")
 GAMING_FLAG_FILE = os.path.join(PROFILES_DIR, "gaming_active.flag")
+
+# Power-plan settings changed for the length of a game session.  Each one's
+# previous value is noted first (core/reg_originals.py, under this scope) —
+# per power plan, so it goes back onto the plan it was changed on even when a
+# per-game target switched plans in between.
+_SCOPE = "gamemode"
+_PROC_SUB = "54533251-82be-4824-96c1-47b60b740d00"      # processor power management
+_CORE_PARKING_MIN = (                                   # minimum share of cores kept unparked, per core type
+    "0cc5b647-c1df-4637-891a-dec35c318583",             #   efficiency class 0: E-cores (every core on a non-hybrid CPU)
+    "0cc5b647-c1df-4637-891a-dec35c318584",             #   efficiency class 1: P-cores
+)
 
 # ═══════════════════════════════════════════════════════════════
 # Known game executables (300+)
@@ -392,6 +403,8 @@ _engine = {
     # active when (if) the game crashes.
     "active_oc_core": 0,
     "active_oc_mem":  0,
+    # What process_tuning.tune() changed on the game's process, for release().
+    "proc_prior": None,
 }
 
 
@@ -493,27 +506,42 @@ def _apply_gaming_tweaks(pid: int, exe_name: str) -> list[str]:
     """Apply hard gaming tweaks."""
     changes = []
 
-    # 1. Process priority -> High
-    r = run_ps(f"try {{ (Get-Process -Id {pid}).PriorityClass='High'; 'OK' }} catch {{ 'FAIL' }}", timeout=5)
-    if not (r["ok"] and "OK" in r["out"]):
-        run_cmd(["wmic","process","where",f"ProcessId={pid}","CALL","setpriority","128"])
-    changes.append("Process priority -> High")
-
-    # (Step 2 used to pin the game to a "best cores" affinity mask.  On
-    # everything but hybrid Intel that mask was simply all cores — a no-op.
-    # On 12th–14th gen it was the first NumberOfCores *logical* processors,
-    # i.e. roughly half the P-cores: an i5-12400F game got 3 of its 6 cores.
-    # The Windows scheduler already keeps a foreground game on the P-cores.)
+    # 1 + 2. The game's own process: High priority, every CPU core, never
+    #    power-throttled (core/process_tuning.py).  The affinity step exists
+    #    to LIFT restrictions — one inherited from a launcher, or left by the
+    #    old "best cores" pin, which on hybrid CPUs gave a game only some of
+    #    its P-cores.  Windows still decides which thread runs where, and
+    #    keeps the heaviest ones on the P-cores.
+    all_cores = bool(_load_gp_settings().get("all_cores", True))
+    tuned = process_tuning.tune(pid, all_cores=all_cores)
+    _engine["proc_prior"] = tuned.get("prior") if tuned.get("ok") else None
+    if tuned.get("priority"):
+        changes.append("Process priority -> High")
+    else:
+        # The handle was refused (anti-cheat, usually).  The old PowerShell
+        # route, for what it is worth — and say so if that fails as well.
+        r = run_ps(f"try {{ (Get-Process -Id {pid}).PriorityClass='High'; 'OK' }} catch {{ 'FAIL' }}", timeout=5)
+        if r["ok"] and "OK" in r["out"]:
+            changes.append("Process priority -> High")
+        else:
+            changes.append("Process priority: unchanged (the game's process is protected)")
+    aff = tuned.get("affinity")
+    if aff and aff.get("ok"):
+        changes.append(f"CPU affinity -> all {process_tuning.describe_cores()}"
+                       + (f" (was limited to {aff['was']})" if aff.get("changed") else ""))
+    elif all_cores and not tuned.get("ok"):
+        changes.append("CPU affinity: unchanged (the game's process is protected)")
+    if tuned.get("throttling"):
+        changes.append("Power throttling -> off for the game")
 
     # 3. Win32PrioritySeparation -> 0x28 (Short/Fixed)
     run_cmd(["reg","add",r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl",
              "/v","Win32PrioritySeparation","/t","REG_DWORD","/d","40","/f"])
     changes.append("Win32PrioritySeparation -> 0x28 (Short/Fixed)")
 
-    # 4. CPU idle disabled (max clocks)
-    run_cmd(["powercfg","/setacvalueindex","SCHEME_CURRENT","SUB_PROCESSOR","IdleDisable","1"])
-    run_cmd(["powercfg","/setactive","SCHEME_CURRENT"])
-    changes.append("CPU idle -> disabled")
+    # 4. (Core parking and CPU idle are power-plan settings: see
+    #    _apply_power_tweaks(), which runs once the per-game target has
+    #    chosen the plan the game will actually run on.)
 
     # 5. SystemResponsiveness -> 10
     # beta.6: was 0.  Setting 0 dedicates 100% of the multimedia class to
@@ -597,6 +625,42 @@ def _apply_gaming_tweaks(pid: int, exe_name: str) -> list[str]:
         log.debug(f"background pauser hook failed: {e}")
 
     log.info(f"  Applied {len(changes)} gaming tweaks")
+    return changes
+
+
+def _apply_power_tweaks() -> list[str]:
+    """The power-plan half of game mode: no parked cores, no CPU idle states.
+
+    Runs AFTER apply_target(), on whichever plan is active by then.  These
+    settings used to be written before a Max-FPS target switched to the
+    Ultimate plan — so for exactly those games they were not in effect at
+    all, and on exit "idle back on" went to a plan the game had not run on.
+    Each previous value is now recorded per plan and put back by
+    restore_normal_mode(), so nothing can land on the wrong plan."""
+    changes = []
+    # Marks the session as one whose plan changes are all on record.  Without
+    # it restore_normal_mode() cannot tell "nothing on record because an older
+    # build applied this" (fall back to the baseline) from "nothing left on
+    # record because the optimizer has since made the setting its own".
+    reg_originals.note("gamemode_plan_recorded")
+
+    # Every core awake.  A parked core takes no threads until Windows decides
+    # to unpark it; with the minimum for both core types at 100 % none is
+    # parked while the game runs, so the E-cores are there the moment the
+    # game wants them.  Only where the old value could be recorded.
+    unparked = 0
+    for setting in _CORE_PARKING_MIN:
+        if reg_originals.remember_power(_PROC_SUB, setting, scope=_SCOPE):
+            if run_cmd(["powercfg", "/setacvalueindex", "SCHEME_CURRENT", _PROC_SUB, setting, "100"])["ok"]:
+                unparked += 1
+    if unparked:
+        changes.append("Core parking -> off (every core kept awake)")
+
+    # CPU idle disabled (max clocks) — likewise only when it can be put back.
+    if reg_originals.remember_power("SUB_PROCESSOR", "IdleDisable", scope=_SCOPE):
+        run_cmd(["powercfg","/setacvalueindex","SCHEME_CURRENT","SUB_PROCESSOR","IdleDisable","1"])
+        changes.append("CPU idle -> disabled")
+    run_cmd(["powercfg","/setactive","SCHEME_CURRENT"])
     return changes
 
 
@@ -746,6 +810,24 @@ def restore_normal_mode(reason: str = "game exit"):
     # beta.13 — reverse any per-game optimization-target posture first
     # (GPU OC / power plan / competitive latency), before the generic tweaks.
     restore_target()
+    # The game's process, if it is still running (game mode switched off
+    # mid-game): priority, affinity and throttling back as they were.  After
+    # a real exit the pid is gone — or already somebody else's.
+    prior = _engine.get("proc_prior")
+    _engine["proc_prior"] = None
+    if prior and reason != "game exit" and _engine.get("active_pid"):
+        try:
+            process_tuning.release(_engine["active_pid"], prior)
+        except Exception as e:
+            log.debug(f"could not release the game process: {e}")
+    # Power-plan settings changed for the session (core parking, CPU idle):
+    # each back to what it was, on the plan it was changed on.
+    recorded_session = bool(reg_originals.noted("gamemode_plan_recorded"))
+    reg_originals.forget_notes("gamemode_plan_recorded")
+    plan = reg_originals.restore_all(_SCOPE)
+    if plan["restored"] or plan["failed"]:
+        log.info(f"  Restored {plan['restored']} power-plan setting(s)"
+                 + (f", {plan['failed']} could not be" if plan["failed"] else ""))
     # Capture the game name BEFORE we clear engine state, so we can use it in the notification.
     _prev_game = _engine.get("active_game")
     baseline = _load_baseline()
@@ -774,8 +856,10 @@ def restore_normal_mode(reason: str = "game exit"):
              "/v","NetworkThrottlingIndex","/t","REG_DWORD","/d",str(val3),"/f"])
     log.info(f"  Restored NetworkThrottlingIndex -> {val3}")
 
-    # 4. Restore CPU idle
-    if not cpu_idle_was_disabled:
+    # 4. Restore CPU idle — only for a session started by a build that kept
+    #    no records (otherwise it was put back above, or has since become the
+    #    optimizer's own setting and is not ours to touch).
+    if not recorded_session and not cpu_idle_was_disabled:
         run_cmd(["powercfg","/setacvalueindex","SCHEME_CURRENT","SUB_PROCESSOR","IdleDisable","0"])
         run_cmd(["powercfg","/setactive","SCHEME_CURRENT"])
         log.info("  Restored CPU idle -> enabled")
@@ -1238,6 +1322,15 @@ def _monitor_loop(gen: int = 0):
                         _engine["active_pid"]  = new["pid"]
                         _engine["active_exe"]  = new["exe"]
                         _engine["active_game"] = new["name"]
+                        # The system-wide tweaks carry over; the per-process
+                        # ones (priority, all cores, no throttling) belonged
+                        # to the game that just closed, so give them to this one.
+                        try:
+                            tuned = process_tuning.tune(
+                                new["pid"], all_cores=bool(_load_gp_settings().get("all_cores", True)))
+                            _engine["proc_prior"] = tuned.get("prior") if tuned.get("ok") else None
+                        except Exception as e:
+                            log.debug(f"could not tune the new game process: {e}")
                         # Notify AT so it can switch its target too
                         try:
                             from core import adaptive_tuning as _at
@@ -1332,6 +1425,13 @@ def _monitor_loop(gen: int = 0):
                         apply_target(exe)
                     except Exception as e:
                         log.debug(f"apply_target failed: {e}")
+
+                    # Power-plan tweaks last, so they land on the plan the
+                    # target has just selected (see _apply_power_tweaks).
+                    try:
+                        _engine["changes"] = changes + _apply_power_tweaks()
+                    except Exception as e:
+                        log.debug(f"power-plan tweaks failed: {e}")
 
                     # v3 — engage Adaptive Tuning if this game is opted in.
                     # AT applies its own learned offsets (overriding the
@@ -1469,6 +1569,9 @@ _GAME_PROFILES_SETTINGS_PATH = _os.path.join(APPDATA_DIR, "game_profiles_setting
 
 _DEFAULT_GP_SETTINGS = {
     "auto_enable_on_boot": True,
+    # Lift any CPU-core restriction on the game (P-cores AND E-cores).  The
+    # switch is for the rare game that misbehaves when handed every core.
+    "all_cores": True,
 }
 
 
@@ -1493,10 +1596,12 @@ def get_settings() -> dict:
     return _load_gp_settings()
 
 
-def set_settings(auto_enable_on_boot=None) -> dict:
+def set_settings(auto_enable_on_boot=None, all_cores=None) -> dict:
     s = _load_gp_settings()
     if auto_enable_on_boot is not None:
         s["auto_enable_on_boot"] = bool(auto_enable_on_boot)
+    if all_cores is not None:
+        s["all_cores"] = bool(all_cores)
     _save_gp_settings(s)
     return {"ok": True, "settings": s}
 

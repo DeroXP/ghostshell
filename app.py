@@ -3254,13 +3254,15 @@ def api_profiles_start():
 # v2.9.9.6 — game-mode auto-enable settings
 @app.route("/api/profiles/settings", methods=["GET", "POST"])
 def api_profiles_settings():
-    """GET → current game-mode auto-enable settings.
-    POST → update.  Body: {auto_enable_on_boot: bool}."""
+    """GET → current game-mode settings.
+    POST → update.  Body: {auto_enable_on_boot: bool, all_cores: bool} —
+    either or both."""
     if request.method == "GET":
         return jsonify({"ok": True, "settings": game_profiles.get_settings()})
     data = request.get_json(force=True) or {}
     return jsonify(game_profiles.set_settings(
         auto_enable_on_boot=data.get("auto_enable_on_boot"),
+        all_cores=data.get("all_cores"),
     ))
 
 
@@ -3854,10 +3856,10 @@ def _set_responsive_mode():
     network monitor is alerting on a burst, etc.
 
     Without this, Vispora stays in Below-Normal/EcoQoS while the
-    game runs at HIGH priority on P-cores — UI lags, mapper polling
-    drops from 4 kHz target to 200 Hz actual, HidHide retry timer
-    stalls.  Calling this restores the process to Normal priority on
-    P-cores."""
+    game runs at HIGH priority — UI lags, mapper polling drops from
+    4 kHz target to 200 Hz actual, HidHide retry timer stalls.
+    Calling this restores the process to Normal priority with no
+    throttling."""
     if sys.platform != "win32":
         return
     try:

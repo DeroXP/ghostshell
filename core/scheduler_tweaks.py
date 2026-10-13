@@ -58,7 +58,8 @@ def get_scheduler_status() -> dict:
             d = json.loads(r5["out"])
             if isinstance(d, list):
                 d = d[0]
-            name = d.get("Name", "").lower()
+            # "Intel(R) Core(TM) Ultra ..." — drop the marks or "core ultra" never matches
+            name = d.get("Name", "").lower().replace("(r)", "").replace("(tm)", "")
             result["hybrid_cpu"] = any(x in name for x in ["12th gen", "13th gen", "14th gen", "core ultra", "raptor", "alder"])
         except Exception:
             result["hybrid_cpu"] = False

@@ -95,7 +95,9 @@ def get_vbs_status() -> dict:
     # Newer CPUs with MBEC/GMET have less performance impact
     has_mbec = False
     if cpu_name:
-        name_lower = cpu_name.lower()
+        # Windows spells it "Intel(R) Core(TM) Ultra 9 285K": without the
+        # marks dropped, "core ultra" below never matched.
+        name_lower = cpu_name.lower().replace("(r)", "").replace("(tm)", "")
         # Intel 7th gen+ has MBEC, AMD Zen 2+ has GMET
         if "intel" in name_lower:
             for gen in ["7th", "8th", "9th", "10th", "11th", "12th", "13th", "14th"]:

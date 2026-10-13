@@ -1120,6 +1120,11 @@ function _renderGameModeSection(settings, status) {
             'Starts the game-detection monitor automatically when Vispora boots so any game you launch afterwards gets the gaming profile applied.',
             !!settings.auto_enable_on_boot,
             "toggleGameModeAutoEnable(this)") +
+        _settingsToggle(
+            'Give games every CPU core',
+            'Lifts any core restriction on the game, so it can use P-cores and E-cores alike, and keeps every core awake while it runs. Windows still puts the heaviest threads on the P-cores. Turn off only for a game that misbehaves with all cores.',
+            settings.all_cores !== false,
+            "toggleGameModeAllCores(this)") +
         '<div style="font-size:10px;color:var(--text-dim);margin-top:8px">' +
             'Currently: <b style="color:' + (monitoring ? 'var(--accent)' : 'var(--text-dim)') + '">' +
             (monitoring ? '● MONITORING' : '○ stopped') + '</b>' + activeGame +
@@ -1143,6 +1148,20 @@ async function toggleGameModeAutoEnable(el) {
         addLog('Could not save game-mode setting');
     } else {
         addLog('Game-mode auto-enable: ' + (on ? 'ON' : 'OFF'));
+    }
+}
+
+async function toggleGameModeAllCores(el) {
+    el.classList.toggle('on');
+    var on = el.classList.contains('on');
+    el.setAttribute('aria-checked', String(on));
+    var r = await apiPost('/api/profiles/settings', { all_cores: on });
+    if (!r || !r.ok) {
+        el.classList.toggle('on');
+        el.setAttribute('aria-checked', String(!on));
+        addLog('Could not save game-mode setting');
+    } else {
+        addLog('Game mode: every CPU core for games ' + (on ? 'ON' : 'OFF') + ' (applies from the next game launch)');
     }
 }
 

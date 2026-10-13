@@ -53,6 +53,28 @@ pyinstaller updater_helper.spec --noconfirm   # dist/VisporaUpdater.exe
 Release binaries are not kept in this repo; they are published through the
 release server, which serves `version.json` + the exe per channel.
 
+## Test
+
+```bash
+python tests/run_all.py            # everything (about 20 seconds)
+python tests/run_all.py reset game # only the files whose name contains a word
+python tests/run_all.py -v         # list every test, not just failures
+```
+
+Run it before a release, with the interpreter the release is built with.
+It needs nothing beyond the app's own requirements — no pytest.
+
+The tests run the real code against a fake machine (`tests/sandbox.py`): an
+in-memory registry, power plans, services, scheduled tasks, boot entry and so
+on, with `reg`, `powercfg`, `sc`, `bcdedit`, DISM and PowerShell answered the
+way Windows answers them.  Nothing on the PC is read or changed, the app's
+data folder is a throwaway one, and a test that tries to start a real process
+fails.  That is what lets "apply every tweak, press Reset All, compare the
+machine value by value" run in seconds.
+
+Add a test by writing a `test_*` function in a `tests/test_*.py` file; start
+the file with `import sandbox as m`, before any app import.
+
 ## Layout
 
 | Path | What lives there |
@@ -62,6 +84,7 @@ release server, which serves `version.json` + the exe per channel.
 | `core/` | One module per feature |
 | `static/`, `templates/` | The UI (plain JS/CSS, no build step) |
 | `updater/` | The standalone updater app (its own Flask + pywebview window) |
+| `tests/` | The test suite and the fake machine it runs on — see [Test](#test) |
 | `cloud/` | Optional FastAPI licensing / trial backend — see `cloud/README.md` |
 
 ## Data
