@@ -42,9 +42,11 @@ def _reg(key, val, data, vtype="REG_DWORD"):
 _DISPLAY_CLASS_GUID = "{4d36e968-e325-11ce-bfc1-08002be10318}"
 
 
-def _find_gpu_class_key(vendor_match: str) -> str:
+def _find_gpu_class_key(vendor_match: str, or_first: bool = True) -> str:
     r"""Return the HKLM display-adapter Class\{GUID}\NNNN subkey whose
-    DriverDesc matches `vendor_match` (e.g. 'NVIDIA'), falling back to \0000.
+    DriverDesc matches `vendor_match` (e.g. 'NVIDIA'), falling back to \0000
+    — or, with or_first=False, to "": for a caller that must not touch
+    another adapter's key.
 
     3.4.3-beta.5 — the old code hardcoded \0000.  That is the WRONG device on
     hybrid laptops and multi-GPU systems (e.g. \0000 is the Intel iGPU, or a
@@ -71,11 +73,12 @@ def _find_gpu_class_key(vendor_match: str) -> str:
                 if vendor_match.lower() in desc.lower():
                     log.info(f"Resolved {vendor_match} display-class key: {idx.strip()} ({desc.strip()})")
                     return reg_base + "\\" + idx.strip()
-        log.warning(f"Could not find a {vendor_match} adapter under the display class — "
-                    f"falling back to \\0000 (tweaks may target the wrong device)")
+        if or_first:
+            log.warning(f"Could not find a {vendor_match} adapter under the display class — "
+                        f"falling back to \\0000 (tweaks may target the wrong device)")
     except Exception as e:
         log.debug(f"GPU class-key probe failed: {e}")
-    return reg_base + r"\0000"
+    return reg_base + r"\0000" if or_first else ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════

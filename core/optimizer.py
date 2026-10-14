@@ -161,6 +161,28 @@ def _bcd_default(bcd, name: str, tweak: str, stock=None) -> None:
         run_cmd(["bcdedit", "/set", "{current}", name, stock])
 
 
+def _reg_default(key: str, value: str, tweak, stock, vtype: str = "REG_DWORD") -> bool:
+    """The same for one registry value: if it is on nobody's record and still
+    reads the way the tweak leaves it, put back the Windows default — `stock`,
+    or, with stock=None, no value at all.
+
+    `tweak` is the data the tweak writes (a tuple where builds differed).
+    A value on record is left to whoever recorded it: the optimizer's come
+    back with the final pass of Reset All, another tab's (GPU, Network, ...)
+    with that tab's own undo.  A value that reads any other way, or does not
+    exist, is not something the tweak left behind and is not touched.
+
+    False only if a default that was called for could not be written."""
+    if reg_originals.on_record(key, value):
+        return True
+    if not any(reg_originals.reads_as(key, value, t, vtype)
+               for t in (tweak if isinstance(tweak, tuple) else (tweak,))):
+        return True
+    if stock is None:
+        return run_cmd(["reg", "delete", key, "/v", value, "/f"])["ok"]
+    return _reg(key, value, stock, vtype)
+
+
 def _enable_msi_mode(device_class: str, working_only: bool = False) -> int:
     """Switch the devices of one PnP class to message-signalled interrupts.
     PowerShell only lists the devices; every value is written through _reg,
@@ -1082,10 +1104,12 @@ def reset_all_optimizations() -> dict:
     except Exception as e:
         log.debug(f"Pre-reset snapshot failed (continuing anyway): {e}")
     results = {}
-    # The per-category resets below write stock defaults.  They must not be
-    # recorded as "originals" themselves, and they are not the last word:
-    # once they have run, every value whose real prior state we have on
-    # record is put back to exactly that (reg_originals.restore_all).
+    # The per-category resets below write stock defaults — for what an older
+    # build changed without keeping a record, and nothing else (see
+    # _run_category_resets).  They must not be recorded as "originals"
+    # themselves, and they are not the last word: once they have run, every
+    # value whose real prior state we have on record is put back to exactly
+    # that (reg_originals.restore_all).
     with reg_originals.suspended():
         results.update(_run_category_resets())
 
@@ -1121,12 +1145,18 @@ def reset_all_optimizations() -> dict:
     # Previously a "Reset ALL optimizations" left debloated services
     # (WSearch, Geolocation, etc.) permanently disabled with no undo.
     # restore_services() puts each back to its recorded original Start
-    # type, or Manual (demand) as a safe fallback.
+    # type; one that is disabled with no record is not touched.
     try:
         from core import debloater
+        services = debloater.restore_services()
         results["debloat_services"] = [
             {"name": f"{r.get('id')} service → {r.get('start') or 'could not be restored'}", "ok": bool(r.get("ok"))}
-            for r in debloater.restore_services().get("results", [])]
+            for r in services.get("results", [])]
+        if services.get("unrecorded"):
+            results["debloat_services"].append({
+                "name": (f"Left disabled — no previous start type on record: {', '.join(services['unrecorded'])} "
+                         f"(if an early version of the debloater did that, services.msc switches them back on)"),
+                "ok": True})
         results["debloat_tasks"] = debloater.restore_scheduled_tasks().get("results", [])
     except Exception as e:
         log.warning(f"service restore during reset failed: {e}")
@@ -1141,6 +1171,13 @@ def reset_all_optimizations() -> dict:
 
 
 def _run_category_resets() -> dict:
+    """The fixed-default fallbacks, category by category.
+
+    One rule for all of them (_reg_default, _service_default, _bcd_default):
+    a default is applied only to something that has no record AND still
+    reads exactly the way the tweak leaves it.  So on a machine no tweak was
+    applied to, and on a second Reset All, these change nothing.  Where it is
+    not known what a tweak wrote, there is no fallback for it at all."""
     results = {}
     results["power"] = _reset_power_plan()
     results["cpu"] = _reset_cpu_tweaks()
@@ -1183,7 +1220,8 @@ def _reset_power_plan() -> list[dict]:
     Ryzen Balanced, or a manually-tuned custom plan got their plan
     silently replaced with Microsoft Balanced on every reset.  Now
     we honor the captured baseline first and only fall back to
-    Balanced if no baseline file exists.
+    Balanced if no baseline file exists — and the machine is on one of
+    the plans this app switches to.
     """
     log.info("Resetting power plan to captured baseline (or Balanced fallback)...")
     results = []
@@ -1195,7 +1233,13 @@ def _reset_power_plan() -> list[dict]:
             "ok":   True,
         })
         return results
-    # No baseline → conservative fallback to Microsoft Balanced
+    # No baseline.  Balanced is the fixed default for a machine an older
+    # build left on one of our own plans.  Any other plan is the user's
+    # choice: this used to move everybody without a baseline to Balanced,
+    # whether or not this app had ever switched plans.
+    if active_power_plan().lower() not in _own_power_plans():
+        results.append({"name": "Power plan left as it is (not one Vispora switched to)", "ok": True})
+        return results
     log.info(f"  No baseline file ({restored.get('err','')}) — falling back to Balanced")
     r = run_cmd(["powercfg", "-setactive", "381b4222-f694-41f0-9685-ff5bb260df2e"])
     results.append({"name": "Balanced Power Plan (fallback — no baseline file)", "ok": r["ok"]})
@@ -1205,33 +1249,49 @@ def _reset_power_plan() -> list[dict]:
 def _reset_cpu_tweaks() -> list[dict]:
     log.info("Resetting CPU tweaks...")
     results = []
+    # name, key, value, what the tweak leaves there, the Windows default
     tweaks = [
-        ("Win32PrioritySeparation", r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl", "Win32PrioritySeparation", "2"),
-        ("SystemResponsiveness", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", "SystemResponsiveness", "20"),
-        ("NetworkThrottlingIndex", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", "NetworkThrottlingIndex", "10"),
-        ("GPU Priority (Games)", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "GPU Priority", "8"),   # stock is 8, not 0
-        ("Scheduling Category", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "Scheduling Category", "Medium"),
-        ("Priority (Games)", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "Priority", "2"),
-        ("SFIO Priority", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "SFIO Priority", "Normal"),
+        # 38 from this page and the start-up prep, 40 from the Hard tweaks and the Kernel page
+        ("Win32PrioritySeparation", r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl", "Win32PrioritySeparation", ("38", "40"), "2"),
+        # 10 since 3.3.1; 0 before
+        ("SystemResponsiveness", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", "SystemResponsiveness", ("10", "0"), "20"),
+        ("NetworkThrottlingIndex", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", "NetworkThrottlingIndex", "4294967295", "10"),
+        # The tweak writes 8, which is also the stock value.  0 is what
+        # Reset All itself wrote here up to 3.5.2.
+        ("GPU Priority (Games)", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "GPU Priority", "0", "8"),
+        ("Scheduling Category", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "Scheduling Category", "High", "Medium"),
+        ("Priority (Games)", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "Priority", "6", "2"),
+        ("SFIO Priority", r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games", "SFIO Priority", "High", "Normal"),
         # Set to 0 by the start-up prep; was in no reset list at all.
-        ("ForegroundLockTimeout", r"HKCU\Control Panel\Desktop", "ForegroundLockTimeout", "200000"),
+        ("ForegroundLockTimeout", r"HKCU\Control Panel\Desktop", "ForegroundLockTimeout", "0", "200000"),
     ]
-    for name, key, val, data in tweaks:
+    for name, key, val, tweak, data in tweaks:
         vtype = "REG_SZ" if data in ("Medium", "Normal", "High", "Low") else "REG_DWORD"
-        ok = _reg(key, val, data, vtype)
+        ok = _reg_default(key, val, tweak, data, vtype)
         log.info(f"  {'OK' if ok else 'FAIL'} Reset: {name}")
         results.append({"name": name, "ok": ok})
 
-    # Re-enable core parking
-    run_cmd(["reg", "delete",
-             r"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00\0cc5b647-c1df-4637-891a-dec35c318583",
-             "/v", "ValueMax", "/f"])
-    results.append({"name": "Core Parking (re-enabled)", "ok": True})
+    # (Core parking: this used to delete ValueMax from the definition of the
+    # "core parking min cores" power setting.  What the long-removed tweak
+    # wrote there is not known, and Windows ships that value — deleting it
+    # was not a default, and it ran on every machine.)
 
-    # Re-enable CPU idle
-    run_cmd(["powercfg", "/setacvalueindex", "SCHEME_CURRENT", "SUB_PROCESSOR", "IdleDisable", "0"])
-    run_cmd(["powercfg", "/setactive", "SCHEME_CURRENT"])
-    results.append({"name": "CPU Idle (re-enabled)", "ok": True})
+    # Re-enable CPU idle where an older build left it switched off without a
+    # record — on the plans this app switches the machine to.  (This used to
+    # force it on for the ACTIVE plan, which by now is the user's own again:
+    # anybody who runs with idle off on purpose lost that at every reset.)
+    # A setting that is on record goes back with the final pass of Reset All.
+    for plan in sorted(_own_power_plans()):
+        if reg_originals.has_power("SUB_PROCESSOR", "IdleDisable", scope=None, scheme=plan):
+            continue
+        cur = reg_originals.query_power(plan, "SUB_PROCESSOR", "IdleDisable")
+        if not cur or cur[0] != 1:
+            continue
+        run_cmd(["powercfg", "/setacvalueindex", plan, "SUB_PROCESSOR", "IdleDisable", "0"])
+        if active_power_plan().lower() == plan:
+            run_cmd(["powercfg", "/setactive", plan])
+    results.append({"name": "CPU Idle (re-enabled on Vispora's own power plans, where an older version left it off)",
+                    "ok": True})
 
     return results
 
@@ -1240,25 +1300,25 @@ def _reset_memory_tweaks() -> list[dict]:
     log.info("Resetting memory tweaks...")
     results = []
     base = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
-    for name, val, data in [
-        ("Paging Executive", "DisablePagingExecutive", "0"),
-        ("Large System Cache", "LargeSystemCache", "0"),
-        ("Clear Pagefile", "ClearPageFileAtShutdown", "0"),
+    # Tweaks removed in 3.3.1 that older builds applied: each wrote 1.
+    # (LargeSystemCache was in this list too.  That tweak wrote 0, the
+    # Windows default, so there is nothing of it to put back.)
+    for name, val, tweak, data in [
+        ("Paging Executive", "DisablePagingExecutive", "1", "0"),
+        ("Clear Pagefile", "ClearPageFileAtShutdown", "1", "0"),
     ]:
-        ok = _reg(base, val, data)
+        ok = _reg_default(base, val, tweak, data)
         results.append({"name": name, "ok": ok})
 
     # beta.5: was ControlSet001 (hardcoded) — wrong on any system booted from a
     # different control set; the live set is always CurrentControlSet.
-    _reg(r"HKLM\SYSTEM\CurrentControlSet\Services\Ndu", "Start", "2")
+    _reg_default(r"HKLM\SYSTEM\CurrentControlSet\Services\Ndu", "Start", "4", "2")
     results.append({"name": "NDU (re-enabled)", "ok": True})
     run_ps("Enable-MMAgent -MemoryCompression -ErrorAction SilentlyContinue")
     results.append({"name": "Memory Compression (re-enabled)", "ok": True})
 
-    # Re-enable Spectre/Meltdown mitigations
-    _reg(r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management", "FeatureSettingsOverride", "0")
-    _reg(r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management", "FeatureSettingsOverrideMask", "3")
-    results.append({"name": "Spectre/Meltdown mitigations (re-enabled)", "ok": True})
+    # (The Spectre/Meltdown override is undone in _reset_hard_tweaks.  The two
+    # values were also written here first — 0 and 3 — for everybody.)
 
     return results
 
@@ -1285,7 +1345,7 @@ def _reset_storage_tweaks() -> list[dict]:
 
     _service_default("WSearch", tweak="disabled", stock="delayed-auto", start=True)
     results.append({"name": "Windows Search (re-enabled)", "ok": True})
-    _reg(r"HKCU\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy", "01", "1")
+    _reg_default(r"HKCU\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy", "01", "0", "1")
     results.append({"name": "Storage Sense (re-enabled)", "ok": True})
 
     return results
@@ -1295,31 +1355,34 @@ def _reset_gaming_tweaks() -> list[dict]:
     """Reset ALL gaming tweaks — this is the critical one for Roblox Studio etc."""
     log.info("Resetting gaming tweaks...")
     results = []
+    # name, key, value, what the tweak leaves there, the Windows default
     tweaks = [
         # Re-enable Game DVR (Windows default is on)
-        ("Game DVR", r"HKCU\System\GameConfigStore", "GameDVR_Enabled", "1"),
-        # Delete the policy override so Windows uses its own default
-        # (We delete rather than set to 1 so Group Policy doesn't conflict)
+        ("Game DVR", r"HKCU\System\GameConfigStore", "GameDVR_Enabled", "0", "1"),
 
         # CRITICAL: Reset Fullscreen Optimizations to DEFAULT (0 = Windows manages it)
         # Setting this to 2 disables FSO globally which breaks viewport rendering in
         # apps like Roblox Studio, Unity, Unreal Editor, 3D modeling tools
-        ("FSO Behavior -> Default", r"HKCU\System\GameConfigStore", "GameDVR_FSEBehaviorMode", "0"),
-        ("FSO Compat -> Default", r"HKCU\System\GameConfigStore", "GameDVR_DXGIHonorFSEWindowsCompatible", "0"),
-        ("FSO Honor -> Default", r"HKCU\System\GameConfigStore", "GameDVR_HonorUserFSEBehaviorMode", "0"),
-        ("FSO EFSEFlags -> Default", r"HKCU\System\GameConfigStore", "GameDVR_EFSEFeatureFlags", "0"),
+        ("FSO Behavior -> Default", r"HKCU\System\GameConfigStore", "GameDVR_FSEBehaviorMode", "2", "0"),
+        # (GameDVR_DXGIHonorFSEWindowsCompatible, GameDVR_HonorUserFSEBehaviorMode
+        # and GameDVR_EFSEFeatureFlags were set to 0 here as well.  What the
+        # tweak removed in 3.3.1 wrote to them is not known, so they are left
+        # as they are.)
 
         # Re-enable Game Bar (some apps use its hooks for window management)
-        ("Game Bar", r"HKCU\Software\Microsoft\GameBar", "UseNexusForGameBarEnabled", "1"),
-        ("Auto Game Mode", r"HKCU\Software\Microsoft\GameBar", "AllowAutoGameMode", "1"),
+        ("Game Bar", r"HKCU\Software\Microsoft\GameBar", "UseNexusForGameBarEnabled", "0", "1"),
+        # (AllowAutoGameMode: the tweak writes 1, and 1 is what this wrote
+        # back, so there is nothing to undo without a record.)
     ]
-    for name, key, val, data in tweaks:
-        ok = _reg(key, val, data)
+    for name, key, val, tweak, data in tweaks:
+        ok = _reg_default(key, val, tweak, data)
         log.info(f"  {'OK' if ok else 'FAIL'} Reset: {name}")
         results.append({"name": name, "ok": ok})
 
-    # Delete GameDVR policy key entirely (let Windows use its own default)
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR", "/f"])
+    # Remove the policy override so Windows uses its own default — the one
+    # value the tweak writes.  (This used to delete the whole GameDVR policy
+    # key, with whatever else an administrator had put there.)
+    _reg_default(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR", "AllowGameDVR", "0", None)
     results.append({"name": "GameDVR Policy (removed)", "ok": True})
 
     # Restore bcdedit timer defaults
@@ -1344,45 +1407,41 @@ def _reset_gpu_rendering() -> list[dict]:
     log.info("Resetting GPU rendering settings...")
     results = []
 
-    # CRITICAL: Reset HW GPU Scheduling to Windows default
-    # On some systems HwSchMode=2 causes viewport lag in non-game apps
-    # Default is 1 (OS managed) on most systems, 2 = HW scheduled
-    # We set it back to 2 (which IS the modern default) but also reset the
-    # per-app GPU preferences that may have been set
-    _reg(r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers", "HwSchMode", "2")
-    results.append({"name": "HW GPU Scheduling (default=2)", "ok": True})
+    # (HW GPU Scheduling: the tweak writes HwSchMode=2 and so did this reset
+    # — 2 is the modern default — so without a record there is nothing to
+    # put back.  A value that was different before is on record.)
 
     # Remove DWM MPO override — let Windows manage Multi-Plane Overlay
-    run_cmd(["reg", "delete", r"HKCU\Software\Microsoft\Windows\DWM", "/v", "OverlayMinFPS", "/f"])
+    _reg_default(r"HKCU\Software\Microsoft\Windows\DWM", "OverlayMinFPS", "0", None)
     results.append({"name": "DWM OverlayMinFPS (removed)", "ok": True})
 
     # Remove ThreadDpcEnable override
-    run_cmd(["reg", "delete", r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel", "/v", "ThreadDpcEnable", "/f"])
+    _reg_default(r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\kernel", "ThreadDpcEnable", "0", None)
     results.append({"name": "ThreadDpcEnable (removed)", "ok": True})
 
     # Reset NVIDIA power settings to default (adaptive, not max performance)
-    nv_key = r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000"
-    for name, val, data in [
-        ("NVIDIA PerfLevelSrc", "PerfLevelSrc", "0x3322"),  # default adaptive
-        ("NVIDIA PowerMizerEnable", "PowerMizerEnable", "1"),
-        ("NVIDIA PowerMizerLevel", "PowerMizerLevel", "0"),  # 0 = adaptive (not forced max)
-        ("NVIDIA PowerMizerLevelAC", "PowerMizerLevelAC", "0"),
+    # — on the NVIDIA adapter's own key.  This was hard-coded to \0000, which
+    # on a hybrid laptop is the integrated GPU and can be a virtual adapter.
+    # (PowerMizerEnable is not here any more: the GPU tab writes 1, and 1 is
+    # what this wrote back.)
+    from core import nvidia_clean
+    nv_key = nvidia_clean._find_gpu_class_key("NVIDIA", or_first=False)
+    for name, val, tweak, data in [
+        ("NVIDIA PerfLevelSrc", "PerfLevelSrc", "0x2222", "0x3322"),  # default adaptive
+        ("NVIDIA PowerMizerLevel", "PowerMizerLevel", "1", "0"),  # 0 = adaptive (not forced max)
+        ("NVIDIA PowerMizerLevelAC", "PowerMizerLevelAC", "1", "0"),
     ]:
-        _reg(nv_key, val, data)
-        results.append({"name": name, "ok": True})
+        if nv_key:      # (no NVIDIA adapter: nothing to reset)
+            results.append({"name": name, "ok": _reg_default(nv_key, val, tweak, data)})
 
     # (This used to clear EVERY value under DirectX\UserGpuPreferences — the
     # per-app "which GPU" choices from Windows Settings, none of which this
     # app ever writes.  On a dual-GPU laptop that sent games back to the
     # integrated GPU.)
 
-    # Ensure DWM is using hardware acceleration (should be default but verify)
-    _reg(r"HKCU\Software\Microsoft\Windows\DWM", "DisableHWAcceleration", "0")
-    results.append({"name": "DWM HW Acceleration (enabled)", "ok": True})
-
-    # Reset compositing settings
-    run_cmd(["reg", "delete", r"HKCU\Software\Microsoft\Windows\DWM", "/v", "Composition", "/f"])
-    results.append({"name": "DWM Composition (default)", "ok": True})
+    # (It also set DWM\DisableHWAcceleration to 0 and deleted DWM\Composition.
+    # Which tweak, if any, ever wrote those is not known, so whatever is
+    # there is left as it is.)
 
     return results
 
@@ -1394,17 +1453,20 @@ def _reset_scheduler_tweaks() -> list[dict]:
 
     # Reset MMCSS DisplayPostProcessing to defaults
     dpp_key = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\DisplayPostProcessing"
-    for name, val, data, vtype in [
-        ("DPP Background Only", "Background Only", "True", "REG_SZ"),
-        # Stock values for this task are 8 / 8 / High.  This used to write
-        # 0 / 2 / Medium — a "reset" that left it lower than Windows ships it.
-        ("DPP GPU Priority", "GPU Priority", "8", "REG_DWORD"),
-        ("DPP Priority", "Priority", "8", "REG_DWORD"),
-        ("DPP Scheduling", "Scheduling Category", "High", "REG_SZ"),
-        ("DPP SFIO Priority", "SFIO Priority", "Normal", "REG_SZ"),
+    # The Kernel page's tweak writes this task's stock values (True / 8 / 8 /
+    # High), so the tweak itself leaves nothing to put back.  What does need
+    # undoing is Reset All as it was up to 3.5.2: it wrote 0 / 2 / Medium
+    # here, lower than Windows ships the task.
+    # (SFIO Priority was set to Normal here as well.  The tweak writes High;
+    # which of the two Windows ships has not been established, so that value
+    # is left as it is.)
+    for name, val, left, data, vtype in [
+        ("DPP GPU Priority", "GPU Priority", "0", "8", "REG_DWORD"),
+        ("DPP Priority", "Priority", "2", "8", "REG_DWORD"),
+        ("DPP Scheduling", "Scheduling Category", "Medium", "High", "REG_SZ"),
     ]:
-        _reg(dpp_key, val, data, vtype)
-        results.append({"name": name, "ok": True})
+        ok = _reg_default(dpp_key, val, left, data, vtype)
+        results.append({"name": name, "ok": ok})
 
     return results
 
@@ -1416,38 +1478,42 @@ def _reset_visual_tweaks() -> list[dict]:
     log.info("Resetting visual effects...")
     results = []
 
+    # name, key, value, what the tweak leaves there, the Windows default, type
     tweaks = [
         # VisualFXSetting 0 = Let Windows choose best for this computer
-        ("Visual Effects", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects", "VisualFXSetting", "0"),
+        ("Visual Effects", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects", "VisualFXSetting", "2", "0", "REG_DWORD"),
         # Menu delay default = 400ms
-        ("Menu Animation Delay", r"HKCU\Control Panel\Desktop", "MenuShowDelay", "400"),
+        ("Menu Animation Delay", r"HKCU\Control Panel\Desktop", "MenuShowDelay", "0", "400", "REG_SZ"),
         # MinAnimate default = 1 (on)
-        ("Window Animation", r"HKCU\Control Panel\Desktop\WindowMetrics", "MinAnimate", "1"),
+        ("Window Animation", r"HKCU\Control Panel\Desktop\WindowMetrics", "MinAnimate", "0", "1", "REG_SZ"),
         # Transparency default = 1 (on)
-        ("Transparency", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "EnableTransparency", "1"),
+        ("Transparency", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "EnableTransparency", "0", "1", "REG_DWORD"),
         # Aero Shake default = 0 (enabled)
-        ("Aero Shake", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "DisallowShaking", "0"),
+        ("Aero Shake", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "DisallowShaking", "1", "0", "REG_DWORD"),
         # Snap Assist default = 1 (enabled)
-        ("Snap Assist", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "SnapAssist", "1"),
-        # DragFullWindows default = 1 (show contents while dragging)
-        ("Drag Full Windows", r"HKCU\Control Panel\Desktop", "DragFullWindows", "1"),
-        # FontSmoothing default = 2 (ClearType)
-        ("Font Smoothing", r"HKCU\Control Panel\Desktop", "FontSmoothing", "2"),
-        ("Font Smoothing Type", r"HKCU\Control Panel\Desktop", "FontSmoothingType", "2"),
+        ("Snap Assist", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "SnapAssist", "0", "1", "REG_DWORD"),
+        # CRITICAL: UserPreferencesMask back to Windows default "Let Windows choose"
+        # This bitmask controls ALL visual effects — animations, shadows, font smoothing,
+        # thumbnail previews, etc. The default value enables all effects.
+        # Default bytes: 9E 3E 07 80 12 01 00 00 (all effects on)
+        ("UserPreferencesMask (all effects ON)", r"HKCU\Control Panel\Desktop", "UserPreferencesMask",
+         "9012038010000000", "9E3E078012010000", "REG_BINARY"),
+        # (DragFullWindows, FontSmoothing and FontSmoothingType were set to
+        # their defaults here too.  No tweak writes them: a user who had
+        # switched ClearType off got it back at every reset.)
     ]
-    for name, key, val, data in tweaks:
-        vtype = "REG_SZ" if val in ("MenuShowDelay", "MinAnimate", "DragFullWindows", "FontSmoothing", "FontSmoothingType") else "REG_DWORD"
-        ok = _reg(key, val, data, vtype)
+    # Is any of these on record to be put back, or still the way the tweak
+    # leaves it?  If not, there is no visual tweak here to undo.
+    undoing = any(reg_originals.has_original(key, val) or reg_originals.reads_as(key, val, tweak, vtype)
+                  for _, key, val, tweak, _, vtype in tweaks)
+    for name, key, val, tweak, data, vtype in tweaks:
+        ok = _reg_default(key, val, tweak, data, vtype)
         log.info(f"  {'OK' if ok else 'FAIL'} Reset: {name}")
         results.append({"name": name, "ok": ok})
-
-    # CRITICAL: Set UserPreferencesMask to Windows default "Let Windows choose"
-    # This bitmask controls ALL visual effects — animations, shadows, font smoothing,
-    # thumbnail previews, etc. The default value enables all effects.
-    # Default bytes: 9E 3E 07 80 12 01 00 00 (all effects on)
-    r = {"ok": _reg(r"HKCU\Control Panel\Desktop", "UserPreferencesMask",
-                    "9E3E078012010000", "REG_BINARY")}
-    results.append({"name": "UserPreferencesMask (all effects ON)", "ok": r["ok"]})
+    if not undoing:
+        # What follows changes settings of the running session and saves
+        # them in the user's profile.  It used to run at every reset.
+        return results
 
     # Use SystemParametersInfo to apply visual effects change immediately (no reboot needed)
     # This triggers Windows to re-read all the visual effect settings
@@ -1478,10 +1544,15 @@ def _reset_hard_tweaks() -> list[dict]:
     log.info("Resetting hard tweaks...")
     results = []
 
-    # Restore Spectre/Meltdown mitigations
+    # Restore Spectre/Meltdown mitigations.  The tweak is the pair 3 / 3.  A
+    # mask of 3 on its own is not it — that is also how the mitigations are
+    # switched ON by hand — so the mask only goes together with an override
+    # that this fallback removes.
     base = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
-    run_cmd(["reg", "delete", base, "/v", "FeatureSettingsOverride", "/f"])
-    run_cmd(["reg", "delete", base, "/v", "FeatureSettingsOverrideMask", "/f"])
+    if not reg_originals.on_record(base, "FeatureSettingsOverride") \
+            and reg_originals.reads_as(base, "FeatureSettingsOverride", "3"):
+        _reg_default(base, "FeatureSettingsOverride", "3", None)
+        _reg_default(base, "FeatureSettingsOverrideMask", "3", None)
     results.append({"name": "Spectre/Meltdown mitigations restored", "ok": True})
 
     # VBS / HVCI.  Where we have the prior values on record, the final pass
@@ -1496,41 +1567,42 @@ def _reset_hard_tweaks() -> list[dict]:
             or reg_originals.has_original(hvci, "Enabled"):
         results.append({"name": "VBS / HVCI restored to their previous setting", "ok": True})
     elif _pro_mode_enabled():
-        _reg(dg, "EnableVirtualizationBasedSecurity", "1")
-        _reg(hvci, "Enabled", "1")
+        # (only while they still read 0, the way the tweak leaves them — a
+        # value that was never set is not created here)
+        _reg_default(dg, "EnableVirtualizationBasedSecurity", "0", "1")
+        _reg_default(hvci, "Enabled", "0", "1")
         results.append({"name": "VBS / HVCI re-enabled", "ok": True})
     else:
         results.append({"name": "VBS / HVCI left as they are (not changed by Vispora)", "ok": True})
 
     # Remove MPO override
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Microsoft\Windows\Dwm", "/v", "OverlayTestMode", "/f"])
+    _reg_default(r"HKLM\SOFTWARE\Microsoft\Windows\Dwm", "OverlayTestMode", "5", None)
     results.append({"name": "MPO restored", "ok": True})
 
     # Mouse defaults: accel on
     mkey = r"HKCU\Control Panel\Mouse"
-    _reg(mkey, "MouseSpeed", "1", "REG_SZ")
-    _reg(mkey, "MouseThreshold1", "6", "REG_SZ")
-    _reg(mkey, "MouseThreshold2", "10", "REG_SZ")
+    _reg_default(mkey, "MouseSpeed", "0", "1", "REG_SZ")
+    _reg_default(mkey, "MouseThreshold1", "0", "6", "REG_SZ")
+    _reg_default(mkey, "MouseThreshold2", "0", "10", "REG_SZ")
     results.append({"name": "Mouse acceleration restored", "ok": True})
 
     # Accessibility key prompts back to defaults
-    _reg(r"HKCU\Control Panel\Accessibility\StickyKeys", "Flags", "510", "REG_SZ")
-    _reg(r"HKCU\Control Panel\Accessibility\ToggleKeys", "Flags", "62", "REG_SZ")
-    _reg(r"HKCU\Control Panel\Accessibility\Keyboard Response", "Flags", "126", "REG_SZ")
+    _reg_default(r"HKCU\Control Panel\Accessibility\StickyKeys", "Flags", "506", "510", "REG_SZ")
+    _reg_default(r"HKCU\Control Panel\Accessibility\ToggleKeys", "Flags", "58", "62", "REG_SZ")
+    _reg_default(r"HKCU\Control Panel\Accessibility\Keyboard Response", "Flags", "122", "126", "REG_SZ")
     results.append({"name": "Accessibility key prompts restored", "ok": True})
 
-    # Delivery optimization — back to default (1 = LAN only)
-    _reg(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization",
-         "DODownloadMode", "1")
+    # Delivery optimization — back to default (1 = LAN only).  0 is this
+    # category's tweak; the Windows Update category writes 1 itself.
+    _reg_default(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization",
+                 "DODownloadMode", "0", "1")
     results.append({"name": "Delivery Optimization (LAN only)", "ok": True})
 
     # Background apps — enable
-    run_cmd(["reg", "delete",
-             r"HKCU\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications",
-             "/v", "GlobalUserDisabled", "/f"])
-    run_cmd(["reg", "delete",
-             r"HKLM\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy",
-             "/v", "LetAppsRunInBackground", "/f"])
+    _reg_default(r"HKCU\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications",
+                 "GlobalUserDisabled", "1", None)
+    _reg_default(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy",
+                 "LetAppsRunInBackground", "2", None)
     results.append({"name": "Background apps restored", "ok": True})
 
     # Xbox services.  The tweak sets them to Manual — which is also how
@@ -1543,41 +1615,47 @@ def _reset_hard_tweaks() -> list[dict]:
     for key, val in [
         (r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "TaskbarDa"),
         (r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced", "ShowCopilotButton"),
+        (r"HKLM\SOFTWARE\Policies\Microsoft\Dsh", "AllowNewsAndInterests"),
     ]:
-        run_cmd(["reg", "delete", key, "/v", val, "/f"])
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Policies\Microsoft\Dsh", "/v", "AllowNewsAndInterests", "/f"])
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot", "/v", "TurnOffWindowsCopilot", "/f"])
+        _reg_default(key, val, "0", None)
+    _reg_default(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot", "TurnOffWindowsCopilot", "1", None)
     results.append({"name": "Widgets + Copilot restored", "ok": True})
 
     # Recall — remove override
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI", "/v", "DisableAIDataAnalysis", "/f"])
-    run_cmd(["reg", "delete", r"HKCU\Software\Policies\Microsoft\Windows\WindowsAI", "/v", "DisableAIDataAnalysis", "/f"])
+    _reg_default(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI", "DisableAIDataAnalysis", "1", None)
+    _reg_default(r"HKCU\Software\Policies\Microsoft\Windows\WindowsAI", "DisableAIDataAnalysis", "1", None)
     results.append({"name": "Recall policy removed", "ok": True})
 
     # Auto HDR — remove overrides
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\VideoSettings", "/v", "EnableAutoHdr", "/f"])
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\VideoSettings", "/v", "EnableHDRForPlayback", "/f"])
+    _reg_default(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\VideoSettings", "EnableAutoHdr", "0", None)
+    _reg_default(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\VideoSettings", "EnableHDRForPlayback", "0", None)
     results.append({"name": "Auto HDR restored", "ok": True})
 
-    # Remove Win10 context menu override
-    run_cmd(["reg", "delete",
-             r"HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}",
-             "/f"])
+    # Remove Win10 context menu override — if it is the tweak's and nothing
+    # more: the key with one sub-key, InprocServer32, whose only value is an
+    # empty default.  (Deleted unconditionally before, whatever was in it.)
+    ctx = r"HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}"
+    if reg_originals.value_names(ctx) == [] \
+            and [s.lower() for s in reg_originals.subkeys(ctx)] == ["inprocserver32"] \
+            and reg_originals.value_names(ctx + r"\InprocServer32") == [""] \
+            and not reg_originals.subkeys(ctx + r"\InprocServer32") \
+            and reg_originals.reads_as(ctx + r"\InprocServer32", "", "", "REG_SZ"):
+        run_cmd(["reg", "delete", ctx, "/f"])
     results.append({"name": "Win11 context menu restored", "ok": True})
 
     # Search bar restored
-    _reg(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Search", "SearchboxTaskbarMode", "2")
-    run_cmd(["reg", "delete", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Search", "/v", "BingSearchEnabled", "/f"])
-    run_cmd(["reg", "delete", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Search", "/v", "CortanaConsent", "/f"])
+    _reg_default(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Search", "SearchboxTaskbarMode", "0", "2")
+    _reg_default(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Search", "BingSearchEnabled", "0", None)
+    _reg_default(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Search", "CortanaConsent", "0", None)
     results.append({"name": "Taskbar search restored", "ok": True})
 
     # TDR timeouts back to default
-    run_cmd(["reg", "delete", r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers", "/v", "TdrDelay", "/f"])
-    run_cmd(["reg", "delete", r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers", "/v", "TdrDdiDelay", "/f"])
+    _reg_default(r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers", "TdrDelay", "10", None)
+    _reg_default(r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers", "TdrDdiDelay", "20", None)
     results.append({"name": "TDR timeouts restored", "ok": True})
 
     # Fault-Tolerant Heap restored
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Microsoft\FTH", "/v", "Enabled", "/f"])
+    _reg_default(r"HKLM\SOFTWARE\Microsoft\FTH", "Enabled", "0", None)
     results.append({"name": "FTH restored", "ok": True})
 
     return results
@@ -1603,9 +1681,8 @@ def _reset_latency_tweaks() -> list[dict]:
     results.append({"name": "bcdedit timers restored", "ok": True})
 
     # Restore power throttling
-    run_cmd(["reg", "delete",
-             r"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling",
-             "/v", "PowerThrottlingOff", "/f"])
+    _reg_default(r"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling",
+                 "PowerThrottlingOff", "1", None)
     results.append({"name": "Power throttling restored", "ok": True})
 
     return results
@@ -1618,17 +1695,17 @@ def _reset_win11_tweaks() -> list[dict]:
 
     advanced = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
     # Taskbar: restore centered align, chat icon, task view
-    _reg(advanced, "TaskbarAl", "1")
-    _reg(advanced, "TaskbarMn", "1")
-    _reg(advanced, "ShowTaskViewButton", "1")
+    _reg_default(advanced, "TaskbarAl", "0", "1")
+    _reg_default(advanced, "TaskbarMn", "0", "1")
+    _reg_default(advanced, "ShowTaskViewButton", "0", "1")
 
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer", "/v", "HideRecommendedSection", "/f"])
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer", "/v", "HideRecentlyAddedApps", "/f"])
+    _reg_default(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer", "HideRecommendedSection", "1", None)
+    _reg_default(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\Explorer", "HideRecentlyAddedApps", "1", None)
 
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Policies\Microsoft\Windows\System", "/v", "AllowClipboardHistory", "/f"])
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Policies\Microsoft\Windows\System", "/v", "AllowCrossDeviceClipboard", "/f"])
+    _reg_default(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\System", "AllowClipboardHistory", "0", None)
+    _reg_default(r"HKLM\SOFTWARE\Policies\Microsoft\Windows\System", "AllowCrossDeviceClipboard", "0", None)
 
-    run_cmd(["reg", "delete", r"HKCU\Software\Policies\Microsoft\Windows\Explorer", "/v", "DisableSearchBoxSuggestions", "/f"])
+    _reg_default(r"HKCU\Software\Policies\Microsoft\Windows\Explorer", "DisableSearchBoxSuggestions", "1", None)
 
     results.append({"name": "Windows 11 UX restored", "ok": True})
     return results
@@ -1978,57 +2055,52 @@ def apply_legacy_tweaks() -> list[dict]:
 def _reset_audio_tweaks() -> list[dict]:
     log.info("Resetting audio tweaks...")
     audio_task = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Pro Audio"
-    # These values ship with Windows.  Deleting them (as this did) stripped
-    # the Pro Audio task on every Reset All, tweak applied or not; write the
-    # stock values instead.
-    for val, data, vtype in (
-        ("Affinity",            "0",     "REG_DWORD"),
-        ("Background Only",     "False", "REG_SZ"),
-        ("Clock Rate",          "10000", "REG_DWORD"),
-        ("GPU Priority",        "8",     "REG_DWORD"),
-        ("Priority",            "1",     "REG_DWORD"),
-        ("Scheduling Category", "High",  "REG_SZ"),
-        ("SFIO Priority",       "Normal", "REG_SZ"),
-    ):
-        _reg(audio_task, val, data, vtype)
+    # Of the seven values the tweak writes here, six are the ones Windows
+    # ships (0 / False / 10000 / 8 / 1 / High); only SFIO Priority differs.
+    # (All seven were written back at every reset — after an earlier version
+    # of this function had DELETED them at every reset.  Values that are
+    # missing for that reason are not recreated here: a value that does not
+    # exist is not one the tweak left.)
+    _reg_default(audio_task, "SFIO Priority", "High", "Normal", "REG_SZ")
     # beta.5: was ControlSet001 (hardcoded) — use the live CurrentControlSet.
-    run_cmd(["reg", "delete",
-             r"HKLM\SYSTEM\CurrentControlSet\Control\Bluetooth\Audio\AVRCP\CT",
-             "/v", "DisableAbsoluteVolume", "/f"])
+    # (A tweak removed in 3.3.1; it wrote 1.)
+    _reg_default(r"HKLM\SYSTEM\CurrentControlSet\Control\Bluetooth\Audio\AVRCP\CT",
+                 "DisableAbsoluteVolume", "1", None)
     return [{"name": "Audio tweaks restored", "ok": True}]
 
 
 def _reset_input_tweaks() -> list[dict]:
     log.info("Resetting input tweaks...")
     mkey = r"HKCU\Control Panel\Mouse"
-    _reg(mkey, "MouseHoverTime",   "400", "REG_SZ")
-    _reg(mkey, "MouseHoverWidth",  "4",   "REG_SZ")
-    _reg(mkey, "MouseHoverHeight", "4",   "REG_SZ")
-    _reg(mkey, "MouseTrails",      "0",   "REG_SZ")
+    _reg_default(mkey, "MouseHoverTime",   "0", "400", "REG_SZ")
+    _reg_default(mkey, "MouseHoverWidth",  "1", "4",   "REG_SZ")
+    _reg_default(mkey, "MouseHoverHeight", "1", "4",   "REG_SZ")
+    # (MouseTrails 0 and KeyboardSpeed 31: what the tweak writes is what was
+    # written back here, so there is nothing to undo without a record.)
 
     kkey = r"HKCU\Control Panel\Keyboard"
-    _reg(kkey, "KeyboardSpeed", "31", "REG_SZ")  # max is fine
-    _reg(kkey, "KeyboardDelay", "1",  "REG_SZ")  # default 1
+    _reg_default(kkey, "KeyboardDelay", "0", "1", "REG_SZ")  # default 1
 
-    run_cmd(["reg", "delete", r"HKCU\Software\Microsoft\TabletTip\1.7",
-             "/v", "EnableAutoInvokeTouchKeyboard", "/f"])
-    run_cmd(["reg", "delete", r"HKCU\Software\Microsoft\Wisp\Pen\SysEventParameters",
-             "/v", "FlickMode", "/f"])
+    _reg_default(r"HKCU\Software\Microsoft\TabletTip\1.7",
+                 "EnableAutoInvokeTouchKeyboard", "0", None)
+    _reg_default(r"HKCU\Software\Microsoft\Wisp\Pen\SysEventParameters",
+                 "FlickMode", "0", None)
     return [{"name": "Input tweaks restored", "ok": True}]
 
 
 def _reset_search_tweaks() -> list[dict]:
     log.info("Resetting search tweaks...")
     cor = r"HKLM\SOFTWARE\Policies\Microsoft\Windows\Windows Search"
-    for val in ("AllowCortana", "AllowCortanaAboveLock", "AllowVoiceActivation",
-                "DisableWebSearch", "ConnectedSearchUseWeb",
-                "EnableDynamicContentInWSB", "AllowSearchToUseLocation",
-                "PreventIndexingOutlook"):
-        run_cmd(["reg", "delete", cor, "/v", val, "/f"])
+    # value, what the tweak leaves there
+    for val, tweak in (("AllowCortana", "0"), ("AllowCortanaAboveLock", "0"), ("AllowVoiceActivation", "0"),
+                       ("DisableWebSearch", "1"), ("ConnectedSearchUseWeb", "0"),
+                       ("EnableDynamicContentInWSB", "0"), ("AllowSearchToUseLocation", "0"),
+                       ("PreventIndexingOutlook", "1")):      # (the last one: removed in 3.3.1)
+        _reg_default(cor, val, tweak, None)
     sh = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Search"
     for val in ("DeviceHistoryEnabled", "HistoryViewEnabled",
                 "BingSearchEnabled", "CortanaConsent"):
-        run_cmd(["reg", "delete", sh, "/v", val, "/f"])
+        _reg_default(sh, val, "0", None)
     return [{"name": "Search & Cortana restored", "ok": True}]
 
 
@@ -2038,13 +2110,18 @@ def _reset_defender_gaming_tweaks() -> list[dict]:
     exactly the exclusions this app added removed again.
 
     What an older build changed has no record.  For that, the two policy bits
-    go to their Windows defaults, and the exclusions stay — they cannot be
-    told apart from ones the user added."""
+    go to their Windows defaults — each only while it still reads the way the
+    tweak leaves it (NeverSend / Disabled); "always prompt" or "basic" is the
+    user's own setting, and used to be overwritten here.  The exclusions
+    stay: they cannot be told apart from ones the user added."""
     log.info("Resetting Defender gaming tweaks...")
-    if not reg_originals.has_state("defender", "SubmitSamplesConsent"):
-        run_ps('Set-MpPreference -SubmitSamplesConsent SendSafeSamples -ErrorAction SilentlyContinue')
-    if not reg_originals.has_state("defender", "MAPSReporting"):
-        run_ps('Set-MpPreference -MAPSReporting Advanced -ErrorAction SilentlyContinue')
+    # name, how the tweak's value reads back, the Windows default
+    bits = [b for b in (("SubmitSamplesConsent", 2, "SendSafeSamples"), ("MAPSReporting", 0, "Advanced"))
+            if not reg_originals.has_state("defender", b[0])]
+    prefs = (sys_state.defender_prefs() or {}) if bits else {}
+    for name, tweak, stock in bits:
+        if prefs.get(name) == tweak:
+            run_ps(f'Set-MpPreference -{name} {stock} -ErrorAction SilentlyContinue')
     n = len(reg_originals.state_records("defender-exclusion"))
     return [{"name": (f"Defender policy restored; {n} exclusion(s) added by Vispora will be removed" if n else
                       "Defender policy restored (no exclusions on record; any added by an earlier version are kept)"),
@@ -2058,8 +2135,8 @@ def _reset_boot_tweaks() -> list[dict]:
     # and recreated a RAM-sized hiberfil.sys for people who had turned them
     # off themselves (deliberately, on a dual-boot machine).
     hb_key = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power"
-    if not reg_originals.has_original(hb_key, "HiberBootEnabled") and _pro_mode_enabled():
-        _reg(hb_key, "HiberBootEnabled", "1")
+    if _pro_mode_enabled():
+        _reg_default(hb_key, "HiberBootEnabled", "0", "1")
     if reg_originals.noted("hibernation_disabled"):
         run_cmd(["powercfg", "-h", "on"])
         reg_originals.forget_notes("hibernation_disabled")
@@ -2075,9 +2152,8 @@ def _reset_boot_tweaks() -> list[dict]:
     _bcd_default(bcd, "bootux", "disabled")
     _bcd_default(bcd, "bootlog", "no")
     _bcd_default(bcd, "quietboot", "yes")       # was never reset at all
-    run_cmd(["reg", "delete",
-             r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
-             "/v", "VerboseStatus", "/f"])
+    _reg_default(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+                 "VerboseStatus", "1", None)
     return [{"name": "Boot tweaks restored", "ok": True}]
 
 
@@ -2612,18 +2688,19 @@ def _reset_edge_tweaks() -> list[dict]:
     tools' Edge configs)."""
     log.info("Resetting Edge tweaks...")
     edge_key = r"HKLM\SOFTWARE\Policies\Microsoft\Edge"
-    # Only the values WE write in apply_edge_tweaks — if you add to the
-    # apply list, mirror here.
+    # Only the values WE write in apply_edge_tweaks / apply_smartscreen_tweaks
+    # (every one of them as 0) — if you add to the apply list, mirror here.
+    # (TabFreezeEnabled, TabSleeping, PreloadOnStartup, NewTabPagePrerender,
+    # AlternateErrorPagesEnabled, AutofillCreditCardEnabled,
+    # PasswordManagerEnabled, BrowserAddProfileEnabled and
+    # HardwareAccelerationModeEnabled were deleted here as well.  Nothing in
+    # this app writes them, and what an older build may have written is not
+    # known: an administrator's or the user's own Edge policy stays.)
     for v in ("StartupBoostEnabled", "BackgroundModeEnabled",
-              "TabFreezeEnabled", "TabSleeping",
-              "PreloadOnStartup", "NewTabPagePrerender",
               "SmartScreenEnabled", "SmartScreenPuaEnabled",
               "PersonalizationReportingEnabled",
-              "AlternateErrorPagesEnabled", "AutofillCreditCardEnabled",
-              "PasswordManagerEnabled", "BrowserAddProfileEnabled",
-              "HardwareAccelerationModeEnabled",
               "ShowMicrosoftRewards"):
-        run_cmd(["reg", "delete", edge_key, "/v", v, "/f"])
+        _reg_default(edge_key, v, "0", None)
     # Of the three Edge services only edgeupdate ships as anything other
     # than Manual, which is what the tweak sets.  (This used to set all
     # three to Automatic.)
@@ -2636,16 +2713,18 @@ def _reset_update_control_tweaks() -> list[dict]:
     log.info("Resetting Windows Update controls...")
     wu_key  = r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
     wu_au   = r"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
-    for v in ("DeferFeatureUpdates", "DeferFeatureUpdatesPeriodInDays",
-              "DeferQualityUpdates", "DeferQualityUpdatesPeriodInDays",
-              "ExcludeWUDriversInQualityUpdate",
-              "BranchReadinessLevel",
-              "DisableDualScan",
-              "DoNotConnectToWindowsUpdateInternetLocations"):
-        run_cmd(["reg", "delete", wu_key, "/v", v, "/f"])
-    for v in ("AUOptions", "NoAutoUpdate", "AutomaticMaintenanceEnabled",
-              "ScheduledInstallDay", "ScheduledInstallTime"):
-        run_cmd(["reg", "delete", wu_au, "/v", v, "/f"])
+    # value, what the tweak leaves there (this page's and the Privacy tab's)
+    for v, tweak in (("DeferFeatureUpdates", "1"), ("DeferFeatureUpdatesPeriodInDays", "365"),
+                     ("DeferQualityUpdates", "1"), ("DeferQualityUpdatesPeriodInDays", "14"),
+                     ("ExcludeWUDriversInQualityUpdate", "1")):
+        _reg_default(wu_key, v, tweak, None)
+    _reg_default(wu_au, "AUOptions", "2", None)
+    # (BranchReadinessLevel, DisableDualScan,
+    # DoNotConnectToWindowsUpdateInternetLocations and, under AU, NoAutoUpdate,
+    # AutomaticMaintenanceEnabled, ScheduledInstallDay and ScheduledInstallTime
+    # were deleted here as well.  Nothing in this app writes them, and what
+    # an older build may have written is not known: somebody's own Windows
+    # Update policy stays.)
     return [{"name": "WU tweak values cleared (subtree preserved)", "ok": True}]
 
 
@@ -2655,7 +2734,7 @@ def _reset_notification_tweaks() -> list[dict]:
     for v in ("NOC_GLOBAL_SETTING_TOASTS_ENABLED",
               "NOC_GLOBAL_SETTING_BADGE_ENABLED",
               "NOC_GLOBAL_SETTING_ALLOW_NOTIFICATION_SOUND"):
-        run_cmd(["reg", "delete", ns, "/v", v, "/f"])
+        _reg_default(ns, v, "0", None)
     return [{"name": "Notification policies restored", "ok": True}]
 
 
@@ -2683,37 +2762,41 @@ def _reset_app_privacy_tweaks() -> list[dict]:
     # need to be re-set by the user via Windows Settings if they want
     # them back on — auto-restoring would create a privacy regression
     # for users who genuinely disabled them).
+    # Every one of these is written as 2 ("deny"), and removed only while it
+    # still reads 2.  LetAppsAccessNotifications and LetAppsGetDiagnosticInfo
+    # are no longer applied; older builds denied those too.
+    # ("LetAppsActivate" was deleted here as well.  Nothing writes a value of
+    # that name.)
     for v in ("LetAppsAccessAccountInfo", "LetAppsAccessCalendar",
               "LetAppsAccessCallHistory", "LetAppsAccessContacts",
               "LetAppsAccessEmail", "LetAppsAccessMessaging",
               "LetAppsAccessMotion", "LetAppsAccessNotifications",
               "LetAppsAccessPhone", "LetAppsAccessRadios",
-              "LetAppsAccessTrustedDevices", "LetAppsActivate",
+              "LetAppsAccessTrustedDevices",
               "LetAppsGetDiagnosticInfo", "LetAppsSyncWithDevices"):
-        run_cmd(["reg", "delete", ap, "/v", v, "/f"])
+        _reg_default(ap, v, "2", None)
     return [{"name": "App privacy tweak values cleared (subtree preserved)", "ok": True}]
 
 
 def _reset_explorer_tweaks() -> list[dict]:
     log.info("Resetting Explorer tweaks...")
     advanced = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
-    for v in ("LaunchTo", "FullPath", "AutoCheckSelect", "ShowDriveLettersFirst",
-              "ShowRecent", "ShowFrequent", "ExplorerRibbonStartsMinimized",
-              "NavPaneExpandToCurrentFolder", "ShowPreviewHandlers"):
-        run_cmd(["reg", "delete", advanced, "/v", v, "/f"])
-    run_cmd(["reg", "delete", r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem",
-             "/v", "LongPathsEnabled", "/f"])
+    # value, what the tweak leaves there
+    for v, tweak in (("LaunchTo", "1"), ("FullPath", "1"), ("AutoCheckSelect", "0"), ("ShowDriveLettersFirst", "4"),
+                     ("ShowRecent", "0"), ("ShowFrequent", "0"), ("ExplorerRibbonStartsMinimized", "4"),
+                     ("NavPaneExpandToCurrentFolder", "0"), ("ShowPreviewHandlers", "0")):
+        _reg_default(advanced, v, tweak, None)
+    _reg_default(r"HKLM\SYSTEM\CurrentControlSet\Control\FileSystem",
+                 "LongPathsEnabled", "1", None)
     return [{"name": "Explorer settings restored to defaults", "ok": True}]
 
 
 def _reset_smartscreen_tweaks() -> list[dict]:
     log.info("Resetting SmartScreen tweaks...")
-    _reg(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer",
-         "SmartScreenEnabled", "RequireAdmin", "REG_SZ")
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Policies\Microsoft\Edge",
-             "/v", "SmartScreenEnabled", "/f"])
-    run_cmd(["reg", "delete", r"HKLM\SOFTWARE\Policies\Microsoft\Edge",
-             "/v", "SmartScreenPuaEnabled", "/f"])
+    _reg_default(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer",
+                 "SmartScreenEnabled", "Off", "RequireAdmin", "REG_SZ")
+    _reg_default(r"HKLM\SOFTWARE\Policies\Microsoft\Edge", "SmartScreenEnabled", "0", None)
+    _reg_default(r"HKLM\SOFTWARE\Policies\Microsoft\Edge", "SmartScreenPuaEnabled", "0", None)
     return [{"name": "SmartScreen restored", "ok": True}]
 
 
@@ -2721,10 +2804,12 @@ def _reset_lock_screen_tweaks() -> list[dict]:
     """v3 — per-value deletes."""
     log.info("Resetting lock screen tweaks...")
     pers = r"HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization"
-    for v in ("NoLockScreen", "LockScreenImage",
-              "NoChangingLockScreen", "LockScreenOverlaysDisabled"):
-        run_cmd(["reg", "delete", pers, "/v", v, "/f"])
+    _reg_default(pers, "NoLockScreen", "0", None)
+    _reg_default(pers, "LockScreenOverlaysDisabled", "1", None)
+    # (LockScreenImage and NoChangingLockScreen were deleted here as well.
+    # Nothing in this app writes them: a lock-screen picture set by policy
+    # is somebody else's.)
     cdm = r"HKCU\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
     for v in ("RotatingLockScreenEnabled", "RotatingLockScreenOverlayEnabled"):
-        _reg(cdm, v, "1")
+        _reg_default(cdm, v, "0", "1")
     return [{"name": "Lock screen Spotlight restored (Personalization subtree preserved)", "ok": True}]

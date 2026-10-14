@@ -37,13 +37,24 @@ class _Os:
 
 OPT.os = _Os()
 
-# ── what Reset All still does to values the optimizer never changed ───
-# The per-category resets write fixed Windows defaults (and delete policy
-# values) for things an OLDER build may have changed without keeping a
-# record.  They do that unconditionally, so a user's own setting for one of
-# these is overwritten by a reset.  Known and listed here so that the list
-# can only shrink: a reset that starts touching anything else fails
-# test_reset_changes_nothing_else.
+# ── what Reset All may do to values the optimizer did not change ──────
+# The per-category resets hold fixed Windows defaults (and policy values to
+# delete) for things an OLDER build may have changed without keeping a
+# record.  Each is applied only to a value that has no record AND still
+# reads exactly the way that tweak left it, so a user's own setting is never
+# one of them.
+#
+# FIXED_DEFAULTS is for exceptions: values a reset changes regardless.  There
+# are none.  Add one only with the reason written next to it - a reset that
+# touches anything not listed fails test_reset_changes_nothing_else.
+FIXED_DEFAULTS: dict = {}
+
+# The defaults used to be written unconditionally.  These are the values
+# that overwrote, although the optimizer had not written them in that run -
+# kept so the tests can put a user's own setting in every one of them and
+# see it survive (_seed_once_overwritten).  For about half of them there is
+# no fallback at all any more: it is not known what, if anything, a tweak
+# ever wrote there.
 _DESKTOP = r"hkcu\control panel\desktop"
 _GAMECFG = r"hkcu\system\gameconfigstore"
 _DWM = r"hkcu\software\microsoft\windows\dwm"
@@ -53,7 +64,7 @@ _NV0 = r"hklm\system\currentcontrolset\control\class\{4d36e968-e325-11ce-bfc1-08
 _MEMORY = r"hklm\system\currentcontrolset\control\session manager\memory management"
 _EDGE = r"hklm\software\policies\microsoft\edge"
 _WU = r"hklm\software\policies\microsoft\windows\windowsupdate"
-FIXED_DEFAULTS = {
+ONCE_OVERWRITTEN = {
     _DESKTOP: {"dragfullwindows", "fontsmoothing", "fontsmoothingtype", "foregroundlocktimeout"},
     _GAMECFG: {"gamedvr_dxgihonorfsewindowscompatible", "gamedvr_efsefeatureflags", "gamedvr_fsebehaviormode",
                "gamedvr_honoruserfsebehaviormode"},
@@ -114,6 +125,51 @@ def _flat_key(key, name):
     return hive, sub, name.lower()
 
 
+_TEXT_VALUES = {"dragfullwindows", "fontsmoothing", "fontsmoothingtype", "background only", "scheduling category",
+                "sfio priority", "lockscreenimage"}
+
+
+def _seed_once_overwritten(skip=()) -> None:
+    """A user's own setting in every value a reset used to overwrite: not a
+    Windows default, and not what any tweak writes."""
+    for path, names in ONCE_OVERWRITTEN.items():
+        for name in names:
+            if _flat_key(path, name) not in skip:
+                m.rset(path, name, "mine" if name in _TEXT_VALUES else 0x55)
+
+
+NV_KEY = m.DISPLAY_CLASS + r"\0001"
+
+
+def _nvidia_adapter() -> None:
+    r"""The NVIDIA card is the second display adapter on this PC; \0000 is a
+    virtual one.  (After m.fresh(), which forgets it.)"""
+    m.PS_HOOKS.append(lambda c: m.R("0000|Meta Virtual Monitor\n0001|NVIDIA GeForce RTX 5070 Ti")
+                      if "DriverDesc" in c else None)
+
+
+def _fallbacks():
+    """Every registry value Reset All holds a fixed default for, learned by
+    watching one reset (in Pro Mode, which has a few more):
+    [(key, value, (what a tweak leaves there, ...), the default - None for
+    "no value" -, type)]."""
+    m.fresh()
+    OPT.set_pro_mode(True)
+    _nvidia_adapter()
+    seen, real = [], OPT._reg_default
+
+    def watch(key, value, tweak, stock, vtype="REG_DWORD"):
+        seen.append((key, value, tweak if isinstance(tweak, tuple) else (tweak,), stock, vtype))
+        return real(key, value, tweak, stock, vtype)
+
+    OPT._reg_default = watch
+    try:
+        OPT.reset_all_optimizations()
+    finally:
+        OPT._reg_default = real
+    return seen
+
+
 def _discover(pro):
     """Run optimize and reset once on a scratch machine to learn every
     registry value either of them writes or deletes."""
@@ -133,12 +189,14 @@ def _cycle(pro=False, seed=True, categories=None):
     targets, others = _discover(pro)
     m.fresh()
     OPT.set_pro_mode(pro)
+    _nvidia_adapter()
     if seed:
         for i, (k, n, t, d) in enumerate(targets.values()):
             if i % 5 != 4:                          # every fifth value does not exist yet on this PC
                 m.rset(k, n, user_value(t, d), t)
         for k, n, t, d in others.values():
             m.rset(k, n, user_value(t, d), t)
+        _seed_once_overwritten(skip=targets)
     m.cell(m.USERPLAN, m.PROC_MIN)[:] = [12, 34]
     c = {"targets": targets, "reg_before": _tweak_values(m.flat()), "sys_before": m.snap_system()}
     m.clear_logs()
@@ -258,15 +316,25 @@ def test_reset_switches_the_startup_tweaks_off():
 
 
 def test_a_second_reset_changes_no_system_state():
-    # (Registry values are another matter: with nothing on record a reset
-    # writes its fixed defaults - see FIXED_DEFAULTS above.)
     _cycle()
     system = m.snap_system()
     m.clear_logs()
     OPT.reset_all_optimizations()
-    after = m.snap_system()
-    assert all(after[part] == system[part] for part in system if part != "plan")
+    assert m.snap_system() == system, "the power plan included: the user's own is not swapped for Balanced"
     assert not m.ran("sc", "config") and not m.ran("dism", "/enable-feature") and not m.ran("schtasks", "/change")
+    assert not m.ran("powercfg", "setactive") and not m.PTOUCH
+
+
+def test_a_second_reset_changes_no_registry_value():
+    for pro in (False, True):
+        c = _cycle(pro=pro)
+        assert c["reg_after"] == c["reg_before"], "(the first one put everything back)"
+        before = m.flat()
+        m.clear_logs()
+        OPT.reset_all_optimizations()
+        assert m.flat() == before, f"Pro Mode {pro}"
+        assert not m.WRITES and not m.DELETES, "with nothing on record, not one `reg add` or `reg delete`"
+        assert not m.ps_ran("SystemParametersInfo"), "nor the live visual-effects switch"
 
 
 def test_optimize_twice_then_reset_still_returns_the_first_values():
@@ -358,11 +426,202 @@ def test_reset_on_an_untouched_machine_changes_no_system_state():
     m.clear_logs()
     OPT.reset_all_optimizations()
     after = m.snap_system()
-    for part in ("services", "tasks", "bcd", "tcp", "stack", "features", "fsutil", "defender", "hibernate"):
+    for part in ("services", "tasks", "bcd", "tcp", "stack", "features", "fsutil", "defender", "hibernate", "plan"):
         assert after[part] == before[part], part
     assert not m.ran("sc", "config") and not m.ran("bcdedit", "/set") and not m.ran("bcdedit", "/deletevalue")
     assert not m.ran("dism", "/enable-feature") and not m.ran("schtasks", "/change")
     assert not [c for c in m.CMDS if c[0] == "netsh" and "reset" in c]
+    assert not m.ran("powercfg", "setactive") and not m.PTOUCH, "the user's plan, and every setting on it"
+
+
+# ── the registry ──────────────────────────────────────────────────────
+# key, value, a setting of the user's own, what an older build's tweak left
+# there, and what Reset All makes of THAT (None: the value is removed)
+_PROFILE = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+_POLICIES = r"HKLM\SOFTWARE\Policies\Microsoft"
+OWN_AND_OLD = [
+    (r"HKCU\Control Panel\Desktop", "ForegroundLockTimeout", 100000, 0, 200000),
+    (r"HKCU\Control Panel\Desktop", "MenuShowDelay", "200", "0", "400"),
+    (r"HKCU\System\GameConfigStore", "GameDVR_FSEBehaviorMode", 1, 2, 0),
+    (r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl", "Win32PrioritySeparation", 0x18, 40, 2),
+    (_PROFILE, "NetworkThrottlingIndex", 20, 0xFFFFFFFF, 10),
+    (_PROFILE, "SystemResponsiveness", 30, 0, 20),
+    (_PROFILE + r"\Tasks\DisplayPostProcessing", "Priority", 4, 2, 8),
+    (r"HKLM\SYSTEM\CurrentControlSet\Services\Ndu", "Start", 3, 4, 2),
+    (NV_KEY, "PowerMizerLevel", 3, 1, 0),
+    (_POLICIES + r"\Edge", "StartupBoostEnabled", 1, 0, None),
+    (_POLICIES + r"\Windows\WindowsUpdate", "DeferFeatureUpdatesPeriodInDays", 30, 365, None),
+    (_POLICIES + r"\Windows\AppPrivacy", "LetAppsAccessNotifications", 1, 2, None),
+    (_POLICIES + r"\Windows\GameDVR", "AllowGameDVR", 1, 0, None),
+    (r"HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers", "TdrDelay", 8, 10, None),
+    (r"HKLM\SOFTWARE\Microsoft\Windows\Dwm", "OverlayTestMode", 1, 5, None),
+]
+# ...and settings Reset All used to overwrite that no tweak is known to have
+# written.  There is no fallback for these at all now.
+NOT_OURS = [
+    (r"HKCU\Control Panel\Desktop", "FontSmoothing", "0"),              # ClearType off
+    (r"HKCU\Control Panel\Desktop", "DragFullWindows", "0"),
+    (r"HKCU\System\GameConfigStore", "GameDVR_DXGIHonorFSEWindowsCompatible", 1),
+    (r"HKCU\Software\Microsoft\Windows\DWM", "Composition", 0),
+    (_POLICIES + r"\Edge", "PasswordManagerEnabled", 0),
+    (_POLICIES + r"\Windows\WindowsUpdate\AU", "NoAutoUpdate", 1),
+    (_POLICIES + r"\Windows\Personalization", "LockScreenImage", r"C:\Company\lock.jpg"),
+    (m.DISPLAY_CLASS + r"\0000", "PowerMizerLevel", 1),                 # not the NVIDIA adapter's key
+    (r"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00"
+     r"\0cc5b647-c1df-4637-891a-dec35c318583", "ValueMax", 100),        # ships with Windows
+]
+
+
+def test_a_users_own_settings_survive_reset_all_on_an_untouched_machine():
+    m.fresh()
+    _nvidia_adapter()
+    for key, value, own, _, _ in OWN_AND_OLD:
+        m.rset(key, value, own)
+    for key, value, own in NOT_OURS:
+        m.rset(key, value, own)
+    before = m.flat()
+    OPT.reset_all_optimizations()
+    assert _diff(before, m.flat()) == {}
+
+
+def test_the_same_settings_left_by_an_older_build_are_still_reset():
+    m.fresh()
+    _nvidia_adapter()
+    for key, value, _, old, _ in OWN_AND_OLD:
+        m.rset(key, value, old)                     # no record: that build kept none
+    for key, value, own in NOT_OURS:
+        m.rset(key, value, own)
+    OPT.reset_all_optimizations()
+    got = {(key, value): m.rdata(key, value) for key, value, _, _, _ in OWN_AND_OLD}
+    assert got == {(key, value): after for key, value, _, _, after in OWN_AND_OLD}
+    assert all(m.rdata(key, value) == own for key, value, own in NOT_OURS), "still nobody's business"
+
+
+def test_no_setting_of_the_users_is_overwritten_whatever_reset_has_a_default_for():
+    """The same, for every single fallback rather than a hand-picked few."""
+    fallbacks = _fallbacks()
+    assert len(fallbacks) > 120
+    for pro in (False, True):
+        m.fresh()
+        OPT.set_pro_mode(pro)
+        _nvidia_adapter()
+        _seed_once_overwritten()
+        for key, value, tweaks, _, vtype in fallbacks:
+            m.rset(key, value, user_value(vtype, tweaks[0]), vtype)
+        before, system = m.flat(), m.snap_system()
+        m.clear_logs()
+        OPT.reset_all_optimizations()
+        assert _diff(before, m.flat()) == {}, f"Pro Mode {pro}"
+        assert not m.WRITES and not m.DELETES, "not one `reg add` or `reg delete`"
+        assert m.snap_system() == system and not m.PTOUCH
+        assert not m.ps_ran("SystemParametersInfo"), "no visual tweak to undo: the live session is left alone too"
+
+
+def test_every_fallback_still_undoes_what_an_older_build_left():
+    fallbacks = _fallbacks()
+    for pick in (0, -1):                            # where builds wrote different values: the first, then the last
+        m.fresh()
+        OPT.set_pro_mode(True)
+        _nvidia_adapter()
+        for key, value, tweaks, _, vtype in fallbacks:
+            m.rset(key, value, m._reg_parse(vtype, tweaks[pick]), vtype)
+        OPT.reset_all_optimizations()
+        wrong = [(key, value, m.rget(key, value)) for key, value, _, stock, vtype in fallbacks
+                 if (m.rget(key, value) is not None if stock is None else not RO.reads_as(key, value, stock, vtype))]
+        assert wrong == [], "back to the Windows default - or gone, where Windows has no such value"
+        assert m.ps_ran("SystemParametersInfo"), "the visual tweak WAS there to undo"
+
+
+def test_a_value_on_another_tabs_record_is_left_to_that_tab():
+    m.fresh()
+    m.rset(_PROFILE, "NetworkThrottlingIndex", 20)
+    RO.remember(_PROFILE, "NetworkThrottlingIndex", "4294967295", scope="network")
+    m.rset(_PROFILE, "NetworkThrottlingIndex", 0xFFFFFFFF)       # the Network tab's tweak, on its own record
+    OPT.reset_all_optimizations()
+    assert m.rdata(_PROFILE, "NetworkThrottlingIndex") == 0xFFFFFFFF, "its undo has the real value; 10 is a guess"
+    assert RO.has_original(_PROFILE, "NetworkThrottlingIndex", scope="network")
+    assert RO.on_record(_PROFILE.upper(), "networkthrottlingindex"), "however the key is spelled"
+
+
+def test_spectre_override_goes_as_a_pair_or_not_at_all():
+    base = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+    m.fresh()
+    m.rset(base, "FeatureSettingsOverride", 0)      # mitigations switched ON by hand: 0 with a mask of 3
+    m.rset(base, "FeatureSettingsOverrideMask", 3)
+    OPT.reset_all_optimizations()
+    assert (m.rdata(base, "FeatureSettingsOverride"), m.rdata(base, "FeatureSettingsOverrideMask")) == (0, 3)
+    m.rset(base, "FeatureSettingsOverride", 3)      # the tweak, from a build that kept no record
+    OPT.reset_all_optimizations()
+    assert m.rget(base, "FeatureSettingsOverride") is None and m.rget(base, "FeatureSettingsOverrideMask") is None
+
+
+def test_pro_mode_reset_does_not_create_values_that_were_never_there():
+    m.fresh()
+    OPT.set_pro_mode(True)
+    hvci = r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity"
+    power = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power"
+    OPT.reset_all_optimizations()
+    assert m.rget(hvci, "Enabled") is None, "this switched Memory Integrity on for people who never had it"
+    assert m.rget(power, "HiberBootEnabled") is None
+    m.rset(hvci, "Enabled", 0)                      # as the Pro Mode tweak leaves them
+    m.rset(power, "HiberBootEnabled", 0)
+    OPT.reset_all_optimizations()
+    assert m.rdata(hvci, "Enabled") == 1 and m.rdata(power, "HiberBootEnabled") == 1
+
+
+def test_gamedvr_policy_key_keeps_what_is_not_the_tweaks():
+    key = _POLICIES + r"\Windows\GameDVR"
+    m.fresh()
+    m.rset(key, "AllowGameDVR", 0)                  # the tweak, no record
+    m.rset(key, "SomebodyElses", 1)
+    OPT.reset_all_optimizations()
+    assert m.rget(key, "AllowGameDVR") is None and m.rdata(key, "SomebodyElses") == 1, \
+        "the whole key used to be deleted"
+
+
+def test_context_menu_override_is_only_removed_when_it_is_exactly_the_tweaks():
+    ctx = r"HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}"
+    inproc = ctx + r"\InprocServer32"
+    m.fresh()
+    m.rset(inproc, "", "")                          # the tweak: an empty default value, nothing else
+    OPT.reset_all_optimizations()
+    assert not m.key_exists(ctx)
+    for more in ((inproc, "ThreadingModel", "Apartment"), (ctx, "", "mine"), (ctx + r"\Other", "x", 1)):
+        m.fresh()
+        m.rset(inproc, "", "")
+        m.rset(*more)                               # ...and something that is not the tweak's
+        before = m.flat()
+        OPT.reset_all_optimizations()
+        assert m.flat() == before, more
+    m.fresh()
+    m.rset(inproc, "", r"C:\Tools\menu.dll")        # somebody's own handler
+    OPT.reset_all_optimizations()
+    assert m.rdata(inproc, "") == r"C:\Tools\menu.dll"
+
+
+def test_visual_effects_are_only_switched_live_when_the_tweak_is_being_undone():
+    m.fresh()
+    OPT.run_full_optimize(["visual"])
+    m.clear_logs()
+    OPT.reset_all_optimizations()
+    assert m.ps_ran("SystemParametersInfo"), "on record: the tweak is being undone"
+    m.clear_logs()
+    OPT.reset_all_optimizations()
+    assert not m.ps_ran("SystemParametersInfo"), "nothing left to undo"
+
+
+def test_defender_bits_are_only_reset_from_what_the_tweak_sets():
+    m.fresh()
+    m.DEF.update(SubmitSamplesConsent=0, MAPSReporting=1)       # "always prompt", "basic": this user's own
+    OPT.reset_all_optimizations()
+    assert (m.DEF["SubmitSamplesConsent"], m.DEF["MAPSReporting"]) == (0, 1), "these became 1 and 2 at every reset"
+    m.DEF.update(SubmitSamplesConsent=2, MAPSReporting=0)       # as an older build's tweak left them
+    OPT.reset_all_optimizations()
+    assert (m.DEF["SubmitSamplesConsent"], m.DEF["MAPSReporting"]) == (1, 2)
+    m.DEF_OK[0] = False                                         # no Defender to ask: nothing is set blindly
+    m.clear_logs()
+    OPT.reset_all_optimizations()
+    assert not m.ps_ran("Set-MpPreference")
 
 
 def test_reset_undoes_what_an_older_build_left_without_records():
@@ -451,6 +710,52 @@ def test_reset_falls_back_to_balanced_when_the_recorded_plan_is_gone():
     m.PLAN["schemes"].discard(m.USERPLAN)           # the user deleted their old plan since
     rows = OPT._reset_power_plan()
     assert m.PLAN["active"] == m.BALANCED and "fallback" in rows[0]["name"]
+
+
+def test_without_a_baseline_the_users_own_plan_stays_active():
+    m.fresh()                                       # on their own plan; this app never switched it
+    rows = OPT._reset_power_plan()
+    assert m.PLAN["active"] == m.USERPLAN and not m.ran("powercfg", "setactive"), \
+        "this used to move everybody without a baseline to Balanced"
+    assert rows[0]["ok"] and "left as it is" in rows[0]["name"]
+
+
+def test_without_a_baseline_one_of_our_own_plans_is_still_left_for_balanced():
+    m.fresh(plan=m.HIGH_PERF)                       # where an older build's start-up prep left the machine
+    rows = OPT._reset_power_plan()
+    assert m.PLAN["active"] == m.BALANCED and "fallback" in rows[0]["name"]
+
+
+def test_cpu_idle_off_on_the_users_own_plan_survives_optimize_and_reset():
+    m.fresh()
+    m.cell(m.USERPLAN, m.IDLE)[:] = [1, 0]          # this user runs with CPU idle off, and means to
+    OPT.run_full_optimize()
+    performance = m.PLAN["active"]
+    assert performance != m.USERPLAN and m.cell(performance, m.IDLE)[0] == 1, "the tweak landed on OUR plan"
+    m.clear_logs()
+    OPT.reset_all_optimizations()
+    assert m.PLAN["active"] == m.USERPLAN
+    assert m.cell(m.USERPLAN, m.IDLE) == [1, 0], "idle was forced back on for whichever plan the reset ended on"
+    assert m.cell(performance, m.IDLE) == [0, 0], "the plan that WAS changed is the one put back"
+    OPT.reset_all_optimizations()                   # and again, with nothing on record any more
+    assert m.cell(m.USERPLAN, m.IDLE) == [1, 0]
+    assert not [t for t in m.PTOUCH if t[0] == m.USERPLAN], "no setting on the user's plan was written at all"
+
+
+def test_cpu_idle_left_off_by_an_older_build_is_switched_back_on_for_our_own_plans_only():
+    m.fresh(plan=m.HIGH_PERF)
+    m.cell(m.HIGH_PERF, m.IDLE)[:] = [1, 0]         # the Kernel page of a build that kept no record
+    m.cell(m.USERPLAN, m.IDLE)[:] = [1, 0]          # the user's own doing
+    m.cell(m.BALANCED, m.IDLE)[:] = [1, 0]          # ...this too
+    OPT.reset_all_optimizations()
+    assert m.cell(m.HIGH_PERF, m.IDLE) == [0, 0]
+    assert m.cell(m.USERPLAN, m.IDLE) == [1, 0] and m.cell(m.BALANCED, m.IDLE) == [1, 0]
+    m.fresh(plan=m.HIGH_PERF)
+    m.cell(m.HIGH_PERF, m.IDLE)[:] = [1, 0]
+    RO.remember_power(m.PROC_SUB, m.IDLE, scope="gamemode")     # a running game's setting, on its own record
+    m.clear_logs()
+    OPT.reset_all_optimizations()
+    assert m.cell(m.HIGH_PERF, m.IDLE) == [1, 0] and not m.PTOUCH, "game mode puts that back itself"
 
 
 def test_advanced_power_tweaks_are_undone_on_the_users_own_plan():

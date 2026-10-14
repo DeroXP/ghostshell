@@ -110,6 +110,30 @@ def test_gpu_tweaks_are_not_undone_by_reset_all():
     assert m.rdata(NV_KEY, "PowerMizerLevel") == 0
 
 
+def test_reset_all_undoes_an_older_builds_power_mode_on_the_nvidia_adapters_own_key():
+    r"""No record: a build that kept none.  The fixed defaults used to go to
+    \0000 whatever adapter that was."""
+    gpu_machine("nvidia")
+    virtual = m.DISPLAY_CLASS + r"\0000"
+    for key in (virtual, NV_KEY):
+        m.rset(key, "PerfLevelSrc", 0x2222)
+        m.rset(key, "PowerMizerLevel", 1)
+        m.rset(key, "PowerMizerLevelAC", 1)
+    before = m.flat()
+    OPT.reset_all_optimizations()
+    assert (m.rdata(NV_KEY, "PerfLevelSrc"), m.rdata(NV_KEY, "PowerMizerLevel"),
+            m.rdata(NV_KEY, "PowerMizerLevelAC")) == (0x3322, 0, 0)
+    assert {k: v for k, v in m.flat().items() if "0000" in k[1]} == {k: v for k, v in before.items() if "0000" in k[1]}, \
+        "another adapter's key is not written to"
+
+    gpu_machine("amd")                              # no NVIDIA card at all
+    m.rset(virtual, "PowerMizerLevel", 1)
+    m.rset(NV_KEY, "PowerMizerLevel", 1)
+    before = m.flat()
+    OPT.reset_all_optimizations()
+    assert m.flat() == before
+
+
 # ═════════════════════════════════════════════════════════════════════
 # Network tab
 # ═════════════════════════════════════════════════════════════════════
@@ -240,6 +264,25 @@ def test_reset_all_restores_debloated_services_and_tasks():
     res = OPT.reset_all_optimizations()
     assert m.svc_get("SysMain") == "auto" and m.task_on(m.TELEMETRY_TASKS[0]) is True
     assert res["debloat_services"] and all(r["ok"] for r in res["debloat_services"])
+
+
+def test_a_service_the_user_disabled_themselves_is_not_switched_back_on():
+    m.fresh()
+    m.svc_set("DiagTrack", "disabled")              # the user's own doing: there is no record
+    m.svc_set("SysMain", "disabled")
+    DB.disable_service("DiagTrack")                 # the debloater finds it disabled: nothing to record
+    DB.disable_service("lfsvc")                     # this one it does disable
+    res = DB.restore_services()
+    assert m.svc_get("lfsvc") == "demand" and (res["restored"], res["total"]) == (1, 1)
+    assert m.svc_get("DiagTrack") == "disabled" and m.svc_get("SysMain") == "disabled", \
+        "both were set to Manual: 'disabled, no record' was taken for a lost record"
+    assert res["unrecorded"] == ["DiagTrack", "SysMain"]
+
+    m.clear_logs()
+    out = OPT.reset_all_optimizations()             # ...which is what every Reset All did, too
+    assert m.svc_get("DiagTrack") == "disabled" and m.svc_get("SysMain") == "disabled"
+    assert not m.ran("sc", "config")
+    assert "DiagTrack, SysMain" in out["debloat_services"][-1]["name"] and out["debloat_services"][-1]["ok"]
 
 
 # ═════════════════════════════════════════════════════════════════════

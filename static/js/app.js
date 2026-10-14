@@ -1562,7 +1562,7 @@ function debloatSelectAll(val) {
 
 // 3.4.2 — undo a service-disable pass.  Re-enables every Windows
 // service the debloater turned off, restoring each to its recorded
-// original start type (or Manual as a safe fallback).
+// original start type (one that is disabled with no record is left alone).
 async function restoreDebloatServices() {
     if (!confirm('Re-enable all Windows services that Vispora disabled?\n\n'
                  + 'Each service is restored to its original start type '

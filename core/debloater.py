@@ -202,35 +202,34 @@ def enable_service(service_id: str, start_keyword: str = "demand") -> dict:
 
 def restore_services() -> dict:
     """Re-enable every service the debloater disabled, restoring each to
-    its recorded original Start type.  For any service we disabled
-    without a recorded original (edge case), fall back to 'demand'
-    (Manual) — the safe Windows default that won't auto-run but is
-    available on request.
+    its recorded original Start type.
+
+    A service on the list that is disabled WITHOUT a record is left as it
+    is, and named in "unrecorded".  Since 3.4.2 disable_service() records
+    every service it changes, so such a service was disabled before the
+    debloater got to it (or by a build older than that) — which cannot be
+    told apart from one the user switched off themselves.  (It used to be
+    set to Manual, on the theory that the record had been lost: that
+    re-enabled DiagTrack, SysMain and the rest for people who had disabled
+    them on purpose, at every Reset All.)
 
     Called by the optimizer's reset-to-defaults flow and exposed via
     /api/debloat/restore-services so the user can always undo a debloat
     pass (previously there was NO way to re-enable disabled services)."""
     backup = _load_service_backup()
-    # Restore everything we have a record for, plus any service in the
-    # manifest that's currently disabled (covers records lost to a
-    # wiped sidecar).
-    targets = dict(backup)
-    for svc in SERVICES_TO_DISABLE:
-        sid = svc["id"]
-        if sid not in targets:
-            cur = _read_service_start(sid)
-            if cur == 4:   # currently disabled but no record → safe default
-                targets[sid] = 3   # demand / Manual
     results = []
-    for sid, start_int in targets.items():
+    for sid, start_int in backup.items():
         kw = _START_INT_TO_KEYWORD.get(int(start_int), "demand")
         results.append(enable_service(sid, kw))
+    unrecorded = [svc["id"] for svc in SERVICES_TO_DISABLE
+                  if svc["id"] not in backup and _read_service_start(svc["id"]) == 4]
     # Clear the backup once restored.
     if backup:
         _save_service_backup({})
     ok = sum(1 for r in results if r.get("ok"))
-    log.info(f"restore_services: re-enabled {ok}/{len(results)} services")
-    return {"ok": True, "restored": ok, "total": len(results), "results": results}
+    log.info(f"restore_services: re-enabled {ok}/{len(results)} services"
+             + (f"; disabled with no record, left alone: {', '.join(unrecorded)}" if unrecorded else ""))
+    return {"ok": True, "restored": ok, "total": len(results), "results": results, "unrecorded": unrecorded}
 
 
 def disable_scheduled_task(task_path: str) -> dict:
