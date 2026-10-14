@@ -199,6 +199,27 @@ def has_original(key_path: str, value_name: str, scope: str = "optimizer") -> bo
         return f"{scope}||{key_path}|{value_name}" in _load()["registry"]
 
 
+def on_record(key_path: str, value_name: str) -> bool:
+    """Is this registry value on record for ANY scope?  Whoever recorded it
+    has its real previous value and is the one to put it back — a fixed
+    default must not get there first.  Compared without regard to case:
+    registry paths have none, and not every caller spells a key the same."""
+    tail = f"||{key_path}|{value_name}".lower()
+    with _lock:
+        return any(i.lower().endswith(tail) for i in _load()["registry"])
+
+
+def reads_as(key_path: str, value_name: str, data: str, vtype: str = "REG_DWORD") -> bool:
+    """Does the value exist and hold exactly what `reg add /t vtype /d data`
+    writes?  False as well when it cannot be read."""
+    current = read_value(key_path, value_name)
+    if not current or current["type"] == ABSENT:
+        return False
+    if vtype == "REG_BINARY":
+        data = str(data).lower()        # read_value gives binary data as lower-case hex
+    return _same(current, data, vtype)
+
+
 # ── power-plan settings ───────────────────────────────────────────────
 _HEX = re.compile(r"0x[0-9a-fA-F]{8}")
 
@@ -265,13 +286,17 @@ def remember_power(sub: str, setting: str, scope: str = "optimizer") -> bool:
         return False
 
 
-def has_power(sub: str, setting: str, scope: str = "optimizer") -> bool:
-    """Is this power setting on record for `scope`, on any plan?"""
+def has_power(sub: str, setting: str, scope: Optional[str] = "optimizer", scheme: str = "") -> bool:
+    """Is this power setting on record for `scope` (None: for any scope) —
+    on the plan `scheme`, or, without one, on any plan?"""
     sub = _POWER_ALIASES.get(sub.lower(), sub.lower())
     setting = _POWER_ALIASES.get(setting.lower(), setting.lower())
-    prefix, tail = f"{scope}||", f"|{sub}|{setting}"
+    tail = f"|{sub}|{setting}"
+    if scheme:
+        tail = f"||{scheme.lower()}{tail}"
     with _lock:
-        return any(i.startswith(prefix) and i.endswith(tail) for i in _load()["power"])
+        return any(i.endswith(tail) and (scope is None or i.startswith(f"{scope}||"))
+                   for i in _load()["power"])
 
 
 # ── notes ─────────────────────────────────────────────────────────────
@@ -354,6 +379,25 @@ def subkeys(key_path: str) -> list:
                     break
     except OSError:
         pass
+    return names
+
+
+def value_names(key_path: str) -> Optional[list]:
+    """Names of a registry key's values (read-only; "" is its default value),
+    or None if the key does not exist or cannot be read."""
+    hive, sub = _split(key_path)
+    if hive is None:
+        return None
+    names: list = []
+    try:
+        with winreg.OpenKey(hive, sub, 0, winreg.KEY_READ) as k:
+            while True:
+                try:
+                    names.append(winreg.EnumValue(k, len(names))[0])
+                except OSError:
+                    break
+    except OSError:
+        return None
     return names
 
 
