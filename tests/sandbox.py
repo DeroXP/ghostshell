@@ -944,8 +944,10 @@ class FakeKernel32:
     """Stands in for kernel32 in core.process_tuning.  A handle is the pid.
 
     A process is a dict in `procs`: priority, affinity, and optionally exe,
-    image, ppid, created, throttle, protected (refuses everything but a
-    query-only handle, like an anti-cheat-protected game), exited."""
+    image, ppid, created, throttle, session (1 unless set; 0 = a service),
+    protected (refuses everything but a query-only handle, like an
+    anti-cheat-protected game), ignore_eco (efficiency mode "succeeds" and
+    changes nothing), exited."""
 
     _QUERY_ONLY = 0x1000 | 0x00100000       # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
 
@@ -1032,7 +1034,17 @@ class FakeKernel32:
     def SetProcessInformation(self, h, info_class, state, size):
         if self.win10 and state._obj.ControlMask & 4:       # the Windows 11 flag: the whole call fails
             return 0
+        if self.procs[h].get("ignore_eco") and state._obj.StateMask & 1:
+            return 1
         self.procs[h]["throttle"] = (state._obj.ControlMask, state._obj.StateMask)
+        self.calls.append(("throttle", h, (state._obj.ControlMask, state._obj.StateMask)))
+        return 1
+
+    def ProcessIdToSessionId(self, pid, session):
+        p = self.procs.get(pid)
+        if p is None or p.get("exited"):
+            return 0
+        session._obj.value = p.get("session", 1)
         return 1
 
 

@@ -91,11 +91,14 @@ def test_game_mode_settings_round_trip():
     c = client()
     m.fresh()
     assert c.get("/api/profiles/settings", headers=auth()).get_json()["settings"] == \
-        {"auto_enable_on_boot": True, "all_cores": True}
+        {"auto_enable_on_boot": True, "all_cores": True, "background_on_ecores": True}
     after = c.post("/api/profiles/settings", headers=auth(), json={"all_cores": False}).get_json()["settings"]
-    assert after == {"auto_enable_on_boot": True, "all_cores": False}
+    assert after == {"auto_enable_on_boot": True, "all_cores": False, "background_on_ecores": True}
     after = c.post("/api/profiles/settings", headers=auth(), json={"auto_enable_on_boot": False}).get_json()["settings"]
-    assert after == {"auto_enable_on_boot": False, "all_cores": False}, "the other switch is left alone"
+    assert after == {"auto_enable_on_boot": False, "all_cores": False, "background_on_ecores": True}, \
+        "the other switches are left alone"
+    after = c.post("/api/profiles/settings", headers=auth(), json={"background_on_ecores": False}).get_json()["settings"]
+    assert after == {"auto_enable_on_boot": False, "all_cores": False, "background_on_ecores": False}
 
 
 def test_undo_routes_answer_on_a_machine_with_nothing_to_undo():

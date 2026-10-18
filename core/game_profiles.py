@@ -418,6 +418,12 @@ _engine = {
     "streamer_prior": {},           # pid -> priority class a streaming app had before it was raised
     "exit_ticks": 0,                # ticks since the last process of the game went away
     "tick": 0,
+    # Background programs in efficiency mode for the session (see _eco_sweep).
+    "eco_on": False,
+    "eco_session": None,            # the Windows session the game runs in
+    "eco_seen": {},                 # pid -> exe of every process already looked at
+    "eco_procs": {},                # pid -> {"exe", "created", "before"}: what to put back
+    "eco_failed": 0,                # processes that did not read back as in efficiency mode
 }
 # One session start, tick or restore at a time.  Two monitor threads used to
 # overlap for a moment when the monitor was restarted (adding a custom game
@@ -649,7 +655,11 @@ def _report_processes(all_cores: bool) -> None:
         _check("proc:priority", False, "Process priority: unchanged (the game's process is protected)")
     else:
         done = sum(1 for r in recs if r["result"].get("priority"))
-        _check("proc:priority", False, f"Process priority -> High on {done} of {n} processes (the others refused it)")
+        if done == 0:
+            _check("proc:priority", False, "Process priority: Windows accepted High but the game is still not at it "
+                   "(its anti-cheat or the game itself holds it back)")
+        else:
+            _check("proc:priority", False, f"Process priority -> High on {done} of {n} processes (the others refused it)")
 
     # every core
     if all_cores:
@@ -874,6 +884,153 @@ def _apply_network_priority(exe_name: str, streamers: list) -> None:
     if counts:
         log.info("  Prioritized streaming app(s): " + ", ".join(
             f"{e} ({counts[e][1]} processes)" if counts[e][1] > 1 else e for e in sorted(counts)))
+
+
+# ── background programs on the efficiency cores ──────────────────────
+# Never put in efficiency mode: what draws the screen, makes the sound or
+# carries the input, the shell, anti-cheat, overlays and recorders — and
+# Vispora, whose gamepad mapper polls at 4 kHz.
+_ECO_KEEP = frozenset({
+    "system", "registry", "idle", "memory compression", "secure system",
+    "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "lsaiso.exe",
+    "dwm.exe", "fontdrvhost.exe", "audiodg.exe", "svchost.exe", "explorer.exe", "sihost.exe",
+    "ctfmon.exe", "textinputhost.exe", "logonui.exe", "conhost.exe",
+    "steam.exe",                                    # Steam Input runs in it
+    "ds4windows.exe", "dsx.exe", "x360ce.exe", "joytokey.exe", "antimicrox.exe",
+    "gamebar.exe", "gamebarftserver.exe", "nvcontainer.exe", "nvidia share.exe", "nvidia overlay.exe",
+    "rtss.exe", "msiafterburner.exe", "steelseriessonar.exe",
+    *STREAMING_EXES, *OWN_PROCESS_NAMES, "app.py",
+})
+_ECO_KEEP_PREFIXES = (
+    "easyanticheat", "eaanticheat", "beservice", "battleye", "faceit", "vgc", "vgtray",     # anti-cheat
+    "razer", "lghub", "logi", "icue", "corsair", "steelseries", "wooting",          # mouse / keyboard software
+    "nahimic",
+)
+_ECO_FILE = os.path.join(PROFILES_DIR, "eco_restore.json")
+
+
+def _eco_keep(exe: str) -> bool:
+    return exe in _ECO_KEEP or exe.startswith(_ECO_KEEP_PREFIXES)
+
+
+def _save_eco() -> None:
+    """What is in efficiency mode because of us, on disk too: after a crash
+    the next start puts it back (see check_and_restore_on_boot)."""
+    recs = _engine.get("eco_procs") or {}
+    try:
+        if recs:
+            atomic_write_json(_ECO_FILE, {str(pid): r for pid, r in recs.items()})
+        elif os.path.exists(_ECO_FILE):
+            os.remove(_ECO_FILE)
+    except Exception as e:
+        log.debug(f"could not save the efficiency-mode records: {e}")
+
+
+def _eco_sweep() -> None:
+    """Every other program in the user's session into efficiency mode, so a
+    hybrid CPU's scheduler puts them on the E-cores and leaves the P-cores to
+    the game (process_tuning.to_efficiency).  At session start, then at every
+    tick for what has been opened since: each process is looked at once, and
+    one that later changes its own setting is not fought.  Never the game,
+    nor anything it or Vispora started."""
+    procs = process_tuning.processes()
+    if procs is None:
+        return
+    seen, eco = _engine["eco_seen"], _engine["eco_procs"]
+    game_exe = (_engine.get("active_exe") or "").lower()
+    children: dict = {}
+    for p in procs:
+        children.setdefault(p["ppid"], []).append(p["pid"])
+    tree, todo = set(), list(_engine.get("game_procs") or {}) + [_engine.get("active_pid"), os.getpid()]
+    while todo:
+        pid = todo.pop()
+        if pid is not None and pid not in tree:
+            tree.add(pid)
+            todo.extend(children.get(pid, []))
+    changed, moved = False, []
+    # A process of the game that was a background program when it was put in
+    # efficiency mode (a second game, now the tracked one) comes back out.
+    for pid in [p for p, r in eco.items() if p in tree or r["exe"] == game_exe]:
+        if process_tuning.from_efficiency(pid, eco[pid]["created"], eco[pid]["before"]):
+            eco.pop(pid)
+            changed = True
+    session = _engine.get("eco_session")
+    for p in procs:
+        pid, exe = p["pid"], p["exe"].lower()
+        if seen.get(pid) == exe:
+            continue
+        seen[pid] = exe
+        if pid in (0, 4) or pid in tree or exe == game_exe or _eco_keep(exe):
+            continue
+        if session is not None and process_tuning.session_of(pid) != session:
+            continue                    # services, and other users' programs
+        r = process_tuning.to_efficiency(pid)
+        if r["done"]:
+            eco[pid] = {"exe": exe, "created": r["created"], "before": r["before"]}
+            moved.append(exe)
+            changed = True
+        elif not r["skip"]:
+            _engine["eco_failed"] = _engine.get("eco_failed", 0) + 1
+    live = {p["pid"] for p in procs}
+    for pid in [p for p in seen if p not in live]:
+        seen.pop(pid)
+    for pid in [p for p in eco if p not in live]:
+        eco.pop(pid)                    # exited: nothing left to put back
+        changed = True
+    if changed:
+        _save_eco()
+    if moved:
+        log.info(f"  Efficiency mode for {len(moved)} background process(es): {', '.join(sorted(set(moved)))}")
+    _report_eco()
+
+
+def _report_eco() -> None:
+    eco = _engine.get("eco_procs") or {}
+    programs = len({r["exe"] for r in eco.values()})
+    if eco:
+        _check("eco", True, f"Background programs -> efficiency cores ({programs} program{'s' * (programs != 1)}, "
+                            f"{len(eco)} process{'es' * (len(eco) != 1)})")
+    elif _engine.get("eco_failed"):
+        _check("eco", False, "Background programs: Windows did not keep them in efficiency mode")
+    else:
+        _check("eco", None, "Background programs: none to move to the efficiency cores")
+
+
+def _eco_tick() -> None:
+    if not _engine.get("eco_on"):
+        return
+    if not _load_gp_settings().get("background_on_ecores", True):
+        _engine["eco_on"] = False                   # switched off mid-game: put back now
+        _eco_restore()
+        _engine["checks"] = [c for c in _engine["checks"] if c["key"] != "eco"]
+        _engine["changes"] = [c["text"] for c in _engine["checks"]]
+        return
+    _eco_sweep()
+
+
+def _eco_restore() -> None:
+    """Every background process game mode put in efficiency mode back as it
+    was — those still running, still the same process, and not changed by
+    themselves since.  From the file when the session's records are gone
+    (a crash)."""
+    recs = dict(_engine.get("eco_procs") or {})
+    if not recs and os.path.exists(_ECO_FILE):
+        try:
+            with open(_ECO_FILE, encoding="utf-8") as f:
+                recs = {int(pid): r for pid, r in (json.load(f) or {}).items()}
+        except Exception as e:
+            log.debug(f"could not read the efficiency-mode records: {e}")
+    back = 0
+    for pid, r in recs.items():
+        try:
+            if r.get("before") is not None and process_tuning.alive(pid, r.get("created")) is not False:
+                back += bool(process_tuning.from_efficiency(pid, r.get("created"), r["before"]))
+        except Exception as e:
+            log.debug(f"could not put process {pid} back out of efficiency mode: {e}")
+    _engine.update(eco_on=False, eco_seen={}, eco_procs={}, eco_failed=0)
+    _save_eco()
+    if back:
+        log.info(f"  Put {back} background process(es) back out of efficiency mode")
 
 
 def _apply_session_extras(exe_name: str) -> None:
@@ -1139,6 +1296,11 @@ def _restore_normal_mode(reason: str):
     _engine["streaming_exes"] = []
     if raised:
         log.info(f"  Put {len(raised)} streaming process(es) back to their own priority")
+    # Background programs out of efficiency mode.
+    try:
+        _eco_restore()
+    except Exception as e:
+        log.debug(f"efficiency-mode restore failed: {e}")
 
     # v3 — capture exe + active OC BEFORE we wipe engine state, so the
     # crash-recovery handler has the data it needs.
@@ -1317,29 +1479,12 @@ def _post_game_refresh(game_name: str = None, game_pids=None):
     except Exception:
         pass
 
-    # 5. Clear shader pipeline cache lock files (DXIL/SPIR-V locks left behind
-    #    by crashed shader compilers — keeping them stale slows next launch).
-    try:
-        run_ps(
-            r"""
-$paths = @(
-    "$env:LOCALAPPDATA\NVIDIA\DXCache",
-    "$env:LOCALAPPDATA\NVIDIA\GLCache",
-    "$env:LOCALAPPDATA\AMD\DxCache",
-    "$env:LOCALAPPDATA\D3DSCache"
-)
-foreach ($p in $paths) {
-    if (Test-Path $p) {
-        Get-ChildItem -Path $p -Filter "*.lock" -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-        Get-ChildItem -Path $p -Filter "*.tmp" -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    }
-}
-""",
-            timeout=8,
-        )
-        log.info("  Shader cache lock/tmp files cleared")
-    except Exception:
-        pass
+    # (A step here used to delete the *.lock and *.tmp files in the NVIDIA,
+    # AMD and DirectX shader caches after every game.  Those files are the
+    # driver's own bookkeeping, still in use by it — and by a game that was
+    # restarting itself.  Pulling them out corrupted the cache, which shows up
+    # in games as visual glitches until the cache is rebuilt.  The driver
+    # manages its cache; it is left alone.)
 
     # 6. Trigger Windows page combine to recompact RAM after working set drop
     try:
@@ -1385,6 +1530,8 @@ def check_and_restore_on_boot():
             _verify_normal_state(baseline)
     if os.path.exists(_TARGET_RESTORE_FILE):
         restore_target()        # a per-game posture that outlived the session that set it
+    if os.path.exists(_ECO_FILE):
+        _eco_restore()          # background programs left in efficiency mode by a crash
 
 
 def _verify_normal_state(baseline: dict):
@@ -1592,7 +1739,10 @@ def _start_session(best: dict, gen: int) -> None:
         ident = process_tuning.identity(pid)
         _engine.update(active_game=display, active_exe=exe, active_pid=pid, game_image=ident.get("image") or "",
                        game_procs={}, checks=[], changes=[], power_applied=[], power_limits={}, streamer_prior={},
-                       exit_ticks=0, tick=0, proc_prior=None)
+                       exit_ticks=0, tick=0, proc_prior=None, eco_seen={}, eco_failed=0)
+        layout = process_tuning.cpu_layout()
+        _engine["eco_on"] = bool(_load_gp_settings().get("background_on_ecores", True) and layout.get("hybrid"))
+        _engine["eco_session"] = process_tuning.session_of(pid)
         _engine["gaming_mode"] = True
         _set_gaming_flag()
         reg_originals.note("gamemode_reg_recorded")
@@ -1606,6 +1756,13 @@ def _start_session(best: dict, gen: int) -> None:
         # 1. The game's own processes first — what Task Manager shows, done in
         #    milliseconds — then the system-wide values.
         _tune_game_processes(process_tuning.find_image(_engine["game_image"], exe) or [pid])
+        # Then everything else onto the E-cores — whether or not the game's
+        # anti-cheat let the settings above through (on Call of Duty it does
+        # not, and the game still gains the P-cores).
+        if _engine["eco_on"]:
+            _eco_sweep()
+        elif not layout.get("hybrid"):
+            log.info("  Background programs left where they are: this CPU has no efficiency cores")
         _apply_registry_tweaks()
         _apply_session_extras(exe)
 
@@ -1723,6 +1880,7 @@ def _session_tick() -> None:
             _engine["active_pid"] = pids[0]
         recheck = _engine["tick"] % _SYSTEM_CHECK_TICKS == 0
         _tune_game_processes(pids, recheck=recheck)
+        _eco_tick()
         if recheck:
             _apply_registry_tweaks(recheck=True)
             _apply_power_tweaks(recheck=True)
@@ -1891,6 +2049,9 @@ _DEFAULT_GP_SETTINGS = {
     # Lift any CPU-core restriction on the game (P-cores AND E-cores).  The
     # switch is for the rare game that misbehaves when handed every core.
     "all_cores": True,
+    # While a game runs, the other programs in efficiency mode, so on a CPU
+    # with E-cores they go there and the game has the P-cores.
+    "background_on_ecores": True,
 }
 
 
@@ -1915,12 +2076,14 @@ def get_settings() -> dict:
     return _load_gp_settings()
 
 
-def set_settings(auto_enable_on_boot=None, all_cores=None) -> dict:
+def set_settings(auto_enable_on_boot=None, all_cores=None, background_on_ecores=None) -> dict:
     s = _load_gp_settings()
     if auto_enable_on_boot is not None:
         s["auto_enable_on_boot"] = bool(auto_enable_on_boot)
     if all_cores is not None:
         s["all_cores"] = bool(all_cores)
+    if background_on_ecores is not None:
+        s["background_on_ecores"] = bool(background_on_ecores)
     _save_gp_settings(s)
     return {"ok": True, "settings": s}
 

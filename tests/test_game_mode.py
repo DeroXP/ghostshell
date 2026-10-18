@@ -91,7 +91,9 @@ def fresh(target="auto", plan=m.BALANCED):
     del candidates[:], cl_calls[:], oc_calls[:], refreshes[:]
     TARGET[0] = target
     GP._engine.update(gaming_mode=False, active_game=None, active_exe=None, active_pid=None, changes=[],
-                      proc_prior=None, game_procs={}, checks=[], exit_ticks=0, streamer_prior={})
+                      proc_prior=None, game_procs={}, checks=[], exit_ticks=0, streamer_prior={},
+                      eco_on=False, eco_seen={}, eco_procs={}, eco_failed=0)
+    m.CPU_LAYOUT.update(logical=24, p=8, e=16, hybrid=True)
     GP._target_restore = {}
     GP._find_running_streaming_exes = lambda: []
     GP._apply_session_extras = REAL_EXTRAS
@@ -220,6 +222,8 @@ def test_a_call_that_succeeds_without_changing_anything_is_not_reported_as_done(
     assert launch(ignore_priority=True, ignore_affinity=True, affinity=0xFF)
     assert check("proc:priority")["ok"] is False and check("proc:affinity")["ok"] is False
     assert "Process priority -> High" not in GP._engine["changes"]
+    assert "on 0 of 1 processes" not in check("proc:priority")["text"], "said 'the others refused it' with no others"
+    assert "still not at it" in check("proc:priority")["text"]
     stop()
 
 
@@ -615,6 +619,17 @@ def test_post_game_refresh_kills_nothing_by_name():
     assert not [c for c in m.K.calls if c[0] == "terminate"]
 
 
+def test_post_game_refresh_leaves_the_shader_caches_alone():
+    """Deleting the drivers' *.lock / *.tmp cache files after every game
+    corrupted the cache and gave games visual glitches."""
+    fresh()
+    m.clear_logs()
+    REAL_REFRESH("Game", {4242})
+    for folder in ("DXCache", "GLCache", "DxCache", "D3DSCache", "NV_Cache"):
+        assert not m.ps_ran(folder), f"{folder} was touched"
+    assert not m.ps_ran("*.lock") and not m.ps_ran("Remove-Item")
+
+
 def test_the_refresh_gets_the_games_processes():
     fresh()
     m.proc(4343, exe="game.exe")
@@ -625,15 +640,210 @@ def test_the_refresh_gets_the_games_processes():
 
 
 # ═════════════════════════════════════════════════════════════════════
+# Background programs on the efficiency cores
+# ═════════════════════════════════════════════════════════════════════
+ECO, UNSET = (1, 1), (0, 0)
+
+
+def thr(pid):
+    return m.K.procs[pid].get("throttle", UNSET)
+
+
+def test_background_programs_go_to_efficiency_mode_and_come_back():
+    fresh()
+    m.proc(500, exe="chrome.exe")
+    m.proc(501, exe="chrome.exe")
+    m.proc(502, exe="Battle.net.exe")
+    assert launch()
+    assert thr(500) == thr(501) == thr(502) == ECO
+    assert check("eco") == {"key": "eco", "ok": True,
+                            "text": "Background programs -> efficiency cores (2 programs, 3 processes)"}
+    assert os.path.exists(GP._ECO_FILE), "kept on disk for after a crash"
+    assert thr(4242) == (5, 0), "the game itself stays out of efficiency mode"
+    assert quit_game()
+    assert thr(500) == thr(501) == thr(502) == UNSET
+    assert not os.path.exists(GP._ECO_FILE) and GP._engine["eco_procs"] == {}
+
+
+def test_what_must_stay_responsive_is_left_alone():
+    fresh()
+    keep = {600: "dwm.exe", 601: "audiodg.exe", 602: "Discord.exe", 603: "EasyAntiCheat_EOS.exe",
+            604: "lghub_agent.exe", 605: "RazerAppEngine.exe", 606: "steam.exe", 607: "explorer.exe",
+            608: "RTSS.exe", 609: "obs64.exe", 610: m.config.APP_EXE_NAME, 611: "csrss.exe"}
+    for pid, exe in keep.items():
+        m.proc(pid, exe=exe)
+    m.proc(620, exe="CrashHandler.exe", ppid=4242)           # started by the game
+    m.proc(621, exe="crashpad.exe", ppid=620)                # and what that started
+    m.proc(622, exe="MsMpEng.exe", session=0)                # a service
+    m.proc(623, exe="spotify.exe")
+    assert launch()
+    assert {pid: thr(pid) for pid in [*keep, 620, 621, 622] if thr(pid) != UNSET} == {}
+    assert thr(623) == ECO
+    stop()
+
+
+def test_a_program_with_its_own_setting_is_left_alone():
+    fresh()
+    m.proc(700, exe="voiceapp.exe", throttle=(1, 0))          # opted out of efficiency mode itself
+    m.proc(701, exe="updater.exe", throttle=(1, 1))           # in it already
+    assert launch()
+    assert thr(700) == (1, 0) and thr(701) == (1, 1)
+    assert not [c for c in m.K.calls if c[0] == "throttle" and c[1] in (700, 701)]
+    assert 700 not in GP._engine["eco_procs"] and 701 not in GP._engine["eco_procs"]
+    assert quit_game()
+    assert thr(700) == (1, 0) and thr(701) == (1, 1), "and nothing is 'put back' on them"
+
+
+def test_other_power_throttling_flags_are_kept():
+    fresh()
+    m.proc(710, exe="tool.exe", throttle=(4, 0))             # its own timer-resolution setting
+    assert launch()
+    assert thr(710) == (5, 1)
+    assert quit_game()
+    assert thr(710) == (4, 0), "exactly what it had"
+
+
+def test_a_program_opened_mid_game_is_moved_too():
+    fresh()
+    assert launch()
+    m.proc(720, exe="notepad.exe")
+    assert m.wait(lambda: thr(720) == ECO)
+    assert check("eco")["text"].endswith("(1 program, 1 process)")
+    assert quit_game() and thr(720) == UNSET
+
+
+def test_a_program_that_changes_its_own_setting_is_not_fought():
+    fresh()
+    m.proc(730, exe="chrome.exe")
+    assert launch() and thr(730) == ECO
+    m.K.procs[730]["throttle"] = (1, 0)                       # Chrome brings a tab to the front
+    time.sleep(0.2)
+    assert thr(730) == (1, 0), "not set again"
+    assert quit_game()
+    assert thr(730) == (1, 0), "and its own choice is not overwritten on the way out"
+
+
+def test_a_reused_pid_is_not_put_back():
+    fresh()
+    m.proc(740, exe="chrome.exe")
+    assert launch() and thr(740) == ECO
+    m.K.procs[740].update(created=999_999)                    # 740 is another process by now, in efficiency mode itself
+    GP.stop_monitoring()
+    assert m.wait(lambda: not GP._engine["gaming_mode"])
+    assert thr(740) == ECO
+
+
+def test_switched_off_mid_game_puts_them_back_at_once():
+    fresh()
+    m.proc(750, exe="chrome.exe")
+    assert launch() and thr(750) == ECO
+    GP.set_settings(background_on_ecores=False)
+    assert m.wait(lambda: thr(750) == UNSET)
+    assert m.wait(lambda: check("eco") is None) and GP._engine["gaming_mode"]
+    m.proc(751, exe="notepad.exe")
+    time.sleep(0.2)
+    assert thr(751) == UNSET, "and nothing new is moved"
+    stop()
+
+
+def test_switched_off_or_no_e_cores_moves_nothing():
+    fresh()
+    GP.set_settings(background_on_ecores=False)
+    m.proc(760, exe="chrome.exe")
+    assert launch()
+    assert thr(760) == UNSET and check("eco") is None
+    stop()
+    fresh()
+    m.CPU_LAYOUT.update(logical=16, p=16, e=0, hybrid=False)
+    m.proc(760, exe="chrome.exe")
+    assert launch()
+    assert thr(760) == UNSET and check("eco") is None
+    stop()
+
+
+def test_a_program_windows_does_not_keep_in_efficiency_mode_is_reported():
+    fresh()
+    m.proc(770, exe="stubborn.exe", ignore_eco=True)
+    assert launch()
+    assert check("eco") == {"key": "eco", "ok": False,
+                            "text": "Background programs: Windows did not keep them in efficiency mode"}
+    assert 770 not in GP._engine["eco_procs"]
+    stop()
+
+
+def test_a_background_program_that_becomes_the_tracked_game_comes_out():
+    fresh()
+    m.proc(5151, exe="other.exe")
+    assert launch() and thr(5151) == ECO
+    candidates.append({"pid": 5151, "exe": "other.exe", "name": "Other", "ws_mb": 700, "foreground": False,
+                       "score": 900})
+    m.exit_proc(4242)
+    assert m.wait(lambda: GP._engine["active_pid"] == 5151)
+    assert m.wait(lambda: 5151 not in GP._engine["eco_procs"])
+    assert thr(5151) == (5, 0), "tuned as the game"
+    assert quit_game(5151)
+    assert thr(5151) == (5, 0) or m.K.procs[5151].get("exited")
+
+
+def test_crash_mid_game_leaves_records_the_next_start_puts_back():
+    fresh()
+    m.proc(780, exe="chrome.exe")
+    assert launch() and thr(780) == ECO
+    GP._engine["monitor_gen"] += 1                  # the app dies: no clean-up runs
+    GP._engine["monitoring"] = False
+    time.sleep(0.15)
+    GP._engine.update(gaming_mode=False, game_procs={}, checks=[], eco_procs={}, eco_seen={}, eco_on=False)
+    RO._cache = None
+    GP.check_and_restore_on_boot()
+    assert thr(780) == UNSET and not os.path.exists(GP._ECO_FILE)
+    # and a records file without the gaming flag (crash after the flag was cleared)
+    m.K.procs[780]["throttle"] = ECO
+    GP._engine["eco_procs"] = {780: {"exe": "chrome.exe", "created": 10_780, "before": [0, 0]}}
+    GP._save_eco()
+    GP._engine["eco_procs"] = {}
+    GP.check_and_restore_on_boot()
+    assert thr(780) == UNSET and not os.path.exists(GP._ECO_FILE)
+
+
+def test_to_and_from_efficiency():
+    fresh()
+    m.proc(790, exe="a.exe")
+    r = PT.to_efficiency(790)
+    assert r == {"done": True, "before": [0, 0], "created": 10_790, "skip": ""} and thr(790) == ECO
+    assert PT.to_efficiency(790)["skip"] == "own setting"
+    assert PT.from_efficiency(790, 10_790, [0, 0]) and thr(790) == UNSET
+    m.proc(791, exe="b.exe", protected=True)
+    assert PT.to_efficiency(791)["skip"] == "cannot be opened"
+    assert PT.to_efficiency(99_999)["skip"] == "cannot be opened"
+    assert PT.from_efficiency(99_999, 1, [0, 0]), "gone: nothing of ours left"
+    m.proc(792, exe="c.exe", throttle=ECO)
+    assert PT.from_efficiency(792, 1, [0, 0]) and thr(792) == ECO, "another process by now: untouched"
+    assert PT.session_of(790) == 1 and PT.session_of(99_999) is None
+
+
+def test_real_session_of_this_process():
+    """Read-only, against Windows."""
+    saved = PT._k32
+    PT._k32 = None
+    try:
+        assert isinstance(PT.session_of(os.getpid()), int)
+    finally:
+        PT._k32 = saved
+
+
+# ═════════════════════════════════════════════════════════════════════
 # The "every CPU core" switch, Windows 10, unrestricted games
 # ═════════════════════════════════════════════════════════════════════
 def test_settings_default_and_persist():
     fresh()
-    assert GP.get_settings() == {"auto_enable_on_boot": True, "all_cores": True}
+    on = {"auto_enable_on_boot": True, "all_cores": True, "background_on_ecores": True}
+    assert GP.get_settings() == on
     GP.set_settings(all_cores=False)
-    assert GP.get_settings() == {"auto_enable_on_boot": True, "all_cores": False}
+    assert GP.get_settings() == {**on, "all_cores": False}
     GP.set_settings(auto_enable_on_boot=False)
-    assert GP.get_settings() == {"auto_enable_on_boot": False, "all_cores": False}
+    assert GP.get_settings() == {**on, "all_cores": False, "auto_enable_on_boot": False}
+    GP.set_settings(background_on_ecores=False)
+    assert GP.get_settings() == {"auto_enable_on_boot": False, "all_cores": False, "background_on_ecores": False}
 
 
 def test_every_core_switched_off_leaves_affinity_alone():

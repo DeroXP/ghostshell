@@ -1125,6 +1125,11 @@ function _renderGameModeSection(settings, status) {
             'Lifts any core restriction on the game, so it can use P-cores and E-cores alike, and keeps every core awake while it runs. Windows still puts the heaviest threads on the P-cores. Turn off only for a game that misbehaves with all cores.',
             settings.all_cores !== false,
             "toggleGameModeAllCores(this)") +
+        _settingsToggle(
+            'Move background programs to the efficiency cores',
+            'While a game runs, puts your other programs in Windows efficiency mode, so on a CPU with E-cores (Intel 12th gen and newer) they run there and the game has the P-cores to itself. Nothing is locked: a program that needs a P-core can still use one. Screen, sound, input software, anti-cheat, streaming apps and Vispora are left alone, and everything goes back when the game closes.',
+            settings.background_on_ecores !== false,
+            "toggleGameModeEcores(this)") +
         '<div style="font-size:10px;color:var(--text-dim);margin-top:8px">' +
             'Currently: <b style="color:' + (monitoring ? 'var(--accent)' : 'var(--text-dim)') + '">' +
             (monitoring ? '● MONITORING' : '○ stopped') + '</b>' + activeGame +
@@ -1162,6 +1167,20 @@ async function toggleGameModeAllCores(el) {
         addLog('Could not save game-mode setting');
     } else {
         addLog('Game mode: every CPU core for games ' + (on ? 'ON' : 'OFF') + ' (applies from the next game launch)');
+    }
+}
+
+async function toggleGameModeEcores(el) {
+    el.classList.toggle('on');
+    var on = el.classList.contains('on');
+    el.setAttribute('aria-checked', String(on));
+    var r = await apiPost('/api/profiles/settings', { background_on_ecores: on });
+    if (!r || !r.ok) {
+        el.classList.toggle('on');
+        el.setAttribute('aria-checked', String(!on));
+        addLog('Could not save game-mode setting');
+    } else {
+        addLog('Game mode: background programs on the efficiency cores ' + (on ? 'ON (from the next game launch)' : 'OFF'));
     }
 }
 

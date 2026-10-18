@@ -3255,14 +3255,15 @@ def api_profiles_start():
 @app.route("/api/profiles/settings", methods=["GET", "POST"])
 def api_profiles_settings():
     """GET → current game-mode settings.
-    POST → update.  Body: {auto_enable_on_boot: bool, all_cores: bool} —
-    either or both."""
+    POST → update.  Body: {auto_enable_on_boot: bool, all_cores: bool,
+    background_on_ecores: bool} — any of them."""
     if request.method == "GET":
         return jsonify({"ok": True, "settings": game_profiles.get_settings()})
     data = request.get_json(force=True) or {}
     return jsonify(game_profiles.set_settings(
         auto_enable_on_boot=data.get("auto_enable_on_boot"),
         all_cores=data.get("all_cores"),
+        background_on_ecores=data.get("background_on_ecores"),
     ))
 
 

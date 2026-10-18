@@ -22,6 +22,10 @@ What tune() guarantees, where Windows lets us open the process:
 Anti-cheat protected games refuse the handle; tune() then reports ok=False
 and nothing about the process is changed.
 
+to_efficiency() / from_efficiency() do the opposite for the OTHER programs
+while a game runs: efficiency mode, so a hybrid CPU's scheduler puts them on
+the E-cores first and leaves the P-cores to the game.
+
 Every result is read back, not assumed: a call that "succeeds" while the
 process ends up otherwise is reported as not done.  read_state() is what the
 game monitor uses to notice when a game (or its launcher, or anti-cheat) has
@@ -95,6 +99,7 @@ def _api():
         k.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry)]
         k.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry)]
         k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
         for name, args in (("SetProcessDefaultCpuSets", [wintypes.HANDLE, ctypes.c_void_p, wintypes.ULONG]),
                            ("GetProcessInformation", [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD])):
             try:
@@ -117,16 +122,25 @@ def _set_throttling(k, handle, control: int) -> bool:
     return bool(k.SetProcessInformation(handle, _POWER_THROTTLING, ctypes.byref(state), ctypes.sizeof(state)))
 
 
-def _throttle_exempt(k, handle) -> Optional[bool]:
-    """Is the process exempt from power throttling, as Windows reports it
-    back?  None where this Windows cannot say."""
+def _throttle_masks(k, handle) -> Optional[tuple]:
+    """(ControlMask, StateMask) of the process's power-throttling setting, as
+    Windows reports it back; None where this Windows cannot say."""
     state = _PowerThrottlingState(1, 0, 0)
     try:
         if not k.GetProcessInformation(handle, _POWER_THROTTLING, ctypes.byref(state), ctypes.sizeof(state)):
             return None
     except Exception:           # (AttributeError: no such call on this Windows)
         return None
-    return bool(state.ControlMask & _EXECUTION_SPEED) and not (state.StateMask & _EXECUTION_SPEED)
+    return int(state.ControlMask), int(state.StateMask)
+
+
+def _throttle_exempt(k, handle) -> Optional[bool]:
+    """Is the process exempt from power throttling, as Windows reports it
+    back?  None where this Windows cannot say."""
+    masks = _throttle_masks(k, handle)
+    if masks is None:
+        return None
+    return bool(masks[0] & _EXECUTION_SPEED) and not (masks[1] & _EXECUTION_SPEED)
 
 
 def _masks(k, handle):
@@ -250,6 +264,86 @@ def set_priority(pid: int, priority_class: int) -> tuple:
         return done, before
     finally:
         k.CloseHandle(h)
+
+
+def _eco_masks(before: tuple) -> tuple:
+    return before[0] | _EXECUTION_SPEED, before[1] | _EXECUTION_SPEED
+
+
+def _write_masks(k, handle, masks) -> bool:
+    state = _PowerThrottlingState(1, int(masks[0]), int(masks[1]))
+    return bool(k.SetProcessInformation(handle, _POWER_THROTTLING, ctypes.byref(state), ctypes.sizeof(state)))
+
+
+def to_efficiency(pid: int) -> dict:
+    """Put a background process in efficiency mode (EcoQoS) — the switch
+    Task Manager calls "Efficiency mode", and Chrome uses for background tabs.
+    On a hybrid CPU Windows then schedules its threads on the E-cores first,
+    at lower clocks.  Nothing forbids it the P-cores: a program that really
+    needs one still gets it, which an E-core-only affinity would not allow.
+
+    A process with a setting of its own either way (in efficiency mode
+    already, or opted out of it, as audio and game processes do) is left
+    alone.  Returns {"done", "before", "created", "skip"}: `before` is the
+    (ControlMask, StateMask) from_efficiency() puts back; done only if the
+    process reads back as in efficiency mode."""
+    out = {"done": False, "before": None, "created": None, "skip": ""}
+    k = _api()
+    h = k.OpenProcess(_ACCESS, False, int(pid))
+    if not h:
+        out["skip"] = "cannot be opened"
+        return out
+    try:
+        if not _running(k, h):
+            out["skip"] = "exited"
+            return out
+        before = _throttle_masks(k, h)
+        if before is None:
+            out["skip"] = "cannot be read"
+            return out
+        if before[0] & _EXECUTION_SPEED:
+            out["skip"] = "own setting"
+            return out
+        out["created"] = _created(k, h)
+        want = _eco_masks(before)
+        if _write_masks(k, h, want) and _throttle_masks(k, h) == want:
+            out["done"], out["before"] = True, list(before)
+    finally:
+        k.CloseHandle(h)
+    return out
+
+
+def from_efficiency(pid: int, created: Optional[int], before) -> bool:
+    """Undo to_efficiency(): the process's setting back to `before` — only if
+    it is still the same process (`created`) and still as to_efficiency() left
+    it; one that has changed its own setting since keeps it.  True when
+    nothing of ours is left on the process (put back, changed by itself, or
+    exited); False when it is still in efficiency mode because of us."""
+    before = tuple(int(x) for x in before)
+    k = _api()
+    h = k.OpenProcess(_ACCESS, False, int(pid))
+    if not h:
+        return ctypes.get_last_error() == _NO_SUCH_PROCESS
+    try:
+        if not _running(k, h):
+            return True
+        if created is not None and _created(k, h) not in (None, created):
+            return True                 # the pid belongs to another process by now
+        if _throttle_masks(k, h) != _eco_masks(before):
+            return True
+        return _write_masks(k, h, before) and _throttle_masks(k, h) == before
+    finally:
+        k.CloseHandle(h)
+
+
+def session_of(pid: int) -> Optional[int]:
+    """The Windows session a process runs in (0 = services), or None."""
+    k = _api()
+    sid = wintypes.DWORD(0)
+    try:
+        return int(sid.value) if k.ProcessIdToSessionId(int(pid), ctypes.byref(sid)) else None
+    except Exception:
+        return None
 
 
 def terminate(pid: int) -> bool:

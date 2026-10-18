@@ -3,7 +3,7 @@ import os
 import sys
 
 APP_NAME = "Vispora"
-APP_VERSION = "3.6.3"
+APP_VERSION = "3.6.4"
 APP_PORT = 5987
 
 # Until 3.5.0 the app shipped as "GhostShell", and installs from that era still
