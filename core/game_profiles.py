@@ -897,14 +897,20 @@ _ECO_KEEP = frozenset({
     "ctfmon.exe", "textinputhost.exe", "logonui.exe", "conhost.exe",
     "steam.exe",                                    # Steam Input runs in it
     "ds4windows.exe", "dsx.exe", "x360ce.exe", "joytokey.exe", "antimicrox.exe",
-    "gamebar.exe", "gamebarftserver.exe", "nvcontainer.exe", "nvidia share.exe", "nvidia overlay.exe",
-    "rtss.exe", "msiafterburner.exe", "steelseriessonar.exe",
+    "gamebar.exe", "gamebarftserver.exe", "gamebarpresencewriter.exe", "xgamehelper.exe",   # Xbox app games
+    "nvcontainer.exe", "nvidia share.exe", "nvidia overlay.exe", "nvdisplay.container.exe",
+    "nvidia broadcast.exe",                         # live microphone noise removal
+    "rtss.exe", "msiafterburner.exe", "steelseriessonar.exe", "dax3api.exe",
+    "vrserver.exe", "vrcompositor.exe", "vrmonitor.exe",                                    # SteamVR
+    "taskmgr.exe",
     *STREAMING_EXES, *OWN_PROCESS_NAMES, "app.py",
 })
 _ECO_KEEP_PREFIXES = (
     "easyanticheat", "eaanticheat", "beservice", "battleye", "faceit", "vgc", "vgtray",     # anti-cheat
-    "razer", "lghub", "logi", "icue", "corsair", "steelseries", "wooting",          # mouse / keyboard software
-    "nahimic",
+    "razer", "rz", "lghub", "logi", "icue", "corsair", "steelseries", "wooting",    # mouse / keyboard software
+    "gameinput",                                    # Microsoft GameInput: controller input for games
+    "rtkaud", "nahimic", "dolby",                   # audio
+    "ovr",                                          # the Oculus VR runtime
 )
 _ECO_FILE = os.path.join(PROFILES_DIR, "eco_restore.json")
 

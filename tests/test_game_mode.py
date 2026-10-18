@@ -682,6 +682,27 @@ def test_what_must_stay_responsive_is_left_alone():
     stop()
 
 
+def test_input_audio_display_and_xbox_helpers_are_left_alone():
+    """What 3.6.4 put in efficiency mode on the developer's PC that it should
+    not have (input, live audio, the display and VR runtimes, the Xbox app's
+    game helpers) — and some it rightly did."""
+    keep = ["gameinputsvc.exe", "gameinputredistservice.exe", "rzenginemon.exe", "rzsdkservice.exe",
+            "nvidia broadcast.exe", "rtkauduservice64.exe", "dax3api.exe", "dolbydax3api.exe",
+            "xgamehelper.exe", "gamebarpresencewriter.exe", "nvdisplay.container.exe",
+            "ovrserver_x64.exe", "ovrredir.exe", "vrserver.exe", "vrcompositor.exe", "taskmgr.exe"]
+    move = ["qbittorrent.exe", "nordvpn.exe", "librehardwaremonitor.exe", "malwarebytes.exe",
+            "searchhost.exe", "bootstrapper.exe", "claude.exe", "msedgewebview2.exe", "awcc.ucsubagent.exe"]
+    assert [e for e in keep if not GP._eco_keep(e)] == []
+    assert [e for e in move if GP._eco_keep(e)] == []
+    fresh()
+    for i, exe in enumerate(keep + move):
+        m.proc(800 + i, exe=exe)
+    assert launch()
+    assert [exe for i, exe in enumerate(keep) if thr(800 + i) != UNSET] == []
+    assert [exe for i, exe in enumerate(move, len(keep)) if thr(800 + i) != ECO] == []
+    stop()
+
+
 def test_a_program_with_its_own_setting_is_left_alone():
     fresh()
     m.proc(700, exe="voiceapp.exe", throttle=(1, 0))          # opted out of efficiency mode itself
