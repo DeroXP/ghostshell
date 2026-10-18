@@ -430,6 +430,13 @@ def restore_all(scope: str = "optimizer") -> dict:
         for ident in [i for i in data["power"] if i.startswith(prefix)]:
             scheme, sub, setting = ident[len(prefix):].split("|")
             rec = data["power"][ident]
+            if query_power(scheme, sub, setting) == (rec["ac"], rec["dc"]):
+                # Already what it was — nothing to put back.  (Writing it
+                # anyway can fail: one PC had a setting whose allowed range an
+                # old tweak had narrowed below its own value, and the record
+                # then failed at every restore, for good.)
+                data["power"].pop(ident); done += 1
+                continue
             ok_ac = run_cmd(["powercfg", "/setacvalueindex", scheme, sub, setting, str(rec["ac"])]).get("ok")
             ok_dc = run_cmd(["powercfg", "/setdcvalueindex", scheme, sub, setting, str(rec["dc"])]).get("ok")
             if ok_ac and ok_dc:

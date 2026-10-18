@@ -830,3 +830,18 @@ def test_pro_mode_setting_persists():
     m.fresh()
     assert OPT.get_pro_mode() == {"enabled": False}
     assert OPT.set_pro_mode(True)["ok"] and OPT.get_pro_mode() == {"enabled": True}
+
+
+def test_reset_all_repairs_the_capped_core_parking_limit():
+    """An old "unpark cores" tweak set the limit of the E-core parking setting
+    to 0, so Windows refuses any other value for it - game mode included."""
+    key = (r"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00"
+           r"\0cc5b647-c1df-4637-891a-dec35c318583")
+    m.fresh()
+    m.rset(key, "ValueMax", 0)
+    OPT.reset_all_optimizations()
+    assert m.rdata(key, "ValueMax") == 100, "back to what Windows ships"
+    m.fresh()
+    m.rset(key, "ValueMax", 50)                     # anything else is somebody's own choice
+    OPT.reset_all_optimizations()
+    assert m.rdata(key, "ValueMax") == 50

@@ -9,6 +9,7 @@ State management:
 """
 import json
 import os
+import re
 import time
 import threading
 from config import APP_NAME, APPDATA_DIR, OWN_PROCESS_NAMES
@@ -403,9 +404,31 @@ _engine = {
     # active when (if) the game crashes.
     "active_oc_core": 0,
     "active_oc_mem":  0,
-    # What process_tuning.tune() changed on the game's process, for release().
+    # What process_tuning.tune() changed on the tracked process, for release().
     "proc_prior": None,
+    # Every process of the game's exe, keyed by pid: {"prior", "created",
+    # "result" (the last tune()), "fixes" (times it was re-applied), "gave_up"}.
+    "game_image": "",
+    "game_procs": {},
+    # What is in effect, as last read back: [{"key", "ok", "text"}].  `changes`
+    # is the same as plain lines, for older callers.
+    "checks": [],
+    "verified_at": 0.0,
+    "power_applied": [],            # [(scheme, setting, value)] set for this session, for the re-checks
+    "streamer_prior": {},           # pid -> priority class a streaming app had before it was raised
+    "exit_ticks": 0,                # ticks since the last process of the game went away
+    "tick": 0,
 }
+# One session start, tick or restore at a time.  Two monitor threads used to
+# overlap for a moment when the monitor was restarted (adding a custom game
+# does that): the new one captured its "normal" baseline while the old one was
+# half-way through applying the gaming values — and restored those for good.
+_session_lock = threading.RLock()
+_TICK_S = 3
+_EXIT_GRACE_TICKS = 4               # ~12 s: a game that restarts itself is back by then
+_SYSTEM_CHECK_TICKS = 10            # system-wide settings are re-read every ~30 s
+_REAPPLY_LIMIT = 5                  # per process, within _REAPPLY_WINDOW_S; past that the game wins
+_REAPPLY_WINDOW_S = 300
 
 
 def note_active_oc(core: int, mem: int) -> None:
@@ -478,6 +501,15 @@ def _load_baseline() -> dict:
     return {}
 
 
+def _check(key: str, ok, text: str) -> None:
+    """Record what one item of game mode really is now (ok: True, False, or
+    None when it cannot be told), replacing an earlier entry for it."""
+    _engine["checks"] = [c for c in _engine.get("checks", []) if c["key"] != key] + \
+        [{"key": key, "ok": ok, "text": text}]
+    _engine["changes"] = [c["text"] for c in _engine["checks"]]
+    _engine["verified_at"] = time.time()
+
+
 def _set_gaming_flag():
     """Write a flag file indicating gaming tweaks are active."""
     try:
@@ -502,100 +534,350 @@ def _is_gaming_flag_set() -> bool:
 # ═══════════════════════════════════════════════════════════════
 # Apply / Revert
 # ═══════════════════════════════════════════════════════════════
-def _apply_gaming_tweaks(pid: int, exe_name: str) -> list[str]:
-    """Apply hard gaming tweaks."""
-    changes = []
-
-    # 1 + 2. The game's own process: High priority, every CPU core, never
-    #    power-throttled (core/process_tuning.py).  The affinity step exists
-    #    to LIFT restrictions — one inherited from a launcher, or left by the
-    #    old "best cores" pin, which on hybrid CPUs gave a game only some of
-    #    its P-cores.  Windows still decides which thread runs where, and
-    #    keeps the heaviest ones on the P-cores.
-    all_cores = bool(_load_gp_settings().get("all_cores", True))
-    tuned = process_tuning.tune(pid, all_cores=all_cores)
-    _engine["proc_prior"] = tuned.get("prior") if tuned.get("ok") else None
-    if tuned.get("priority"):
-        changes.append("Process priority -> High")
-    else:
+# ── the game's own processes ─────────────────────────────────────────
+def _tune_one(pid: int, rec: dict, all_cores: bool) -> None:
+    """tune() one process and keep what release() will need: the state it
+    had before game mode first touched it, whatever later re-applies saw."""
+    r = process_tuning.tune(pid, all_cores=all_cores)
+    if not r.get("ok"):
         # The handle was refused (anti-cheat, usually).  The old PowerShell
-        # route, for what it is worth — and say so if that fails as well.
-        r = run_ps(f"try {{ (Get-Process -Id {pid}).PriorityClass='High'; 'OK' }} catch {{ 'FAIL' }}", timeout=5)
-        if r["ok"] and "OK" in r["out"]:
-            changes.append("Process priority -> High")
+        # route, for what it is worth — counted only if it reads back as done.
+        ps = run_ps(f"try {{ (Get-Process -Id {int(pid)}).PriorityClass='High'; 'OK' }} catch {{ 'FAIL' }}", timeout=5)
+        if ps.get("ok") and "OK" in (ps.get("out") or ""):
+            st = process_tuning.read_state(pid)
+            if st.get("ok"):
+                r["priority"] = st.get("priority") == process_tuning.HIGH_PRIORITY_CLASS
+            else:
+                r["priority_unchecked"] = True
+    if r.get("ok"):
+        if rec["prior"] is None:
+            rec["prior"] = dict(r.get("prior") or {})
         else:
-            changes.append("Process priority: unchanged (the game's process is protected)")
-    aff = tuned.get("affinity")
-    if aff and aff.get("ok"):
-        changes.append(f"CPU affinity -> all {process_tuning.describe_cores()}"
-                       + (f" (was limited to {aff['was']})" if aff.get("changed") else ""))
-    elif all_cores and not tuned.get("ok"):
-        changes.append("CPU affinity: unchanged (the game's process is protected)")
-    if tuned.get("throttling"):
-        changes.append("Power throttling -> off for the game")
+            for k, v in (r.get("prior") or {}).items():
+                rec["prior"].setdefault(k, v)
+    rec["result"] = r
+    if pid == _engine.get("active_pid"):
+        _engine["proc_prior"] = rec["prior"]
 
-    # 3. Win32PrioritySeparation -> 0x28 (Short/Fixed)
-    run_cmd(["reg","add",r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl",
-             "/v","Win32PrioritySeparation","/t","REG_DWORD","/d","40","/f"])
-    changes.append("Win32PrioritySeparation -> 0x28 (Short/Fixed)")
 
-    # 4. (Core parking and CPU idle are power-plan settings: see
-    #    _apply_power_tweaks(), which runs once the per-game target has
-    #    chosen the plan the game will actually run on.)
+def _drift(pid: int, rec: dict, all_cores: bool) -> list:
+    """What of this process's tuning is no longer in effect (read back now)."""
+    st = process_tuning.read_state(pid)
+    if not st.get("ok"):
+        return []
+    r, out = rec["result"], []
+    if r.get("priority") and st.get("priority") != process_tuning.HIGH_PRIORITY_CLASS:
+        out.append("priority")
+    if all_cores and (r.get("affinity") or {}).get("ok") and st.get("system") and st.get("affinity") != st.get("system"):
+        out.append("CPU affinity")
+    if r.get("throttling") and st.get("throttle_exempt") is False:
+        out.append("power throttling")
+    return out
 
-    # 5. SystemResponsiveness -> 10
+
+def _tune_game_processes(pids: list, recheck: bool = False) -> None:
+    """High priority, every CPU core, no power throttling — for every process
+    of the game's exe (some games run more than one, and some restart
+    themselves), each read back afterwards.  Re-checked at every monitor
+    tick: when the game, its launcher or its anti-cheat changes something
+    back, it is applied again, up to _REAPPLY_LIMIT times in
+    _REAPPLY_WINDOW_S per process — past that the game is left to have its
+    way, and the status says so.  (It used to be applied once at detection
+    and reported as done from then on, whatever the process was set to.)"""
+    all_cores = bool(_load_gp_settings().get("all_cores", True))
+    procs = _engine["game_procs"]
+    now = time.time()
+    exe = _engine.get("active_exe") or "the game"
+    for pid in pids:
+        rec = procs.get(pid)
+        if rec is None:
+            rec = procs[pid] = {"prior": None, "created": process_tuning.identity(pid).get("created"),
+                                "result": {}, "fixes": [], "fixed": {}, "gave_up": False}
+            _tune_one(pid, rec, all_cores)
+            if len(procs) > 1:
+                log.info(f"  {exe}: tuned another process of the game (PID {pid})")
+            continue
+        if rec["gave_up"]:
+            continue
+        if not rec["result"].get("ok"):
+            if recheck:             # refused before: some anti-cheat allows it once the game is running
+                _tune_one(pid, rec, all_cores)
+            continue
+        drift = _drift(pid, rec, all_cores)
+        if not drift:
+            continue
+        rec["fixes"] = [t for t in rec["fixes"] if now - t < _REAPPLY_WINDOW_S]
+        if len(rec["fixes"]) >= _REAPPLY_LIMIT:
+            rec["gave_up"] = True
+            rec["gave_up_on"] = drift
+            log.warning(f"  {exe} (PID {pid}) keeps changing its own {', '.join(drift)} — "
+                        f"no longer forced (re-applied {_REAPPLY_LIMIT}x in {_REAPPLY_WINDOW_S // 60} min)")
+            continue
+        rec["fixes"].append(now)
+        for item in drift:
+            rec["fixed"][item] = rec["fixed"].get(item, 0) + 1
+        log.info(f"  {exe} (PID {pid}): its {', '.join(drift)} had been changed back — re-applied")
+        _tune_one(pid, rec, all_cores)
+    for gone in [p for p in procs if p not in pids]:
+        procs.pop(gone)
+    _report_processes(all_cores)
+
+
+def _report_processes(all_cores: bool) -> None:
+    recs = list(_engine["game_procs"].values())
+    if not recs:
+        return
+    n = len(recs)
+    several = f" ({n} processes)" if n > 1 else ""
+    opened = [r for r in recs if r["result"].get("ok")]
+
+    def again(item):
+        times = sum(r["fixed"].get(item, 0) for r in recs)
+        return f" — re-applied {times}x after the game changed it back" if times else ""
+
+    def given_up(item):
+        return any(r["gave_up"] and item in r.get("gave_up_on", []) for r in recs)
+
+    # priority
+    if given_up("priority"):
+        _check("proc:priority", False, "Process priority: the game keeps setting its own — no longer forced")
+    elif all(r["result"].get("priority") for r in recs):
+        _check("proc:priority", True, "Process priority -> High" + several + again("priority"))
+    elif any(r["result"].get("priority_unchecked") for r in recs) and not opened:
+        _check("proc:priority", None, "Process priority -> High (set through PowerShell; Windows does not let it be checked)")
+    elif not opened:
+        _check("proc:priority", False, "Process priority: unchanged (the game's process is protected)")
+    else:
+        done = sum(1 for r in recs if r["result"].get("priority"))
+        _check("proc:priority", False, f"Process priority -> High on {done} of {n} processes (the others refused it)")
+
+    # every core
+    if all_cores:
+        main = _engine["game_procs"].get(_engine.get("active_pid")) or recs[0]
+        aff = main["result"].get("affinity") or {}
+        if given_up("CPU affinity"):
+            _check("proc:affinity", False, "CPU affinity: the game keeps restricting itself — no longer forced")
+        elif not opened:
+            _check("proc:affinity", False, "CPU affinity: unchanged (the game's process is protected)")
+        elif all((r["result"].get("affinity") or {}).get("ok") for r in opened):
+            _check("proc:affinity", True, f"CPU affinity -> all {process_tuning.describe_cores()}"
+                   + (f" (was limited to {aff['was']})" if aff.get("changed") else "") + several + again("CPU affinity"))
+        else:
+            _check("proc:affinity", False, "CPU affinity: could not be widened to every core")
+    else:
+        _engine["checks"] = [c for c in _engine["checks"] if c["key"] != "proc:affinity"]
+
+    # power throttling
+    if opened:
+        if given_up("power throttling"):
+            _check("proc:throttle", False, "Power throttling: the game keeps opting back in — no longer forced")
+        elif all(r["result"].get("throttling") for r in opened):
+            _check("proc:throttle", True, "Power throttling -> off for the game" + again("power throttling"))
+        else:
+            _check("proc:throttle", False, "Power throttling: could not be switched off for the game")
+
+
+# ── system-wide values ───────────────────────────────────────────────
+_REG_TWEAKS = (
+    # key, value, data, what it means
+    (r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl", "Win32PrioritySeparation", 40,
+     "Win32PrioritySeparation -> 0x28 (Short/Fixed)"),
     # beta.6: was 0.  Setting 0 dedicates 100% of the multimedia class to
     # foreground threads and STARVES Audiosrv (Discord / in-game voice
     # crackle under load).  The rest of the app (optimizer, network_tweaks)
     # standardized on Microsoft's gaming value 10, and auto_recover actively
     # reverts any 0 it finds — so a per-game 0 here just got undone.  Aligned.
-    run_cmd(["reg","add",r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
-             "/v","SystemResponsiveness","/t","REG_DWORD","/d","10","/f"])
-    changes.append("SystemResponsiveness -> 10")
+    (r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", "SystemResponsiveness", 10,
+     "SystemResponsiveness -> 10"),
+    (r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", "NetworkThrottlingIndex",
+     4294967295, "Network throttling -> disabled"),
+)
 
-    # 6. NetworkThrottlingIndex -> max
-    run_cmd(["reg","add",r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
-             "/v","NetworkThrottlingIndex","/t","REG_DWORD","/d","4294967295","/f"])
-    changes.append("Network throttling -> disabled")
 
-    # 7. DSCP 46 (highest priority — EF / expedited forwarding) for the game.
-    #    exe_name comes from live process enumeration, so validate it as a
-    #    plain .exe basename before it touches a PowerShell -Command string —
-    #    a process/folder named with a quote or semicolon would otherwise
-    #    inject into our elevated shell.  Reject → just skip the QoS tag.
+def _reads(key: str, name: str, data: int) -> bool:
+    cur = reg_originals.read_value(key, name) or {}
+    return cur.get("type") == "REG_DWORD" and cur.get("data") == data
+
+
+def _apply_registry_tweaks(recheck: bool = False) -> None:
+    """Each value's previous state is recorded (scope "gamemode") before it
+    is changed, so the exit puts back exactly that.  It used to be put back
+    from a separately captured "baseline" — captured, once, while another
+    monitor thread had the gaming values in place, and from then on restored
+    as "normal" after every game.  On a re-check, a value that is no longer on
+    this session's record (the optimizer or the user has set it since) is
+    theirs, and is left alone."""
+    for key, name, data, text in _REG_TWEAKS:
+        what = text.split(" ->")[0]
+        if _reads(key, name, data):
+            if not recheck:
+                _check(f"reg:{name}", True, text)
+            continue
+        if recheck and not reg_originals.has_original(key, name, scope=_SCOPE):
+            _check(f"reg:{name}", None, f"{what}: changed since by another setting — left as it is")
+            continue
+        reg_originals.remember(key, name, str(data), "REG_DWORD", scope=_SCOPE)
+        run_cmd(["reg", "add", key, "/v", name, "/t", "REG_DWORD", "/d", str(data), "/f"])
+        ok = _reads(key, name, data)
+        if recheck and ok:
+            log.info(f"  {name} had been changed back — re-applied")
+            text += " — re-applied after it was changed back"
+        _check(f"reg:{name}", ok, text if ok else f"{what}: could not be set")
+
+
+# ── power plan ───────────────────────────────────────────────────────
+_HEX8 = re.compile(r"0x[0-9a-fA-F]{8}")
+
+
+def _power_limit(scheme: str, setting: str):
+    """The largest value Windows accepts for this processor setting on this
+    PC, or None if that cannot be read.  (/qh lists, for a range setting:
+    minimum, maximum, increment, then the AC and DC values.)"""
+    r = run_cmd(["powercfg", "/qh", scheme, _PROC_SUB, setting])
+    found = _HEX8.findall(r.get("out") or "") if r.get("ok") else []
+    return int(found[-4], 16) if len(found) >= 5 else None
+
+
+def _apply_power_tweaks(recheck: bool = False) -> None:
+    """The power-plan half of game mode: no parked cores, no CPU idle states.
+
+    Runs AFTER apply_target(), on whichever plan is active by then, and
+    stays on that plan for the re-checks.  Each previous value is recorded
+    per plan and put back by restore_normal_mode(), so nothing can land on
+    the wrong plan.  Every setting is read back after it is set — a setting
+    Windows refuses (on one PC an old tweak had capped "core parking min
+    cores" at 0) is reported as not done instead of as done."""
+    if not recheck:
+        # Marks the session as one whose plan changes are all on record.
+        reg_originals.note("gamemode_plan_recorded")
+        _engine["power_scheme"] = _active_power_guid().lower()
+    scheme = _engine.get("power_scheme") or ""
+    if not scheme:
+        _check("power:parking", None, "Power plan: could not be read, so it was left as it is")
+        return
+    hybrid = bool(process_tuning.cpu_layout().get("hybrid"))
+    cores = {_CORE_PARKING_MIN[0]: "E-cores" if hybrid else "cores", _CORE_PARKING_MIN[1]: "P-cores"}
+    outcome, changed = {}, False
+    limits = _engine.setdefault("power_limits", {})
+    for setting in (_CORE_PARKING_MIN if hybrid else _CORE_PARKING_MIN[:1]):
+        cur = reg_originals.query_power(scheme, _PROC_SUB, setting)
+        if setting not in limits or not recheck:
+            limits[setting] = _power_limit(scheme, setting)
+        limit = limits[setting]
+        if limit is not None and limit < 100:
+            outcome[setting] = "capped"
+        elif cur and cur[0] >= 100:
+            outcome[setting] = "on"
+        elif recheck and not reg_originals.has_power(_PROC_SUB, setting, scope=_SCOPE, scheme=scheme):
+            outcome[setting] = "not ours"
+        elif not reg_originals.remember_power(_PROC_SUB, setting, scope=_SCOPE):
+            outcome[setting] = "unreadable"
+        else:
+            run_cmd(["powercfg", "/setacvalueindex", scheme, _PROC_SUB, setting, "100"])
+            now = reg_originals.query_power(scheme, _PROC_SUB, setting)
+            outcome[setting] = "on" if now and now[0] == 100 else "refused"
+            changed = changed or outcome[setting] == "on"
+    good = [s for s, o in outcome.items() if o == "on"]
+    if len(good) == len(outcome):
+        if not (recheck and not changed):
+            _check("power:parking", True, "Core parking -> off (every core kept awake)"
+                   + (" — re-applied after it was changed back" if recheck and changed else ""))
+    else:
+        bad = [s for s in outcome if s not in good]
+        why = []
+        if any(outcome[s] == "capped" for s in bad):
+            why.append("an old tweak capped Windows' limit for that setting at 0 (Reset All on the Optimizer "
+                       "page repairs it)")
+        if any(outcome[s] in ("refused", "unreadable") for s in bad):
+            why.append("Windows did not accept the change")
+        if any(outcome[s] == "not ours" for s in bad):
+            why.append("it has been changed since by another setting")
+        head = (f"Core parking -> off for the {' and '.join(cores[s] for s in good)}; " if good else "Core parking: ")
+        _check("power:parking", False, head + f"the {' and '.join(cores[s] for s in bad)} could not be changed: "
+               + "; ".join(why))
+
+    # CPU idle disabled (max clocks) — likewise only when it can be put back.
+    cur = reg_originals.query_power(scheme, "SUB_PROCESSOR", "IdleDisable")
+    if cur and cur[0] == 1:
+        if not recheck:
+            _check("power:idle", True, "CPU idle -> disabled")
+    elif recheck and not reg_originals.has_power("SUB_PROCESSOR", "IdleDisable", scope=_SCOPE, scheme=scheme):
+        _check("power:idle", None, "CPU idle: changed since by another setting — left as it is")
+    elif reg_originals.remember_power("SUB_PROCESSOR", "IdleDisable", scope=_SCOPE):
+        run_cmd(["powercfg", "/setacvalueindex", scheme, "SUB_PROCESSOR", "IdleDisable", "1"])
+        now = reg_originals.query_power(scheme, "SUB_PROCESSOR", "IdleDisable")
+        ok = bool(now and now[0] == 1)
+        changed = changed or ok
+        _check("power:idle", ok, ("CPU idle -> disabled" + (" — re-applied after it was changed back" if recheck else ""))
+               if ok else "CPU idle: Windows did not accept the change")
+    else:
+        _check("power:idle", False, "CPU idle: its current setting could not be read, so it was not changed")
+    if changed or not recheck:
+        run_cmd(["powercfg", "/setactive", scheme])
+
+
+# ── network priority and streaming apps ──────────────────────────────
+def _raise_streamers(streamers: list) -> dict:
+    """AboveNormal for each streaming app's processes (not High — the game
+    gets High).  Returns {exe: (raised, total)}."""
+    counts = {}
+    for s in streamers:
+        done, before = process_tuning.set_priority(s["pid"], process_tuning.ABOVE_NORMAL_PRIORITY_CLASS)
+        if done and before and before != process_tuning.ABOVE_NORMAL_PRIORITY_CLASS:
+            _engine["streamer_prior"][s["pid"]] = before
+        raised, total = counts.get(s["exe"], (0, 0))
+        counts[s["exe"]] = (raised + bool(done), total + 1)
+    return counts
+
+
+def _apply_network_priority(exe_name: str, streamers: list) -> None:
+    """DSCP 46 for the game's traffic and 34 for the streaming apps' — in ONE
+    PowerShell call, each policy looked up afterwards.  This used to be two
+    calls per streaming process: with Discord's eight processes, half a minute
+    passed between "game detected" and the rest of game mode."""
+    counts = _raise_streamers(streamers)
+    rules = []
     if is_safe_ps_exe_name(exe_name):
-        rule = f"{APP_NAME}_Game_{exe_name.replace('.exe','').replace(' ','_')}"
-        run_ps(f'Remove-NetQosPolicy -Name "{rule}" -Confirm:$false -ErrorAction SilentlyContinue')
-        run_ps(f'New-NetQosPolicy -Name "{rule}" -AppPathNameMatchCondition "{exe_name}" '
-               f'-DSCPAction 46 -NetworkProfile All -Confirm:$false -ErrorAction SilentlyContinue')
-        changes.append(f"DSCP 46 for {exe_name}")
+        rules.append(("qos:game", f"{APP_NAME}_Game_{exe_name.replace('.exe', '').replace(' ', '_')}", exe_name, 46))
     else:
         log.warning(f"  skipped DSCP QoS for unsafe exe name: {exe_name!r}")
-
-    # 8. Streaming software — prioritize any running streaming apps
-    #    (DSCP 34 = AF41, Assured Forwarding high — below the game but above default)
-    streamers = _find_running_streaming_exes()
-    for s in streamers:
-        s_exe = s["exe"]
-        s_pid = s["pid"]
-        # Raise streamer process priority to AboveNormal (not High — game gets High)
-        run_ps(f"try {{ (Get-Process -Id {s_pid}).PriorityClass='AboveNormal' }} catch {{}}", timeout=3)
-        # DSCP 34 for streamer traffic — same exe-name validation as the game.
-        if not is_safe_ps_exe_name(s_exe):
+    for s_exe in sorted(counts):
+        if is_safe_ps_exe_name(s_exe):
+            rules.append((f"qos:{s_exe}", f"{APP_NAME}_Stream_{s_exe.replace('.exe', '').replace(' ', '_')}", s_exe, 34))
+        else:
             log.warning(f"  skipped stream QoS for unsafe exe name: {s_exe!r}")
-            continue
-        s_rule = f"{APP_NAME}_Stream_{s_exe.replace('.exe','').replace(' ','_')}"
-        run_ps(f'Remove-NetQosPolicy -Name "{s_rule}" -Confirm:$false -ErrorAction SilentlyContinue')
-        run_ps(f'New-NetQosPolicy -Name "{s_rule}" -AppPathNameMatchCondition "{s_exe}" '
-               f'-DSCPAction 34 -NetworkProfile All -Confirm:$false -ErrorAction SilentlyContinue')
-        changes.append(f"Stream priority: {s_exe}")
+    made = set()
+    if rules:
+        script = "$ErrorActionPreference = 'SilentlyContinue'\n" + "\n".join(
+            f"Remove-NetQosPolicy -Name '{name}' -Confirm:$false\n"
+            f"New-NetQosPolicy -Name '{name}' -AppPathNameMatchCondition '{exe}' -DSCPAction {dscp} "
+            f"-NetworkProfile All -Confirm:$false | Out-Null\n"
+            f"if (Get-NetQosPolicy -Name '{name}') {{ 'OK {name}' }}"
+            for _, name, exe, dscp in rules)
+        r = run_ps(script, timeout=90)
+        made = {ln.strip()[3:] for ln in (r.get("out") or "").splitlines() if ln.strip().startswith("OK ")}
+    for key, name, exe, _ in rules:
+        if key == "qos:game":
+            _check(key, name in made, f"DSCP 46 for {exe}" if name in made
+                   else f"Network priority (DSCP 46) for {exe}: the rule could not be created")
+        else:
+            raised, total = counts.get(exe, (0, 0))
+            several = f" ({total} processes)" if total > 1 else ""
+            if name in made and raised == total:
+                _check(key, True, f"Stream priority: {exe}{several}")
+            else:
+                parts = [] if name in made else ["network rule could not be created"]
+                if raised < total:
+                    parts.append(f"priority raised for {raised} of {total} processes")
+                _check(key, False, f"Stream priority: {exe}{several}: " + "; ".join(parts))
+    _engine["streaming_exes"] = sorted(counts)
+    if counts:
+        log.info("  Prioritized streaming app(s): " + ", ".join(
+            f"{e} ({counts[e][1]} processes)" if counts[e][1] > 1 else e for e in sorted(counts)))
 
-    _engine["streaming_exes"] = [s["exe"] for s in streamers]
-    if streamers:
-        log.info(f"  Prioritized {len(streamers)} streaming app(s): {', '.join(s['exe'] for s in streamers)}")
 
-    _set_gaming_flag()
-
+def _apply_session_extras(exe_name: str) -> None:
+    """Vispora's own responsiveness and the optional background pauser."""
     # v3.4 — bump Vispora out of efficiency mode so the mapper /
     # HidHide retry / network monitor / etc. stay responsive while the
     # game runs at HIGH priority.  Without this, Vispora sits at
@@ -611,57 +893,17 @@ def _apply_gaming_tweaks(pid: int, exe_name: str) -> list[str]:
     except Exception as e:
         log.debug(f"could not set responsive mode: {e}")
 
-    # 9. Background pauser — freeze AI apps + browsers (opt-in)
+    # Background pauser — freeze AI apps + browsers (opt-in)
     try:
         from core import background_pauser
         if background_pauser.get_settings().get("enabled"):
             r = background_pauser.pause_now(reason=f"game start: {exe_name}")
             if r.get("ok") and r.get("paused"):
-                changes.append(f"Paused {len(r['paused'])} bg apps "
-                               f"(~{r['total_freed_mb']} MB)")
+                _check("bg-pause", True, f"Paused {len(r['paused'])} bg apps (~{r['total_freed_mb']} MB)")
                 log.info(f"  Paused {len(r['paused'])} background apps, "
                          f"freed ~{r['total_freed_mb']} MB")
     except Exception as e:
         log.debug(f"background pauser hook failed: {e}")
-
-    log.info(f"  Applied {len(changes)} gaming tweaks")
-    return changes
-
-
-def _apply_power_tweaks() -> list[str]:
-    """The power-plan half of game mode: no parked cores, no CPU idle states.
-
-    Runs AFTER apply_target(), on whichever plan is active by then.  These
-    settings used to be written before a Max-FPS target switched to the
-    Ultimate plan — so for exactly those games they were not in effect at
-    all, and on exit "idle back on" went to a plan the game had not run on.
-    Each previous value is now recorded per plan and put back by
-    restore_normal_mode(), so nothing can land on the wrong plan."""
-    changes = []
-    # Marks the session as one whose plan changes are all on record.  Without
-    # it restore_normal_mode() cannot tell "nothing on record because an older
-    # build applied this" (fall back to the baseline) from "nothing left on
-    # record because the optimizer has since made the setting its own".
-    reg_originals.note("gamemode_plan_recorded")
-
-    # Every core awake.  A parked core takes no threads until Windows decides
-    # to unpark it; with the minimum for both core types at 100 % none is
-    # parked while the game runs, so the E-cores are there the moment the
-    # game wants them.  Only where the old value could be recorded.
-    unparked = 0
-    for setting in _CORE_PARKING_MIN:
-        if reg_originals.remember_power(_PROC_SUB, setting, scope=_SCOPE):
-            if run_cmd(["powercfg", "/setacvalueindex", "SCHEME_CURRENT", _PROC_SUB, setting, "100"])["ok"]:
-                unparked += 1
-    if unparked:
-        changes.append("Core parking -> off (every core kept awake)")
-
-    # CPU idle disabled (max clocks) — likewise only when it can be put back.
-    if reg_originals.remember_power("SUB_PROCESSOR", "IdleDisable", scope=_SCOPE):
-        run_cmd(["powercfg","/setacvalueindex","SCHEME_CURRENT","SUB_PROCESSOR","IdleDisable","1"])
-        changes.append("CPU idle -> disabled")
-    run_cmd(["powercfg","/setactive","SCHEME_CURRENT"])
-    return changes
 
 
 # ── Per-game optimization target dispatch (beta.13) ──────────────────
@@ -805,28 +1047,43 @@ def restore_target() -> None:
 
 def restore_normal_mode(reason: str = "game exit"):
     """Revert ALL hard tweaks back to the saved baseline — guaranteed normal state."""
+    with _session_lock:
+        _restore_normal_mode(reason)
+
+
+def _restore_normal_mode(reason: str):
     log.info(f"Restoring normal mode (reason: {reason})...")
     _exit_seen_ts = time.time()      # for crash detection, which runs after all of this
     # beta.13 — reverse any per-game optimization-target posture first
     # (GPU OC / power plan / competitive latency), before the generic tweaks.
     restore_target()
-    # The game's process, if it is still running (game mode switched off
+    # The game's processes that are still running (game mode switched off
     # mid-game): priority, affinity and throttling back as they were.  After
-    # a real exit the pid is gone — or already somebody else's.
-    prior = _engine.get("proc_prior")
+    # a real exit they are gone — and a pid may be somebody else's by now,
+    # which the creation time tells apart.
+    procs = dict(_engine.get("game_procs") or {})
+    if not procs and _engine.get("proc_prior") and _engine.get("active_pid"):
+        procs = {_engine["active_pid"]: {"prior": _engine["proc_prior"], "created": None}}
+    game_pids = set(procs)
     _engine["proc_prior"] = None
-    if prior and reason != "game exit" and _engine.get("active_pid"):
-        try:
-            process_tuning.release(_engine["active_pid"], prior)
-        except Exception as e:
-            log.debug(f"could not release the game process: {e}")
-    # Power-plan settings changed for the session (core parking, CPU idle):
-    # each back to what it was, on the plan it was changed on.
+    _engine["game_procs"] = {}
+    if reason != "game exit":
+        for pid, rec in procs.items():
+            if not rec.get("prior") or process_tuning.alive(pid, rec.get("created")) is False:
+                continue
+            try:
+                process_tuning.release(pid, rec["prior"])
+            except Exception as e:
+                log.debug(f"could not release game process {pid}: {e}")
+    # Everything else changed for the session — the registry values, and the
+    # power-plan settings on the plan they were changed on — back to exactly
+    # what it was before.
     recorded_session = bool(reg_originals.noted("gamemode_plan_recorded"))
-    reg_originals.forget_notes("gamemode_plan_recorded")
+    recorded_registry = bool(reg_originals.noted("gamemode_reg_recorded"))
+    reg_originals.forget_notes("gamemode_plan_recorded", "gamemode_reg_recorded")
     plan = reg_originals.restore_all(_SCOPE)
     if plan["restored"] or plan["failed"]:
-        log.info(f"  Restored {plan['restored']} power-plan setting(s)"
+        log.info(f"  Restored {plan['restored']} setting(s) to what they were before the game"
                  + (f", {plan['failed']} could not be" if plan["failed"] else ""))
     # Capture the game name BEFORE we clear engine state, so we can use it in the notification.
     _prev_game = _engine.get("active_game")
@@ -838,23 +1095,21 @@ def restore_normal_mode(reason: str = "game exit"):
     net_throttle = baseline.get("net_throttle", "a")  # 0x0a = 10 = default
     cpu_idle_was_disabled = baseline.get("cpu_idle_disabled", False)
 
-    # 1. Restore Win32PrioritySeparation
-    val = int(priority_sep, 16)
-    run_cmd(["reg","add",r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl",
-             "/v","Win32PrioritySeparation","/t","REG_DWORD","/d",str(val),"/f"])
-    log.info(f"  Restored Win32PrioritySeparation -> 0x{priority_sep}")
-
-    # 2. Restore SystemResponsiveness
-    val2 = int(sys_resp, 16)
-    run_cmd(["reg","add",r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
-             "/v","SystemResponsiveness","/t","REG_DWORD","/d",str(val2),"/f"])
-    log.info(f"  Restored SystemResponsiveness -> {val2}")
-
-    # 3. Restore NetworkThrottlingIndex
-    val3 = int(net_throttle, 16)
-    run_cmd(["reg","add",r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
-             "/v","NetworkThrottlingIndex","/t","REG_DWORD","/d",str(val3),"/f"])
-    log.info(f"  Restored NetworkThrottlingIndex -> {val3}")
+    # 1-3. Registry values, from the baseline — only for a session started by
+    #      a build that did not record them (they came back above otherwise).
+    if not recorded_registry:
+        val = int(priority_sep, 16)
+        run_cmd(["reg","add",r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl",
+                 "/v","Win32PrioritySeparation","/t","REG_DWORD","/d",str(val),"/f"])
+        log.info(f"  Restored Win32PrioritySeparation -> 0x{priority_sep}")
+        val2 = int(sys_resp, 16)
+        run_cmd(["reg","add",r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
+                 "/v","SystemResponsiveness","/t","REG_DWORD","/d",str(val2),"/f"])
+        log.info(f"  Restored SystemResponsiveness -> {val2}")
+        val3 = int(net_throttle, 16)
+        run_cmd(["reg","add",r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile",
+                 "/v","NetworkThrottlingIndex","/t","REG_DWORD","/d",str(val3),"/f"])
+        log.info(f"  Restored NetworkThrottlingIndex -> {val3}")
 
     # 4. Restore CPU idle — only for a session started by a build that kept
     #    no records (otherwise it was put back above, or has since become the
@@ -871,14 +1126,19 @@ def restore_normal_mode(reason: str = "game exit"):
 
     # 5b. Remove streaming DSCP rules & restore streamer process priority to Normal
     run_ps(f'Get-NetQosPolicy | Where-Object {{{qos_policy_filter("Stream_")}}} | Remove-NetQosPolicy -Confirm:$false -ErrorAction SilentlyContinue')
-    streamers = _engine.get("streaming_exes", []) or []
-    for s_exe in streamers:
-        # Revert any still-running streamer process to Normal priority
-        base = s_exe.replace(".exe", "")
-        run_ps(f"try {{ Get-Process -Name '{base}' -ErrorAction SilentlyContinue | ForEach-Object {{ $_.PriorityClass='Normal' }} }} catch {{}}", timeout=3)
+    # Streaming apps: each process game mode raised goes back to the class it
+    # had — not to Normal for everyone with that name, which also lowered
+    # copies the user had raised themselves.
+    raised = dict(_engine.get("streamer_prior") or {})
+    for pid, before in raised.items():
+        try:
+            process_tuning.set_priority(pid, before)
+        except Exception as e:
+            log.debug(f"could not put streaming process {pid} back: {e}")
+    _engine["streamer_prior"] = {}
     _engine["streaming_exes"] = []
-    if streamers:
-        log.info(f"  Reverted {len(streamers)} streaming app(s) to normal priority")
+    if raised:
+        log.info(f"  Put {len(raised)} streaming process(es) back to their own priority")
 
     # v3 — capture exe + active OC BEFORE we wipe engine state, so the
     # crash-recovery handler has the data it needs.
@@ -889,9 +1149,15 @@ def restore_normal_mode(reason: str = "game exit"):
     _clear_gaming_flag()
     _engine["gaming_mode"] = False
     _engine["changes"] = []
+    _engine["checks"] = []
     _engine["active_game"] = None
     _engine["active_exe"] = None
     _engine["active_pid"] = None
+    _engine["game_image"] = ""
+    _engine["power_applied"] = []
+    _engine["power_scheme"] = ""
+    _engine["power_limits"] = {}
+    _engine["exit_ticks"] = 0
     _engine["active_oc_core"] = 0
     _engine["active_oc_mem"]  = 0
     log.info("  Normal mode restored")
@@ -934,7 +1200,7 @@ def restore_normal_mode(reason: str = "game exit"):
     #    fresh for the next game session. Done in a background thread so the
     #    notification fires immediately and we don't block.
     if reason in ("game exit",):
-        threading.Thread(target=_post_game_refresh, args=(_prev_game,), daemon=True).start()
+        threading.Thread(target=_post_game_refresh, args=(_prev_game, game_pids), daemon=True).start()
 
     # v3 — release the perf sampler's game-mode consumer slot.  It
     # keeps running if hwmon-page or adaptive-tuning are still using it.
@@ -985,9 +1251,34 @@ def restore_normal_mode(reason: str = "game exit"):
             log.debug(f"Notifier failed: {e}")
 
 
-def _post_game_refresh(game_name: str = None):
-    """Refresh the PC state after a game exits — frees RAM, kills orphan processes,
-    flushes caches, so the next game launches into a clean state.
+# Helper processes a game starts and can leave running after it exits.  Only
+# ever stopped when the process is a CHILD of the game that has just exited.
+# (This used to stop every process of these names — Steam's and the Epic
+# launcher's own web helpers, SteamVR, a crash reporter the user was about to
+# send — and it ran whenever the monitor believed a game had exited, which
+# under load it sometimes did while the game was still running.)
+_GAME_LEFTOVERS = frozenset(n.lower() for n in (
+    "UnrealCEFSubProcess.exe", "ShaderCompileWorker.exe", "ShaderCompileWorker-Win64-Shipping.exe",
+    "EasyAntiCheat_Setup.exe", "ScreenshotUploader.exe",
+))
+
+
+def _stop_game_leftovers(game_pids) -> int:
+    pids = {int(p) for p in (game_pids or ())}
+    if not pids:
+        return 0
+    stopped = 0
+    for p in process_tuning.processes() or []:
+        if p["ppid"] in pids and p["pid"] not in pids and p["exe"].lower() in _GAME_LEFTOVERS:
+            if process_tuning.terminate(p["pid"]):
+                stopped += 1
+                log.info(f"  Stopped {p['exe']} (PID {p['pid']}), left running by the game")
+    return stopped
+
+
+def _post_game_refresh(game_name: str = None, game_pids=None):
+    """Refresh the PC state after a game exits — frees RAM, stops what the game
+    left running, flushes caches, so the next game launches into a clean state.
 
     Runs in a background thread; does not block the caller.
     """
@@ -1012,27 +1303,11 @@ def _post_game_refresh(game_name: str = None):
     except Exception as e:
         log.debug(f"  DNS flush failed: {e}")
 
-    # 3. Kill orphaned game-related processes that often linger after game exit
-    #    (overlay components, anti-cheat helpers, shader compilers, etc.)
-    orphan_targets = [
-        "EpicWebHelper.exe", "EpicGamesLauncher.exe.tmp",
-        "BattlEye-Service.exe.bak", "EasyAntiCheat_Setup.exe",
-        "ShaderCompileWorker-Win64-Shipping.exe", "CrashReportClient.exe",
-        "UnrealCEFSubProcess.exe", "Steamwebhelper.exe.tmp",
-        "DiscordOverlay.exe", "ScreenshotUploader.exe",
-        "vrserver.exe", "vrcompositor.exe",  # SteamVR leftovers
-    ]
-    killed = 0
-    for proc in orphan_targets:
-        base = proc.replace(".exe", "").replace(".tmp", "").replace(".bak", "")
-        r = run_ps(
-            f"try {{ Get-Process -Name '{base}' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; if ($?) {{ 'killed' }} }} catch {{}}",
-            timeout=4,
-        )
-        if r.get("ok") and "killed" in (r.get("out") or ""):
-            killed += 1
-    if killed > 0:
-        log.info(f"  Killed {killed} orphaned game-related process(es)")
+    # 3. Stop helper processes the game itself started and left running.
+    try:
+        _stop_game_leftovers(game_pids)
+    except Exception as e:
+        log.debug(f"  leftover check failed: {e}")
 
     # 4. Reset MMCSS gaming task scheduler state — bounces the multimedia
     #    scheduler so the next game gets a clean priority slot.
@@ -1072,11 +1347,9 @@ foreach ($p in $paths) {
     except Exception:
         pass
 
-    # 7. Re-arm the boot prep cache so subsequent game launches pre-cache hot data
-    try:
-        run_ps("Get-Process -Name 'rundll32' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -eq '' -and $_.StartTime -gt (Get-Date).AddMinutes(-10) } | Stop-Process -Force -ErrorAction SilentlyContinue", timeout=5)
-    except Exception:
-        pass
+    # (A step here used to stop every windowless rundll32 started in the last
+    # ten minutes — Windows runs maintenance, printing and control-panel work
+    # in those.  It did nothing for the next game, and is gone.)
 
     duration = time.time() - started
     log.info(f"=== Post-game refresh done in {duration:.1f}s ===")
@@ -1178,24 +1451,8 @@ def _is_game(proc_name: str) -> bool:
 
 def _find_running_streaming_exes() -> list[dict]:
     """Return list of {exe, pid} for streaming apps currently running."""
-    try:
-        r = run_ps(
-            "Get-Process | Select-Object Id,ProcessName | ConvertTo-Json", timeout=8)
-        if not (r["ok"] and r["out"]):
-            return []
-        procs = json.loads(r["out"])
-        if not isinstance(procs, list):
-            procs = [procs]
-        found = []
-        for p in procs:
-            pname = (p.get("ProcessName","") or "").lower()
-            pid = p.get("Id", 0)
-            exe = pname + ".exe"
-            if exe in STREAMING_EXES and pid:
-                found.append({"exe": exe, "pid": pid})
-        return found
-    except Exception:
-        return []
+    return [{"exe": p["exe"].lower(), "pid": p["pid"]}
+            for p in (process_tuning.processes() or []) if p["exe"].lower() in STREAMING_EXES]
 
 
 def _nice_name(exe: str) -> str:
@@ -1294,54 +1551,207 @@ def _scan_game_candidates() -> list[dict]:
     return candidates
 
 
+def _live_game_pids() -> list:
+    """The processes of the tracked game's exe that are running now.  Read
+    through the API, which cannot time out: the PowerShell check this used to
+    be took over five seconds under load now and then, and a timeout was
+    taken for "the game has exited" — normal mode came back mid-game, and the
+    whole profile was applied again a minute later."""
+    exe = _engine.get("active_exe") or ""
+    pids = process_tuning.find_image(_engine.get("game_image") or "", exe)
+    pid = _engine.get("active_pid")
+    if not pids and pid:
+        rec = (_engine.get("game_procs") or {}).get(pid) or {}
+        if process_tuning.alive(pid, rec.get("created"), exe) is not False:
+            pids = [pid]        # (cannot be told counts as running: only a definite exit ends a session)
+    return pids
+
+
+def _log_checks(prefix: str = "") -> None:
+    checks = _engine.get("checks") or []
+    good = sum(1 for c in checks if c["ok"])
+    log.info(f"  {prefix}{good} of {len(checks)} game-mode settings in effect (read back)")
+    for c in checks:
+        if not c["ok"]:
+            log.info(f"    {'not done' if c['ok'] is False else 'unknown'}: {c['text']}")
+
+
+def _start_session(best: dict, gen: int) -> None:
+    with _session_lock:
+        if _engine["gaming_mode"] or not _engine["monitoring"] or _engine.get("monitor_gen", 0) != gen:
+            return          # another monitor thread has already started it, or this one is being replaced
+        pid, exe, display = best["pid"], best["exe"], best["name"]
+        fg = " [foreground]" if best.get("foreground") else ""
+        log.info(f"Game detected: {display} ({exe}, PID {pid}, {best.get('ws_mb', 0)} MB{fg}, "
+                 f"score {best.get('score', 0)})")
+        # The baseline is only a fallback now, for a session left behind by a
+        # build that kept no records.  Never taken while a session's gaming
+        # values may still be in place.
+        if not _is_gaming_flag_set():
+            _save_baseline(_capture_baseline())
+        ident = process_tuning.identity(pid)
+        _engine.update(active_game=display, active_exe=exe, active_pid=pid, game_image=ident.get("image") or "",
+                       game_procs={}, checks=[], changes=[], power_applied=[], power_limits={}, streamer_prior={},
+                       exit_ticks=0, tick=0, proc_prior=None)
+        _engine["gaming_mode"] = True
+        _set_gaming_flag()
+        reg_originals.note("gamemode_reg_recorded")
+        # Fire the notification BEFORE the tweaks — user sees it immediately.
+        if _notifier:
+            try:
+                _notifier.notify_game_detected(display, exe)
+            except Exception as e:
+                log.debug(f"Notifier failed: {e}")
+
+        # 1. The game's own processes first — what Task Manager shows, done in
+        #    milliseconds — then the system-wide values.
+        _tune_game_processes(process_tuning.find_image(_engine["game_image"], exe) or [pid])
+        _apply_registry_tweaks()
+        _apply_session_extras(exe)
+
+        # v3 — snapshot the OC offsets that are active right now
+        # so crash_recovery can blacklist them if the game crashes.
+        try:
+            from core import gpu_overclock
+            st = gpu_overclock.read_live_state()
+            # We want the OFFSETS (over stock baseline), not raw clocks
+            bl = gpu_overclock.get_stock_baseline() or {}
+            if st.get("ok") and bl:
+                _engine["active_oc_core"] = max(
+                    0, int(st.get("core_max_mhz", 0))
+                    - int(bl.get("core_max_mhz", st.get("core_max_mhz", 0))))
+                _engine["active_oc_mem"]  = max(
+                    0, int(st.get("mem_app_mhz", 0))
+                    - int(bl.get("mem_app_mhz", st.get("mem_app_mhz", 0))))
+            else:
+                # Fallback: read from saved profile
+                p = gpu_overclock.load_profile()
+                if p.get("exists"):
+                    _engine["active_oc_core"] = int(p.get("core_offset_mhz", 0))
+                    _engine["active_oc_mem"]  = int(p.get("mem_offset_mhz", 0))
+                else:
+                    _engine["active_oc_core"] = 0
+                    _engine["active_oc_mem"]  = 0
+            log.info(f"  Captured active OC at game-start: "
+                     f"core+{_engine['active_oc_core']} / "
+                     f"mem+{_engine['active_oc_mem']}")
+        except Exception as e:
+            log.debug(f"Could not capture active OC: {e}")
+            _engine["active_oc_core"] = 0
+            _engine["active_oc_mem"]  = 0
+        # v3 — start the perf sampler so we have data ready
+        # for crash diagnostics and Adaptive Tuning.
+        try:
+            from core import perf_monitor
+            perf_monitor.start(consumer="game-mode")
+        except Exception as e:
+            log.debug(f"perf_monitor start failed: {e}")
+
+        # beta.13 — apply this game's optimization TARGET posture
+        # (max_fps / low_latency) BEFORE AT engages.  For targeted
+        # games AT is auto-disabled, so on_game_start below no-ops
+        # for them and won't fight the posture we just set.
+        try:
+            apply_target(exe)
+        except Exception as e:
+            log.debug(f"apply_target failed: {e}")
+
+        # Power-plan tweaks after the target, so they land on the plan the
+        # target has just selected (see _apply_power_tweaks).
+        try:
+            _apply_power_tweaks()
+        except Exception as e:
+            log.debug(f"power-plan tweaks failed: {e}")
+
+        # The slow part last: network priority (PowerShell) and streaming apps.
+        try:
+            _apply_network_priority(exe, _find_running_streaming_exes())
+        except Exception as e:
+            log.debug(f"network priority failed: {e}")
+
+        # v3 — engage Adaptive Tuning if this game is opted in.
+        # AT applies its own learned offsets (overriding the
+        # current OC) and starts the per-game tuning loop.
+        try:
+            from core import adaptive_tuning
+            at_result = adaptive_tuning.on_game_start(exe, display)
+            if at_result.get("engaged"):
+                log.info(f"  Adaptive Tuning engaged: starting at "
+                         f"core+{at_result['starting_core']}/"
+                         f"mem+{at_result['starting_mem']}")
+                # Update our OC snapshot now that AT applied its own
+                _engine["active_oc_core"] = at_result["starting_core"]
+                _engine["active_oc_mem"]  = at_result["starting_mem"]
+        except Exception as e:
+            log.debug(f"adaptive_tuning.on_game_start failed: {e}")
+        _log_checks()
+
+
+def _switch_game(new: dict) -> None:
+    """Another known game is still running: track that one.  The system-wide
+    tweaks carry over; the per-process ones go to the new game's processes."""
+    log.info(f"  Other known game(s) still running: switching tracker to {new['name']} (PID {new['pid']})")
+    old_exe, old_game = _engine.get("active_exe", ""), _engine.get("active_game")
+    ident = process_tuning.identity(new["pid"])
+    _engine.update(active_pid=new["pid"], active_exe=new["exe"], active_game=new["name"],
+                   game_image=ident.get("image") or "", game_procs={}, exit_ticks=0, proc_prior=None)
+    _engine["checks"] = [c for c in _engine["checks"] if not c["key"].startswith("proc:") and c["key"] != "waiting"]
+    _tune_game_processes(process_tuning.find_image(_engine["game_image"], new["exe"]) or [new["pid"]])
+    # Notify AT so it can switch its target too
+    try:
+        from core import adaptive_tuning as _at
+        _at.on_game_exit(old_exe, old_game, was_crash=False, reason="game-mode tracker switch")
+        _at.on_game_start(new["exe"], new["name"])
+    except Exception as e:
+        log.debug(f"AT switch failed: {e}")
+
+
+def _session_tick() -> None:
+    """One monitor tick during a game: follow the game's processes, keep what
+    game mode set in effect, and end the session only on a definite exit."""
+    _engine["tick"] = _engine.get("tick", 0) + 1
+    exe = _engine.get("active_exe") or "the game"
+    pids = _live_game_pids()
+    if pids:
+        if _engine.get("exit_ticks"):
+            log.info(f"  {exe} is running again (PID {', '.join(map(str, pids))}) — game mode stays on")
+            _engine["checks"] = [c for c in _engine["checks"] if c["key"] != "waiting"]
+            _engine["changes"] = [c["text"] for c in _engine["checks"]]
+        _engine["exit_ticks"] = 0
+        if _engine.get("active_pid") not in pids:
+            log.info(f"  {exe}: following its new process (PID {_engine.get('active_pid')} -> {pids[0]})")
+            _engine["active_pid"] = pids[0]
+        recheck = _engine["tick"] % _SYSTEM_CHECK_TICKS == 0
+        _tune_game_processes(pids, recheck=recheck)
+        if recheck:
+            _apply_registry_tweaks(recheck=True)
+            _apply_power_tweaks(recheck=True)
+        return
+    # No process of the game is running any more.
+    _engine["exit_ticks"] = _engine.get("exit_ticks", 0) + 1
+    if _engine["exit_ticks"] == 1:
+        log.info(f"Tracked game exited: {_engine.get('active_game') or 'Unknown'} (PID {_engine.get('active_pid')})")
+        others = _scan_game_candidates()
+        if others:
+            _switch_game(others[0])
+            return
+        # Some games close and start again (an update, a restart after the
+        # first launch, an anti-cheat handshake).  Normal mode used to come
+        # back in between, and the game ran a minute without the profile.
+        _check("waiting", None, "Game closed — game mode stays on a few seconds in case it restarts")
+    elif _engine["exit_ticks"] >= _EXIT_GRACE_TICKS:
+        _restore_normal_mode("game exit")
+
+
 def _monitor_loop(gen: int = 0):
     log.info("Game monitor started")
 
     while _engine["monitoring"] and _engine.get("monitor_gen", 0) == gen:
         try:
-            if _engine["gaming_mode"] and _engine["active_pid"]:
-                # Check if the tracked game is still alive.
-                pid = _engine["active_pid"]
-                r = run_ps(f"(Get-Process -Id {pid} -ErrorAction SilentlyContinue).Id", timeout=5)
-                alive = r["ok"] and r["out"].strip().isdigit()
-                if not alive:
-                    game = _engine["active_game"] or "Unknown"
-                    log.info(f"Tracked game exited: {game} (PID {pid})")
-                    # v3.3 — Multi-game support: if ANY other known game is
-                    # still running, don't restore normal mode — just switch
-                    # tracking to it.  Game-mode tweaks are system-wide so
-                    # the existing optimizations stay relevant; we just
-                    # update the "which game is the user playing" pointer.
-                    others = _scan_game_candidates()
-                    if others:
-                        new = others[0]
-                        log.info(
-                            f"  Other known game(s) still running: switching "
-                            f"tracker to {new['name']} (PID {new['pid']})"
-                        )
-                        _engine["active_pid"]  = new["pid"]
-                        _engine["active_exe"]  = new["exe"]
-                        _engine["active_game"] = new["name"]
-                        # The system-wide tweaks carry over; the per-process
-                        # ones (priority, all cores, no throttling) belonged
-                        # to the game that just closed, so give them to this one.
-                        try:
-                            tuned = process_tuning.tune(
-                                new["pid"], all_cores=bool(_load_gp_settings().get("all_cores", True)))
-                            _engine["proc_prior"] = tuned.get("prior") if tuned.get("ok") else None
-                        except Exception as e:
-                            log.debug(f"could not tune the new game process: {e}")
-                        # Notify AT so it can switch its target too
-                        try:
-                            from core import adaptive_tuning as _at
-                            _at.on_game_exit(_engine.get("active_exe", ""),
-                                             game, was_crash=False,
-                                             reason="game-mode tracker switch")
-                            _at.on_game_start(new["exe"], new["name"])
-                        except Exception as e:
-                            log.debug(f"AT switch failed: {e}")
-                    else:
-                        restore_normal_mode("game exit")
+            if _engine["gaming_mode"]:
+                with _session_lock:
+                    if _engine["gaming_mode"] and _engine["monitoring"] and _engine.get("monitor_gen", 0) == gen:
+                        _session_tick()
             else:
                 # No active game — scan for candidates and pick the best one.
                 candidates = _scan_game_candidates()
@@ -1356,101 +1766,10 @@ def _monitor_loop(gen: int = 0):
                             f"Multiple game candidates running ({len(candidates)}). "
                             f"Other matches: {runners_up}"
                         )
-                    best = candidates[0]
-                    pid, exe, display = best["pid"], best["exe"], best["name"]
-                    fg = " [foreground]" if best["foreground"] else ""
-                    log.info(
-                        f"Game detected: {display} ({exe}, PID {pid}, "
-                        f"{best['ws_mb']} MB{fg}, score {best['score']})"
-                    )
-                    # Capture baseline right before applying (freshest snapshot)
-                    if not _engine["gaming_mode"]:
-                        baseline = _capture_baseline()
-                        _save_baseline(baseline)
-                    # Fire the notification BEFORE the tweaks — user sees it immediately.
-                    if _notifier:
-                        try:
-                            _notifier.notify_game_detected(display, exe)
-                        except Exception as e:
-                            log.debug(f"Notifier failed: {e}")
-                    changes = _apply_gaming_tweaks(pid, exe)
-                    _engine["active_game"] = display
-                    _engine["active_exe"] = exe
-                    _engine["active_pid"] = pid
-                    _engine["gaming_mode"] = True
-                    _engine["changes"] = changes
-                    # v3 — snapshot the OC offsets that are active right now
-                    # so crash_recovery can blacklist them if the game crashes.
-                    try:
-                        from core import gpu_overclock
-                        st = gpu_overclock.read_live_state()
-                        # We want the OFFSETS (over stock baseline), not raw clocks
-                        bl = gpu_overclock.get_stock_baseline() or {}
-                        if st.get("ok") and bl:
-                            _engine["active_oc_core"] = max(
-                                0, int(st.get("core_max_mhz", 0))
-                                - int(bl.get("core_max_mhz", st.get("core_max_mhz", 0))))
-                            _engine["active_oc_mem"]  = max(
-                                0, int(st.get("mem_app_mhz", 0))
-                                - int(bl.get("mem_app_mhz", st.get("mem_app_mhz", 0))))
-                        else:
-                            # Fallback: read from saved profile
-                            p = gpu_overclock.load_profile()
-                            if p.get("exists"):
-                                _engine["active_oc_core"] = int(p.get("core_offset_mhz", 0))
-                                _engine["active_oc_mem"]  = int(p.get("mem_offset_mhz", 0))
-                            else:
-                                _engine["active_oc_core"] = 0
-                                _engine["active_oc_mem"]  = 0
-                        log.info(f"  Captured active OC at game-start: "
-                                 f"core+{_engine['active_oc_core']} / "
-                                 f"mem+{_engine['active_oc_mem']}")
-                    except Exception as e:
-                        log.debug(f"Could not capture active OC: {e}")
-                        _engine["active_oc_core"] = 0
-                        _engine["active_oc_mem"]  = 0
-                    # v3 — start the perf sampler so we have data ready
-                    # for crash diagnostics and Adaptive Tuning.
-                    try:
-                        from core import perf_monitor
-                        perf_monitor.start(consumer="game-mode")
-                    except Exception as e:
-                        log.debug(f"perf_monitor start failed: {e}")
-
-                    # beta.13 — apply this game's optimization TARGET posture
-                    # (max_fps / low_latency) BEFORE AT engages.  For targeted
-                    # games AT is auto-disabled, so on_game_start below no-ops
-                    # for them and won't fight the posture we just set.
-                    try:
-                        apply_target(exe)
-                    except Exception as e:
-                        log.debug(f"apply_target failed: {e}")
-
-                    # Power-plan tweaks last, so they land on the plan the
-                    # target has just selected (see _apply_power_tweaks).
-                    try:
-                        _engine["changes"] = changes + _apply_power_tweaks()
-                    except Exception as e:
-                        log.debug(f"power-plan tweaks failed: {e}")
-
-                    # v3 — engage Adaptive Tuning if this game is opted in.
-                    # AT applies its own learned offsets (overriding the
-                    # current OC) and starts the per-game tuning loop.
-                    try:
-                        from core import adaptive_tuning
-                        at_result = adaptive_tuning.on_game_start(exe, display)
-                        if at_result.get("engaged"):
-                            log.info(f"  Adaptive Tuning engaged: starting at "
-                                     f"core+{at_result['starting_core']}/"
-                                     f"mem+{at_result['starting_mem']}")
-                            # Update our OC snapshot now that AT applied its own
-                            _engine["active_oc_core"] = at_result["starting_core"]
-                            _engine["active_oc_mem"]  = at_result["starting_mem"]
-                    except Exception as e:
-                        log.debug(f"adaptive_tuning.on_game_start failed: {e}")
+                    _start_session(candidates[0], gen)
         except Exception as e:
             log.warning(f"Monitor error: {e}")
-        time.sleep(3)
+        time.sleep(_TICK_S)
 
     if _engine.get("monitor_gen", 0) != gen:
         log.info("Game monitor thread superseded by a newer one — exiting quietly")
@@ -1652,6 +1971,11 @@ def get_engine_status() -> dict:
         "active_exe": _engine["active_exe"],
         "active_pid": _engine["active_pid"],
         "applied_changes": _engine["changes"],
+        # What is in effect as last read back — {"ok": True | False | None, "text"} each.
+        "checks": [{"ok": c["ok"], "text": c["text"]} for c in _engine.get("checks", [])],
+        "verified_at": _engine.get("verified_at", 0.0),
+        "game_pids": sorted(_engine.get("game_procs") or {}),
+        "waiting_for_restart": bool(_engine.get("exit_ticks")),
         "known_game_count": len(KNOWN_GAME_EXES),
         "streaming_count": len(STREAMING_EXES),
         "streaming_prioritized": _engine.get("streaming_exes", []),

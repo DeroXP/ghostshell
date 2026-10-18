@@ -306,9 +306,21 @@ def test_restore_with_no_power_records_does_not_ask_powercfg():
 def test_restoring_the_active_plan_makes_it_re_read_its_settings():
     m.fresh()
     RO.remember_power(m.PROC_SUB, m.PROC_MAX)
+    m.cell(m.USERPLAN, m.PROC_MAX)[0] = 100
     m.clear_logs()
     RO.restore_all()
     assert m.ran("powercfg", "/setactive", m.USERPLAN)
+
+
+def test_a_power_setting_already_back_at_its_value_counts_as_restored():
+    """A record whose setting Windows will no longer accept (an old tweak had
+    narrowed its range on one PC) used to fail at every restore, for good."""
+    m.fresh()
+    RO.remember_power(m.PROC_SUB, m.PARK_E)                 # [100, 10]
+    m.POWER_LIMITS[m.PARK_E] = 0                            # writing 100 is refused now
+    m.clear_logs()
+    assert RO.restore_all() == {"restored": 1, "failed": 0}
+    assert not m.ran("powercfg", "setacvalueindex") and RO.summary()["power"] == 0
 
 
 # ── notes and other state ─────────────────────────────────────────────

@@ -344,10 +344,17 @@ def apply_nvidia_tweaks() -> list[dict]:
         log.info(f"  {'✓' if ok else '✗'} {name}")
         results.append({"name": name, "ok": ok})
 
-    # Shader cache — disable size limit (10GB cache = fewer recompiles)
-    shader_key = r"HKCU\SOFTWARE\NVIDIA Corporation\Global\NVTweak"
-    _reg(shader_key, "ShaderDiskCacheSizeBytes", "10737418240")
-    results.append({"name": "NVIDIA Shader Cache: 10GB", "ok": True})
+    # The driver's own settings (NVIDIA Control Panel -> Manage 3D settings,
+    # global): maximum-performance power mode, Low Latency Mode, a shader
+    # cache of at least 10 GB.  (The shader cache used to be a registry
+    # value the driver does not read — and too large for the DWORD it was
+    # written as, so the write failed while the tab reported it as done.)
+    try:
+        from core import nvidia_profile
+        results += nvidia_profile.apply()
+    except Exception as e:
+        log.warning(f"NVIDIA driver settings failed: {e}")
+        results.append({"name": "NVIDIA driver settings", "ok": False})
 
     # MSI mode
     results += _apply_msi_mode("NVIDIA")
@@ -462,6 +469,16 @@ def undo_gpu_tweaks() -> dict:
                              + (f" ({reg['failed']} could not be)" if reg["failed"] else ""),
                      "ok": reg["failed"] == 0})
     rows += sys_state.restore_all(_SCOPE)
+    try:
+        from core import nvidia_profile
+        drs = nvidia_profile.restore()
+        if drs["restored"] or drs["failed"]:
+            rows.append({"name": f"{drs['restored']} NVIDIA driver setting(s) restored"
+                                 + (f" ({drs['failed']} could not be)" if drs["failed"] else ""),
+                         "ok": drs["failed"] == 0})
+    except Exception as e:
+        log.warning(f"NVIDIA driver settings undo failed: {e}")
+        rows.append({"name": "NVIDIA driver settings could not be restored", "ok": False})
     if not rows:
         return {"ok": True, "nothing": True,
                 "results": [{"name": "Nothing on record to undo — tweaks applied by an earlier "

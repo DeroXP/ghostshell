@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 from core.utils import get_logger, run_ps
@@ -153,12 +154,49 @@ def _check_hdr() -> list[dict]:
 # ═══════════════════════════════════════════════════════════════════════
 # MEMORY checks
 # ═══════════════════════════════════════════════════════════════════════
+# The rated speed (MT/s) as RAM vendors spell it in part numbers:
+#   Corsair CMK32GX5M2B6000C36, ADATA AX5U6000C3016G  -> "6000C"
+#   G.Skill F5-6000J3636F16G, F4-3600C16D             -> "F5-6000", "F4-3600"
+#   TeamGroup FF3D532G6000HC38A                        -> "6000HC"
+#   Kingston KF560C36BBE-16, KF432C16                  -> DDR"5" "60" = 6000, DDR"4" "32" = 3200
+#   Crucial / Micron CT16G56C46U5, BL16G36C16U4,
+#     MTC8C1084S1UC56BD1                               -> "56C", "36C", "UC56" = 5600 / 3600
+_RATED_PATTERNS = (
+    (re.compile(r"F[45]-(\d{4})"), 1),
+    (re.compile(r"(\d{4})(?:C|HC|CL|J)\d"), 1),
+    (re.compile(r"\bK[FV][A-Z]?[45](\d{2})C"), 100),
+    (re.compile(r"(?:\d{1,2}G|UC)(\d{2})(?:C|B|A)"), 100),
+)
+_DDR4, _DDR5 = 26, 34                                       # SMBIOSMemoryType
+_JEDEC_TOP = {_DDR4: 3200, _DDR5: 5600}                    # the fastest standard (non-XMP) speed of each
+
+
+def _rated_speed(part: str, memory_type: int = 0):
+    """A kit's rated speed from its part number, or None if it is not one of
+    the spellings above (or the number makes no sense for the memory type)."""
+    part = (part or "").upper().replace(" ", "")
+    lo, hi = {_DDR4: (1600, 5333), _DDR5: (4000, 10000)}.get(memory_type, (1600, 10000))
+    for rx, scale in _RATED_PATTERNS:
+        for m in rx.finditer(part):
+            mts = int(m.group(1)) * scale
+            if lo <= mts <= hi:
+                return mts
+    return None
+
+
 def _check_ram_speed() -> list[dict]:
-    """Compare configured RAM speed to JEDEC-rated speed.  The classic
-    'XMP/EXPO not enabled in BIOS, RAM running at 4800 instead of 6000'."""
+    """Is the RAM running at the speed the kit is sold for?  The classic loss
+    is XMP / EXPO left off in the BIOS: a 6000 MT/s kit running at 4800.
+
+    Windows only reports the speed the memory runs at (ConfiguredClockSpeed)
+    and the module's standard base speed (Speed) — not its XMP rating — so
+    the rating is read from the part number where the vendor's spelling is
+    known.  (This used to call any DDR4 kit up to 4800 MT/s "running at base
+    speed", and to report XMP as active when the base and running speeds were
+    the same, which is what XMP being off looks like.)"""
     d = _ps_json(
         "Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue | "
-        "Select-Object Speed, ConfiguredClockSpeed, Capacity, Manufacturer, PartNumber | "
+        "Select-Object Speed, ConfiguredClockSpeed, Capacity, Manufacturer, PartNumber, SMBIOSMemoryType | "
         "ConvertTo-Json"
     )
     if d is None:
@@ -167,45 +205,33 @@ def _check_ram_speed() -> list[dict]:
         d = [d]
     if not d:
         return []
-    # Speed = JEDEC-rated max (or whatever the SPD declares as base profile),
-    # ConfiguredClockSpeed = what Windows is actually running at.
-    rated_max  = max((s.get("Speed") or 0)              for s in d)
-    config_max = max((s.get("ConfiguredClockSpeed") or 0) for s in d)
-    if not rated_max or not config_max:
+    running = min((s.get("ConfiguredClockSpeed") or 0) for s in d)
+    base = max((s.get("Speed") or 0) for s in d)
+    if not running:
         return []
-    # On most boards the SPD lists the JEDEC base, NOT the XMP profile.
-    # So if configured > rated, that means XMP is on.  If configured ==
-    # rated, XMP is off (running at JEDEC base).  We can only flag the
-    # explicit 'configured < rated' case here; for the more common XMP-
-    # off case the user has to check their BIOS.
-    if config_max < rated_max - 50:
-        return [{
-            "id": "memory.speed", "category": "memory",
-            "name": "RAM speed",
-            "severity": "warn",
-            "current": f"{config_max} MT/s",
-            "expected": f"{rated_max} MT/s (SPD base)",
-            "detail": "RAM is running below its rated speed.  "
-                      "Reboot into BIOS and enable XMP / EXPO / DOCP.",
-        }]
-    # Bonus heuristic: DDR5 below 5200 MT/s strongly suggests XMP is off
-    if config_max <= 4800 and any((s.get("Capacity") or 0) >= 8 * 1024**3 for s in d):
-        return [{
-            "id": "memory.speed", "category": "memory",
-            "name": "RAM speed",
-            "severity": "warn",
-            "current": f"{config_max} MT/s (likely JEDEC base)",
-            "expected": "Higher (your RAM kit is rated faster)",
-            "detail": "RAM is running at JEDEC base speed.  If your kit is rated "
-                      "for higher (e.g. 6000 / 6400 MT/s), enable XMP / EXPO in BIOS.",
-        }]
-    return [{
-        "id": "memory.speed", "category": "memory",
-        "name": "RAM speed", "severity": "ok",
-        "current": f"{config_max} MT/s",
-        "expected": None,
-        "detail": "Running at or above SPD-rated speed (XMP / EXPO appears active).",
-    }]
+    mtype = int(d[0].get("SMBIOSMemoryType") or 0)
+    kind = {_DDR4: "DDR4", _DDR5: "DDR5"}.get(mtype, "RAM")
+    rated = [r for r in (_rated_speed(s.get("PartNumber"), mtype) for s in d) if r]
+    rated_kit = min(rated) if rated else None           # a mixed set runs at the slowest kit's rating
+    row = {"id": "memory.speed", "category": "memory", "name": "RAM speed", "current": f"{running} MT/s"}
+    if rated_kit and running < rated_kit - 100:
+        return [dict(row, severity="warn", expected=f"{rated_kit} MT/s (what the kit is rated for)",
+                     detail=f"Your {kind} kit is rated {rated_kit} MT/s but runs at {running}.  Enable XMP / "
+                            f"EXPO / DOCP in the BIOS — it is a free and often large gain in CPU-bound games.")]
+    if base and running < base - 100:
+        return [dict(row, severity="warn", expected=f"{base} MT/s (the modules' base speed)",
+                     detail="The RAM runs below even its standard speed.  Check the memory settings in the BIOS.")]
+    if rated_kit:
+        return [dict(row, severity="ok", expected=None,
+                     detail=f"Running at the kit's rated {rated_kit} MT/s.")]
+    top = _JEDEC_TOP.get(mtype)
+    if top and running <= top:
+        return [dict(row, severity="warn", expected="Your kit's rated speed (on its label)",
+                     detail=f"{running} MT/s is a standard {kind} speed, which is what XMP / EXPO being off looks "
+                            f"like — but this kit's rating cannot be read here.  If its label says faster, enable "
+                            f"XMP / EXPO in the BIOS.")]
+    return [dict(row, severity="ok", expected=None,
+                 detail=f"Running above the standard {kind} speeds, so XMP / EXPO is on.")]
 
 
 # ═══════════════════════════════════════════════════════════════════════

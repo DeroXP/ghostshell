@@ -420,6 +420,7 @@ BOOST = "be337238-0d82-4146-a960-4f3749d470c7"
 _POWER_ALIAS = {"sub_processor": PROC_SUB, "idledisable": IDLE}
 _POWER_HIDDEN = {IDLE, BOOST, PARK_E, PARK_P}               # `powercfg /query` does not list these
 POWER_DEFAULTS = {IDLE: [0, 0], PARK_E: [100, 10], PARK_P: [0, 5]}      # [AC, DC]; anything else is [5, 6]
+POWER_LIMITS: dict = {}     # setting -> the largest value Windows accepts (100 unless listed)
 
 PLAN = {"active": USERPLAN, "schemes": set(), "vals": {}}
 PTOUCH: list = []       # every powercfg set: (scheme, setting, "ac" | "dc", value)
@@ -463,12 +464,15 @@ def _powercfg(a: list) -> dict:
             return R(head)                      # exits 0 and simply leaves the setting out
         ac, dc = cell(scheme, setting)
         return R(f"{head}\n    Power Setting GUID: {setting}  (A setting)\n"
-                 f"      Minimum Possible Setting: 0x00000000\n      Maximum Possible Setting: 0x00000064\n"
+                 f"      Minimum Possible Setting: 0x00000000\n"
+                 f"      Maximum Possible Setting: 0x{POWER_LIMITS.get(setting, 100):08x}\n"
                  f"      Possible Settings increment: 0x00000001\n"
                  f"    Current AC Power Setting Index: 0x{ac:08x}\n    Current DC Power Setting Index: 0x{dc:08x}")
     if op in ("setacvalueindex", "setdcvalueindex") and len(a) >= 6:
         if _scheme(a[2]) not in PLAN["schemes"]:
             return F("The power scheme, subgroup or setting specified does not exist.")
+        if int(a[5]) > POWER_LIMITS.get(_POWER_ALIAS.get(a[4].lower(), a[4].lower()), 100):
+            return F("The value is out of range for this setting.")
         which = 0 if op == "setacvalueindex" else 1
         cell(a[2], a[4])[which] = int(a[5])
         PTOUCH.append((_scheme(a[2]), _POWER_ALIAS.get(a[4].lower(), a[4].lower()), "ac" if which == 0 else "dc", int(a[5])))
@@ -875,6 +879,61 @@ from core import nvapi_oc as _nvapi_oc              # noqa: E402
 # The NVIDIA clock interface: never loaded, so nothing can read or write clocks.
 _nvapi_oc._nvapi.load = lambda: {"ok": False, "err": "NVAPI is not available in the test sandbox"}
 
+# The NVIDIA driver settings store: a dict.  DRS[setting id] = value set in the
+# global profile (absent = not set).  DRS_OK[0] False: no NVIDIA driver.
+from core import nvidia_profile as _nvp       # noqa: E402
+
+real_nvidia_open = _nvp._open
+DRS: dict = {}
+DRS_OK = [True]
+DRS_SAVE_OK = [True]
+DRS_IGNORED: set = set()        # ids the "driver" accepts and then does not keep
+DRS_CALLS: list = []
+
+
+class _FakeDrsSession:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, sid):
+        return DRS.get(sid)
+
+    def set(self, sid, value):
+        DRS_CALLS.append(("set", sid, value))
+        if sid not in DRS_IGNORED:
+            self._pending[sid] = int(value)
+        return True
+
+    def delete(self, sid):
+        DRS_CALLS.append(("delete", sid))
+        self._pending[sid] = None
+        return True
+
+    def save(self):
+        DRS_CALLS.append(("save",))
+        if not DRS_SAVE_OK[0]:
+            self._pending.clear()
+            return False
+        for sid, v in self._pending.items():
+            if v is None:
+                DRS.pop(sid, None)
+            else:
+                DRS[sid] = v
+        self._pending.clear()
+        return True
+
+    def close(self):
+        pass
+
+    def __init__(self):
+        self._pending = {}
+
+
+_nvp._open = lambda: _FakeDrsSession() if DRS_OK[0] else None
+
 SYSTEM_MASK = 0xFFFFFF                              # 24 logical processors
 CPU_LAYOUT = {"logical": 24, "p": 8, "e": 16, "hybrid": True}
 real_cpu_layout = _pt.cpu_layout                    # (read-only; one test looks at the real answer)
@@ -882,19 +941,64 @@ _pt.cpu_layout = lambda: dict(CPU_LAYOUT)
 
 
 class FakeKernel32:
-    """Stands in for kernel32 in core.process_tuning.  A handle is the pid."""
+    """Stands in for kernel32 in core.process_tuning.  A handle is the pid.
+
+    A process is a dict in `procs`: priority, affinity, and optionally exe,
+    image, ppid, created, throttle, protected (refuses everything but a
+    query-only handle, like an anti-cheat-protected game), exited."""
+
+    _QUERY_ONLY = 0x1000 | 0x00100000       # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
 
     def __init__(self):
         self.procs, self.calls, self.win10 = {}, [], False
+        self.snapshots = {}
 
     def OpenProcess(self, access, inherit, pid):
         p = self.procs.get(pid)
-        if p is None or p.get("protected"):
+        if p is None or (p.get("protected") and access & ~self._QUERY_ONLY):
             ctypes.set_last_error(5 if p else 87)
             return None
         return pid
 
     def CloseHandle(self, h):
+        self.snapshots.pop(h, None)
+        return 1
+
+    def QueryFullProcessImageNameW(self, h, flags, buf, size):
+        p = self.procs[h]
+        buf.value = p.get("image") or rf"C:\Games\{p.get('exe', 'game.exe')}"
+        size._obj.value = len(buf.value)
+        return 1
+
+    def GetProcessTimes(self, h, created, exited, kernel, user):
+        created._obj.value = self.procs[h].get("created", 10_000 + h)
+        return 1
+
+    def CreateToolhelp32Snapshot(self, flags, pid):
+        token = 0x5000 + len(self.calls) + len(self.snapshots)
+        self.snapshots[token] = [(pid_, p) for pid_, p in sorted(self.procs.items()) if not p.get("exited")]
+        return token
+
+    def _next(self, snap, entry):
+        rows = self.snapshots.get(snap) or []
+        if not rows:
+            return 0
+        pid, p = rows.pop(0)
+        e = entry._obj
+        e.th32ProcessID, e.th32ParentProcessID, e.szExeFile = pid, p.get("ppid", 1), p.get("exe", "game.exe")
+        return 1
+
+    Process32FirstW = _next
+    Process32NextW = _next
+
+    def GetProcessInformation(self, h, info_class, state, size):
+        state._obj.ControlMask, state._obj.StateMask = self.procs[h].get("throttle", (0, 0))
+        return 1
+
+    def TerminateProcess(self, h, code):
+        self.procs[h]["exited"] = True
+        ALIVE.discard(h)
+        self.calls.append(("terminate", h))
         return 1
 
     def GetExitCodeProcess(self, h, code):
@@ -905,7 +1009,8 @@ class FakeKernel32:
         return self.procs[h]["priority"]
 
     def SetPriorityClass(self, h, value):
-        self.procs[h]["priority"] = value
+        if not self.procs[h].get("ignore_priority"):        # (the call "succeeds" and changes nothing)
+            self.procs[h]["priority"] = value
         self.calls.append(("priority", h, value))
         return 1
 
@@ -915,7 +1020,8 @@ class FakeKernel32:
         return 1
 
     def SetProcessAffinityMask(self, h, mask):
-        self.procs[h]["affinity"] = mask
+        if not self.procs[h].get("ignore_affinity"):
+            self.procs[h]["affinity"] = mask
         self.calls.append(("affinity", h, mask))
         return 1
 
@@ -934,9 +1040,10 @@ K = FakeKernel32()
 _pt._k32 = K
 
 
-def proc(pid: int, affinity: int = SYSTEM_MASK, **more) -> None:
+def proc(pid: int, affinity: int = SYSTEM_MASK, exe: str = "game.exe", **more) -> None:
     """A running process for the process-tuning fake (and for Get-Process)."""
-    K.procs[pid] = dict(priority=_pt.NORMAL_PRIORITY_CLASS, affinity=affinity, **more)
+    K.procs[pid] = dict(priority=_pt.NORMAL_PRIORITY_CLASS, affinity=affinity, exe=exe)
+    K.procs[pid].update(more)
     ALIVE.add(pid)
 
 
@@ -1095,12 +1202,16 @@ def _wipe_app_data() -> None:
 def fresh(plan: str = USERPLAN) -> None:
     """A clean machine and a clean app: nothing tweaked, nothing on record."""
     for box in (STORE, _KEY_CASE, REG_FAIL, SC_FAIL, RUNNING, TASKS, TASK_FAIL, TASK_NO_FLAG, BCD, BCD_FAIL, TCP,
-                STACK, FEATURES, DISM_3010, FSUTIL, DEF, PNP, COUNTS, GPU, ALIVE):
+                STACK, FEATURES, DISM_3010, FSUTIL, DEF, PNP, COUNTS, GPU, ALIVE, POWER_LIMITS, K.snapshots):
         box.clear()
     for log_ in (WRITES, DELETES, PTOUCH, CMDS, PSC, CMD_HOOKS, PS_HOOKS, SPI, TIMER, K.calls):
         del log_[:]
-    for flag in (BCD_OK, DISM_OK, FSUTIL_OK, DEF_OK, STACK_OK, TCP_OK, DUPLICATE_OK, HIBERNATE):
+    for flag in (BCD_OK, DISM_OK, FSUTIL_OK, DEF_OK, STACK_OK, TCP_OK, DUPLICATE_OK, HIBERNATE, DRS_OK, DRS_SAVE_OK):
         flag[0] = True
+    DRS.clear()
+    DRS.update({_nvp.POWER_MODE: 5, _nvp.PRERENDER: 0, _nvp.SHADER_CACHE: 4096})     # this user's driver settings
+    DRS_IGNORED.clear()
+    del DRS_CALLS[:]
     PS_PRIORITY_OK[0] = False
     WSL_DISTROS[0] = ""
     K.procs.clear()

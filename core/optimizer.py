@@ -183,6 +183,30 @@ def _reg_default(key: str, value: str, tweak, stock, vtype: str = "REG_DWORD") -
     return _reg(key, value, stock, vtype)
 
 
+_DX_PREFS = r"HKCU\Software\Microsoft\DirectX\UserGpuPreferences"
+_DX_GLOBAL = "DirectXUserGlobalSettings"
+
+
+def _enable_windowed_flip_model() -> bool:
+    """SwapEffectUpgradeEnable=1 inside the semicolon-separated global DirectX
+    settings string, keeping every other entry in it (Auto HDR, VRR…).  The
+    whole string's previous value is on record, so Reset All puts back exactly
+    what was there."""
+    cur = reg_originals.read_value(_DX_PREFS, _DX_GLOBAL) or {}
+    text = cur.get("data") if cur.get("type") == "REG_SZ" else ""
+    pairs = {}
+    for part in (text or "").split(";"):
+        k, sep, v = part.partition("=")
+        if sep and k.strip():
+            pairs[k.strip()] = v.strip()
+    if pairs.get("SwapEffectUpgradeEnable") == "1":
+        return True
+    pairs["SwapEffectUpgradeEnable"] = "1"
+    new = ";".join(f"{k}={v}" for k, v in pairs.items()) + ";"
+    return _reg(_DX_PREFS, _DX_GLOBAL, new, "REG_SZ") and \
+        (reg_originals.read_value(_DX_PREFS, _DX_GLOBAL) or {}).get("data") == new
+
+
 def _enable_msi_mode(device_class: str, working_only: bool = False) -> int:
     """Switch the devices of one PnP class to message-signalled interrupts.
     PowerShell only lists the devices; every value is written through _reg,
@@ -580,6 +604,14 @@ def apply_gaming_tweaks() -> list[dict]:
         status = "✓" if ok else "✗"
         log.info(f"  {status} {name}")
         results.append({"name": name, "ok": ok})
+
+    # Windows 11 "Optimizations for windowed games": borderless and windowed
+    # DirectX 10/11 games use the flip presentation model, which reaches
+    # exclusive-fullscreen latency and lets VRR work in borderless.  Until now
+    # only Competitive Latency switched it on, for its own session.
+    ok = _enable_windowed_flip_model()
+    log.info(f"  {'✓' if ok else '✗'} Optimizations for windowed games")
+    results.append({"name": "Optimizations for windowed games (flip model)", "ok": ok})
 
     # Timer resolution — bcdedit
     # v3.3.1-beta.7: removed `useplatformtick yes`.  On Zen2+/Skylake+
@@ -1271,10 +1303,14 @@ def _reset_cpu_tweaks() -> list[dict]:
         log.info(f"  {'OK' if ok else 'FAIL'} Reset: {name}")
         results.append({"name": name, "ok": ok})
 
-    # (Core parking: this used to delete ValueMax from the definition of the
-    # "core parking min cores" power setting.  What the long-removed tweak
-    # wrote there is not known, and Windows ships that value — deleting it
-    # was not a default, and it ran on every machine.)
+    # Core parking: the long-removed tweak (and the "unpark cores" registry
+    # tweak it came from) set ValueMax of the "core parking min cores" setting
+    # to 0, where Windows ships 100.  With 0 there, Windows refuses any other
+    # value for that setting, so nothing — game mode included — can keep the
+    # E-cores unparked.  (Reset All used to delete ValueMax outright, on every
+    # machine; a value that reads 100, or anything but 0, is left alone.)
+    _reg_default(r"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\54533251-82be-4824-96c1-47b60b740d00"
+                 r"\0cc5b647-c1df-4637-891a-dec35c318583", "ValueMax", "0", "100")
 
     # Re-enable CPU idle where an older build left it switched off without a
     # record — on the plans this app switches the machine to.  (This used to

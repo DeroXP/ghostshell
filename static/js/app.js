@@ -7961,12 +7961,22 @@ async function loadProfileEngineStatus() {
     var agi = document.getElementById('active-game-info');
     if (agi) {
         if (data.gaming_mode && data.active_game) {
-            var changesHtml = (data.applied_changes || []).map(function(c) {
+            // Each item as last read back from Windows: ✓ in effect, ✗ not, • cannot be told.
+            var checks = data.checks || [];
+            var changesHtml = checks.length ? checks.map(function(c) {
+                var icon = c.ok === true ? '✓' : (c.ok === false ? '✗' : '•');
+                var color = c.ok === false ? 'var(--orange)' : (c.ok === true ? 'var(--accent)' : 'var(--text-dim)');
+                return '<div style="font-size:10px;color:' + color + ';padding:1px 0">' + icon + ' ' + escHtml(c.text) + '</div>';
+            }).join('') : (data.applied_changes || []).map(function(c) {
                 return '<div style="font-size:10px;color:var(--accent);padding:1px 0">  + ' + escHtml(c) + '</div>';
             }).join('');
+            var checkedAt = data.verified_at ? new Date(data.verified_at * 1000).toLocaleTimeString() : '';
+            var pids = (data.game_pids && data.game_pids.length > 1) ? ('PIDs ' + data.game_pids.join(', ')) : ('PID ' + data.active_pid);
             agi.innerHTML = '<div style="font-size:16px;color:var(--accent);font-weight:600;margin-bottom:4px">' + escHtml(data.active_game) + '</div>' +
-                '<div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">' + escHtml(data.active_exe || '') + ' (PID ' + data.active_pid + ')</div>' +
-                '<div style="font-size:10px;color:var(--text-dim);margin-bottom:4px">Hard tweaks applied:</div>' + changesHtml +
+                '<div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">' + escHtml(data.active_exe || '') + ' (' + escHtml(pids) + ')</div>' +
+                '<div style="font-size:10px;color:var(--text-dim);margin-bottom:4px">' +
+                    (checks.length ? 'Game mode, as checked with Windows' + (checkedAt ? ' at ' + escHtml(checkedAt) : '') + ':' : 'Hard tweaks applied:') +
+                '</div>' + changesHtml +
                 '<div style="font-size:10px;color:var(--orange);margin-top:8px">All tweaks will revert automatically when the game exits.</div>';
         } else if (data.monitoring) {
             agi.textContent = 'No game detected. Waiting...';
