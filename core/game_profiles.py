@@ -13,7 +13,7 @@ import re
 import time
 import threading
 from config import APP_NAME, APPDATA_DIR, OWN_PROCESS_NAMES
-from core import process_tuning, reg_originals
+from core import process_tuning, reg_originals, session_report
 from core.network_tweaks import qos_policy_filter
 from core.utils import run_ps, run_cmd, get_logger, atomic_write_json, is_safe_ps_exe_name
 
@@ -424,6 +424,8 @@ _engine = {
     "eco_seen": {},                 # pid -> exe of every process already looked at
     "eco_procs": {},                # pid -> {"exe", "created", "before"}: what to put back
     "eco_failed": 0,                # processes that did not read back as in efficiency mode
+    "eco_moved": {},                # exe -> processes moved this session, exited ones included (the report)
+    "ifeo_written": "",             # the exe whose launch priority was set during this session
 }
 # One session start, tick or restore at a time.  Two monitor threads used to
 # overlap for a moment when the monitor was restarted (adding a custom game
@@ -545,7 +547,9 @@ def _tune_one(pid: int, rec: dict, all_cores: bool) -> None:
     """tune() one process and keep what release() will need: the state it
     had before game mode first touched it, whatever later re-applies saw."""
     r = process_tuning.tune(pid, all_cores=all_cores)
-    if not r.get("ok"):
+    if not r.get("ok") and process_tuning.read_state(pid).get("priority") == process_tuning.HIGH_PRIORITY_CLASS:
+        r["priority"] = True        # refused, but already High (Windows started it so: _set_launch_priority)
+    elif not r.get("ok"):
         # The handle was refused (anti-cheat, usually).  The old PowerShell
         # route, for what it is worth — counted only if it reads back as done.
         ps = run_ps(f"try {{ (Get-Process -Id {int(pid)}).PriorityClass='High'; 'OK' }} catch {{ 'FAIL' }}", timeout=5)
@@ -590,7 +594,8 @@ def _tune_game_processes(pids: list, recheck: bool = False) -> None:
     _REAPPLY_WINDOW_S per process — past that the game is left to have its
     way, and the status says so.  (It used to be applied once at detection
     and reported as done from then on, whatever the process was set to.)"""
-    all_cores = bool(_load_gp_settings().get("all_cores", True))
+    settings = _load_gp_settings()
+    all_cores = bool(settings.get("all_cores", True))
     procs = _engine["game_procs"]
     now = time.time()
     exe = _engine.get("active_exe") or "the game"
@@ -626,13 +631,60 @@ def _tune_game_processes(pids: list, recheck: bool = False) -> None:
         _tune_one(pid, rec, all_cores)
     for gone in [p for p in procs if p not in pids]:
         procs.pop(gone)
-    _report_processes(all_cores)
+    _report_processes(all_cores, bool(settings.get("priority_at_launch")))
 
 
-def _report_processes(all_cores: bool) -> None:
+# ── High priority from the game's launch ─────────────────────────────
+# Windows' own per-program setting: a process of this exe is created at
+# High priority, by Windows, before any anti-cheat runs.  For the games whose
+# anti-cheat refuses the change while they run (Call of Duty).  Off unless the
+# user switches it on; recorded, and removed again when it is switched off.
+_IFEO = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+_IFEO_SCOPE = "gamepriority"
+_SAFE_EXE = re.compile(r"^[A-Za-z0-9 _.()+\-]+\.exe$")
+
+
+def _ifeo_key(exe: str) -> str:
+    return rf"{_IFEO}\{exe}\PerfOptions"
+
+
+def _launch_high(exe: str) -> bool:
+    return bool(exe) and reg_originals.reads_as(_ifeo_key(exe), "CpuPriorityClass", "3")
+
+
+def _set_launch_priority(exe: str) -> bool:
+    _engine["ifeo_tried"] = (exe or "").lower()          # once per session, written or not
+    if not _SAFE_EXE.match(exe or ""):
+        return False
+    key = _ifeo_key(exe)
+    reg_originals.remember(key, "CpuPriorityClass", "3", "REG_DWORD", scope=_IFEO_SCOPE)
+    run_cmd(["reg", "add", key, "/v", "CpuPriorityClass", "/t", "REG_DWORD", "/d", "3", "/f"])
+    ok = _launch_high(exe)
+    if ok:
+        _engine["ifeo_written"] = exe.lower()
+        log.info(f"  {exe}: Windows will start it at High priority from its next launch")
+    return ok
+
+
+def undo_launch_priority() -> dict:
+    """Every launch priority this setting wrote, back as it was — and the
+    keys it had to create removed again once they are empty."""
+    keys = sorted({k for k, _ in reg_originals.registry_records(_IFEO_SCOPE)})
+    r = reg_originals.restore_all(_IFEO_SCOPE)
+    for key in keys:
+        for k in (key, key.rsplit("\\", 1)[0]):              # PerfOptions, then the exe's own key
+            if reg_originals.value_names(k) == [] and not reg_originals.subkeys(k):
+                run_cmd(["reg", "delete", k, "/f"])
+    if r["restored"]:
+        log.info(f"  Launch priority removed for {r['restored']} game(s)")
+    return r
+
+
+def _report_processes(all_cores: bool, at_launch: bool = False) -> None:
     recs = list(_engine["game_procs"].values())
     if not recs:
         return
+    exe = _engine.get("active_exe") or ""
     n = len(recs)
     several = f" ({n} processes)" if n > 1 else ""
     opened = [r for r in recs if r["result"].get("ok")]
@@ -648,16 +700,30 @@ def _report_processes(all_cores: bool) -> None:
     if given_up("priority"):
         _check("proc:priority", False, "Process priority: the game keeps setting its own — no longer forced")
     elif all(r["result"].get("priority") for r in recs):
-        _check("proc:priority", True, "Process priority -> High" + several + again("priority"))
+        _check("proc:priority", True, "Process priority -> High" + several + again("priority")
+               + (" (Windows starts the game at High)" if _launch_high(exe) else ""))
     elif any(r["result"].get("priority_unchecked") for r in recs) and not opened:
         _check("proc:priority", None, "Process priority -> High (set through PowerShell; Windows does not let it be checked)")
-    elif not opened:
-        _check("proc:priority", False, "Process priority: unchanged (the game's process is protected)")
+    elif at_launch and _launch_high(exe):
+        if _engine.get("ifeo_written") == exe.lower():
+            _check("proc:priority", None, "Process priority: blocked while the game runs — Windows will start it at "
+                                          "High from the next launch")
+        else:
+            _check("proc:priority", False, "Process priority: Windows started the game at High, but the game or its "
+                                           "anti-cheat lowered it again")
+    elif at_launch and _engine.get("ifeo_tried") != exe.lower() and _set_launch_priority(exe):
+        _check("proc:priority", None, "Process priority: blocked while the game runs — Windows will start it at "
+                                      "High from the next launch")
     else:
+        hint = "" if at_launch else " (Settings → Game mode can have Windows start it at High instead)"
         done = sum(1 for r in recs if r["result"].get("priority"))
-        if done == 0:
-            _check("proc:priority", False, "Process priority: Windows accepted High but the game is still not at it "
-                   "(its anti-cheat or the game itself holds it back)")
+        if not opened:
+            _check("proc:priority", False, "Process priority: unchanged (the game's process is protected)" + hint)
+        elif done == 0 and any(r["result"].get("priority_refused") for r in recs):
+            _check("proc:priority", False, "Process priority: the game's anti-cheat blocks the change" + hint)
+        elif done == 0:
+            _check("proc:priority", False, "Process priority: Windows accepted High but the game set itself back"
+                   + hint)
         else:
             _check("proc:priority", False, f"Process priority -> High on {done} of {n} processes (the others refused it)")
 
@@ -748,6 +814,27 @@ def _power_limit(scheme: str, setting: str):
     return int(found[-4], 16) if len(found) >= 5 else None
 
 
+_PARKING_CAP_KEY = (rf"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\{_PROC_SUB}"
+                    rf"\{_CORE_PARKING_MIN[0]}")
+
+
+def _repair_parking_cap() -> bool:
+    """A long-removed "unpark cores" tweak set ValueMax of the E-core parking
+    setting to 0, where Windows ships 100; with 0 there Windows refuses any
+    other value for it, on every plan.  Put back Windows' 100 — only where the
+    value still reads exactly 0 and nobody has it on record — which is what
+    Reset All does for it, without the rest of Reset All.  True if it was
+    repaired now."""
+    if not reg_originals.reads_as(_PARKING_CAP_KEY, "ValueMax", "0"):
+        return False
+    from core import optimizer          # (late: optimizer imports this module)
+    optimizer._reg_default(_PARKING_CAP_KEY, "ValueMax", "0", "100")
+    ok = reg_originals.reads_as(_PARKING_CAP_KEY, "ValueMax", "100")
+    log.info("  Core parking: the old tweak's cap of 0 was put back to Windows' 100" if ok
+             else "  Core parking: the old tweak's cap of 0 could not be put back")
+    return ok
+
+
 def _apply_power_tweaks(recheck: bool = False) -> None:
     """The power-plan half of game mode: no parked cores, no CPU idle states.
 
@@ -769,15 +856,20 @@ def _apply_power_tweaks(recheck: bool = False) -> None:
     cores = {_CORE_PARKING_MIN[0]: "E-cores" if hybrid else "cores", _CORE_PARKING_MIN[1]: "P-cores"}
     outcome, changed = {}, False
     limits = _engine.setdefault("power_limits", {})
+    repaired = False
     for setting in (_CORE_PARKING_MIN if hybrid else _CORE_PARKING_MIN[:1]):
         cur = reg_originals.query_power(scheme, _PROC_SUB, setting)
         if setting not in limits or not recheck:
             limits[setting] = _power_limit(scheme, setting)
+            if limits[setting] is not None and limits[setting] < 100 and setting == _CORE_PARKING_MIN[0] \
+                    and _repair_parking_cap():
+                repaired = True
+                limits[setting] = _power_limit(scheme, setting)
         limit = limits[setting]
-        if limit is not None and limit < 100:
+        if cur and cur[0] >= 100:
+            outcome[setting] = "on"     # already what game mode wants, cap or no cap
+        elif limit is not None and limit < 100:
             outcome[setting] = "capped"
-        elif cur and cur[0] >= 100:
-            outcome[setting] = "on"
         elif recheck and not reg_originals.has_power(_PROC_SUB, setting, scope=_SCOPE, scheme=scheme):
             outcome[setting] = "not ours"
         elif not reg_originals.remember_power(_PROC_SUB, setting, scope=_SCOPE):
@@ -791,13 +883,14 @@ def _apply_power_tweaks(recheck: bool = False) -> None:
     if len(good) == len(outcome):
         if not (recheck and not changed):
             _check("power:parking", True, "Core parking -> off (every core kept awake)"
-                   + (" — re-applied after it was changed back" if recheck and changed else ""))
+                   + (" — re-applied after it was changed back" if recheck and changed else "")
+                   + (" — after repairing the limit an old tweak had set to 0" if repaired else ""))
     else:
         bad = [s for s in outcome if s not in good]
         why = []
         if any(outcome[s] == "capped" for s in bad):
-            why.append("an old tweak capped Windows' limit for that setting at 0 (Reset All on the Optimizer "
-                       "page repairs it)")
+            why.append("its limit was put back to Windows' 100, which Windows takes up after a restart" if repaired
+                       else f"Windows' limit for that setting is {min(limits[s] for s in bad if outcome[s] == 'capped')}")
         if any(outcome[s] in ("refused", "unreadable") for s in bad):
             why.append("Windows did not accept the change")
         if any(outcome[s] == "not ours" for s in bad):
@@ -903,7 +996,22 @@ _ECO_KEEP = frozenset({
     "rtss.exe", "msiafterburner.exe", "steelseriessonar.exe", "dax3api.exe",
     "vrserver.exe", "vrcompositor.exe", "vrmonitor.exe",                                    # SteamVR
     "taskmgr.exe",
+    # Defender and SmartScreen: left alone, as they are everywhere else.
+    "smartscreen.exe", "msmpeng.exe", "nissrv.exe", "mpcmdrun.exe", "mpdefendercoreservice.exe",
+    "securityhealthservice.exe", "securityhealthsystray.exe",
     *STREAMING_EXES, *OWN_PROCESS_NAMES, "app.py",
+})
+# Windows' own background work that runs as a service (session 0) and is
+# known to take CPU at the worst moment: indexing, Windows Update, .NET
+# precompiling, telemetry scans.  These go to the efficiency cores too —
+# but no other service.
+_ECO_SERVICES = frozenset({
+    "searchindexer.exe", "searchprotocolhost.exe", "searchfilterhost.exe",
+    "tiworker.exe", "trustedinstaller.exe", "mousocoreworker.exe", "usocoreworker.exe", "wuauclt.exe",
+    "sihclient.exe", "waasmedicagent.exe", "dismhost.exe",
+    "compattelrunner.exe", "devicecensus.exe", "mrt.exe",
+    "mscorsvw.exe", "ngen.exe", "ngentask.exe",
+    "defrag.exe", "microsoftedgeupdate.exe", "googleupdate.exe",
 })
 _ECO_KEEP_PREFIXES = (
     "easyanticheat", "eaanticheat", "beservice", "battleye", "faceit", "vgc", "vgtray",     # anti-cheat
@@ -957,7 +1065,8 @@ def _eco_sweep() -> None:
     # A process of the game that was a background program when it was put in
     # efficiency mode (a second game, now the tracked one) comes back out.
     for pid in [p for p, r in eco.items() if p in tree or r["exe"] == game_exe]:
-        if process_tuning.from_efficiency(pid, eco[pid]["created"], eco[pid]["before"]):
+        r = eco[pid]
+        if process_tuning.from_efficiency(pid, r["created"], r["before"], privileged=bool(r.get("privileged"))):
             eco.pop(pid)
             changed = True
     session = _engine.get("eco_session")
@@ -968,12 +1077,14 @@ def _eco_sweep() -> None:
         seen[pid] = exe
         if pid in (0, 4) or pid in tree or exe == game_exe or _eco_keep(exe):
             continue
-        if session is not None and process_tuning.session_of(pid) != session:
-            continue                    # services, and other users' programs
-        r = process_tuning.to_efficiency(pid)
+        service = session is not None and process_tuning.session_of(pid) != session
+        if service and exe not in _ECO_SERVICES:
+            continue                    # other services, and other users' programs
+        r = process_tuning.to_efficiency(pid, privileged=service)
         if r["done"]:
-            eco[pid] = {"exe": exe, "created": r["created"], "before": r["before"]}
+            eco[pid] = {"exe": exe, "created": r["created"], "before": r["before"], "privileged": service}
             moved.append(exe)
+            _engine["eco_moved"][exe] = _engine["eco_moved"].get(exe, 0) + 1
             changed = True
         elif not r["skip"]:
             _engine["eco_failed"] = _engine.get("eco_failed", 0) + 1
@@ -1030,10 +1141,11 @@ def _eco_restore() -> None:
     for pid, r in recs.items():
         try:
             if r.get("before") is not None and process_tuning.alive(pid, r.get("created")) is not False:
-                back += bool(process_tuning.from_efficiency(pid, r.get("created"), r["before"]))
+                back += bool(process_tuning.from_efficiency(pid, r.get("created"), r["before"],
+                                                            privileged=bool(r.get("privileged"))))
         except Exception as e:
             log.debug(f"could not put process {pid} back out of efficiency mode: {e}")
-    _engine.update(eco_on=False, eco_seen={}, eco_procs={}, eco_failed=0)
+    _engine.update(eco_on=False, eco_seen={}, eco_procs={}, eco_failed=0, eco_moved={})
     _save_eco()
     if back:
         log.info(f"  Put {back} background process(es) back out of efficiency mode")
@@ -1302,6 +1414,12 @@ def _restore_normal_mode(reason: str):
     _engine["streaming_exes"] = []
     if raised:
         log.info(f"  Put {len(raised)} streaming process(es) back to their own priority")
+    # The session's report, while its efficiency-mode counts are still there.
+    try:
+        moved = _engine.get("eco_moved") or {}
+        session_report.finish(eco_programs=len(moved), eco_processes=sum(moved.values()))
+    except Exception as e:
+        log.debug(f"session report failed: {e}")
     # Background programs out of efficiency mode.
     try:
         _eco_restore()
@@ -1369,6 +1487,13 @@ def _restore_normal_mode(reason: str):
     #    notification fires immediately and we don't block.
     if reason in ("game exit",):
         threading.Thread(target=_post_game_refresh, args=(_prev_game, game_pids), daemon=True).start()
+
+    # An update that was held back while the game ran installs now.
+    try:
+        from core import updater
+        updater.on_game_closed()
+    except Exception as e:
+        log.debug(f"updater hook failed: {e}")
 
     # v3 — release the perf sampler's game-mode consumer slot.  It
     # keeps running if hwmon-page or adaptive-tuning are still using it.
@@ -1745,7 +1870,8 @@ def _start_session(best: dict, gen: int) -> None:
         ident = process_tuning.identity(pid)
         _engine.update(active_game=display, active_exe=exe, active_pid=pid, game_image=ident.get("image") or "",
                        game_procs={}, checks=[], changes=[], power_applied=[], power_limits={}, streamer_prior={},
-                       exit_ticks=0, tick=0, proc_prior=None, eco_seen={}, eco_failed=0)
+                       exit_ticks=0, tick=0, proc_prior=None, eco_seen={}, eco_failed=0, eco_moved={},
+                       ifeo_written="", ifeo_tried="")
         layout = process_tuning.cpu_layout()
         _engine["eco_on"] = bool(_load_gp_settings().get("background_on_ecores", True) and layout.get("hybrid"))
         _engine["eco_session"] = process_tuning.session_of(pid)
@@ -1769,6 +1895,10 @@ def _start_session(best: dict, gen: int) -> None:
             _eco_sweep()
         elif not layout.get("hybrid"):
             log.info("  Background programs left where they are: this CPU has no efficiency cores")
+        try:
+            session_report.start(display, exe, _engine["eco_on"])
+        except Exception as e:
+            log.debug(f"session report start failed: {e}")
         _apply_registry_tweaks()
         _apply_session_extras(exe)
 
@@ -1887,6 +2017,10 @@ def _session_tick() -> None:
         recheck = _engine["tick"] % _SYSTEM_CHECK_TICKS == 0
         _tune_game_processes(pids, recheck=recheck)
         _eco_tick()
+        try:
+            session_report.tick(pids)
+        except Exception as e:
+            log.debug(f"session report tick failed: {e}")
         if recheck:
             _apply_registry_tweaks(recheck=True)
             _apply_power_tweaks(recheck=True)
@@ -2058,6 +2192,9 @@ _DEFAULT_GP_SETTINGS = {
     # While a game runs, the other programs in efficiency mode, so on a CPU
     # with E-cores they go there and the game has the P-cores.
     "background_on_ecores": True,
+    # A game whose anti-cheat blocks High priority while it runs is started
+    # at High by Windows from its next launch (see _set_launch_priority).
+    "priority_at_launch": False,
 }
 
 
@@ -2082,7 +2219,8 @@ def get_settings() -> dict:
     return _load_gp_settings()
 
 
-def set_settings(auto_enable_on_boot=None, all_cores=None, background_on_ecores=None) -> dict:
+def set_settings(auto_enable_on_boot=None, all_cores=None, background_on_ecores=None,
+                 priority_at_launch=None) -> dict:
     s = _load_gp_settings()
     if auto_enable_on_boot is not None:
         s["auto_enable_on_boot"] = bool(auto_enable_on_boot)
@@ -2090,7 +2228,11 @@ def set_settings(auto_enable_on_boot=None, all_cores=None, background_on_ecores=
         s["all_cores"] = bool(all_cores)
     if background_on_ecores is not None:
         s["background_on_ecores"] = bool(background_on_ecores)
+    if priority_at_launch is not None:
+        s["priority_at_launch"] = bool(priority_at_launch)
     _save_gp_settings(s)
+    if priority_at_launch is False:
+        undo_launch_priority()
     return {"ok": True, "settings": s}
 
 
@@ -2150,6 +2292,7 @@ def get_engine_status() -> dict:
         "streaming_prioritized": _engine.get("streaming_exes", []),
         "baseline_exists": os.path.exists(BASELINE_FILE),
         "gaming_flag_set": _is_gaming_flag_set(),
+        "last_report": session_report.latest(),
     }
 
 

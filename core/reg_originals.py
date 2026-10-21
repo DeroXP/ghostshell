@@ -199,6 +199,13 @@ def has_original(key_path: str, value_name: str, scope: str = "optimizer") -> bo
         return f"{scope}||{key_path}|{value_name}" in _load()["registry"]
 
 
+def registry_records(scope: str) -> list:
+    """[(key_path, value_name)] of every registry value `scope` has on record."""
+    prefix = f"{scope}||"
+    with _lock:
+        return [tuple(i[len(prefix):].rsplit("|", 1)) for i in _load()["registry"] if i.startswith(prefix)]
+
+
 def on_record(key_path: str, value_name: str) -> bool:
     """Is this registry value on record for ANY scope?  Whoever recorded it
     has its real previous value and is the one to put it back — a fixed

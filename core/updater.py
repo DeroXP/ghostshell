@@ -463,6 +463,7 @@ _update_state = {
     "update_available": False,
     "download_complete": False,
     "pending_install_path": None,    # path to the downloaded .exe / .zip ready to apply
+    "install_after_game": False,     # the user asked to install while a game ran: do it when it closes
     "error": None,
 }
 
@@ -949,13 +950,55 @@ def download_update() -> dict:
     return {"ok": True, "path": dest, "size_mb": round(size_mb, 1), "cached": cached}
 
 
-def install_update_now() -> dict:
+def _game_running() -> str:
+    """The game game mode is tracking right now, or "".  Installing restarts
+    Vispora, and game mode with it — for a few seconds mid-game."""
+    try:
+        from core import game_profiles
+        e = game_profiles._engine
+        return (e.get("active_game") or "A game") if e.get("gaming_mode") else ""
+    except Exception:
+        return ""
+
+
+_INSTALL_AFTER_GAME_DELAY_S = 10        # let the post-game refresh and crash check run first
+
+
+def on_game_closed() -> None:
+    """Game mode has ended: an install held back for the game goes ahead."""
+    if not _update_state.get("install_after_game"):
+        return
+
+    def later():
+        time.sleep(_INSTALL_AFTER_GAME_DELAY_S)
+        if _game_running():
+            return                      # another game has started: wait for that one too
+        _update_state["install_after_game"] = False
+        log.info("The game has closed — installing the update that was waiting for it")
+        try:
+            install_update_now()
+        except Exception as e:
+            log.warning(f"Install after the game failed: {e}")
+
+    threading.Thread(target=later, daemon=True, name="updater-after-game").start()
+
+
+def install_update_now(force: bool = False) -> dict:
     """Spawn the swap-and-restart batch, then exit the app.
 
     NOTE: the app process must die for the batch to overwrite the .exe.
     We schedule `os._exit(0)` 800ms after launching the batch so this
     response can be returned to the UI first.
+
+    While game mode is tracking a game it waits instead, and installs when
+    the game closes — unless `force`.
     """
+    game = "" if force else _game_running()
+    if game:
+        _update_state["install_after_game"] = True
+        log.info(f"Install held back: {game} is running — it installs when the game closes")
+        return {"ok": True, "deferred": True,
+                "msg": f"{game} is running. The update installs as soon as it closes."}
     path = _update_state.get("pending_install_path")
     if not path or not os.path.exists(path):
         # Try downloading on-demand if user clicked Install before download finished
@@ -1343,6 +1386,8 @@ def get_update_status() -> dict:
         "install_safe":              safety["safe"],
         "install_blocked_reason":    "" if safety["safe"] else safety["reason"],
         "user_idle_threshold_sec":   USER_IDLE_THRESHOLD_SEC,
+        # An install the user asked for that is waiting for the game to close.
+        "install_after_game":        bool(_update_state.get("install_after_game")),
     }
 
 
@@ -1351,12 +1396,13 @@ def get_update_status() -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # Rules (all must pass for auto-install to fire):
-#   • No game in foreground         — would yank the user out mid-match
+#   • No game running under game mode, and none in the foreground
 #   • Vispora window not focused    — user is actively configuring
 #   • User input idle for >= 5 min  — keyboard / mouse untouched
 #
 # Manual install (the user clicking "Install now") bypasses this gate —
-# it's an explicit consent action.
+# it's an explicit consent action — except that while game mode tracks a
+# game it waits for the game to close (install_update_now), unless forced.
 
 USER_IDLE_THRESHOLD_SEC = 5 * 60      # 5 minutes of no input
 SAFETY_GATE_RECHECK_SEC = 120          # try again every 2 min when deferred
@@ -1415,6 +1461,9 @@ def is_safe_to_install() -> dict:
     """Return {safe: bool, reason: str} indicating whether auto-install
     can fire right now without disrupting the user.  Caller logs the
     reason on defer so the in-app log shows why an update is waiting."""
+    game = _game_running()
+    if game:
+        return {"safe": False, "reason": f"{game} is running"}
     if _is_game_foreground():
         return {"safe": False, "reason": "game in foreground"}
     if _is_own_window_foreground():

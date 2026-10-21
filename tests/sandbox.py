@@ -429,6 +429,14 @@ DUPLICATE_OK = [True]   # False: this Windows has no Ultimate Performance templa
 _dup = [0]
 
 
+def _limit(setting: str) -> int:
+    """The largest value Windows accepts for a processor setting: its
+    ValueMax in the registry where there is one (an old tweak's 0, say), else
+    POWER_LIMITS, else 100."""
+    reg = rdata(rf"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\{PROC_SUB}\{setting}", "ValueMax")
+    return reg if isinstance(reg, int) else POWER_LIMITS.get(setting, 100)
+
+
 def _scheme(text: str) -> str:
     text = text.lower()
     return PLAN["active"] if text == "scheme_current" else text
@@ -465,13 +473,13 @@ def _powercfg(a: list) -> dict:
         ac, dc = cell(scheme, setting)
         return R(f"{head}\n    Power Setting GUID: {setting}  (A setting)\n"
                  f"      Minimum Possible Setting: 0x00000000\n"
-                 f"      Maximum Possible Setting: 0x{POWER_LIMITS.get(setting, 100):08x}\n"
+                 f"      Maximum Possible Setting: 0x{_limit(setting):08x}\n"
                  f"      Possible Settings increment: 0x00000001\n"
                  f"    Current AC Power Setting Index: 0x{ac:08x}\n    Current DC Power Setting Index: 0x{dc:08x}")
     if op in ("setacvalueindex", "setdcvalueindex") and len(a) >= 6:
         if _scheme(a[2]) not in PLAN["schemes"]:
             return F("The power scheme, subgroup or setting specified does not exist.")
-        if int(a[5]) > POWER_LIMITS.get(_POWER_ALIAS.get(a[4].lower(), a[4].lower()), 100):
+        if int(a[5]) > _limit(_POWER_ALIAS.get(a[4].lower(), a[4].lower())):
             return F("The value is out of range for this setting.")
         which = 0 if op == "setacvalueindex" else 1
         cell(a[2], a[4])[which] = int(a[5])
@@ -974,6 +982,7 @@ class FakeKernel32:
 
     def GetProcessTimes(self, h, created, exited, kernel, user):
         created._obj.value = self.procs[h].get("created", 10_000 + h)
+        kernel._obj.value, user._obj.value = 0, self.procs[h].get("cpu", 0)     # CPU time used, 100 ns units
         return 1
 
     def CreateToolhelp32Snapshot(self, flags, pid):
@@ -1050,6 +1059,29 @@ class FakeKernel32:
 
 K = FakeKernel32()
 _pt._k32 = K
+
+PRIV: list = []                                     # SeDebugPrivilege switched on / off: True / False
+real_debug_privilege = _pt._debug_privilege
+_pt._debug_privilege = lambda on: PRIV.append(bool(on)) or True
+
+# Per-processor time counters, [(busy, total)] per logical processor in 100 ns
+# units, as process_tuning.cpu_times() gives them; tests advance them.
+CPU_TIMES: list = []
+real_cpu_times, real_core_classes = _pt.cpu_times, _pt.core_classes
+_pt.cpu_times = lambda: [tuple(t) for t in CPU_TIMES]
+_pt.core_classes = lambda: [True] * CPU_LAYOUT["p"] + [False] * CPU_LAYOUT["e"]
+
+
+def run_cpu(seconds: float, p_busy: float, e_busy: float) -> None:
+    """Advance the per-processor counters: `seconds` pass, with the P-cores
+    and the E-cores busy that share of the time (0..1)."""
+    if not CPU_TIMES:
+        CPU_TIMES.extend([0, 0] for _ in range(CPU_LAYOUT["logical"]))
+    step = int(seconds * 1e7)
+    for i, t in enumerate(CPU_TIMES):
+        share = p_busy if i < CPU_LAYOUT["p"] else e_busy
+        t[0] += int(step * share)
+        t[1] += step
 
 
 def proc(pid: int, affinity: int = SYSTEM_MASK, exe: str = "game.exe", **more) -> None:
@@ -1216,7 +1248,7 @@ def fresh(plan: str = USERPLAN) -> None:
     for box in (STORE, _KEY_CASE, REG_FAIL, SC_FAIL, RUNNING, TASKS, TASK_FAIL, TASK_NO_FLAG, BCD, BCD_FAIL, TCP,
                 STACK, FEATURES, DISM_3010, FSUTIL, DEF, PNP, COUNTS, GPU, ALIVE, POWER_LIMITS, K.snapshots):
         box.clear()
-    for log_ in (WRITES, DELETES, PTOUCH, CMDS, PSC, CMD_HOOKS, PS_HOOKS, SPI, TIMER, K.calls):
+    for log_ in (WRITES, DELETES, PTOUCH, CMDS, PSC, CMD_HOOKS, PS_HOOKS, SPI, TIMER, K.calls, PRIV, CPU_TIMES):
         del log_[:]
     for flag in (BCD_OK, DISM_OK, FSUTIL_OK, DEF_OK, STACK_OK, TCP_OK, DUPLICATE_OK, HIBERNATE, DRS_OK, DRS_SAVE_OK):
         flag[0] = True

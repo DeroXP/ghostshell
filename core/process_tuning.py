@@ -178,8 +178,11 @@ def tune(pid: int, all_cores: bool = True) -> dict:
             return out
         out["ok"] = True
         out["prior"]["priority"] = int(k.GetPriorityClass(h) or NORMAL_PRIORITY_CLASS)
-        out["priority"] = bool(k.SetPriorityClass(h, HIGH_PRIORITY_CLASS)) \
-            and k.GetPriorityClass(h) == HIGH_PRIORITY_CLASS
+        set_ok = bool(k.SetPriorityClass(h, HIGH_PRIORITY_CLASS))
+        out["priority"] = k.GetPriorityClass(h) == HIGH_PRIORITY_CLASS     # in effect — however it got there
+        # Refused outright (an anti-cheat driver strips the right from the
+        # handle), as opposed to accepted and then not in effect.
+        out["priority_refused"] = not set_ok
 
         if all_cores:
             was, want = _masks(k, h)
@@ -275,7 +278,56 @@ def _write_masks(k, handle, masks) -> bool:
     return bool(k.SetProcessInformation(handle, _POWER_THROTTLING, ctypes.byref(state), ctypes.sizeof(state)))
 
 
-def to_efficiency(pid: int) -> dict:
+class _Luid(ctypes.Structure):
+    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+
+class _TokenPrivileges(ctypes.Structure):      # TOKEN_PRIVILEGES with one entry
+    _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Luid", _Luid), ("Attributes", wintypes.DWORD)]
+
+
+def _debug_privilege(on: bool) -> bool:
+    """Switch SeDebugPrivilege on or off in this process's token.  Windows'
+    own service processes grant administrators only a query handle; with the
+    privilege on, an elevated program can open them to change their settings
+    (as elevated Task Manager does).  It stays on only while those handles
+    are opened.  False where it could not be changed (not elevated)."""
+    try:
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        adv.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(_Luid)]
+        adv.AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(_TokenPrivileges),
+                                              wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+        token = wintypes.HANDLE()
+        if not adv.OpenProcessToken(k.GetCurrentProcess(), 0x0020 | 0x0008, ctypes.byref(token)):   # ADJUST | QUERY
+            return False
+        try:
+            tp = _TokenPrivileges(1, _Luid(), 0x2 if on else 0)                 # SE_PRIVILEGE_ENABLED
+            if not adv.LookupPrivilegeValueW(None, "SeDebugPrivilege", ctypes.byref(tp.Luid)):
+                return False
+            ok = adv.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
+            return bool(ok) and ctypes.get_last_error() == 0                     # 1300: not held at all
+        finally:
+            k.CloseHandle(token)
+    except Exception as e:
+        log.debug(f"SeDebugPrivilege {'on' if on else 'off'} failed: {e}")
+        return False
+
+
+def _open_for_change(k, pid: int, privileged: bool):
+    if not privileged:
+        return k.OpenProcess(_ACCESS, False, int(pid))
+    _debug_privilege(True)
+    h = k.OpenProcess(_ACCESS, False, int(pid))
+    err = ctypes.get_last_error()
+    _debug_privilege(False)
+    ctypes.set_last_error(err)          # (the callers read why the open failed)
+    return h
+
+
+def to_efficiency(pid: int, privileged: bool = False) -> dict:
     """Put a background process in efficiency mode (EcoQoS) — the switch
     Task Manager calls "Efficiency mode", and Chrome uses for background tabs.
     On a hybrid CPU Windows then schedules its threads on the E-cores first,
@@ -286,10 +338,11 @@ def to_efficiency(pid: int) -> dict:
     already, or opted out of it, as audio and game processes do) is left
     alone.  Returns {"done", "before", "created", "skip"}: `before` is the
     (ControlMask, StateMask) from_efficiency() puts back; done only if the
-    process reads back as in efficiency mode."""
+    process reads back as in efficiency mode.  `privileged` for one of
+    Windows' own service processes (see _debug_privilege)."""
     out = {"done": False, "before": None, "created": None, "skip": ""}
     k = _api()
-    h = k.OpenProcess(_ACCESS, False, int(pid))
+    h = _open_for_change(k, pid, privileged)
     if not h:
         out["skip"] = "cannot be opened"
         return out
@@ -313,7 +366,7 @@ def to_efficiency(pid: int) -> dict:
     return out
 
 
-def from_efficiency(pid: int, created: Optional[int], before) -> bool:
+def from_efficiency(pid: int, created: Optional[int], before, privileged: bool = False) -> bool:
     """Undo to_efficiency(): the process's setting back to `before` — only if
     it is still the same process (`created`) and still as to_efficiency() left
     it; one that has changed its own setting since keeps it.  True when
@@ -321,7 +374,7 @@ def from_efficiency(pid: int, created: Optional[int], before) -> bool:
     exited); False when it is still in efficiency mode because of us."""
     before = tuple(int(x) for x in before)
     k = _api()
-    h = k.OpenProcess(_ACCESS, False, int(pid))
+    h = _open_for_change(k, pid, privileged)
     if not h:
         return ctypes.get_last_error() == _NO_SUCH_PROCESS
     try:
@@ -489,6 +542,86 @@ def cpu_layout() -> dict:
     except Exception as e:
         log.debug(f"cpu_layout failed: {e}")
     return out
+
+
+def core_classes() -> list:
+    """For each logical processor 0..n-1 (processor group 0): True for a
+    P-core, False for an E-core.  Every core counts as a P-core on a CPU
+    without E-cores; [] if it cannot be read."""
+    try:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        size = wintypes.DWORD(0)
+        k.GetLogicalProcessorInformationEx(0, None, ctypes.byref(size))
+        buf = (ctypes.c_ubyte * size.value)()
+        if not k.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(size)):
+            return []
+        raw, off, cores = bytes(buf), 0, []
+        while off + 32 <= size.value:
+            rel = int.from_bytes(raw[off:off + 4], "little")
+            length = int.from_bytes(raw[off + 4:off + 8], "little")
+            if length <= 0:
+                break
+            if rel == 0:
+                groups = int.from_bytes(raw[off + 30:off + 32], "little")
+                for g in range(groups):
+                    m = off + 32 + g * 16
+                    if int.from_bytes(raw[m + 8:m + 10], "little") == 0:                # group 0 only
+                        mask = int.from_bytes(raw[m:m + 8], "little")
+                        cores.append((raw[off + 9], [i for i in range(64) if mask >> i & 1]))
+            off += length
+        if not cores:
+            return []
+        top = max(eff for eff, _ in cores)
+        out = [True] * (max(i for _, ids in cores for i in ids) + 1)
+        for eff, ids in cores:
+            for i in ids:
+                out[i] = eff == top
+        return out
+    except Exception as e:
+        log.debug(f"core_classes failed: {e}")
+        return []
+
+
+class _ProcessorTimes(ctypes.Structure):       # SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION
+    _fields_ = [("IdleTime", ctypes.c_longlong), ("KernelTime", ctypes.c_longlong),
+                ("UserTime", ctypes.c_longlong), ("DpcTime", ctypes.c_longlong),
+                ("InterruptTime", ctypes.c_longlong), ("InterruptCount", wintypes.ULONG)]
+
+
+def cpu_times() -> list:
+    """For each logical processor of group 0: (busy, total) time so far, in
+    100 ns units — counters, to be compared between two readings.  [] if
+    they cannot be read."""
+    try:
+        nt = ctypes.WinDLL("ntdll")
+        n = os.cpu_count() or 64
+        arr = (_ProcessorTimes * n)()
+        got = wintypes.ULONG(0)
+        if nt.NtQuerySystemInformation(8, ctypes.byref(arr), ctypes.sizeof(arr), ctypes.byref(got)) != 0:
+            return []
+        count = got.value // ctypes.sizeof(_ProcessorTimes)
+        # KernelTime includes the idle time.
+        return [(int(p.KernelTime + p.UserTime - p.IdleTime), int(p.KernelTime + p.UserTime)) for p in arr[:count]]
+    except Exception as e:
+        log.debug(f"cpu_times failed: {e}")
+        return []
+
+
+def process_cpu(pid: int) -> Optional[int]:
+    """CPU time the process has used so far (kernel + user, 100 ns units),
+    through a query-only handle — which even anti-cheat-protected games
+    grant.  None if it cannot be read."""
+    k = _api()
+    h = k.OpenProcess(_QUERY, False, int(pid))
+    if not h:
+        return None
+    try:
+        t = [ctypes.c_ulonglong(0) for _ in range(4)]
+        if not k.GetProcessTimes(h, *[ctypes.byref(x) for x in t]):
+            return None
+        return int(t[2].value + t[3].value)
+    finally:
+        k.CloseHandle(h)
 
 
 def describe_cores(layout: Optional[dict] = None) -> str:

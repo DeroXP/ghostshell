@@ -3256,7 +3256,7 @@ def api_profiles_start():
 def api_profiles_settings():
     """GET → current game-mode settings.
     POST → update.  Body: {auto_enable_on_boot: bool, all_cores: bool,
-    background_on_ecores: bool} — any of them."""
+    background_on_ecores: bool, priority_at_launch: bool} — any of them."""
     if request.method == "GET":
         return jsonify({"ok": True, "settings": game_profiles.get_settings()})
     data = request.get_json(force=True) or {}
@@ -3264,6 +3264,7 @@ def api_profiles_settings():
         auto_enable_on_boot=data.get("auto_enable_on_boot"),
         all_cores=data.get("all_cores"),
         background_on_ecores=data.get("background_on_ecores"),
+        priority_at_launch=data.get("priority_at_launch"),
     ))
 
 
@@ -3417,9 +3418,12 @@ def api_updater_install():
     """Apply the downloaded update and restart Vispora.
 
     The Python process exits ~800ms after this returns.  The new exe is
-    swapped in by a detached batch script which then relaunches.
+    swapped in by a detached batch script which then relaunches.  While a
+    game runs it waits for the game to close, unless the body says
+    {force: true}.
     """
-    return jsonify(updater.install_update_now())
+    data = request.get_json(silent=True) or {}
+    return jsonify(updater.install_update_now(force=bool(data.get("force"))))
 
 
 # v2.9.4 — post-install state endpoint.

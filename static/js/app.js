@@ -1130,6 +1130,11 @@ function _renderGameModeSection(settings, status) {
             'While a game runs, puts your other programs in Windows efficiency mode, so on a CPU with E-cores (Intel 12th gen and newer) they run there and the game has the P-cores to itself. Nothing is locked: a program that needs a P-core can still use one. Screen, sound, input software, anti-cheat, streaming apps and Vispora are left alone, and everything goes back when the game closes.',
             settings.background_on_ecores !== false,
             "toggleGameModeEcores(this)") +
+        _settingsToggle(
+            'Start protected games at High priority',
+            'Some anti-cheats (Call of Duty\'s, for one) block priority changes while the game runs. With this on, Vispora sets Windows\' own per-game setting so Windows starts that game at High priority, from its next launch. Turning it off removes the setting again.',
+            !!settings.priority_at_launch,
+            "toggleGameModeLaunchPriority(this)") +
         '<div style="font-size:10px;color:var(--text-dim);margin-top:8px">' +
             'Currently: <b style="color:' + (monitoring ? 'var(--accent)' : 'var(--text-dim)') + '">' +
             (monitoring ? '● MONITORING' : '○ stopped') + '</b>' + activeGame +
@@ -1181,6 +1186,21 @@ async function toggleGameModeEcores(el) {
         addLog('Could not save game-mode setting');
     } else {
         addLog('Game mode: background programs on the efficiency cores ' + (on ? 'ON (from the next game launch)' : 'OFF'));
+    }
+}
+
+async function toggleGameModeLaunchPriority(el) {
+    el.classList.toggle('on');
+    var on = el.classList.contains('on');
+    el.setAttribute('aria-checked', String(on));
+    var r = await apiPost('/api/profiles/settings', { priority_at_launch: on });
+    if (!r || !r.ok) {
+        el.classList.toggle('on');
+        el.setAttribute('aria-checked', String(!on));
+        addLog('Could not save game-mode setting');
+    } else {
+        addLog('Game mode: High priority from launch for protected games ' +
+               (on ? 'ON (set the next time such a game runs)' : 'OFF (removed again)'));
     }
 }
 
@@ -3407,13 +3427,24 @@ async function downloadAndInstall() {
     return installUpdateNow();
 }
 
-async function installUpdateNow() {
+async function installUpdateNow(force) {
     var modal = document.getElementById('modal-content');
     if (modal) modal.innerHTML =
         '<div class="modal-title">INSTALLING...</div>' +
         '<p style="color:var(--text-dim);font-size:11px;text-align:center">Vispora will close and restart in a moment.</p>';
 
-    var r = await apiPost('/api/updater/install', {}, { timeoutMs: 10000 });
+    var r = await apiPost('/api/updater/install', { force: !!force }, { timeoutMs: 10000 });
+    if (r && r.ok && r.deferred) {
+        // A game is running: installing would restart Vispora, and game mode with it.
+        addLog('Update waiting: ' + (r.msg || 'it installs when the game closes.'));
+        if (modal) modal.innerHTML =
+            '<div class="modal-title" style="color:var(--accent)">UPDATE WAITING FOR THE GAME</div>' +
+            '<p style="color:var(--text-dim);font-size:11px;text-align:center">' + escHtml(r.msg || '') +
+            ' Installing now restarts Vispora, and game mode drops for a few seconds.</p>' +
+            '<div class="modal-actions"><button class="btn" onclick="closeModal()">OK</button>' +
+            '<button class="btn btn-danger" onclick="installUpdateNow(true)">Install now anyway</button></div>';
+        return;
+    }
     if (r && r.ok) {
         addLog('Update install triggered — exiting in ~1s.');
         if (modal) modal.innerHTML =
@@ -7997,10 +8028,17 @@ async function loadProfileEngineStatus() {
                     (checks.length ? 'Game mode, as checked with Windows' + (checkedAt ? ' at ' + escHtml(checkedAt) : '') + ':' : 'Hard tweaks applied:') +
                 '</div>' + changesHtml +
                 '<div style="font-size:10px;color:var(--orange);margin-top:8px">All tweaks will revert automatically when the game exits.</div>';
-        } else if (data.monitoring) {
-            agi.textContent = 'No game detected. Waiting...';
         } else {
-            agi.textContent = 'Start monitoring to enable auto-detection.';
+            agi.textContent = data.monitoring ? 'No game detected. Waiting...' : 'Start monitoring to enable auto-detection.';
+            var rep = data.last_report;
+            if (rep && rep.lines && rep.lines.length) {
+                agi.innerHTML = '<div>' + escHtml(agi.textContent) + '</div>' +
+                    '<div style="margin-top:10px;font-size:10px;color:var(--text-dim)">' +
+                    rep.lines.map(function(l, i) {
+                        return '<div style="padding:1px 0' + (i === 0 ? ';color:var(--text);font-weight:600' : '') + '">' + escHtml(l) + '</div>';
+                    }).join('') +
+                    '</div>';
+            }
         }
     }
 }

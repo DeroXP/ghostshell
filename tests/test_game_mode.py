@@ -121,6 +121,9 @@ def reg_now():
             m.rdata(PROFILE_KEY, "NetworkThrottlingIndex"))
 
 
+HINT = " (Settings → Game mode can have Windows start it at High instead)"
+
+
 def check(key):
     return next((c for c in GP._engine["checks"] if c["key"] == key), None)
 
@@ -223,7 +226,7 @@ def test_a_call_that_succeeds_without_changing_anything_is_not_reported_as_done(
     assert check("proc:priority")["ok"] is False and check("proc:affinity")["ok"] is False
     assert "Process priority -> High" not in GP._engine["changes"]
     assert "on 0 of 1 processes" not in check("proc:priority")["text"], "said 'the others refused it' with no others"
-    assert "still not at it" in check("proc:priority")["text"]
+    assert check("proc:priority")["text"] == "Process priority: Windows accepted High but the game set itself back" + HINT
     stop()
 
 
@@ -484,7 +487,7 @@ def test_protected_game_is_left_alone_and_the_ui_says_so():
     assert launch(protected=True, affinity=0xFF)
     p, changes = m.K.procs[4242], GP._engine["changes"]
     assert p["priority"] == NORMAL and p["affinity"] == 0xFF
-    assert "Process priority: unchanged (the game's process is protected)" in changes
+    assert "Process priority: unchanged (the game's process is protected)" + HINT in changes
     assert "CPU affinity: unchanged (the game's process is protected)" in changes
     assert not any("Power throttling" in c for c in changes)
     assert check("proc:priority")["ok"] is False
@@ -511,7 +514,7 @@ def test_powershell_saying_ok_without_doing_it_is_not_believed():
     fresh()
     m.PS_PRIORITY_OK[0] = True                      # says OK, changes nothing
     assert launch(protected=True)
-    assert "Process priority: unchanged (the game's process is protected)" in GP._engine["changes"]
+    assert "Process priority: unchanged (the game's process is protected)" + HINT in GP._engine["changes"]
     stop()
 
 
@@ -532,15 +535,65 @@ def test_a_setting_windows_has_capped_is_reported_and_not_left_failing_on_record
     parking setting's maximum to 0: Windows refused 100, and the restore of
     the record failed at every game exit, for good."""
     fresh()
-    m.POWER_LIMITS[m.PARK_E] = 0
+    m.POWER_LIMITS[m.PARK_E] = 0                    # capped some other way than by the old tweak's ValueMax
+    m.cell(m.BALANCED, m.PARK_E)[:] = [10, 10]
     assert launch()
     c = check("power:parking")
     assert c["ok"] is False and "P-cores" in c["text"] and "E-cores could not be changed" in c["text"]
-    assert "capped" in c["text"] and "Reset All" in c["text"]
+    assert "Windows' limit for that setting is 0" in c["text"] and "Reset All" not in c["text"]
     assert m.cell(m.BALANCED, m.PARK_P)[0] == 100, "the P-cores still are"
     assert not RO.has_power(m.PROC_SUB, m.PARK_E, scope="gamemode"), "nothing recorded that cannot be restored"
     assert quit_game()
-    assert RO.summary()["power"] == 0 and plan_vals(m.BALANCED) == STOCK
+    assert RO.summary()["power"] == 0 and m.cell(m.BALANCED, m.PARK_E) == [10, 10]
+
+
+PARK_CAP = rf"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\{m.PROC_SUB}\{m.PARK_E}"
+
+
+def test_the_old_tweaks_parking_cap_is_repaired_by_game_mode():
+    """The developer's PC: ValueMax 0 on the E-core setting.  Game mode used
+    to report it and point at Reset All; it puts Windows' 100 back itself."""
+    fresh()
+    m.rset(PARK_CAP, "ValueMax", 0)
+    m.cell(m.BALANCED, m.PARK_E)[:] = [10, 10]
+    assert launch()
+    assert m.rdata(PARK_CAP, "ValueMax") == 100
+    assert check("power:parking") == {"key": "power:parking", "ok": True, "text":
+                                      "Core parking -> off (every core kept awake) — after repairing the limit an "
+                                      "old tweak had set to 0"}
+    assert m.cell(m.BALANCED, m.PARK_E)[0] == 100
+    assert quit_game()
+    assert m.cell(m.BALANCED, m.PARK_E) == [10, 10], "the plan's own value back"
+    assert m.rdata(PARK_CAP, "ValueMax") == 100, "the repair stays: it is Windows' own default"
+
+
+def test_a_capped_setting_already_at_100_is_not_reported_as_failed():
+    """Also the developer's PC: the High performance plan already had the
+    E-cores at 100 — and game mode still said they "could not be changed"."""
+    fresh()
+    m.POWER_LIMITS[m.PARK_E] = 0
+    assert launch()                                 # (the plan's E-core value is 100 already)
+    assert check("power:parking")["ok"] is True
+    assert quit_game()
+
+
+def test_a_parking_cap_somebody_set_on_purpose_is_left_alone():
+    fresh()
+    m.rset(PARK_CAP, "ValueMax", 50)
+    m.cell(m.BALANCED, m.PARK_E)[:] = [10, 10]
+    assert launch()
+    assert m.rdata(PARK_CAP, "ValueMax") == 50
+    assert "Windows' limit for that setting is 50" in check("power:parking")["text"]
+    stop()
+    fresh()
+    m.rset(PARK_CAP, "ValueMax", 5)
+    RO.remember(PARK_CAP, "ValueMax", "0", scope="optimizer")      # on somebody's record: theirs to put back
+    m.rset(PARK_CAP, "ValueMax", 0)
+    assert RO.on_record(PARK_CAP, "ValueMax")
+    m.cell(m.BALANCED, m.PARK_E)[:] = [10, 10]
+    assert launch()
+    assert m.rdata(PARK_CAP, "ValueMax") == 0
+    stop()
 
 
 def test_cpu_idle_windows_refuses_is_reported():
@@ -842,6 +895,26 @@ def test_to_and_from_efficiency():
     assert PT.session_of(790) == 1 and PT.session_of(99_999) is None
 
 
+def test_windows_background_services_are_moved_and_no_other_service_is():
+    fresh()
+    for pid, exe in ((900, "SearchIndexer.exe"), (901, "TiWorker.exe"), (902, "MoUsoCoreWorker.exe"),
+                     (903, "spoolsv.exe"), (904, "svchost.exe"), (905, "MsMpEng.exe"), (906, "audiodg.exe")):
+        m.proc(pid, exe=exe, session=0)
+    m.proc(907, exe="smartscreen.exe")                       # Defender / SmartScreen: left alone everywhere
+    m.proc(908, exe="SecurityHealthSystray.exe")
+    assert launch()
+    assert thr(900) == thr(901) == thr(902) == ECO
+    assert {pid: thr(pid) for pid in range(903, 909) if thr(pid) != UNSET} == {}
+    assert m.PRIV and len(m.PRIV) % 2 == 0 and m.PRIV[::2] == [True] * (len(m.PRIV) // 2) \
+        and m.PRIV[1::2] == [False] * (len(m.PRIV) // 2), "the debug privilege on only while each is opened"
+    assert GP._engine["eco_procs"][900]["privileged"] is True
+    assert GP._engine["eco_procs"].get(4242) is None
+    del m.PRIV[:]
+    assert quit_game()
+    assert thr(900) == thr(901) == thr(902) == UNSET
+    assert m.PRIV.count(True) == 3, "and again to put them back"
+
+
 def test_real_session_of_this_process():
     """Read-only, against Windows."""
     saved = PT._k32
@@ -853,18 +926,215 @@ def test_real_session_of_this_process():
 
 
 # ═════════════════════════════════════════════════════════════════════
+# High priority from the game's launch (anti-cheat-protected games)
+# ═════════════════════════════════════════════════════════════════════
+IFEO_EXE = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\game.exe"
+IFEO_KEY = IFEO_EXE + r"\PerfOptions"
+
+
+def test_launch_priority_is_off_unless_switched_on():
+    fresh()
+    assert launch(protected=True)
+    assert m.rget(IFEO_KEY, "CpuPriorityClass") is None
+    assert check("proc:priority")["text"].endswith(HINT), "the panel says where it can be switched on"
+    stop()
+
+
+def test_a_protected_game_is_started_at_high_from_its_next_launch():
+    fresh()
+    GP.set_settings(priority_at_launch=True)
+    assert launch(protected=True)
+    assert m.rdata(IFEO_KEY, "CpuPriorityClass") == 3
+    want = {"key": "proc:priority", "ok": None, "text":
+            "Process priority: blocked while the game runs — Windows will start it at High from the next launch"}
+    assert check("proc:priority") == want
+    time.sleep(0.2)
+    assert check("proc:priority") == want, "and the ticks after it say the same, not 'lowered it again'"
+    assert quit_game()
+    assert m.rdata(IFEO_KEY, "CpuPriorityClass") == 3, "kept: it is for the next launch"
+    assert launch(protected=True, priority=HIGH)             # Windows has started it at High
+    assert check("proc:priority") == {"key": "proc:priority", "ok": True,
+                                      "text": "Process priority -> High (Windows starts the game at High)"}
+    assert quit_game()
+    GP.set_settings(priority_at_launch=False)
+    assert RO.value_names(IFEO_EXE) is None, "removed, keys and all"
+    assert RO.registry_records("gamepriority") == []
+
+
+def test_launch_priority_the_game_lowers_again_is_reported_so():
+    fresh()
+    GP.set_settings(priority_at_launch=True)
+    m.rset(IFEO_KEY, "CpuPriorityClass", 3)                  # set at an earlier session
+    assert launch(protected=True)                            # and still Normal
+    assert check("proc:priority") == {"key": "proc:priority", "ok": False, "text":
+                                      "Process priority: Windows started the game at High, but the game or its "
+                                      "anti-cheat lowered it again"}
+    stop()
+
+
+def test_launch_priority_is_not_set_for_a_game_that_takes_high_anyway():
+    fresh()
+    GP.set_settings(priority_at_launch=True)
+    assert launch()
+    assert check("proc:priority")["ok"] is True and m.rget(IFEO_KEY, "CpuPriorityClass") is None
+    stop()
+
+
+def test_a_launch_priority_the_user_had_is_put_back():
+    fresh()
+    m.rset(IFEO_EXE, "MitigationOptions", 1)                 # something else under the game's key
+    m.rset(IFEO_KEY, "CpuPriorityClass", 2)
+    GP.set_settings(priority_at_launch=True)
+    assert launch(protected=True)
+    assert m.rdata(IFEO_KEY, "CpuPriorityClass") == 3
+    stop()
+    GP.set_settings(priority_at_launch=False)
+    assert m.rdata(IFEO_KEY, "CpuPriorityClass") == 2 and m.rdata(IFEO_EXE, "MitigationOptions") == 1
+
+
+def test_an_anti_cheat_that_refuses_the_call_is_named():
+    fresh()
+    real = m.K.SetPriorityClass
+    m.K.SetPriorityClass = lambda h, value: 0                # the handle's right stripped
+    try:
+        assert launch()
+        assert check("proc:priority")["text"] == "Process priority: the game's anti-cheat blocks the change" + HINT
+        stop()
+        fresh()
+        assert launch(priority=HIGH)                         # refused, but Windows started it at High
+        assert check("proc:priority") == {"key": "proc:priority", "ok": True, "text": "Process priority -> High"}
+        stop()
+    finally:
+        m.K.SetPriorityClass = real
+
+
+# ═════════════════════════════════════════════════════════════════════
+# The session report
+# ═════════════════════════════════════════════════════════════════════
+from core import session_report as SR      # noqa: E402
+
+
+def play(minutes, p_busy, e_busy, game_share, eco=True):
+    """One game session: `minutes` of play with the cores that busy and the
+    game using that share of the whole CPU."""
+    fresh()
+    GP.set_settings(background_on_ecores=eco)
+    m.run_cpu(0, 0, 0)
+    m.proc(500, exe="chrome.exe")
+    assert launch(cpu=0)
+    time.sleep(0.1)                                          # a tick reads the starting point
+    m.run_cpu(minutes * 60, p_busy, e_busy)
+    m.K.procs[4242]["cpu"] = int(game_share * minutes * 60 * 24 * 1e7)
+    time.sleep(0.1)
+    assert quit_game()
+    return GP.get_engine_status()["last_report"]
+
+
+def test_a_session_report_with_core_load_and_the_games_share():
+    r = play(10, 0.6, 0.2, 0.25)
+    assert (r["minutes"], r["p_busy"], r["e_busy"], r["game_share"], r["other_share"]) == (10.0, 60.0, 20.0, 25.0, 8.3)
+    assert (r["eco_on"], r["eco_programs"], r["eco_processes"]) == (True, 1, 1)
+    assert r["lines"][0].startswith("Last session: Game, 10.0 min")
+    assert r["lines"][1] == "P-cores 60.0% busy, E-cores 20.0% busy; the game used 25.0% of the CPU, everything else 8.3%"
+    assert r["lines"][2] == "Background programs on the efficiency cores: 1 (1 processes)"
+
+
+def test_the_report_compares_with_the_same_game_the_other_way_round():
+    play(10, 0.7, 0.1, 0.25, eco=False)
+    reports = SR._load()
+    r = play(10, 0.6, 0.2, 0.25, eco=True)                   # (fresh() wiped the file: put the first one back)
+    SR.atomic_write_json(SR._FILE, reports + SR._load())
+    r = SR.latest()
+    assert r["lines"][-1].startswith("Same game with efficiency cores off (")
+    assert r["lines"][-1].endswith("P-cores 70.0% busy, E-cores 10.0% busy; the game used 25.0% of the CPU, "
+                                   "everything else 5.0%")
+
+
+def test_a_session_too_short_to_say_anything_leaves_no_report():
+    assert play(0.5, 0.6, 0.2, 0.25) is None
+
+
+def test_real_cpu_counters_core_classes_and_process_time():
+    """Read-only, against Windows."""
+    times, classes = m.real_cpu_times(), m.real_core_classes()
+    assert times and all(0 <= b <= t for b, t in times)
+    assert classes and len(classes) == len(times) and any(classes)
+    saved = PT._k32
+    PT._k32 = None
+    try:
+        assert PT.process_cpu(os.getpid()) > 0
+    finally:
+        PT._k32 = saved
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Updates wait for the game
+# ═════════════════════════════════════════════════════════════════════
+from core import updater as UP      # noqa: E402
+
+
+class _Staged:
+    """A downloaded update, and an installer that only records."""
+
+    def __enter__(self):
+        self.applied = []
+        self.saved = (UP._apply_exe_update_async, UP._INSTALL_AFTER_GAME_DELAY_S, dict(UP._update_state))
+        UP._apply_exe_update_async = lambda path: self.applied.append(path) or {"ok": True}
+        UP._INSTALL_AFTER_GAME_DELAY_S = 0
+        self.path = os.path.join(m.config.APPDATA_DIR, "staged-update.exe")
+        with open(self.path, "wb") as f:
+            f.write(b"MZ" + b"\0" * 64)
+        UP._update_state.update(pending_install_path=self.path, latest_url="https://example.invalid/v.exe",
+                                download_complete=True, update_available=True, install_after_game=False)
+        return self
+
+    def __exit__(self, *exc):
+        UP._apply_exe_update_async, UP._INSTALL_AFTER_GAME_DELAY_S, state = self.saved
+        UP._update_state.clear()
+        UP._update_state.update(state)
+
+
+def test_an_update_waits_for_the_game_and_installs_when_it_closes():
+    fresh()
+    with _Staged() as st:
+        assert launch()
+        r = UP.install_update_now()
+        assert r["ok"] and r["deferred"] and r["msg"] == "Game is running. The update installs as soon as it closes."
+        assert st.applied == [] and UP._update_state["install_after_game"] is True
+        assert UP.is_safe_to_install() == {"safe": False, "reason": "Game is running"}, "auto-install waits too"
+        assert quit_game()
+        assert m.wait(lambda: st.applied == [st.path])
+        assert UP._update_state["install_after_game"] is False
+
+
+def test_install_now_anyway_and_without_a_game():
+    fresh()
+    with _Staged() as st:
+        assert launch()
+        assert UP.install_update_now(force=True) == {"ok": True} and st.applied == [st.path]
+        stop()
+    fresh()
+    with _Staged() as st:
+        assert UP.install_update_now() == {"ok": True} and st.applied == [st.path]
+        UP.on_game_closed()                                  # nothing waiting: nothing happens
+        time.sleep(0.1)
+        assert st.applied == [st.path]
+
+
+# ═════════════════════════════════════════════════════════════════════
 # The "every CPU core" switch, Windows 10, unrestricted games
 # ═════════════════════════════════════════════════════════════════════
 def test_settings_default_and_persist():
     fresh()
-    on = {"auto_enable_on_boot": True, "all_cores": True, "background_on_ecores": True}
+    on = {"auto_enable_on_boot": True, "all_cores": True, "background_on_ecores": True, "priority_at_launch": False}
     assert GP.get_settings() == on
     GP.set_settings(all_cores=False)
     assert GP.get_settings() == {**on, "all_cores": False}
     GP.set_settings(auto_enable_on_boot=False)
     assert GP.get_settings() == {**on, "all_cores": False, "auto_enable_on_boot": False}
-    GP.set_settings(background_on_ecores=False)
-    assert GP.get_settings() == {"auto_enable_on_boot": False, "all_cores": False, "background_on_ecores": False}
+    GP.set_settings(background_on_ecores=False, priority_at_launch=True)
+    assert GP.get_settings() == {"auto_enable_on_boot": False, "all_cores": False, "background_on_ecores": False,
+                                 "priority_at_launch": True}
 
 
 def test_every_core_switched_off_leaves_affinity_alone():
