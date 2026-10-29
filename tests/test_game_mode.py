@@ -222,6 +222,7 @@ def test_a_setting_windows_refuses_is_reported_as_not_done():
 
 def test_a_call_that_succeeds_without_changing_anything_is_not_reported_as_done():
     fresh()
+    GP.set_settings(priority_at_launch=False)             # (the wording without the launch setting)
     assert launch(ignore_priority=True, ignore_affinity=True, affinity=0xFF)
     assert check("proc:priority")["ok"] is False and check("proc:affinity")["ok"] is False
     assert "Process priority -> High" not in GP._engine["changes"]
@@ -484,6 +485,7 @@ def test_per_game_posture_survives_an_app_restart():
 # ═════════════════════════════════════════════════════════════════════
 def test_protected_game_is_left_alone_and_the_ui_says_so():
     fresh()
+    GP.set_settings(priority_at_launch=False)             # (the wording without the launch setting)
     assert launch(protected=True, affinity=0xFF)
     p, changes = m.K.procs[4242], GP._engine["changes"]
     assert p["priority"] == NORMAL and p["affinity"] == 0xFF
@@ -512,6 +514,7 @@ def test_protected_game_whose_priority_powershell_can_set():
 
 def test_powershell_saying_ok_without_doing_it_is_not_believed():
     fresh()
+    GP.set_settings(priority_at_launch=False)             # (the wording without the launch setting)
     m.PS_PRIORITY_OK[0] = True                      # says OK, changes nothing
     assert launch(protected=True)
     assert "Process priority: unchanged (the game's process is protected)" + HINT in GP._engine["changes"]
@@ -932,8 +935,9 @@ IFEO_EXE = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execut
 IFEO_KEY = IFEO_EXE + r"\PerfOptions"
 
 
-def test_launch_priority_is_off_unless_switched_on():
+def test_launch_priority_switched_off_writes_nothing():
     fresh()
+    GP.set_settings(priority_at_launch=False)
     assert launch(protected=True)
     assert m.rget(IFEO_KEY, "CpuPriorityClass") is None
     assert check("proc:priority")["text"].endswith(HINT), "the panel says where it can be switched on"
@@ -941,8 +945,10 @@ def test_launch_priority_is_off_unless_switched_on():
 
 
 def test_a_protected_game_is_started_at_high_from_its_next_launch():
+    """On by default: Call of Duty on the developer's PC never got it while
+    it was a switch to find first."""
     fresh()
-    GP.set_settings(priority_at_launch=True)
+    assert GP.get_settings()["priority_at_launch"] is True
     assert launch(protected=True)
     assert m.rdata(IFEO_KEY, "CpuPriorityClass") == 3
     want = {"key": "proc:priority", "ok": None, "text":
@@ -995,6 +1001,7 @@ def test_a_launch_priority_the_user_had_is_put_back():
 def test_an_anti_cheat_that_refuses_the_call_is_named():
     fresh()
     real = m.K.SetPriorityClass
+    GP.set_settings(priority_at_launch=False)
     m.K.SetPriorityClass = lambda h, value: 0                # the handle's right stripped
     try:
         assert launch()
@@ -1126,15 +1133,15 @@ def test_install_now_anyway_and_without_a_game():
 # ═════════════════════════════════════════════════════════════════════
 def test_settings_default_and_persist():
     fresh()
-    on = {"auto_enable_on_boot": True, "all_cores": True, "background_on_ecores": True, "priority_at_launch": False}
+    on = {"auto_enable_on_boot": True, "all_cores": True, "background_on_ecores": True, "priority_at_launch": True}
     assert GP.get_settings() == on
     GP.set_settings(all_cores=False)
     assert GP.get_settings() == {**on, "all_cores": False}
     GP.set_settings(auto_enable_on_boot=False)
     assert GP.get_settings() == {**on, "all_cores": False, "auto_enable_on_boot": False}
-    GP.set_settings(background_on_ecores=False, priority_at_launch=True)
+    GP.set_settings(background_on_ecores=False, priority_at_launch=False)
     assert GP.get_settings() == {"auto_enable_on_boot": False, "all_cores": False, "background_on_ecores": False,
-                                 "priority_at_launch": True}
+                                 "priority_at_launch": False}
 
 
 def test_every_core_switched_off_leaves_affinity_alone():

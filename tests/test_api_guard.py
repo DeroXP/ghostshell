@@ -90,16 +90,16 @@ def test_errors_come_back_as_json():
 def test_game_mode_settings_round_trip():
     c = client()
     m.fresh()
-    base = {"auto_enable_on_boot": True, "all_cores": True, "background_on_ecores": True, "priority_at_launch": False}
+    base = {"auto_enable_on_boot": True, "all_cores": True, "background_on_ecores": True, "priority_at_launch": True}
     assert c.get("/api/profiles/settings", headers=auth()).get_json()["settings"] == base
     after = c.post("/api/profiles/settings", headers=auth(), json={"all_cores": False}).get_json()["settings"]
     assert after == {**base, "all_cores": False}
     after = c.post("/api/profiles/settings", headers=auth(), json={"auto_enable_on_boot": False}).get_json()["settings"]
     assert after == {**base, "all_cores": False, "auto_enable_on_boot": False}, "the other switches are left alone"
     after = c.post("/api/profiles/settings", headers=auth(),
-                   json={"background_on_ecores": False, "priority_at_launch": True}).get_json()["settings"]
+                   json={"background_on_ecores": False, "priority_at_launch": False}).get_json()["settings"]
     assert after == {"auto_enable_on_boot": False, "all_cores": False, "background_on_ecores": False,
-                     "priority_at_launch": True}
+                     "priority_at_launch": False}
 
 
 def test_undo_routes_answer_on_a_machine_with_nothing_to_undo():

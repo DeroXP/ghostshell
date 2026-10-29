@@ -1133,7 +1133,7 @@ function _renderGameModeSection(settings, status) {
         _settingsToggle(
             'Start protected games at High priority',
             'Some anti-cheats (Call of Duty\'s, for one) block priority changes while the game runs. With this on, Vispora sets Windows\' own per-game setting so Windows starts that game at High priority, from its next launch. Turning it off removes the setting again.',
-            !!settings.priority_at_launch,
+            settings.priority_at_launch !== false,
             "toggleGameModeLaunchPriority(this)") +
         '<div style="font-size:10px;color:var(--text-dim);margin-top:8px">' +
             'Currently: <b style="color:' + (monitoring ? 'var(--accent)' : 'var(--text-dim)') + '">' +

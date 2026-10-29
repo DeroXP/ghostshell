@@ -637,8 +637,8 @@ def _tune_game_processes(pids: list, recheck: bool = False) -> None:
 # ── High priority from the game's launch ─────────────────────────────
 # Windows' own per-program setting: a process of this exe is created at
 # High priority, by Windows, before any anti-cheat runs.  For the games whose
-# anti-cheat refuses the change while they run (Call of Duty).  Off unless the
-# user switches it on; recorded, and removed again when it is switched off.
+# anti-cheat refuses the change while they run (Call of Duty).  On unless the
+# user switches it off; recorded, and removed again when it is switched off.
 _IFEO = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
 _IFEO_SCOPE = "gamepriority"
 _SAFE_EXE = re.compile(r"^[A-Za-z0-9 _.()+\-]+\.exe$")
@@ -2194,7 +2194,9 @@ _DEFAULT_GP_SETTINGS = {
     "background_on_ecores": True,
     # A game whose anti-cheat blocks High priority while it runs is started
     # at High by Windows from its next launch (see _set_launch_priority).
-    "priority_at_launch": False,
+    # On by default since 3.6.7: off, it never did anything for the games it
+    # is for — nobody found the switch.
+    "priority_at_launch": True,
 }
 
 
