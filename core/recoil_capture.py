@@ -222,9 +222,19 @@ def _to_grayscale(rgba_arr):
 
 _ROI_SIZE = 256
 
+# A capture ends by itself after this long, whatever was asked for.  The
+# dialogs offer up to 20 s, but closing one doesn't stop its capture, and
+# with auto-fire on, RT stays pulled until the capture ends.
+_MAX_CAPTURE_SEC = 60.0
+
 # Capture state (single global session — only one capture can run at a time)
 _session: Optional[dict] = None
 _session_lock = threading.Lock()
+
+
+def _capture_running() -> bool:
+    with _session_lock:
+        return _session is not None and bool(_session.get("active"))
 
 
 def _phase_correlate(a, b) -> "tuple[int, int]":
@@ -281,6 +291,10 @@ def start_screen_capture(rpm: int = 600,
     Returns {ok, session_id, autofire_engaged} on success."""
     if not _ensure_libs():
         return {"ok": False, "err": _lib_err or "capture libraries unavailable"}
+    # Refuse a second start before touching anything: the rollback further
+    # down released the RT the running capture was auto-firing with.
+    if _capture_running():
+        return {"ok": False, "err": "a capture session is already running"}
     # v3.1 — pause AT for the capture window so its OC changes don't
     # perturb the phase-correlation signal.  Resumed in the runner's
     # finally block (and again on stop_screen_capture as belt-and-braces).
@@ -288,7 +302,7 @@ def start_screen_capture(rpm: int = 600,
     rect = _get_foreground_window_rect()
     if rect is None:
         _resume_at_for_capture("recoil-capture-screen")
-        return {"ok": False, "err": "couldn't read foreground window — is your game in windowed/borderless mode?"}
+        return {"ok": False, "err": "couldn't read foreground window. Is your game in windowed/borderless mode?"}
 
     autofire_engaged = False
     if auto_fire:
@@ -327,7 +341,7 @@ def start_screen_capture(rpm: int = 600,
             "stop_event":  stop_event,
             "deltas":      [],         # list of (dx, dy, t)
             "started_ts":  time.time(),
-            "max_dur":     float(max_duration_sec),
+            "max_dur":     min(_MAX_CAPTURE_SEC, float(max_duration_sec)),
             "capture_hz":  max(30, min(240, int(capture_hz))),
             "auto_fire":   bool(autofire_engaged),
             "err":         None,
@@ -405,7 +419,7 @@ def _screen_capture_runner(session: dict):
         # stay frozen for the rest of the Vispora session.
         _resume_at_for_capture("recoil-capture-screen")
         session["active"] = False
-        log.info(f"capture {sid} ended — {len(session['deltas'])} samples"
+        log.info(f"capture {sid} ended: {len(session['deltas'])} samples"
                  + (" (auto-fired)" if session.get("auto_fire") else ""))
 
 
@@ -454,6 +468,12 @@ def start_counter_pull_capture(rpm: int = 600,
     if source not in (CP_SOURCE_MOUSE, CP_SOURCE_RSTICK):
         return {"ok": False, "err": f"unknown source '{source}'"}
 
+    # Refuse a second start before touching anything: the rollback further
+    # down released the running capture's auto-fire RT and lifted its
+    # Adaptive Tuning pause.
+    if _capture_running():
+        return {"ok": False, "err": "a capture session is already running"}
+
     # v3.1 — pause AT for the capture window so its clock changes can't
     # change the feel of the gun (and bias what the user counter-pulls).
     # Paired resume lives in _counter_pull_runner's finally block.
@@ -493,7 +513,7 @@ def start_counter_pull_capture(rpm: int = 600,
             # perf_counter timestamp paired with started_ts — hooks use this
             # to compute relative elapsed time without re-reading wall clock
             "started_ts_perf": time.perf_counter(),
-            "max_dur":        float(max_duration_sec),
+            "max_dur":        min(_MAX_CAPTURE_SEC, float(max_duration_sec)),
             "auto_fire":      bool(autofire_engaged),
             "err":            None,
         }
@@ -541,7 +561,7 @@ def _counter_pull_runner(session: dict):
         # ALWAYS resume AT — paired with the pause at start_counter_pull_capture.
         _resume_at_for_capture("recoil-capture-counter-pull")
         session["active"] = False
-        log.info(f"counter-pull {sid} ended — {len(session.get('samples') or [])} samples")
+        log.info(f"counter-pull {sid} ended: {len(session.get('samples') or [])} samples")
 
 
 def record_counter_pull_delta(dx: int, dy: int) -> None:
@@ -589,25 +609,29 @@ def stop_counter_pull_capture() -> dict:
                               are absolute, not deltas)"""
     global _session
     with _session_lock:
-        if _session is None:
+        # Kept in a local: a second stop arriving meanwhile (the UI's
+        # auto-stop and the button) set _session to None under this one.
+        sess = _session
+        if sess is None:
             return {"ok": False, "err": "no capture in progress"}
-        if _session.get("method") != "counter_pull":
+        if sess.get("method") != "counter_pull":
             return {"ok": False, "err": "active capture is not a counter-pull session"}
-        sid = _session["id"]
-        _session["stop_event"].set()
+        sid = sess["id"]
+        sess["stop_event"].set()
     for _ in range(30):
-        if not _session.get("active"):
+        if not sess.get("active"):
             break
         time.sleep(0.05)
-    samples = list(_session.get("samples") or [])
-    rpm     = _session.get("rpm", 600)
-    src     = _session.get("source")
-    err     = _session.get("err")
+    samples = list(sess.get("samples") or [])
+    rpm     = sess.get("rpm", 600)
+    src     = sess.get("source")
+    err     = sess.get("err")
     with _session_lock:
-        _session = None
+        if _session is sess:
+            _session = None
     if not samples:
         return {"ok": False, "err": err or
-                "no input recorded — did you actually move the mouse / stick?"}
+                "no input recorded. Did you actually move the mouse / stick?"}
 
     binned = _bin_counter_pull(samples, rpm, src)
     return {
@@ -683,7 +707,7 @@ def auto_fire_mag(duration_sec: float = 3.0) -> dict:
     try:
         from core import gamepad_mapper
         if not gamepad_mapper.is_virtual_pad_active():
-            return {"ok": False, "err": "virtual pad isn't running — "
+            return {"ok": False, "err": "virtual pad isn't running: "
                     "switch the active profile to Virtual controller mode "
                     "and turn the mapper master switch on first"}
     except Exception as e:
@@ -718,21 +742,25 @@ def stop_screen_capture() -> dict:
     after the user picks a name + sensitivity scale."""
     global _session
     with _session_lock:
-        if _session is None:
+        # Kept in a local: a second stop arriving meanwhile (the UI's
+        # auto-stop and the button) set _session to None under this one.
+        sess = _session
+        if sess is None:
             return {"ok": False, "err": "no capture in progress"}
-        sid = _session["id"]
-        _session["stop_event"].set()
+        sid = sess["id"]
+        sess["stop_event"].set()
     # Wait briefly for the runner to exit cleanly
     for _ in range(30):
-        if not _session.get("active"):
+        if not sess.get("active"):
             break
         time.sleep(0.05)
-    deltas = list(_session.get("deltas") or [])
-    rpm    = _session.get("rpm", 600)
-    err    = _session.get("err")
+    deltas = list(sess.get("deltas") or [])
+    rpm    = sess.get("rpm", 600)
+    err    = sess.get("err")
     # Move out of the active slot so a new capture can start
     with _session_lock:
-        _session = None
+        if _session is sess:
+            _session = None
     if not deltas:
         return {"ok": False, "err": err or "no frames captured"}
     binned = _bin_deltas_by_rpm(deltas, rpm)
@@ -820,7 +848,7 @@ def bullet_hole_snapshot(which: str) -> dict:
         return {"ok": False, "err": "which must be 'before' or 'after'"}
     rect = _get_foreground_window_rect()
     if rect is None:
-        return {"ok": False, "err": "couldn't read foreground window — is your game in windowed/borderless mode?"}
+        return {"ok": False, "err": "couldn't read foreground window. Is your game in windowed/borderless mode?"}
     try:
         with _mss.mss() as sct:
             arr = _grab_region(sct, rect)
@@ -863,8 +891,8 @@ def detect_bullet_holes(rpm: int = 600,
     if before is None or after is None:
         return {"ok": False, "err": "need both before and after snapshots first"}
     if before.shape != after.shape:
-        return {"ok": False, "err": f"shape mismatch ({before.shape} vs {after.shape}) "
-                                    f"— don't resize the window between snapshots"}
+        return {"ok": False, "err": f"shape mismatch ({before.shape} vs {after.shape}): "
+                                    f"don't resize the window between snapshots"}
 
     # Diff in float to avoid uint8 overflow, then threshold on summed
     # absolute channel difference.
@@ -877,7 +905,7 @@ def detect_bullet_holes(rpm: int = 600,
     # 20-50 holes, runs in <100 ms.
     labels, num = _label_connected(mask)
     if num == 0:
-        return {"ok": False, "err": "no changed regions found — try a darker wall, "
+        return {"ok": False, "err": "no changed regions found: try a darker wall, "
                                     "lower threshold, or different game settings"}
 
     # Compute centroid + area per component
@@ -1032,6 +1060,14 @@ def _load_user_presets() -> list:
             return list(data.get("presets") or [])
         if isinstance(data, list):
             return data
+    except ValueError as e:
+        # Unreadable JSON.  The next save would write over every preset in
+        # it, so keep the damaged copy where the user's work can be recovered.
+        log.warning(f"failed to load user presets: {e}")
+        try:
+            os.replace(USER_PRESETS_PATH, USER_PRESETS_PATH + ".corrupt")
+        except OSError:
+            pass
     except Exception as e:
         log.warning(f"failed to load user presets: {e}")
     return []
@@ -1114,7 +1150,7 @@ def save_capture_as_preset(name: str,
         "shots":        len(steps),
         "description":  description or
             (f"User-captured via {method}.  "
-             f"Sensitivity scale {sens} — re-capture or adjust scale "
+             f"Sensitivity scale {sens}. Re-capture or adjust scale "
              f"if compensation feels off."),
         "play_mode":    play_mode if play_mode in ("once", "loop_while_held", "repeat_n") else "once",
         "steps":        steps,

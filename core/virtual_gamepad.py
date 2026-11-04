@@ -234,6 +234,7 @@ class VirtualPad:
         self._button_map = button_map
         self._dpad_map = dpad_map           # only set for DS4
         self._lock = threading.Lock()
+        self._update_failing = False
 
     @property
     def pad_type(self) -> str:
@@ -276,8 +277,14 @@ class VirtualPad:
             # ── Flush to driver ────────────────────────────────────
             try:
                 gp.update()
+                self._update_failing = False
             except Exception as e:
-                log.warning(f"virtual pad update failed: {e}")
+                # Called every poll tick (up to 8 kHz).  Once the driver is
+                # gone each call fails, and logging all of them rotated the
+                # whole log away within seconds.
+                if not self._update_failing:
+                    log.warning(f"virtual pad update failed: {e}")
+                self._update_failing = True
 
     def _push_x360(self, gp, target_pressed: set, physical: dict,
                    passthrough_axes: bool):
@@ -488,7 +495,7 @@ def download_and_install(timeout_sec: int = 180) -> dict:
         _install_status.update({
             "phase":        "installing",
             "progress_pct": 100,
-            "msg":          ("Installer window opened — click through it. "
+            "msg":          ("Installer window opened: click through it. "
                              "Vispora will detect when it's done."),
         })
         if fname.lower().endswith(".msi"):
@@ -517,7 +524,7 @@ def download_and_install(timeout_sec: int = 180) -> dict:
 
         _install_status.update({
             "phase":       "done",
-            "msg":         "Installer timed out (5 min) — try again or install manually",
+            "msg":         "Installer timed out (5 min). Try again or install manually",
             "installed":   False,
             "in_progress": False,
         })

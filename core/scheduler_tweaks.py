@@ -139,8 +139,9 @@ def toggle_cpu_idle(disable: bool = True) -> dict:
     """Disable/enable CPU idle states during gaming for max clock speeds."""
     log.info(f"{'Disabling' if disable else 'Enabling'} CPU idle...")
     val = "1" if disable else "0"
-    if disable:
-        reg_originals.remember_power("SUB_PROCESSOR", "IdleDisable")    # so Reset All can undo it
+    if disable and not reg_originals.remember_power("SUB_PROCESSOR", "IdleDisable"):    # so Reset All can undo it
+        log.info("  ✗ CPU idle left as it is: its current setting could not be read, so the change could not be undone")
+        return {"ok": False, "idle_disabled": disable}
     r = run_cmd(["powercfg", "/setacvalueindex", "SCHEME_CURRENT", "SUB_PROCESSOR", "IdleDisable", val])
     run_cmd(["powercfg", "/setactive", "SCHEME_CURRENT"])
     log.info(f"  {'✓' if r['ok'] else '✗'} CPU idle {'disabled' if disable else 'enabled'}")

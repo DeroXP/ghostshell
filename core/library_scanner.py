@@ -305,11 +305,15 @@ def scan_steam() -> list[dict]:
     if os.path.isfile(libfolders):
         for extra in _parse_libraryfolders_vdf(libfolders):
             extra_steamapps = os.path.join(extra, "steamapps")
-            if os.path.isdir(extra_steamapps) and extra_steamapps not in libs:
+            # Steam keeps SteamPath in lower case, and the .vdf lists the
+            # main library too, in its real case: it was scanned twice.
+            if os.path.isdir(extra_steamapps) and os.path.normcase(extra_steamapps) \
+                    not in [os.path.normcase(x) for x in libs]:
                 libs.append(extra_steamapps)
 
     for lib in libs:
-        for manifest in glob.glob(os.path.join(lib, "appmanifest_*.acf")):
+        # escape(): a library in "D:\Games [SSD]" was read as a [...] pattern
+        for manifest in glob.glob(os.path.join(glob.escape(lib), "appmanifest_*.acf")):
             info = _parse_appmanifest(manifest)
             if not info:
                 continue
@@ -352,7 +356,9 @@ def scan_epic() -> list[dict]:
         title = data.get("DisplayName") or ""
         install_path = data.get("InstallLocation") or ""
         launch_exe = data.get("LaunchExecutable") or ""
-        if not (title and install_path):
+        # (isdir: the launcher keeps the manifest of a game on a drive that
+        # is gone; the other launchers skip those too)
+        if not (title and install_path and os.path.isdir(install_path)):
             continue
         # LaunchExecutable is relative to InstallLocation
         full_exe = os.path.join(install_path, launch_exe) if launch_exe else ""
@@ -491,7 +497,8 @@ def scan_ubisoft() -> list[dict]:
         if not (path and os.path.isdir(path)):
             continue
         # Use install dir basename as fallback title
-        title = os.path.basename(path.rstrip("\\")) or f"Ubisoft Game {gid}"
+        # (Ubisoft writes "D:/Games/Far Cry 5/": forward slashes, one at the end)
+        title = os.path.basename(path.rstrip("\\/")) or f"Ubisoft Game {gid}"
         best = _pick_best_exe(path, title_hint=title) or ""
         out.append(_enrich({
             "title": title,

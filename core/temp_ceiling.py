@@ -212,7 +212,7 @@ def _do_trip(temp_c: int, settings: dict) -> None:
     ceiling = int(settings["ceiling_c"])
     action  = settings["action"]
     log.warning(
-        f"⚠ TEMP CEILING TRIPPED — GPU at {temp_c}°C, ceiling {ceiling}°C, action={action}"
+        f"⚠ TEMP CEILING TRIPPED: GPU at {temp_c}°C, ceiling {ceiling}°C, action={action}"
     )
 
     reset_result: dict = {}
@@ -232,7 +232,7 @@ def _do_trip(temp_c: int, settings: dict) -> None:
         title = "GPU Temp Ceiling Tripped"
         msg = (f"GPU hit {temp_c}°C (ceiling {ceiling}°C). "
                + ("Overclock reverted to stock." if action == "reset"
-                  else "Notify-only mode — no auto-revert."))
+                  else "Notify-only mode: no auto-revert."))
         notifier.toast(title, msg, force=True)
     except Exception as e:
         log.debug(f"toast failed: {e}")
@@ -281,7 +281,7 @@ def _watchdog_loop(stop_event: threading.Event) -> None:
                 if temp is not None and temp >= ceiling and not in_cooldown:
                     if _state["above_since"] is None:
                         _state["above_since"] = time.time()
-                        log.warning(f"GPU {temp}°C ≥ ceiling {ceiling}°C — sustaining…")
+                        log.warning(f"GPU {temp}°C ≥ ceiling {ceiling}°C, sustaining…")
                     sustained_for = time.time() - _state["above_since"]
                     if sustained_for >= sustain:
                         # Trip!  Release the lock first so _do_trip can grab it.
@@ -368,7 +368,7 @@ def test_trip() -> dict:
     try:
         from core import notifier
         notifier.toast(
-            "GPU Temp Ceiling — TEST",
+            "GPU Temp Ceiling (TEST)",
             f"This is what you'll see when the GPU hits {fake_temp}°C "
             f"(ceiling: {s['ceiling_c']}°C). No actual revert was performed.",
             force=True,

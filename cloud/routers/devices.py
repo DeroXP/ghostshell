@@ -19,7 +19,6 @@ What we don't store:
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 from uuid import UUID
 
@@ -28,6 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from db import get_db
+from security import hash_ip
 
 log = logging.getLogger("vispora-cloud.devices")
 
@@ -36,12 +36,14 @@ router = APIRouter(prefix="/v1/devices", tags=["devices"])
 
 # ── Schemas ───────────────────────────────────────────────────────────────
 class HardwareFingerprint(BaseModel):
-    gpu_model:   str | None = None
-    cpu_family:  str | None = None
-    cpu_model:   str | None = None
-    ram_gb:      int | None = None
-    os_build:    str | None = None
-    app_version: str | None = None
+    # Bounded: the endpoint is anonymous and every field is stored, and
+    # ram_gb lands in an INT column (a larger number fails in asyncpg).
+    gpu_model:   str | None = Field(None, max_length=128)
+    cpu_family:  str | None = Field(None, max_length=64)
+    cpu_model:   str | None = Field(None, max_length=128)
+    ram_gb:      int | None = Field(None, ge=0, le=1_000_000)
+    os_build:    str | None = Field(None, max_length=64)
+    app_version: str | None = Field(None, max_length=64)
 
 
 class DeviceSettings(BaseModel):
@@ -95,7 +97,9 @@ def _ram_bucket(gb: int | None) -> str | None:
 def _ip_hash(req: Request) -> str:
     """Hash the client IP for rate-limiting.  Never store the raw IP."""
     ip = (req.client.host if req.client else "0.0.0.0") or "0.0.0.0"
-    return hashlib.sha256(ip.encode()).hexdigest()[:16]
+    # Peppered: a bare SHA-256 of an IPv4 address is undone by hashing
+    # all 2**32 of them.
+    return hash_ip(ip).hex()[:16]
 
 
 async def _device_exists(db: asyncpg.Connection, device_id: UUID) -> bool:
@@ -188,7 +192,7 @@ async def heartbeat(
     to know who's "currently active".
     """
     if not await _device_exists(db, device_id):
-        raise HTTPException(404, "Device not registered — call /register first")
+        raise HTTPException(404, "Device not registered: call /register first")
 
     if req.hardware:
         hw = req.hardware
@@ -232,9 +236,11 @@ async def put_device_settings(
     db: asyncpg.Connection = Depends(get_db),
 ):
     if not await _device_exists(db, device_id):
-        raise HTTPException(404, "Device not registered — call /register first")
-    if body.update_channel not in ("stable", "insiders"):
-        raise HTTPException(400, "update_channel must be 'stable' or 'insiders'")
+        raise HTTPException(404, "Device not registered: call /register first")
+    # v3 clients call the pre-release channel "beta" (core/cloud_client.py);
+    # older ones send "insiders".
+    if body.update_channel not in ("stable", "beta", "insiders"):
+        raise HTTPException(400, "update_channel must be 'stable', 'beta' or 'insiders'")
     await db.execute(
         """
         INSERT INTO device_settings

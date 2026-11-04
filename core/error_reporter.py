@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import urllib.request
@@ -113,12 +114,14 @@ _seen_hashes: dict = {}     # hash -> timestamp
 def _hash_report(kind: str, message: str, detail: str) -> str:
     """Stable hash of the error identity (kind + message + first 200 of
     detail).  Used both client-side and server-side for dedup."""
+    # surrogatepass: a JS message cut by .slice() inside an emoji arrives
+    # with half of it, which plain utf-8 refuses to encode.
     h = hashlib.sha256()
-    h.update((kind or "").encode("utf-8"))
+    h.update((kind or "").encode("utf-8", "surrogatepass"))
     h.update(b"\x1f")
-    h.update((message or "").encode("utf-8"))
+    h.update((message or "").encode("utf-8", "surrogatepass"))
     h.update(b"\x1f")
-    h.update((detail or "")[:200].encode("utf-8"))
+    h.update((detail or "")[:200].encode("utf-8", "surrogatepass"))
     return h.hexdigest()[:16]
 
 
@@ -158,17 +161,14 @@ def _build_environment() -> dict:
         env["admin"] = bool(is_admin())
     except Exception: pass
     try:
-        import subprocess
-        r = subprocess.run(
-            ["wmic", "cpu", "get", "name"],
-            capture_output=True, text=True, timeout=3,
-            creationflags=0x08000000,
-        )
-        for line in (r.stdout or "").splitlines():
-            line = line.strip()
-            if line and "Name" not in line:
-                env["cpu"] = line[:80]
-                break
+        # From the registry: wmic.exe, which this used to ask, is gone from
+        # current Windows 11, so reports carried no CPU name at all.
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+            name = str(winreg.QueryValueEx(k, "ProcessorNameString")[0]).strip()
+        if name:
+            env["cpu"] = name[:80]
     except Exception: pass
     try:
         from core import gpu_overclock
@@ -188,19 +188,34 @@ def _recent_log_tail(n: int = 30) -> list:
     except Exception: return []
 
 
+def _redact_profile(text):
+    """`text` with the user's profile folder (C:\\Users\\<name>) replaced by
+    %USERPROFILE%.  Paths in log lines and error messages carry it, and with
+    it the Windows user name.  Any slash style matches, and so do the doubled
+    backslashes of a repr()."""
+    parts = [p for p in re.split(r"[\\/]+", os.path.expanduser("~")) if p]
+    if not isinstance(text, str) or len(parts) < 2:
+        return text
+    pattern = r"[\\/]+".join(re.escape(p) for p in parts) + r"(?!\w)"
+    return re.sub(pattern, "%USERPROFILE%", text, flags=re.IGNORECASE)
+
+
 def build_report(kind: str, message: str, detail: str = "",
                   user_note: str = "") -> dict:
     """Pure helper — assembles the report payload without sending it.
     Useful when the UI wants to PREVIEW what will be sent before the
     user clicks Submit."""
     s = _load_settings()
+    logs = _recent_log_tail(30) if s.get("include_log_lines") else []
     payload = {
-        "kind":      str(kind  or "")[:100],
-        "message":   str(message or "")[:2000],
-        "detail":    str(detail  or "")[:8000],
-        "user_note": str(user_note or "")[:1500],
+        "kind":      _redact_profile(str(kind  or ""))[:100],
+        "message":   _redact_profile(str(message or ""))[:2000],
+        "detail":    _redact_profile(str(detail  or ""))[:8000],
+        "user_note": _redact_profile(str(user_note or ""))[:1500],
         "env":       _build_environment(),
-        "logs":      _recent_log_tail(30) if s.get("include_log_lines") else [],
+        # Copies: the entries are the in-app log view's own.
+        "logs":      [{k: _redact_profile(v) for k, v in e.items()} if isinstance(e, dict) else e
+                      for e in logs],
     }
     payload["hash"] = _hash_report(payload["kind"], payload["message"],
                                      payload["detail"])
@@ -270,7 +285,7 @@ def submit_report(kind: str, message: str, detail: str = "",
     report = build_report(kind, message, detail, user_note)
     h = report["hash"]
     if _recently_seen(h):
-        log.debug(f"error report dedup: {h} seen recently — skipping POST")
+        log.debug(f"error report dedup: {h} seen recently, skipping POST")
         return {"ok": True, "duplicate": True, "hash": h}
 
     local_path = _save_local(report)

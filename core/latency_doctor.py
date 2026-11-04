@@ -11,7 +11,7 @@ scan()  -> {score, grade, checks:[...]}  (read-only)
 fix()   -> applies the safe latency set, then returns a fresh scan
 """
 from core.utils import run_cmd, run_ps, get_logger
-from core import competitive_latency, timer_manager, network_tweaks
+from core import competitive_latency, timer_manager, network_tweaks, reg_originals
 
 log = get_logger("latency_doctor")
 
@@ -89,10 +89,11 @@ def scan() -> dict:
 
     # 4. Min CPU processor state — REAL (no clock-ramp on first input).
     try:
-        r = run_ps("(powercfg /q SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN "
-                   "| Select-String 'Current AC')[0].ToString()")
-        line = (r.get("out") or "")
-        pct = int(line.split("0x")[-1], 16) if "0x" in line else None
+        # By position, not by the "Current AC" label: that is localised, and
+        # on a non-English Windows this check simply never appeared.
+        cur = reg_originals.query_power("SCHEME_CURRENT", competitive_latency._PROC_SUB,
+                                        competitive_latency._PROC_MIN)
+        pct = cur[0] if cur else None
         if pct is not None:
             good = pct >= 100
             checks.append(_chk("cpu_min_state", "CPU minimum processor state",
@@ -149,7 +150,7 @@ def scan() -> dict:
                            "on" if hags == 2 else ("off" if hags == 1 else "unknown"),
                            "on (enabler)",
                            "INFO (enabler)",
-                           "Microsoft: transparent plumbing — not a direct latency win, but enables some Reflex/FG paths. Reboot to change.",
+                           "Microsoft: transparent plumbing. Not a direct latency win, but enables some Reflex/FG paths. Reboot to change.",
                            weight=0, fixable=False))
     except Exception:
         pass
@@ -179,7 +180,7 @@ def scan() -> dict:
                            "info",
                            f"{res} ms" if res else "unknown", "0.5-1 ms",
                            "INFO (best-effort)",
-                           "Largely per-process since Win10 2004 — Vispora requests 0.5 ms but it's not a guaranteed click-to-photon win.",
+                           "Largely per-process since Win10 2004. Vispora requests 0.5 ms but it's not a guaranteed click-to-photon win.",
                            weight=0, fixable=False))
     except Exception:
         pass

@@ -228,7 +228,9 @@ def fetch_games(force: bool = False) -> dict:
 
     cache = _load_cache()
     age = time.time() - (cache.get("fetched_at") or 0)
-    if not force and age < 6 * 3600 and cache.get("games"):
+    # A fetched_at in the future (the clock was set back since) is not
+    # fresh; it would otherwise block every refetch until that date.
+    if not force and 0 <= age < 6 * 3600 and cache.get("games"):
         return {"ok": True, "games": cache["games"],
                 "from_cache": True, "fetched_at": cache["fetched_at"]}
 

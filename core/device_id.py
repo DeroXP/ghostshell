@@ -75,7 +75,9 @@ def reset_device_id() -> str:
 # Used as join keys for "users with similar hardware" aggregations.  None
 # of this is PII.  CPU/GPU model strings are public retail SKU names.
 
-_INTEL_FAMILY_RX = re.compile(r"\b(i\d|ultra|xeon|core)\b", re.I)
+# Leading ".*": the last match wins, since "Core(TM)" comes before the tier
+# ("Core(TM) i7-13700K", "Core(TM) Ultra 9 285K").
+_INTEL_FAMILY_RX = re.compile(r".*\b(i\d|ultra|xeon|core)\b", re.I)
 _AMD_FAMILY_RX   = re.compile(r"\b(ryzen|threadripper|epyc|athlon)\b", re.I)
 
 

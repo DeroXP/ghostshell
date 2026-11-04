@@ -231,7 +231,7 @@ def _close_app(target_exe: str, timeout_s: int = 30) -> dict:
     image = os.path.basename(target_exe) or APP_EXE_NAMES[0]
     pids = _find_app_pids(image)
     if not pids:
-        _log(f"no running {image} — skipping close step")
+        _log(f"no running {image}, skipping close step")
         return {"ok": True, "msg": "not running", "skipped": True}
 
     _log(f"{image} running, pids={pids}")
@@ -261,7 +261,7 @@ def _close_app(target_exe: str, timeout_s: int = 30) -> dict:
         time.sleep(0.5)
 
     # Step B: Force-close
-    _log("graceful close timed out — escalating to taskkill /F")
+    _log("graceful close timed out, escalating to taskkill /F")
     server.update_step("close", "active", "Force-closing stuck process…")
     for pid in _find_app_pids(image):
         try:
@@ -336,6 +336,7 @@ def _download(url: str, dest: str, total_hint: int = 0) -> dict:
             with open(tmp, "wb") as f:
                 while True:
                     if _check_cancelled():
+                        f.close()       # Windows won't delete a file that is still open
                         try: os.remove(tmp)
                         except Exception: pass
                         return {"ok": False, "err": "cancelled"}
@@ -352,7 +353,7 @@ def _download(url: str, dest: str, total_hint: int = 0) -> dict:
             try: os.remove(tmp)
             except Exception: pass
             return {"ok": False,
-                    "err": f"downloaded file is {size} B — likely a server error page"}
+                    "err": f"downloaded file is {size} B, likely a server error page"}
         return {"ok": True, "sha256": h.hexdigest(), "size_bytes": size,
                 "path": tmp}
     except Exception as e:
@@ -408,8 +409,14 @@ def _install_exe(staged_path: str, target_exe: str) -> dict:
             shutil.copy2(target_exe, backup)
             _log(f"backed up old exe to {backup}")
         except Exception as e:
-            _log(f"backup failed (continuing anyway): {e}")
-            backup = ""
+            _log(f"backup failed: {e}")
+            # Without a backup, a failed copy below would leave no exe at
+            # all, so the old one stays where it is.  (A full disk leaves
+            # a partial backup behind.)
+            try: os.remove(backup)
+            except OSError: pass
+            return {"ok": False, "msg": f"could not back up the old exe: {e}",
+                    "backup_path": ""}
 
     # If it pre-existed, delete it so the copy is unambiguous.  Skip
     # this for fresh installs (target didn't exist to begin with).
@@ -500,10 +507,10 @@ def run_install_pipeline() -> int:
 
     # Sanity: we need both target_exe AND channel before we can install.
     if not st["target_exe"]:
-        server.set_error(f"No target install path — please pick where {APP_NAME} lives.")
+        server.set_error(f"No target install path: please pick where {APP_NAME} lives.")
         return 2
     if not st["channel"]:
-        server.set_error("No release channel — please pick stable or beta.")
+        server.set_error("No release channel: please pick stable or beta.")
         return 2
 
     # ── Step 1: Close the app (skipped in install mode) ────────
@@ -520,13 +527,13 @@ def run_install_pipeline() -> int:
             server.set_error(f"Couldn't create install directory: {e}")
             return 3
         server.update_step("close", "skipped",
-                            "fresh install — nothing to close")
+                            "fresh install, nothing to close")
     else:
         r = _close_app(st["target_exe"])
         if not r["ok"]:
             server.update_step("close", "error", r["msg"])
             server.set_error(r["msg"] +
-                             f" — please close {APP_NAME} manually and click Retry.")
+                             f". Please close {APP_NAME} manually and click Retry.")
             return 3
         server.update_step("close", "done", r["msg"])
 
@@ -570,7 +577,7 @@ def run_install_pipeline() -> int:
         # MITM/misconfigured server stripping it, and installing an
         # unverified binary is exactly the scenario this check exists to
         # prevent.  Refuse rather than silently skip.
-        err = ("Server did not provide a SHA-256 hash for this build — "
+        err = ("Server did not provide a SHA-256 hash for this build; "
                "refusing to install an unverified binary.")
         server.update_step("verify", "error", err)
         server.set_error(err)
@@ -578,7 +585,7 @@ def run_install_pipeline() -> int:
         except Exception: pass
         return 6
     if actual != expected:
-        err = (f"SHA-256 mismatch — expected {expected[:16]}…, "
+        err = (f"SHA-256 mismatch: expected {expected[:16]}…, "
                f"got {actual[:16]}….  Aborting to avoid installing "
                f"a corrupted or tampered build.")
         server.update_step("verify", "error", err)
@@ -607,6 +614,27 @@ def run_install_pipeline() -> int:
 
     server.update_step("launch", "active", f"Starting new {APP_NAME}…")
     ln = _launch_new(st["target_exe"])
+    if not ln["ok"] and inst["backup_path"] and os.path.exists(inst["backup_path"]):
+        # The new exe would not start (antivirus quarantined it after the
+        # copy, say): put the previous one back and start that instead.
+        try:
+            shutil.copy2(inst["backup_path"], st["target_exe"])
+            _log(f"new exe would not start ({ln['err']}); rolled back to backup")
+        except Exception as e:
+            _log(f"rollback after a failed start failed: {e}")
+            server.update_step("launch", "error", ln["err"])
+            server.set_error(f"Couldn't start the new {APP_NAME} ({ln['err']}) or put "
+                             f"the previous version back ({e}).  It is saved as "
+                             f"{inst['backup_path']}.")
+            return 8
+        old = _launch_new(st["target_exe"])
+        server.update_step("install", "error", "rolled back: the new version would not start")
+        server.update_step("launch", "error", ln["err"])
+        server.set_error(f"Couldn't start the new {APP_NAME} ({ln['err']}), so the "
+                         f"previous version was put back"
+                         + (" and started." if old["ok"]
+                            else f".  Launch it from {st['target_exe']}."))
+        return 8
     if not ln["ok"]:
         server.update_step("launch", "error", ln["err"])
         server.set_error(f"Install OK but couldn't start the new {APP_NAME}: "
@@ -615,7 +643,7 @@ def run_install_pipeline() -> int:
         return 8
     server.update_step("launch", "done", "Launched")
     server.set_done()
-    _log("pipeline complete — exit 0")
+    _log("pipeline complete (exit 0)")
     return 0
 
 

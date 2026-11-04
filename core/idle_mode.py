@@ -30,6 +30,7 @@ DESIGN PRINCIPLES (deliberate):
     driver missing) it simply skips the GPU lever and still does the
     power-plan lever.  Any error degrades to a no-op, never a crash.
 """
+import functools
 import threading
 import time
 from typing import Any, Optional
@@ -128,6 +129,21 @@ def set_settings(enabled: Optional[bool] = None,
 
 
 # ─── The two cooling levers (each captures + restores exactly) ───────
+# One engage or release at a time.  _engage() applies its levers after marking
+# itself engaged; a wake or quit in between restored first, then the levers
+# landed: the card stayed parked with idle mode off, and the next engage took
+# the parked values for the user's own.
+_transition = threading.RLock()
+
+
+def _one_transition(fn):
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        with _transition:
+            return fn(*args, **kwargs)
+    return run
+
+
 def _current_power_guid() -> str:
     """The GUID of the currently-active power scheme, or '' if unknown."""
     r = run_cmd(["powercfg", "/getactivescheme"], timeout=6)
@@ -140,6 +156,7 @@ def _current_power_guid() -> str:
     return ""
 
 
+@_one_transition
 def _engage() -> None:
     """Capture the current posture, then apply the cool/quiet levers.
     Assumes caller holds nothing — grabs _lock internally."""
@@ -191,13 +208,14 @@ def _engage() -> None:
     except Exception as e:
         log.debug(f"idle GPU lever skipped: {e}")
 
-    msg = "Idle Mode engaged — " + (", ".join(detail) if detail else "no coolable levers available")
+    msg = "Idle Mode engaged: " + (", ".join(detail) if detail else "no coolable levers available")
     log.info(msg)
     with _lock:
         _state["last_transition"] = msg
         _state["last_transition_ts"] = time.time()
 
 
+@_one_transition
 def _restore_if_engaged(reason: str) -> None:
     """Put the captured posture back and mark disengaged.  Safe to call
     even when not engaged (no-op)."""
@@ -228,7 +246,7 @@ def _restore_if_engaged(reason: str) -> None:
         except Exception as e:
             log.warning(f"idle OC restore failed: {e}")
 
-    msg = f"Idle Mode released ({reason}) — " + (", ".join(detail) if detail else "nothing to restore")
+    msg = f"Idle Mode released ({reason}): " + (", ".join(detail) if detail else "nothing to restore")
     log.info(msg)
     with _lock:
         _state["last_transition"] = msg
@@ -345,7 +363,7 @@ def run_on_boot() -> None:
     Called from a deferred boot hook so it never blocks window creation."""
     if _load().get("enabled"):
         _ensure_running()
-        log.info("Idle Mode was enabled — watcher armed on boot")
+        log.info("Idle Mode was enabled. Watcher armed on boot")
 
 
 def manual_release() -> dict:

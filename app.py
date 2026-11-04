@@ -2673,7 +2673,7 @@ def api_gamepad_install_hidhide():
     from core import hidhide
     threading.Thread(target=hidhide.download_and_install, daemon=True,
                      name="hidhide-install").start()
-    return jsonify({"ok": True, "msg": "HidHide install started — poll /install-progress"})
+    return jsonify({"ok": True, "msg": "HidHide install started. Poll /install-progress"})
 
 
 @app.route("/api/gamepad/install-vigembus", methods=["POST"])
@@ -2682,7 +2682,7 @@ def api_gamepad_install_vigembus():
     from core import virtual_gamepad
     threading.Thread(target=virtual_gamepad.download_and_install, daemon=True,
                      name="vigembus-install").start()
-    return jsonify({"ok": True, "msg": "ViGEmBus install started — poll /install-progress"})
+    return jsonify({"ok": True, "msg": "ViGEmBus install started. Poll /install-progress"})
 
 
 @app.route("/api/gamepad/install-progress")
@@ -2996,8 +2996,8 @@ def api_diagnostics_snapshot():
         snap["hardware"] = {
             "cpu":      info.get("cpu", {}),
             "gpu":      info.get("gpu", {}),
-            "ram_gb":   info.get("ram_gb"),
-            "drives":   info.get("drives", [])[:3],   # cap to 3 entries
+            "ram_gb":   (info.get("ram") or {}).get("total_gb"),
+            "drives":   (info.get("storage") or {}).get("drives", [])[:3],   # cap to 3 entries
         }
     except Exception as e:
         snap["hardware"]["err"] = str(e)
@@ -3387,7 +3387,7 @@ def api_full_spectrum():
     results["interrupts"] = interrupt_affinity.auto_optimize_interrupts()
 
     log.info("╔══════════════════════════════════════╗")
-    log.info("║   FULL SPECTRUM COMPLETE — REBOOT!   ║")
+    log.info("║   FULL SPECTRUM COMPLETE. REBOOT!    ║")
     log.info("╚══════════════════════════════════════╝")
     return jsonify(results)
 
@@ -3591,7 +3591,7 @@ def api_window_quit():
     left in a half-modified state, then schedules os._exit() so the
     HTTP response can be flushed before the process dies.
     """
-    log.info("Quit requested by user — shutting down")
+    log.info("Quit requested by user, shutting down")
     _restore_system_before_exit("user quit")
 
     def _suicide():
@@ -3606,13 +3606,34 @@ def _restore_system_before_exit(reason: str) -> None:
     os._exit(), which skips atexit handlers and `finally` blocks, so this has
     to be called explicitly — the tray's Quit used to skip all of it."""
     try:
-        # Roll back any active gaming tweaks; this also resumes whatever the
-        # Background Pauser suspended.
-        if game_profiles.get_engine_status().get("gaming_mode"):
-            game_profiles.restore_normal_mode(reason)
+        # First, so the monitor cannot start a new session behind the restore.
         game_profiles.stop_monitoring()
     except Exception as e:
+        log.warning(f"Error stopping the game monitor during quit: {e}")
+    try:
+        # Roll back any active gaming tweaks; this also resumes whatever the
+        # Background Pauser suspended.  Checked under game mode's own lock,
+        # as its monitor does: a restore already under way (the game has just
+        # closed) finishes and clears the flag first.  A second one found no
+        # records and wrote the old baseline back over it.
+        with game_profiles._session_lock:
+            if game_profiles._engine.get("gaming_mode"):
+                game_profiles.restore_normal_mode(reason)
+    except Exception as e:
         log.warning(f"Error restoring state during quit: {e}")
+    try:
+        # Tournament Mode stops services, mutes notifications and pauses
+        # programs, and only its own timer or the user switches it back.
+        # disable() checks under its own lock whether it is on.
+        tournament_mode.disable(reason)
+    except Exception as e:
+        log.warning(f"Tournament Mode restore during quit failed: {e}")
+    try:
+        # Anything else still suspended: paused by hand or from the Network
+        # tab.  The game-mode restore above resumes only when game mode is on.
+        background_pauser.resume_now(reason=reason)
+    except Exception as e:
+        log.warning(f"Background pauser resume during quit failed: {e}")
     try:
         # A tuning run that is still in progress has an untested offset on
         # the card.  With the app gone nothing watches it — no watchdog, no
@@ -3818,7 +3839,16 @@ def api_boot_prep_run():
 # Launcher
 # ═══════════════════════════════════════════════════════════════════════════
 def start_flask():
-    app.run(host="127.0.0.1", port=config.APP_PORT, debug=False, threaded=True, use_reloader=False)
+    try:
+        app.run(host="127.0.0.1", port=config.APP_PORT, debug=False, threaded=True, use_reloader=False)
+    except BaseException as e:
+        # A port Werkzeug cannot bind (in use, or reserved by Hyper-V / WSL)
+        # is printed to stderr, which the windowed exe does not have, and
+        # ends this thread with SystemExit: the window stayed blank and the
+        # log never said why.  The OSError is the SystemExit's context.
+        cause = e.__context__ if isinstance(e, SystemExit) and e.__context__ else e
+        log.error(f"Local server on port {config.APP_PORT} stopped: {cause!r}")
+        raise
 
 
 def _set_efficiency_mode():
@@ -3962,7 +3992,7 @@ def _create_tray_icon(show_window_func, quit_func):
         from pystray import Icon, Menu, MenuItem
         from core import game_profiles, cleaner, power, notifier
     except ImportError:
-        log.warning("pystray or Pillow not installed — no system tray icon")
+        log.warning("pystray or Pillow not installed, so no system tray icon")
         try:
             while True:
                 time.sleep(1)
@@ -4111,8 +4141,8 @@ def _create_tray_icon(show_window_func, quit_func):
                     log.info(f"Tray icon → {state}")
                 if game != last_game:
                     icon.title = (
-                        f"Vispora — playing {game[:48]}" if game else
-                        "Vispora — game mode armed"   if state == "armed" else
+                        f"Vispora: playing {game[:48]}" if game else
+                        "Vispora: game mode armed"   if state == "armed" else
                         "Vispora"
                     )
                     last_game = game
@@ -4193,7 +4223,7 @@ def _acquire_single_instance_lock() -> bool:
         handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
         last_err = ctypes.get_last_error()
         if not handle:
-            log.warning(f"CreateMutexW returned NULL (err {last_err}) — assuming first instance")
+            log.warning(f"CreateMutexW returned NULL (err {last_err}), assuming first instance")
             return True
         if last_err == ERROR_ALREADY_EXISTS:
             kernel32.CloseHandle(handle)
@@ -4216,18 +4246,18 @@ def main():
     # Done BEFORE the admin elevation prompt so the user doesn't get a
     # UAC popup just to be told "already running".
     if not _acquire_single_instance_lock():
-        log.info("Another Vispora instance is running — handing off")
+        log.info("Another Vispora instance is running, handing off")
         if _focus_running_instance():
             sys.exit(0)
         # If the existing instance didn't respond, it may be hung — the
         # mutex name will remain held by the dead-but-still-listed
         # process for a moment.  Exit anyway to avoid running two.
-        log.warning("Existing instance held the mutex but didn't respond — exiting")
+        log.warning("Existing instance held the mutex but didn't respond, exiting")
         sys.exit(0)
 
     # Check admin on Windows
     if sys.platform == "win32" and not is_admin():
-        log.warning("Not running as administrator — requesting elevation")
+        log.warning("Not running as administrator, requesting elevation")
         try:
             import ctypes
             ctypes.windll.shell32.ShellExecuteW(
@@ -4244,7 +4274,7 @@ def main():
     from_autostart = "--from-autostart" in sys.argv
 
     log.info(f"Starting {config.APP_NAME} v{config.APP_VERSION}"
-             + (" (autostart mode — gentle launch)" if from_autostart else ""))
+             + (" (autostart mode, gentle launch)" if from_autostart else ""))
 
     # v2.9.4 — post-install detection.
     # Right after an auto-update swap, this returns 'updated' (success) or
@@ -4310,7 +4340,10 @@ def main():
         log.debug(f"popup_killer start failed: {e}")
 
     # Check if gaming tweaks are stuck from a previous session (crash/reboot mid-game)
-    game_profiles.check_and_restore_on_boot()
+    try:
+        game_profiles.check_and_restore_on_boot()
+    except Exception as e:
+        log.warning(f"Boot recovery of game mode failed: {e}")
 
     # v3.1 fix — clear AT runtime if a previous run left it tracking a
     # process that no longer exists (e.g. game closed without firing exit).
@@ -4625,7 +4658,7 @@ def main():
             caps = capabilities.get()
             log.info(f"WebView2 GPU policy ({caps.get('gpu_tier')}): {gpu_args}")
             if not caps.get("webview2_present"):
-                log.warning("WebView2 runtime NOT detected — UI may fall back "
+                log.warning("WebView2 runtime NOT detected, so the UI may fall back "
                             "to MSHTML.  Dependency check will auto-install it.")
         except Exception as e:
             log.warning(f"capability-based GPU policy failed (UI still works): {e}")
@@ -4651,7 +4684,7 @@ def main():
         if from_autostart:
             global _window_hidden
             _window_hidden = True
-            log.info("Started hidden (autostart mode) — click tray icon to show")
+            log.info("Started hidden (autostart mode). Click tray icon to show")
 
         # Start tray icon in background
         tray_thread = threading.Thread(target=_create_tray_icon, args=(show_window, quit_app), daemon=True)
@@ -4666,9 +4699,15 @@ def main():
         except Exception as e:
             log.warning(f"edgechromium start failed ({e}); letting pywebview pick a backend")
             webview.start(debug=False)
+        # start() returns once the window is gone, i.e. it was closed from
+        # outside the app (Alt+F4, the taskbar, signing out).  Returning from
+        # main() would end the process without the restore every Quit does.
+        log.info("Window closed - shutting down")
+        _restore_system_before_exit("window closed")
+        os._exit(0)
 
     except ImportError:
-        log.warning("pywebview not installed — opening in browser mode")
+        log.warning("pywebview not installed, opening in browser mode")
         import webbrowser
         webbrowser.open(_ui_url())
         # Run tray icon on main thread (blocking)

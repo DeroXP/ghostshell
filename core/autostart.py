@@ -200,7 +200,10 @@ def _task_exists(name: str) -> bool:
 def _delete_task(name: str) -> dict:
     """Delete a scheduled task.  A task that isn't registered counts as success."""
     r = _run(["schtasks", "/Delete", "/TN", name, "/F"])
-    not_found = "cannot find" in (r["err"] + r["out"]).lower()
+    # schtasks words that error in the display language of Windows, so
+    # without the English text, ask whether the task is registered at all.
+    not_found = ("cannot find" in (r["err"] + r["out"]).lower()
+                 or (not r["ok"] and not _task_exists(name)))
     return {"ok": r["ok"] or not_found, "err": "" if (r["ok"] or not_found) else r["err"]}
 
 
@@ -208,7 +211,7 @@ def _purge_legacy_run_key():
     """One-shot cleanup: remove old v2.9.5/2.9.6 Run-key entry, if any."""
     r = _run(["reg", "query", LEGACY_RUN_KEY, "/v", LEGACY_VALUE])
     if r["ok"]:
-        log.info("Found legacy Run-key autostart entry — removing")
+        log.info("Found legacy Run-key autostart entry, removing it")
         _run(["reg", "delete", LEGACY_RUN_KEY, "/v", LEGACY_VALUE, "/f"])
 
 
@@ -294,7 +297,7 @@ def enable(delay_seconds: Optional[int] = None) -> dict:
     settings["enabled"] = True
     settings["delay_seconds"] = delay_seconds
     _save_settings(settings)
-    log.info(f"Autostart enabled — scheduled task '{TASK_NAME}', "
+    log.info(f"Autostart enabled: scheduled task '{TASK_NAME}', "
              f"delay {delay_seconds}s, exe {exe}")
     return {
         "ok": True,
@@ -364,7 +367,7 @@ def migrate_from_legacy_runkey() -> dict:
         return {"ok": True, "migrated": False, "reason": "not frozen exe"}
 
     log.info(f"Autostart enabled in settings but task '{TASK_NAME}' isn't "
-             f"registered — migrating from the legacy Run key / pre-rename task")
+             f"registered, so migrating from the legacy Run key / pre-rename task")
     r = enable(delay_seconds=settings.get("delay_seconds", STARTUP_DELAY_SECONDS_DEFAULT))
     return {
         "ok":       r.get("ok", False),

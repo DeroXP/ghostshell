@@ -47,7 +47,7 @@ async def close_pool() -> None:
 
 def get_pool() -> asyncpg.Pool:
     if _pool is None:
-        raise RuntimeError("Postgres pool not initialised — did the lifespan run?")
+        raise RuntimeError("Postgres pool not initialised. Did the lifespan run?")
     return _pool
 
 

@@ -126,7 +126,9 @@ def _get_primary_disk_serial() -> str:
         "Select-Object -First 1 -ExpandProperty SerialNumber"
     )
     if r["ok"] and r["out"]:
-        v = re.sub(r"\s+", "", r["out"].strip())
+        # Same clean-up as above: when both paths read the same disk they
+        # must agree, or a run that falls back looks like another PC.
+        v = re.sub(r"\s+", "", r["out"].strip().strip("."))
         if v:
             return v
 

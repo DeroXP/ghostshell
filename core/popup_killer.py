@@ -191,7 +191,7 @@ def _watchdog_loop():
                         if len(_left_alone) > 500:
                             _left_alone.clear()
                         _left_alone.add(hwnd)
-                        log.debug(f"popup-killer: title matched but not the picker — left alone "
+                        log.debug(f"popup-killer: title matched but not the picker, so left alone "
                                   f"(cls={cls}, owner={_owner_exe(hwnd) or '?'})")
                     continue
                 log.info(f"popup-killer: closing '{title}' (cls={cls}, hwnd={hwnd})")

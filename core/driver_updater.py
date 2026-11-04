@@ -369,7 +369,7 @@ def _check_nvidia_latest(gpu_name: str) -> dict:
     if not ids:
         return {
             "ok": False,
-            "err": f"GPU not in our model database — please check NVIDIA's site for {gpu_name}",
+            "err": f"GPU not in our model database: please check NVIDIA's site for {gpu_name}",
             "manual_link": manual_link,
         }
     psid, pfid = ids
@@ -503,7 +503,8 @@ def _prune_old_drivers(keep_fname: str = "") -> int:
         if not os.path.isdir(DRIVERS_DIR):
             return 0
         for name in os.listdir(DRIVERS_DIR):
-            if not name.lower().endswith(".exe"):
+            # (.part: a download that never finished, e.g. the app was closed)
+            if not name.lower().endswith((".exe", ".part")):
                 continue
             if name == keep_fname:
                 continue
@@ -515,7 +516,7 @@ def _prune_old_drivers(keep_fname: str = "") -> int:
             except OSError:
                 continue
         if freed:
-            log.info(f"Pruned old driver installers — freed "
+            log.info(f"Pruned old driver installers: freed "
                      f"{freed / (1024*1024):.0f} MB from {DRIVERS_DIR}")
     except Exception as e:
         log.debug(f"driver prune failed: {e}")
@@ -527,7 +528,7 @@ def download_driver() -> dict:
     expected size already exists, returns immediately.
     """
     if not _state.get("download_url"):
-        return {"ok": False, "err": "No download URL available — run a check first"}
+        return {"ok": False, "err": "No download URL available: run a check first"}
     if _state["downloading"]:
         return {"ok": False, "err": "Already downloading"}
 
@@ -541,7 +542,7 @@ def download_driver() -> dict:
     # inside a PowerShell double-quoted string: the previous pattern still
     # allowed `$`, `(` and `)`, and `$(...)` is evaluated in that context.
     if not re.fullmatch(r"https://[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.nvidia\.com/[A-Za-z0-9._~/?#@!&*+,;=%-]*", url or ""):
-        return {"ok": False, "err": "driver download URL failed validation — refusing"}
+        return {"ok": False, "err": "driver download URL failed validation, refusing"}
     # Derive a SAFE local filename (URL is validated, but the basename still
     # feeds an -OutFile path, so strip it to a plain token defensively).
     raw_fname = url.split("/")[-1].split("?")[0]
@@ -567,11 +568,16 @@ def download_driver() -> dict:
         _state["downloading"]       = True
         _state["download_progress"] = 0
     log.info(f"Downloading NVIDIA driver from {url}")
+    # Downloaded under a .part name and renamed once complete: a failed or
+    # timed-out Invoke-WebRequest leaves what it got at -OutFile, and the
+    # size check above would take a cut-off installer for a finished one.
+    tmp = dest + ".part"
+    r = None
     try:
         cmd = (
             "$ProgressPreference = 'SilentlyContinue'; "
             "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
-            f'Invoke-WebRequest -Uri "{url}" -OutFile "{dest}" -UseBasicParsing'
+            f'Invoke-WebRequest -Uri "{url}" -OutFile "{tmp}" -UseBasicParsing'
         )
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
@@ -586,9 +592,18 @@ def download_driver() -> dict:
         return {"ok": False, "err": str(e)}
     finally:
         _state["downloading"] = False
+        if r is None or r.returncode != 0:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
-    if r.returncode != 0 or not os.path.exists(dest):
+    if r.returncode != 0 or not os.path.exists(tmp):
         return {"ok": False, "err": (r.stderr or r.stdout or "Download failed")[:200]}
+    try:
+        os.replace(tmp, dest)
+    except OSError as e:
+        return {"ok": False, "err": f"Could not finish the download: {e}"}
     size_mb = os.path.getsize(dest) / (1024 * 1024)
     with _state_lock:
         _state["downloaded_path"]   = dest
@@ -648,7 +663,7 @@ def _watch_install(target_version: str, prev_version: str):
                     _state["update_available"] = False
                     _state["install_result"]   = "success"
                     _state["install_message"]  = f"Driver updated to {cur}."
-                log.info(f"Driver install confirmed — now on {cur}")
+                log.info(f"Driver install confirmed: now on {cur}")
                 # The installer has served its purpose; reclaim the space.
                 try:
                     p = _state.get("downloaded_path")
@@ -664,7 +679,7 @@ def _watch_install(target_version: str, prev_version: str):
         with _state_lock:
             _state["install_result"]  = "unconfirmed"
             _state["install_message"] = ("Could not confirm the driver version "
-                                         "changed — check NVIDIA's installer window.")
+                                         "changed. Check NVIDIA's installer window.")
         log.info("Driver install watcher timed out without a version change")
     finally:
         _state["installing"] = False
@@ -734,8 +749,8 @@ def install_driver() -> dict:
 
     if not launched:
         return {"ok": False,
-                "err": "The shell refused to launch the installer — "
-                       "open it manually from " + path}
+                "err": "The shell refused to launch the installer. "
+                       "Open it manually from " + path}
 
     log.info(f"Driver installer launched via {method} (de-elevated like a "
              f"double-click): {path}")
@@ -754,7 +769,7 @@ def install_driver() -> dict:
                      daemon=True).start()
 
     return {"ok": True,
-            "msg": "NVIDIA installer launched — Vispora will confirm once "
+            "msg": "NVIDIA installer launched. Vispora will confirm once "
                    "the new driver is active."}
 
 

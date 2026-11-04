@@ -79,11 +79,13 @@ def test_vendor_tweaks_are_skipped_on_another_vendors_card():
 
 def test_amd_tweaks_undo_exactly():
     gpu_machine("amd")
-    m.rset(m.DISPLAY_CLASS + r"\0000", "EnableUlps", 1)
+    amd_key = NV_KEY                                # the Radeon; \0000 is the virtual monitor
+    m.rset(amd_key, "EnableUlps", 1)
     before, tasks = m.flat(), dict(m.snap_system()["tasks"])
     out = NC.apply_all_gpu_tweaks()
     assert out["gpu"]["vendor"] == "amd" and all(r["ok"] for r in out["tweaks"])
-    assert m.rdata(m.DISPLAY_CLASS + r"\0000", "EnableUlps") == 0
+    assert m.rdata(amd_key, "EnableUlps") == 0
+    assert m.rget(m.DISPLAY_CLASS + r"\0000", "EnableUlps") is None, "not written to another adapter's key"
     assert m.rdata(r"HKLM\SOFTWARE\AMD\CN", "UEPNotificationStatus") == 0
     assert m.task_on(r"\AMD\RadeonSoftwareStartupTask") is False
     assert NC.undo_gpu_tweaks()["ok"]

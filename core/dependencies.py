@@ -392,7 +392,7 @@ def start_lhm() -> dict:
                     "message": "LHM launched, CPU temp will populate within a few seconds"}
     return {"ok": True, "running": _lhm_process_running(),
             "wmi_registered": False,
-            "message": "LHM launched but WMI namespace not visible yet — "
+            "message": "LHM launched but WMI namespace not visible yet: "
                        "first launch can take 10-15s on slower disks"}
 
 
@@ -418,7 +418,7 @@ def install_webview2() -> dict:
     winget = _winget_path()
     if not winget:
         return {"ok": False, "needs_restart": False,
-                "message": "winget not available — install WebView2 manually "
+                "message": "winget not available: install WebView2 manually "
                            "from https://developer.microsoft.com/microsoft-edge/webview2/"}
     _set_progress(current_step="Installing WebView2 runtime via winget…")
     install_cmd = [
@@ -444,7 +444,7 @@ def install_webview2() -> dict:
                     # New runtime needs a Vispora restart to bind to it.
                     "needs_restart": not installed or True,
                     "log_path": log_path,
-                    "message": "WebView2 runtime installed — restart Vispora "
+                    "message": "WebView2 runtime installed: restart Vispora "
                                "to render with the modern engine"}
         return {"ok": False, "needs_restart": False, "log_path": log_path,
                 "message": f"winget install failed (rc={r.returncode}): "
@@ -475,7 +475,7 @@ def install_lhm() -> dict:
     winget = _winget_path()
     if not winget:
         return {"ok": False, "needs_restart": False,
-                "message": "winget not available — install LibreHardwareMonitor "
+                "message": "winget not available: install LibreHardwareMonitor "
                            "manually from https://github.com/LibreHardwareMonitor/LibreHardwareMonitor"}
 
     _set_progress(current_step="Installing LibreHardwareMonitor via winget…")
@@ -593,12 +593,12 @@ def _download(url: str, dest: str, progress_cb: Optional[Callable] = None) -> bo
         sz = os.path.getsize(tmp)
         if sz < 50 * 1024:   # smaller than 50 KB = probably a 404 HTML page
             os.remove(tmp)
-            log.warning(f"download too small ({sz} B) — likely 404: {url}")
+            log.warning(f"download too small ({sz} B), likely 404: {url}")
             return False
         os.replace(tmp, dest)
         return True
     except Exception as e:
-        log.warning(f"download failed: {url} — {e}")
+        log.warning(f"download failed: {url} ({e})")
         try:
             if os.path.exists(tmp): os.remove(tmp)
         except Exception: pass
@@ -647,7 +647,7 @@ def install_presentmon2() -> dict:
     msi_path = os.path.join(INSTALLER_DIR, f"PresentMon-v{PM2_VERSION}.msi")
     if not _download(PM2_MSI_URL, msi_path):
         return {"ok": False, "needs_restart": False,
-                "message": "Download failed — check internet connection"}
+                "message": "Download failed: check internet connection"}
 
     _set_progress(current_step="Installing PresentMon 2.x service…")
     try:
@@ -828,7 +828,7 @@ def install_ffmpeg() -> dict:
     winget = _winget_path()
     if not winget:
         return {"ok": False, "needs_restart": False,
-                "message": "winget not available — install FFmpeg manually "
+                "message": "winget not available: install FFmpeg manually "
                            "from https://www.gyan.dev/ffmpeg/builds/"}
 
     _set_progress(current_step="Installing FFmpeg via winget…")
@@ -862,7 +862,7 @@ def install_ffmpeg() -> dict:
             return {"ok": True, "needs_restart": False,
                     "log_path": log_path,
                     "message": "FFmpeg installed (PATH refresh may need a "
-                               "new shell — restart Vispora after this "
+                               "new shell, so restart Vispora after this "
                                "install batch)"}
         return {"ok": False, "needs_restart": False,
                 "log_path": log_path,
@@ -920,7 +920,7 @@ def install_hidhide() -> dict:
 DEPENDENCIES = [
     {
         "key":          "presentmon1",
-        "label":        "PresentMon 1.x (frame timing — D3D9-12)",
+        "label":        "PresentMon 1.x (frame timing for D3D9-12)",
         "description":  "Microsoft's frame-timing tool. Used by Adaptive Tuning to read FPS, 1%-low, and frametime σ for D3D9-12 games.",
         "auto_install": True,
         "detect":       lambda: bool(_detect_pm1_path()),
@@ -929,8 +929,8 @@ DEPENDENCIES = [
     },
     {
         "key":          "presentmon2",
-        "label":        "PresentMon 2.x (frame timing — adds OpenGL + Vulkan)",
-        "description":  "Microsoft's newer frame-timing service. Captures the full ETW provider set — D3D, OpenGL, and Vulkan. Lets AT see frame data for Minecraft Java and other non-D3D games.",
+        "label":        "PresentMon 2.x (frame timing, adds OpenGL + Vulkan)",
+        "description":  "Microsoft's newer frame-timing service. Captures the full ETW provider set: D3D, OpenGL, and Vulkan. Lets AT see frame data for Minecraft Java and other non-D3D games.",
         "auto_install": True,
         "detect":       lambda: _detect_pm2().get("installed"),
         "install":      install_presentmon2,
@@ -948,7 +948,7 @@ DEPENDENCIES = [
     {
         "key":          "hidhide",
         "label":        "HidHide (hide physical controllers from games)",
-        "description":  "Optional helper for the gamepad mapper — hides your physical controller so the game only sees Vispora's virtual one, avoiding double-input. Signed driver.",
+        "description":  "Optional helper for the gamepad mapper: hides your physical controller so the game only sees Vispora's virtual one, avoiding double-input. Signed driver.",
         "auto_install": True,
         "detect":       lambda: _detect_hidhide().get("installed"),
         "install":      install_hidhide,
@@ -1189,7 +1189,7 @@ def check_on_boot() -> dict:
     try:
         lhm_state = _detect_lhm()
         if lhm_state.get("installed") and not lhm_state.get("wmi_registered"):
-            log.info("LHM installed but WMI namespace not active — launching")
+            log.info("LHM installed but WMI namespace not active, launching it")
             launch = start_lhm()
             nudge_results.append({
                 "key":     "lhm",
@@ -1207,7 +1207,7 @@ def check_on_boot() -> dict:
             # start_lhm re-verifies the config and LHM comes back in the tray.
             exe = _find_lhm_exe()
             if exe and _ensure_lhm_settings_minimized(exe):
-                log.info("LHM running with window-popping config — restarting it hidden")
+                log.info("LHM running with window-popping config, restarting it hidden")
                 try:
                     subprocess.run(["taskkill", "/F", "/IM", "LibreHardwareMonitor.exe"],
                                    capture_output=True, timeout=10)
@@ -1258,11 +1258,19 @@ def request_restart_now() -> dict:
     """Initiate a Windows restart in 10 seconds.  User can cancel with
     `shutdown /a` if they change their mind."""
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["shutdown", "/r", "/t", "10",
              "/c", "Vispora installed driver updates that need a restart."],
+            capture_output=True, text=True, errors="replace",
             creationflags=_CREATE_NO_WINDOW,
+            timeout=30,
         )
+        if r.returncode != 0:
+            # Nothing was scheduled (1190: another shutdown already is), so
+            # the marker stays and the banner keeps asking.
+            return {"ok": False,
+                    "err": ((r.stderr or r.stdout or "").strip()
+                            or f"shutdown exited with code {r.returncode}")[:200]}
         # Clear our own pending marker so we don't re-prompt
         state = _load_state()
         state.pop("pending_restart", None)

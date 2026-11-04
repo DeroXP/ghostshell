@@ -314,4 +314,4 @@ def apply_on_boot():
     """Re-assert the (process-lifetime) timer hold if the mode was left on."""
     if _load().get("enabled"):
         timer_manager.start_timer_resolution_hold(0.5)
-        log.info("Competitive Latency was enabled — re-asserted timer hold on boot")
+        log.info("Competitive Latency was enabled. Re-asserted timer hold on boot")

@@ -149,7 +149,7 @@
                 <div class="page-header-row">
                     <div>
                         <div class="section-title">System Overview</div>
-                        <div class="section-subtitle">Your hardware, your modules, your control surface — all in one view.</div>
+                        <div class="section-subtitle">Your hardware, your modules, your control surface, all in one view.</div>
                     </div>
                     <div class="page-header-actions">
                         <button class="btn btn-cta btn-primary" onclick="runFullSpectrum()">⚡ Full Spectrum</button>
@@ -236,7 +236,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
                     </div>
                     <div class="action-card-title">Optimize</div>
-                    <div class="action-card-desc">Hard performance tweaks — power, CPU, memory, gaming.</div>
+                    <div class="action-card-desc">Hard performance tweaks: power, CPU, memory, gaming.</div>
                 </div>
                 <div class="action-card" onclick="switchPage('privacy')">
                     <div class="action-card-icon">
@@ -281,7 +281,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
                         Power &amp; Clean Reboot
                     </div>
-                    <div class="card-section-desc">Cleans temp files, caches, DNS, RAM, and event logs <em>before</em> shutting down or restarting — so the next boot is faster and ready for gaming.</div>
+                    <div class="card-section-desc">Cleans temp files, caches, DNS, RAM, and event logs <em>before</em> shutting down or restarting, so the next boot is faster and ready for gaming.</div>
                     <div class="toggle-row">
                         <div class="toggle-info"><div class="toggle-name">Clean before shutdown / restart</div><div class="toggle-desc">Runs the full cleanup pass first (~5–15 s).</div></div>
                         <div class="toggle-switch on" id="toggle-power-clean" onclick="toggleSwitch(this)"></div>
@@ -311,7 +311,7 @@
                 <div class="page-header-row">
                     <div>
                         <div class="section-title">Debloat</div>
-                        <div class="section-subtitle">Strip Windows 11 of bloatware, telemetry services, and scheduled tasks. Reversible — only the apps you select are removed.</div>
+                        <div class="section-subtitle">Strip Windows 11 of bloatware, telemetry services, and scheduled tasks. Reversible, and only the apps you select are removed.</div>
                     </div>
                     <div class="page-header-actions">
                         <button class="btn" onclick="debloatSelectAll(true)">Select all</button>
@@ -393,7 +393,7 @@
                 <div style="display:flex;align-items:center;gap:14px">
                     <div style="flex:1;min-width:0">
                         <div style="font-size:15px;font-weight:600;color:var(--text-bright)">Latency Doctor</div>
-                        <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;line-height:1.5">Scans your <b>actual</b> system for input-latency issues and grades it honestly — no placebos, each item shows the real verdict. Fix the safe ones in one click.</div>
+                        <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;line-height:1.5">Scans your <b>actual</b> system for input-latency issues and grades it honestly. No placebos: each item shows the real verdict. Fix the safe ones in one click.</div>
                     </div>
                     <button class="btn btn-primary" id="ld-scan-btn" onclick="runLatencyDoctor()" style="white-space:nowrap">Run scan</button>
                 </div>
@@ -404,7 +404,7 @@
                 <div style="display:flex;align-items:center;gap:14px">
                     <div style="flex:1;min-width:0">
                         <div style="font-size:15px;font-weight:600;color:var(--text-bright)">Competitive Latency Mode</div>
-                        <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;line-height:1.5">One click for the research-backed input-latency wins: Win11 windowed-game <b>flip-model</b> optimization, <b>mouse acceleration off</b> (1:1 raw aim), Game&nbsp;DVR/Game&nbsp;Bar off, CPU pinned 100% with USB-suspend &amp; PCIe-ASPM off, foreground-priority quanta, HID queue trim, and a best-effort timer hold. It also tells you the optimal <b>in-game FPS cap</b> for your display (an in-game cap beats a driver cap, so we don't force it) — useful only if you actually sustain that framerate; if you're GPU-bound (e.g. heavy games at 4K) enable in-game <b>NVIDIA Reflex</b> instead, which is the bigger win when GPU-limited. Placebos (MenuShowDelay, ThreadDpcEnable, forcing&nbsp;HPET) are deliberately excluded. Fully reversible.</div>
+                        <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;line-height:1.5">One click for the research-backed input-latency wins: Win11 windowed-game <b>flip-model</b> optimization, <b>mouse acceleration off</b> (1:1 raw aim), Game&nbsp;DVR/Game&nbsp;Bar off, CPU pinned 100% with USB-suspend &amp; PCIe-ASPM off, foreground-priority quanta, HID queue trim, and a best-effort timer hold. It also tells you the optimal <b>in-game FPS cap</b> for your display (an in-game cap beats a driver cap, so we don't force it). That cap only helps if you actually sustain that framerate; if you're GPU-bound (e.g. heavy games at 4K) enable in-game <b>NVIDIA Reflex</b> instead, which is the bigger win when GPU-limited. Placebos (MenuShowDelay, ThreadDpcEnable, forcing&nbsp;HPET) are deliberately excluded. Fully reversible.</div>
                         <div id="competitive-status" style="font-size:12px;color:var(--text-tertiary);margin-top:7px">Checking…</div>
                     </div>
                     <button class="btn btn-primary" id="competitive-btn" onclick="toggleCompetitive()" style="white-space:nowrap">Enable</button>
@@ -415,7 +415,7 @@
                 <div style="display:flex;align-items:center;gap:14px">
                     <div style="flex:1;min-width:0">
                         <div style="font-size:15px;font-weight:600;color:var(--text-bright)">Competitive Game Advisor</div>
-                        <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;line-height:1.5">Finds the competitive games you have installed and gives the per-game settings Vispora <b>can't</b> set for you — Reflex, Frame-Gen off, display mode, and your exact in-game FPS cap.</div>
+                        <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;line-height:1.5">Finds the competitive games you have installed and gives the per-game settings Vispora <b>can't</b> set for you: Reflex, Frame-Gen off, display mode, and your exact in-game FPS cap.</div>
                     </div>
                     <button class="btn btn-primary" id="advisor-btn" onclick="runAdvisor()" style="white-space:nowrap">Scan games</button>
                 </div>
@@ -433,7 +433,7 @@
             <div class="card" id="pro-mode-card" style="border-left:3px solid var(--warning)">
                 <div class="card-title">Pro Mode <span style="color:var(--text-tertiary);font-weight:400;font-size:12px">(off by default)</span></div>
                 <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:10px;line-height:1.55;max-width:780px">
-                    Flip this on to let Apply All Tweaks include the latency/perf tweaks that have real benefit but real side-effects — the kind you only want if you know what you're trading.  When off, Apply All stays on the safe path.
+                    Flip this on to let Apply All Tweaks include the latency/perf tweaks that have real benefit but real side-effects, the kind you only want if you know what you're trading.  When off, Apply All stays on the safe path.
                 </p>
                 <p style="font-size:11.5px;color:var(--text-tertiary);margin-bottom:12px;line-height:1.55;max-width:780px">
                     Behind the gate: <b>VBS / HVCI / Credential Guard disable</b> (weakens kernel-driver attack hardening), <b>Spectre/Meltdown mitigations disable</b> (~5-8% on storage-heavy workloads, vanishingly small on game FPS), <b>HPET disable</b> (can cause clock drift / monitor wake failures on some chipsets), <b>bcdedit disabledynamictick</b> (laptop battery murderer), <b>MPO disable</b> (obsolete NVIDIA workaround; now causes HDR/G-Sync hand-off issues), <b>blanket USB MSI mode</b> (Code 10 on some controllers), <b>raised GPU TDR delays</b> (10 s desktop hang on driver fault instead of 2 s), <b>Windows Search disable</b> (breaks Start Menu search), <b>Memory Compression disable</b> (only helps with 32 GB+ RAM), <b>hibernation off</b> (laptops lose the feature).
@@ -441,12 +441,12 @@
                 <div class="toggle-row" style="padding-bottom:4px">
                     <div class="toggle-info">
                         <div class="toggle-name">Enable Pro Mode</div>
-                        <div class="toggle-desc">Adds the gated tweaks to subsequent Apply All / Apply Selected runs.  Idempotent — toggle off + re-run to skip them next time.</div>
+                        <div class="toggle-desc">Adds the gated tweaks to subsequent Apply All / Apply Selected runs.  Idempotent: toggle off + re-run to skip them next time.</div>
                     </div>
                     <div class="toggle-switch" id="toggle-pro-mode" onclick="toggleProMode(this)"></div>
                 </div>
                 <div id="pro-mode-status" style="font-size:11.5px;color:var(--text-tertiary);line-height:1.5;padding:8px 10px;background:var(--bg-overlay);border-radius:var(--radius-sm);margin-top:8px">
-                    Pro Mode is OFF — Apply All will skip risky tweaks.
+                    Pro Mode is OFF. Apply All will skip risky tweaks.
                 </div>
             </div>
 
@@ -515,7 +515,7 @@
                     <div class="opt-cat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg></div>
                     <div class="opt-cat-info">
                         <div class="opt-cat-title">Audio</div>
-                        <div class="opt-cat-desc">MMCSS Pro Audio task tuned (priority + GPU + scheduling), Bluetooth absolute volume off — fixes mic latency &amp; BT-headset stutter.</div>
+                        <div class="opt-cat-desc">MMCSS Pro Audio task tuned (priority + GPU + scheduling), Bluetooth absolute volume off. Fixes mic latency &amp; BT-headset stutter.</div>
                         <div class="opt-cat-count">~9 tweaks</div>
                     </div>
                 </div>
@@ -657,7 +657,7 @@
                     <div class="opt-cat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
                     <div class="opt-cat-info">
                         <div class="opt-cat-title">Lock Screen</div>
-                        <div class="opt-cat-desc">Strip Win11 lock screen — Spotlight rotating wallpaper off, fun-fact tips off, ads off, pen workspace nag off, first-logon animation off.</div>
+                        <div class="opt-cat-desc">Strip the Win11 lock screen: Spotlight rotating wallpaper off, fun-fact tips off, ads off, pen workspace nag off, first-logon animation off.</div>
                         <div class="opt-cat-count">~11 tweaks</div>
                     </div>
                 </div>
@@ -698,7 +698,7 @@
                 <div class="page-header-row">
                     <div>
                         <div class="section-title">Network</div>
-                        <div class="section-subtitle">DNS, latency, adapter tweaks. The game profiler handles DSCP per-app automatically — pin manually below if you need to.</div>
+                        <div class="section-subtitle">DNS, latency, adapter tweaks. The game profiler handles DSCP per-app automatically. Pin manually below if you need to.</div>
                     </div>
                     <div class="page-header-actions">
                         <button class="btn" onclick="restoreNetworking()" title="One-click recovery if WiFi disappeared, IPv6 broke things, or DNS won't apply.  Restarts WLAN service, re-enables IPv6, resets adapter bindings.  Reboot recommended.">Restore networking</button>
@@ -716,7 +716,7 @@
                     </div>
                     <div style="flex:1;min-width:0">
                         <div style="font-size:14px;font-weight:600;color:var(--text-bright);letter-spacing:-0.01em">Bandwidth Monitor</div>
-                        <div style="font-size:12.5px;color:var(--text-secondary);margin-top:2px">Live per-process network usage — flags any non-game process that bursts above 5 MB/s during gameplay so you know what's costing you ping.</div>
+                        <div style="font-size:12.5px;color:var(--text-secondary);margin-top:2px">Live per-process network usage. Flags any non-game process that bursts above 5 MB/s during gameplay so you know what's costing you ping.</div>
                     </div>
                 </div>
 
@@ -789,7 +789,7 @@
                     </div>
                     <div class="btn-group" style="margin-top:8px">
                         <button class="btn btn-primary" onclick="applyDns()">Apply DNS</button>
-                        <button class="btn" onclick="apiPost('/api/network/dns/reset').then(loadNetworkInfo)">Reset to DHCP</button>
+                        <button class="btn" title="Puts back the DNS servers each adapter had before Vispora changed them (DHCP if it had none)" onclick="apiPost('/api/network/dns/reset').then(loadNetworkInfo)">Reset DNS</button>
                         <button class="btn" onclick="testDnsLatency()">Test Latency</button>
                     </div>
                 </div>
@@ -821,7 +821,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3h18v18H3z"/><path d="M9 9h6v6H9z"/></svg>
                         DSCP Per-App Priority
                     </div>
-                    <div class="card-section-desc">Assign DSCP priority to a specific executable. The game profiler handles the running game + streaming apps automatically — pin manually here if needed.</div>
+                    <div class="card-section-desc">Assign DSCP priority to a specific executable. The game profiler handles the running game + streaming apps automatically. Pin manually here if needed.</div>
                     <div class="form-row" style="margin-bottom:12px">
                         <div class="form-group">
                             <label class="form-label">Executable Name</label>
@@ -898,7 +898,7 @@
                     <div>
                         <div class="hero-card-eyebrow">⚡ GPU Overclocking</div>
                         <div class="hero-card-title">Tune core, memory, and power</div>
-                        <div class="hero-card-desc">Multi-signal stability check: TDR events, WebGL context loss, pixel-correctness checksum, frametime variance, clock-dip detection, thermal abort. Your stable profile is remembered and re-applied on startup. Overclocking can cause instability or rare hardware damage — Reset is always one click away.</div>
+                        <div class="hero-card-desc">Multi-signal stability check: TDR events, WebGL context loss, pixel-correctness checksum, frametime variance, clock-dip detection, thermal abort. Your stable profile is remembered and re-applied on startup. Overclocking can cause instability or rare hardware damage. Reset is always one click away.</div>
                         <div id="oc-capability" style="font-size:12.5px;color:var(--text-secondary);margin-top:14px"></div>
                     </div>
                 </div>
@@ -909,7 +909,7 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg></div>
                 <div class="card-title">Hard Temp Ceiling</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:640px">
-                    Background watchdog. If GPU temperature stays above the ceiling for the sustained period, Vispora automatically reverts the OC to stock and notifies you. Runs even when no OC is applied — catches a failing fan or hot day before it cooks the card.
+                    Background watchdog. If GPU temperature stays above the ceiling for the sustained period, Vispora automatically reverts the OC to stock and notifies you. Runs even when no OC is applied, so it catches a failing fan or a hot day before it cooks the card.
                 </p>
                 <div class="toggle-row">
                     <div class="toggle-info"><div class="toggle-name">Watchdog enabled</div><div class="toggle-desc">Monitor GPU temperature in the background.</div></div>
@@ -984,7 +984,7 @@
                 </div>
                 <div style="margin-top:14px;display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--text-secondary)">
                     <span class="live-dot"></span>
-                    <span>Live — refreshing every second</span>
+                    <span>Live, refreshing every second</span>
                     <button class="btn btn-sm" style="margin-left:auto;display:none" onclick="toggleOcLive()"><span id="oc-live-toggle-label">Pause</span></button>
                 </div>
             </div>
@@ -1033,8 +1033,8 @@
                         <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg></div>
                         <div class="card-title">Auto Overclock</div>
                         <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.6">
-                            <b style="color:var(--accent)">Quick Tune</b> — binary search, fastest path to stable max (~3–5 min).<br>
-                            <b style="color:var(--text-bright)">Benchmark Tune</b> — tests each offset, scores FPS + 1 % lows + stability, picks best actual performance (~5–7 min).
+                            <b style="color:var(--accent)">Quick Tune</b>: binary search, fastest path to stable max (~3–5 min).<br>
+                            <b style="color:var(--text-bright)">Benchmark Tune</b>: tests each offset, scores FPS + 1 % lows + stability, picks best actual performance (~5–7 min).
                         </p>
                         <div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;font-size:12.5px;color:var(--text-secondary)">
                             <label>Core jump
@@ -1076,7 +1076,7 @@
             <!-- Benchmark results (hidden until populated) -->
             <div class="card" id="oc-benchmark-card" style="display:none">
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></div>
-                <div class="card-title">Benchmark — Stock vs OC</div>
+                <div class="card-title">Benchmark: Stock vs OC</div>
                 <div id="oc-benchmark-content"></div>
             </div>
 
@@ -1112,7 +1112,7 @@
                 <div class="page-header-row">
                     <div>
                         <div class="section-title">Cleaner</div>
-                        <div class="section-subtitle">Free RAM, wipe temp files, and reclaim disk space — never touches documents, photos, or videos.</div>
+                        <div class="section-subtitle">Free RAM, wipe temp files, and reclaim disk space. Never touches documents, photos, or videos.</div>
                     </div>
                 </div>
             </div>
@@ -1145,7 +1145,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
                         Disk Cleaner
                     </div>
-                    <div class="card-section-desc">Light junk cleanup — temp/cache/log files only. Documents are never touched.</div>
+                    <div class="card-section-desc">Light junk cleanup: temp/cache/log files only. Documents are never touched.</div>
                     <div id="disk-list" style="font-size:13px;color:var(--text-secondary);line-height:1.55;margin-bottom:12px"><span class="pulse">Loading drives…</span></div>
                     <div class="btn-group">
                         <button class="btn" onclick="loadDiskList()">Refresh</button>
@@ -1162,7 +1162,7 @@
                         Disk Analyzer
                     </div>
                     <div class="card-section-desc">
-                        See exactly what's eating your disk space — like WizTree, with a treemap of folder sizes, top-N largest files, and a checked-row delete with hard caps + system-path protection.
+                        See exactly what's eating your disk space, like WizTree, with a treemap of folder sizes, top-N largest files, and a checked-row delete with hard caps + system-path protection.
                     </div>
 
                     <div id="da-toolbar" class="btn-group" style="flex-wrap:wrap;gap:8px;margin-bottom:12px">
@@ -1275,7 +1275,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
                         Firewall Rules
                     </div>
-                    <div class="card-section-desc">Block outbound connections from known telemetry executables — DiagTrack, CompatTel, DeviceCensus, SmartScreen.</div>
+                    <div class="card-section-desc">Block outbound connections from known telemetry executables: DiagTrack, CompatTel, DeviceCensus, SmartScreen.</div>
                     <button class="btn btn-sm btn-primary" onclick="apiPost('/api/privacy/firewall').then(r=>termLog('privacy',r))">Create Rules</button>
                 </div>
 
@@ -1295,7 +1295,7 @@
                     </div>
                     <div id="device-status">
                         <div class="toggle-row">
-                            <div class="toggle-info"><div class="toggle-name">Webcam</div><div class="toggle-desc">Global camera access for all apps. Microphone is intentionally <b>not</b> here — managing it from Vispora broke voice chat for users, so mic privacy is left to Windows Settings.</div></div>
+                            <div class="toggle-info"><div class="toggle-name">Webcam</div><div class="toggle-desc">Global camera access for all apps. Microphone is intentionally <b>not</b> here: managing it from Vispora broke voice chat for users, so mic privacy is left to Windows Settings.</div></div>
                             <div class="toggle-switch" id="toggle-webcam" onclick="toggleDevice('webcam', this)"></div>
                         </div>
                     </div>
@@ -1383,7 +1383,7 @@
                 <div class="page-header-row">
                     <div>
                         <div class="section-title">Kernel Tweaks</div>
-                        <div class="section-subtitle">VBS/HVCI, timer resolution, interrupt affinity, scheduler. Aggressive territory — safe for gaming, but trade-offs are real.</div>
+                        <div class="section-subtitle">VBS/HVCI, timer resolution, interrupt affinity, scheduler. Aggressive territory: safe for gaming, but the trade-offs are real.</div>
                     </div>
                 </div>
             </div>
@@ -1407,7 +1407,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
                         Timer Resolution
                     </div>
-                    <div class="card-section-desc">Disable dynamic tick, HPET, force TSC timer — consistent frame pacing, lower input lag.</div>
+                    <div class="card-section-desc">Disable dynamic tick, HPET, force TSC timer: consistent frame pacing, lower input lag.</div>
                     <div id="timer-status" style="margin-bottom:12px;font-size:13px"><span class="pulse" style="color:var(--text-secondary)">Checking…</span></div>
                     <div class="btn-group">
                         <button class="btn btn-primary" onclick="applyTimerTweaks()">Apply</button>
@@ -1466,7 +1466,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01"/><path d="M10 8h.01"/><path d="M14 8h.01"/><path d="M18 8h.01"/><path d="M7 16h10"/></svg>
                         Input Device Priority
                     </div>
-                    <div class="card-section-desc">Boost interrupt priority for your input devices. <em>High</em> tells Windows to handle those interrupts before normal-priority ones — measurable reduction in input lag under heavy CPU load. <b>Reboot required.</b><br><br><span style="color:var(--text-tertiary);font-size:12px">Note: <code style="color:var(--accent);font-size:11px">HKLM\\Enum</code> is locked-down on Windows by default — Vispora takes ownership + grants Admin write before applying. The result is read back from the registry to verify (see kernel log below). For USB-attached devices, also raise priority on the host controller via Auto-Optimize above.</span></div>
+                    <div class="card-section-desc">Boost interrupt priority for your input devices. <em>High</em> tells Windows to handle those interrupts before normal-priority ones, for a measurable reduction in input lag under heavy CPU load. <b>Reboot required.</b><br><br><span style="color:var(--text-tertiary);font-size:12px">Note: <code style="color:var(--accent);font-size:11px">HKLM\\Enum</code> is locked down on Windows by default, so Vispora takes ownership + grants Admin write before applying. The result is read back from the registry to verify (see kernel log below). For USB-attached devices, also raise priority on the host controller via Auto-Optimize above.</span></div>
 
                     <!-- Keyboards -->
                     <div style="margin-top:14px;padding:12px;border-radius:8px;background:var(--bg-overlay)">
@@ -1498,7 +1498,7 @@
                             <span id="ct-count" style="margin-left:auto;font-size:11px;color:var(--text-tertiary)">—</span>
                         </div>
                         <div style="font-size:12.5px;color:var(--text-secondary);margin-bottom:10px;line-height:1.55">
-                            Multiple paired controllers can show up here even when only one is in your hands. <b>Press any button on the controller you actually want to use</b> — Vispora will identify it and boost only that one.
+                            Multiple paired controllers can show up here even when only one is in your hands. <b>Press any button on the controller you actually want to use</b> and Vispora will identify it and boost only that one.
                         </div>
                         <div id="ct-detect-zone" style="padding:14px;border-radius:6px;background:var(--bg-elevated);border:1px dashed var(--border-faint);text-align:center;font-size:13px;color:var(--text-secondary);margin-bottom:10px">
                             <div id="ct-detect-msg">Connect a controller and press any button…</div>
@@ -1561,10 +1561,10 @@
                 </div>
                 <div style="font-size:13px;color:var(--text);margin-top:12px;line-height:1.8">
                     <span style="color:var(--accent);font-weight:600">1.</span> Process priority → High<br>
-                    <span style="color:var(--accent);font-weight:600">2.</span> Every CPU core made available to the game — P-cores and E-cores, any core restriction lifted (Windows still puts the heaviest threads on the P-cores)<br>
-                    <span style="color:var(--accent);font-weight:600">3.</span> Core parking off — no core is put to sleep while the game runs<br>
+                    <span style="color:var(--accent);font-weight:600">2.</span> Every CPU core made available to the game: P-cores and E-cores, any core restriction lifted (Windows still puts the heaviest threads on the P-cores)<br>
+                    <span style="color:var(--accent);font-weight:600">3.</span> Core parking off, so no core is put to sleep while the game runs<br>
                     <span style="color:var(--accent);font-weight:600">4.</span> Game exempt from Windows power throttling (never moved to efficiency mode)<br>
-                    <span style="color:var(--accent);font-weight:600">5.</span> Win32PrioritySeparation = 0x28 (Short/Fixed — lowest input lag)<br>
+                    <span style="color:var(--accent);font-weight:600">5.</span> Win32PrioritySeparation = 0x28 (Short/Fixed, lowest input lag)<br>
                     <span style="color:var(--accent);font-weight:600">6.</span> CPU idle states disabled (max clock speeds)<br>
                     <span style="color:var(--accent);font-weight:600">7.</span> DSCP 46 network priority for the game<br>
                     <span style="color:var(--accent);font-weight:600">8.</span> SystemResponsiveness = 10 (foreground priority, audio-safe)<br>
@@ -1585,12 +1585,12 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
                 <div class="card-title">Per-Game Auto-Tuning</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:680px">
-                    During real gameplay, Vispora nudges your GPU OC offsets up while watching the live stability score (clock variance, temp, util consistency). When stable, it bumps. When the score drops or a crash happens, it steps down and remembers — that offset is permanently blacklisted for that game. Each game gets its own learned profile that improves over time.
+                    During real gameplay, Vispora nudges your GPU OC offsets up while watching the live stability score (clock variance, temp, util consistency). When stable, it bumps. When the score drops or a crash happens, it steps down and remembers: that offset is permanently blacklisted for that game. Each game gets its own learned profile that improves over time.
                 </p>
                 <div class="toggle-row">
                     <div class="toggle-info">
                         <div class="toggle-name">Adaptive Tuning</div>
-                        <div class="toggle-desc">Master switch — opt-in. Per-game toggles below let you control which titles AT touches.</div>
+                        <div class="toggle-desc">Master switch (opt-in). Per-game toggles below let you control which titles AT touches.</div>
                     </div>
                     <div class="toggle-switch" id="toggle-adaptive-global" onclick="toggleAdaptiveGlobal(this)"></div>
                 </div>
@@ -1604,13 +1604,13 @@
                      AT might be idle and what telemetry sources are alive. -->
                 <details id="adaptive-diagnostics-wrap" style="margin-top:14px" ontoggle="if(this.open) startAdaptiveDiagnosticsPoll(); else stopAdaptiveDiagnosticsPoll()">
                     <summary style="cursor:pointer;font-size:11.5px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase;padding:6px 0">
-                        Diagnostics — what is AT seeing right now?
+                        Diagnostics: what is AT seeing right now?
                     </summary>
                     <div id="adaptive-diagnostics" style="margin-top:10px;font-size:12.5px"></div>
                 </details>
                 <div class="filter-row" style="margin-top:18px;margin-bottom:8px">
                     <span class="filter-row-label">Manual control</span>
-                    <button class="btn btn-sm" onclick="pauseAtManually()" title="Stop AT from tuning until you resume — useful before running benchmarks, capturing recoil patterns, or temporarily testing manual offsets.">Pause AT</button>
+                    <button class="btn btn-sm" onclick="pauseAtManually()" title="Stop AT from tuning until you resume. Useful before running benchmarks, capturing recoil patterns, or temporarily testing manual offsets.">Pause AT</button>
                     <button class="btn btn-sm" onclick="resumeAtManually()" title="Release a manual pause.">Resume AT</button>
                 </div>
                 <div class="filter-row" style="margin-top:18px;margin-bottom:8px">
@@ -1622,7 +1622,7 @@
                 <details style="margin-top:18px" ontoggle="if (this.open) loadCrossGameBlacklist()">
                     <summary style="cursor:pointer;font-size:12px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase;padding:6px 0">Cross-game offset blacklist</summary>
                     <div style="margin-top:8px;font-size:12px;color:var(--text-secondary);line-height:1.55">
-                        Offsets that caused a <b>driver-level</b> crash (TDR, BSOD, WER, thermal trip, stuck clocks).  AT will refuse to step into these in ANY game until you clear them — driver-level crashes signal the offset is bad regardless of game.
+                        Offsets that caused a <b>driver-level</b> crash (TDR, BSOD, WER, thermal trip, stuck clocks).  AT will refuse to step into these in ANY game until you clear them, because driver-level crashes signal the offset is bad regardless of game.
                     </div>
                     <div id="adaptive-cross-blacklist" style="margin-top:8px"></div>
                     <button class="btn btn-sm btn-danger" onclick="clearCrossGameBlacklist()" style="margin-top:8px">Clear cross-game blacklist</button>
@@ -1638,7 +1638,7 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></div>
                 <div class="card-title">Installed Games</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:680px">
-                    Scans Steam, Epic, Riot, Battle.net, GOG, Ubisoft, EA and Microsoft Store and lists every game Vispora can recognize.  One click enables Adaptive Tuning for an installed title — no need to launch it first.  Re-scan after installing a new game.
+                    Scans Steam, Epic, Riot, Battle.net, GOG, Ubisoft, EA and Microsoft Store and lists every game Vispora can recognize.  One click enables Adaptive Tuning for an installed title, with no need to launch it first.  Re-scan after installing a new game.
                 </p>
                 <div id="library-summary" style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">Loading…</div>
                 <div class="filter-row" style="margin-bottom:10px">
@@ -1655,12 +1655,12 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg></div>
                 <div class="card-title">Pause Apps During Gaming</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:680px">
-                    Suspends AI desktop apps and browsers when a game launches — they consume zero CPU and Windows pushes their RAM to standby until the game exits. <b style="color:var(--text-bright)">Discord, Spotify, music apps, and stream software are never paused</b> so calls and audio keep working.
+                    Suspends AI desktop apps and browsers when a game launches. They consume zero CPU and Windows pushes their RAM to standby until the game exits. <b style="color:var(--text-bright)">Discord, Spotify, music apps, and stream software are never paused</b> so calls and audio keep working.
                 </p>
                 <div class="toggle-row">
                     <div class="toggle-info">
                         <div class="toggle-name">Background Pauser</div>
-                        <div class="toggle-desc">Master switch — opt-in. Categories below let you choose what gets suspended.</div>
+                        <div class="toggle-desc">Master switch (opt-in). Categories below let you choose what gets suspended.</div>
                     </div>
                     <div class="toggle-switch" id="toggle-pauser-global" onclick="togglePauserGlobal(this)"></div>
                 </div>
@@ -1696,10 +1696,10 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="6" y1="11" x2="10" y2="11"/><line x1="8" y1="9" x2="8" y2="13"/><circle cx="15" cy="12" r="1"/><circle cx="18" cy="10" r="1"/><path d="M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258A4 4 0 0 0 17.32 5z"/></svg></div>
                 <div class="card-title">Gamepad → Keyboard Remap + Macros</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:680px">
-                    Bind any controller button to a keyboard key or run a macro sequence. Useful for games that don't natively support remap, or for binding combos onto a single button. By default, mappings only fire while a known game is in the foreground — your controller won't type in Discord when you alt-tab.
+                    Bind any controller button to a keyboard key or run a macro sequence. Useful for games that don't natively support remap, or for binding combos onto a single button. By default, mappings only fire while a known game is in the foreground, so your controller won't type in Discord when you alt-tab.
                 </p>
                 <div style="font-size:12.5px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.35);color:var(--text);padding:11px 14px;border-radius:8px;margin-bottom:12px;line-height:1.55;max-width:680px">
-                    <b style="color:#ef4444">⚠ Anti-cheat / ban warning.</b> Emulating a controller (virtual-controller mode) and running input macros are treated as cheating by many competitive games and their kernel anti-cheats. Call of Duty's RICOCHET flags controller-emulation + scripted input the same as a Cronus/XIM, and Riot (Valorant), EA (Apex), Epic (Fortnite) and Activision prohibit input automation in their Terms <b>regardless of whether it's detected</b>. Using button→macro or virtual-controller mode in ranked/competitive titles can get your account <b>permanently banned</b>. Use these only in single-player, private servers, or games without kernel anti-cheat — never in ranked.
+                    <b style="color:#ef4444">⚠ Anti-cheat / ban warning.</b> Emulating a controller (virtual-controller mode) and running input macros are treated as cheating by many competitive games and their kernel anti-cheats. Call of Duty's RICOCHET flags controller-emulation + scripted input the same as a Cronus/XIM, and Riot (Valorant), EA (Apex), Epic (Fortnite) and Activision prohibit input automation in their Terms <b>regardless of whether it's detected</b>. Using button→macro or virtual-controller mode in ranked/competitive titles can get your account <b>permanently banned</b>. Use these only in single-player, private servers, or games without kernel anti-cheat. Never in ranked.
                 </div>
                 <div id="gpm-vigembus-banner" style="display:none;font-size:12.5px;background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);color:var(--text);padding:10px 14px;border-radius:6px;margin-bottom:10px;line-height:1.55">
                     <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap">
@@ -1733,7 +1733,7 @@
                 <div class="toggle-row">
                     <div class="toggle-info">
                         <div class="toggle-name">Gamepad Mapper</div>
-                        <div class="toggle-desc">Master switch — opt-in. The polling loop runs always for the bind UI; this controls whether mapped keys actually fire.</div>
+                        <div class="toggle-desc">Master switch (opt-in). The polling loop runs always for the bind UI; this controls whether mapped keys actually fire.</div>
                     </div>
                     <div class="toggle-switch" id="toggle-gpm-master" onclick="toggleGpmMaster(this)"></div>
                 </div>
@@ -1741,7 +1741,7 @@
                 <div class="filter-row" style="margin-top:18px;margin-bottom:8px">
                     <span class="filter-row-label">Active profile</span>
                     <select id="gpm-profile-select" onchange="onGpmProfileSelect()" style="padding:6px 10px;border-radius:6px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);min-width:180px">
-                        <option value="">— none —</option>
+                        <option value="">(none)</option>
                     </select>
                     <button class="btn btn-sm" onclick="newGpmProfile()">New profile</button>
                     <button class="btn btn-sm btn-danger" onclick="deleteGpmProfile()">Delete profile</button>
@@ -1875,7 +1875,7 @@
                         <!-- "No controller" overlay (toggle visibility from JS) -->
                         <text id="gpm-svg-noctrl" x="300" y="320" text-anchor="middle"
                               fill="var(--text-tertiary)" font-size="12" font-family="monospace" style="display:none">
-                            No controller detected — plug in or wake yours
+                            No controller detected. Plug in or wake yours
                         </text>
                     </svg>
                 </div>
@@ -1898,7 +1898,7 @@
                                     <option value="ds4">DualShock 4</option>
                                 </select>
                             </label>
-                            <label style="font-size:12px;color:var(--text-secondary);display:flex;gap:6px;align-items:center" title="Internal sample rate — how fast Vispora reads your physical controller and pushes updates to the virtual pad. Higher = lower latency between input and the virtual pad's state being current. Note: ViGEmBus's USB-side rate to the GAME is hardcoded by the kernel driver (~1 kHz for DS4, ~250 Hz for X360); higher internal rates make the data the game sees fresher, but don't increase how often the game polls.">
+                            <label style="font-size:12px;color:var(--text-secondary);display:flex;gap:6px;align-items:center" title="Internal sample rate: how fast Vispora reads your physical controller and pushes updates to the virtual pad. Higher = lower latency between input and the virtual pad's state being current. Note: ViGEmBus's USB-side rate to the GAME is hardcoded by the kernel driver (~1 kHz for DS4, ~250 Hz for X360); higher internal rates make the data the game sees fresher, but don't increase how often the game polls.">
                                 Sample:
                                 <select id="gpm-poll-hz" onchange="onGpmPollHzChange()" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">
                                     <option value="1000">1 kHz</option>
@@ -1922,7 +1922,7 @@
 
                     <!-- v3.5 — Advanced settings collapsible -->
                     <details id="gpm-advanced" style="margin-top:16px;border:1px solid var(--border-faint);border-radius:8px;padding:8px 12px;background:var(--bg-overlay)">
-                        <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--text-secondary);padding:4px 0">Advanced — sticks, modifier layer, auto-switch, latency</summary>
+                        <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--text-secondary);padding:4px 0">Advanced: sticks, modifier layer, auto-switch, latency</summary>
                         <div style="padding-top:12px;display:flex;flex-direction:column;gap:18px;font-size:12px">
                             <!-- Stick tuning -->
                             <div>
@@ -2018,7 +2018,7 @@
                             <b style="color:#ef4444">Recording…</b>
                             <span id="gpm-macro-rec-timer" style="margin-left:auto;font-family:var(--font-mono,monospace);color:var(--text-bright)">0.0s · 0 events</span>
                         </div>
-                        <div style="font-size:12px;color:var(--text-secondary);line-height:1.5">Press your sequence — keyboard, mouse, controller — anywhere on screen. Vispora timestamps each press/release. Mouse movement is filtered out. Hit Stop when done.</div>
+                        <div style="font-size:12px;color:var(--text-secondary);line-height:1.5">Press your sequence (keyboard, mouse, controller) anywhere on screen. Vispora timestamps each press/release. Mouse movement is filtered out. Hit Stop when done.</div>
                         <div class="btn-group" style="margin-top:10px">
                             <button class="btn btn-sm btn-primary" onclick="stopMacroRecording(false)">Stop &amp; replace</button>
                             <button class="btn btn-sm" onclick="stopMacroRecording(true)">Stop &amp; append</button>
@@ -2042,16 +2042,16 @@
             <!-- v3.6 — Macro recording options modal (sources + countdown) -->
             <div id="gpm-macro-record-options-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1001;align-items:center;justify-content:center">
                 <div style="background:var(--bg-card,var(--bg-elevated));padding:24px;border-radius:12px;max-width:480px;width:90%;border:1px solid var(--border-faint)">
-                    <div style="font-size:14px;font-weight:600;color:var(--text-bright);margin-bottom:8px">● Record macro — pick sources</div>
+                    <div style="font-size:14px;font-weight:600;color:var(--text-bright);margin-bottom:8px">● Record macro: pick sources</div>
                     <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55">
-                        Recording starts after a configurable delay so you have time to alt-tab into your target window.  Tick anything you want recorded — analog inputs (stick / trigger / mouse-move) sample at 30 Hz and produce more steps than digital presses, so leave them off if you only need keyboard / button taps.
+                        Recording starts after a configurable delay so you have time to alt-tab into your target window.  Tick anything you want recorded. Analog inputs (stick / trigger / mouse-move) sample at 30 Hz and produce more steps than digital presses, so leave them off if you only need keyboard / button taps.
                     </div>
                     <div style="display:flex;flex-direction:column;gap:8px;font-size:12.5px;margin-bottom:14px">
                         <div style="font-size:11px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase;margin-top:4px">Digital (press / release)</div>
                         <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="gpm-rec-opt-keyboard" checked /> Keyboard keys</label>
                         <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="gpm-rec-opt-mouse-buttons" checked /> Mouse buttons + wheel</label>
                         <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="gpm-rec-opt-ctrl-buttons" checked /> Controller buttons (A/B/X/Y/LB/RB/etc.)</label>
-                        <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="gpm-rec-opt-ctrl-triggers" checked /> Controller triggers (LT/RT — both digital threshold + analog sampling)</label>
+                        <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="gpm-rec-opt-ctrl-triggers" checked /> Controller triggers (LT/RT, both digital threshold + analog sampling)</label>
 
                         <div style="font-size:11px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase;margin-top:8px">Analog (continuous, sampled at 30 Hz)</div>
                         <label style="display:flex;gap:8px;align-items:center" title="Records left/right stick positions over time as a series of vstick steps.  Useful for capturing aim sweeps, but generates ~30 steps per second of stick motion."><input type="checkbox" id="gpm-rec-opt-ctrl-sticks" /> Controller sticks (L/R)</label>
@@ -2072,7 +2072,7 @@
                 <div style="background:var(--bg-card,var(--bg-elevated));padding:24px;border-radius:12px;max-width:680px;width:90%;border:1px solid var(--border-faint);max-height:85vh;overflow-y:auto">
                     <div style="font-size:14px;font-weight:600;color:var(--text-bright);margin-bottom:8px">Insert recoil preset</div>
                     <div style="font-size:12.5px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55">
-                        Pick a curated anti-recoil pattern. The selected pattern will <b>replace</b> the current macro steps. Default magnitudes are conservative — tweak per-step after insertion to match your in-game sensitivity.
+                        Pick a curated anti-recoil pattern. The selected pattern will <b>replace</b> the current macro steps. Default magnitudes are conservative. Tweak per-step after insertion to match your in-game sensitivity.
                     </div>
 
                     <!-- Anti-cheat disclaimer -->
@@ -2094,7 +2094,7 @@
                 <div style="background:var(--bg-card,var(--bg-elevated));padding:24px;border-radius:12px;max-width:560px;width:90%;border:1px solid var(--border-faint);max-height:90vh;overflow-y:auto">
                     <div style="font-size:14px;font-weight:600;color:var(--text-bright);margin-bottom:8px">✋ Counter-pull recording</div>
                     <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55">
-                        Aim at any target in your game (no screen capture, so windowed mode <i>not</i> required).  Click <b>Start</b>, then fire your full magazine while <b>manually compensating</b> — drag your mouse down or push your right stick down to keep the crosshair on target.  We record what you do.  Whatever inputs you make IS the compensation pattern.
+                        Aim at any target in your game (no screen capture, so windowed mode <i>not</i> required).  Click <b>Start</b>, then fire your full magazine while <b>manually compensating</b>: drag your mouse down or push your right stick down to keep the crosshair on target.  We record what you do.  Whatever inputs you make IS the compensation pattern.
                         <br/><br/>
                         Quality depends on your counter-pull technique.  Practice the spray a few times first; your last attempt is usually the cleanest.
                     </div>
@@ -2143,7 +2143,7 @@
                     <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55">
                         Aim at a flat wall in your game (<b>windowed or borderless</b>), click <b>Start</b>, fire your full magazine <b>without moving your aim</b> (don't touch the right stick / mouse).  We screenshot the foreground window at 120 Hz and use FFT-based phase correlation to extract the camera-drift pattern.  After firing, click Stop (or wait for the duration to elapse) and save as a preset.
                         <br/><br/>
-                        <b>Controller user?</b>  Enable <b>Auto-fire</b> below — Vispora will push RT through your virtual pad so you don't have to hold the trigger yourself.  Requires virtual_controller mode + master switch on.
+                        <b>Controller user?</b>  Enable <b>Auto-fire</b> below and Vispora will push RT through your virtual pad so you don't have to hold the trigger yourself.  Requires virtual_controller mode + master switch on.
                     </div>
                     <div style="display:grid;grid-template-columns:max-content 1fr;gap:8px 12px;font-size:12px;margin-bottom:14px;align-items:center">
                         <label>Preset name</label>
@@ -2152,7 +2152,7 @@
                         <input type="text" id="gpm-capture-screen-game" placeholder="Counter-Strike 2" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
                         <label>Weapon</label>
                         <input type="text" id="gpm-capture-screen-weapon" placeholder="AK-47" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
-                        <label title="Rounds per minute — controls how the captured frames are binned into per-shot deltas">RPM</label>
+                        <label title="Rounds per minute. Controls how the captured frames are binned into per-shot deltas">RPM</label>
                         <input type="number" id="gpm-capture-screen-rpm" value="600" min="60" max="1500" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:90px"/>
                         <label title="How long to capture for (seconds).  Auto-stops when the magazine ends.">Max duration</label>
                         <input type="number" id="gpm-capture-screen-dur" value="6.0" min="1" max="20" step="0.5" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:90px"/>
@@ -2163,7 +2163,7 @@
                             <option value="once">Once (full mag spray)</option>
                             <option value="loop_while_held">Loop while held (rapid SMG)</option>
                         </select>
-                        <label title="Have Vispora hold RT through your virtual pad during the capture window — you don't have to physically touch the trigger.  Requires the active profile in Virtual controller mode + master switch on.">Auto-fire</label>
+                        <label title="Have Vispora hold RT through your virtual pad during the capture window, so you don't have to physically touch the trigger.  Requires the active profile in Virtual controller mode + master switch on.">Auto-fire</label>
                         <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="gpm-capture-screen-autofire" /> <span style="font-size:11px;color:var(--text-tertiary)">Push RT via virtual pad for me (controller users)</span></label>
                     </div>
 
@@ -2185,7 +2185,7 @@
                     <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55">
                         Aim at a clean flat wall in a training map (e.g. CS2's <code>aim_botz</code>, Apex firing range, R6's terrorist hunt).  Click <b>Capture before</b>, fire your full magazine <b>without moving your aim</b> (don't touch the right stick / mouse), then click <b>Capture after</b>.  We diff the two screenshots, detect bullet holes via connected components, and sort top-down (first-shot-highest convention).
                         <br/><br/>
-                        <b>Controller user?</b>  Click <b>Auto-fire mag</b> between Before and After — Vispora will hold RT through your virtual pad for the right duration so you don't need to alt-tab.  Requires virtual_controller mode.
+                        <b>Controller user?</b>  Click <b>Auto-fire mag</b> between Before and After and Vispora will hold RT through your virtual pad for the right duration so you don't need to alt-tab.  Requires virtual_controller mode.
                     </div>
                     <div style="display:grid;grid-template-columns:max-content 1fr;gap:8px 12px;font-size:12px;margin-bottom:14px;align-items:center">
                         <label>Preset name</label>
@@ -2194,7 +2194,7 @@
                         <input type="text" id="gpm-capture-bullet-game" placeholder="Counter-Strike 2" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
                         <label>Weapon</label>
                         <input type="text" id="gpm-capture-bullet-weapon" placeholder="AK-47" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
-                        <label title="Rounds per minute — affects timing, not detection">RPM</label>
+                        <label title="Rounds per minute (affects timing, not detection)">RPM</label>
                         <input type="number" id="gpm-capture-bullet-rpm" value="600" min="60" max="1500" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:90px"/>
                         <label title="Per-pixel BGR-sum delta below which we ignore changes.  60 works for most games.  Bump up if you get too many false positives, down if you miss faint holes.">Threshold</label>
                         <input type="number" id="gpm-capture-bullet-threshold" value="60" min="10" max="200" step="5" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:90px"/>
@@ -2248,15 +2248,15 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg></div>
                 <div class="card-title">Auto stream helper (experimental)</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:720px">
-                    Turn this on and Vispora takes over: it configures OBS automatically with Game Capture (hook-injected — handles fullscreen-exclusive games way better than display capture), then sets up three separate audio sources on independent tracks so you can mix them in OBS / your broadcast software:
+                    Turn this on and Vispora takes over: it configures OBS automatically with Game Capture (hook-injected, handles fullscreen-exclusive games way better than display capture), then sets up three separate audio sources on independent tracks so you can mix them in OBS / your broadcast software:
                 </p>
                 <ul style="font-size:12.5px;color:var(--text-secondary);margin-top:-4px;margin-bottom:14px;line-height:1.7;padding-left:22px">
-                    <li><b>Game audio</b> — captures only the active game's process via per-app WASAPI</li>
-                    <li><b>Discord audio</b> — captures only Discord.exe's output (so voice chat is its own track)</li>
-                    <li><b>Microphone</b> — your default Windows recording device</li>
+                    <li><b>Game audio</b>: captures only the active game's process via per-app WASAPI</li>
+                    <li><b>Discord audio</b>: captures only Discord.exe's output (so voice chat is its own track)</li>
+                    <li><b>Microphone</b>: your default Windows recording device</li>
                 </ul>
                 <p style="font-size:12.5px;color:var(--text-tertiary);margin-bottom:14px;line-height:1.55;max-width:720px">
-                    The Game Capture + Game Audio sources auto-follow whichever game is in the foreground.  When the toggle is on, the manual Capture controls below are hidden — Vispora does it all.
+                    The Game Capture + Game Audio sources auto-follow whichever game is in the foreground.  When the toggle is on, the manual Capture controls below are hidden and Vispora does it all.
                 </p>
                 <div class="toggle-row">
                     <div class="toggle-info">
@@ -2266,7 +2266,7 @@
                     <div class="toggle-switch" id="toggle-stream-helper-enabled" onclick="toggleStreamHelper(this)"></div>
                 </div>
                 <div id="stream-helper-status" style="font-size:11.5px;color:var(--text-tertiary);line-height:1.5;padding:8px 10px;background:var(--bg-overlay);border-radius:var(--radius-sm);margin-top:12px">
-                    Off — flip the toggle to let Vispora take over OBS setup.
+                    Off. Flip the toggle to let Vispora take over OBS setup.
                 </div>
                 <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
                     <button class="btn btn-sm" onclick="streamHelperSetup()">Setup scene now</button>
@@ -2278,7 +2278,7 @@
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg></div>
                 <div class="card-title">Instant-replay buffer</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:680px">
-                    A rolling FFmpeg buffer captures the last <span id="clip-buffer-label">30 seconds</span> of your desktop in the background. Press your save-clip hotkey mid-game and Vispora concats the last N seconds into a single mp4 — like NVIDIA ShadowPlay or Xbox Game Bar's instant replay, but vendor-agnostic. Uses NVENC if you have an NVIDIA GPU, AMF for AMD, QSV for Intel, else libx264.
+                    A rolling FFmpeg buffer captures the last <span id="clip-buffer-label">30 seconds</span> of your desktop in the background. Press your save-clip hotkey mid-game and Vispora concats the last N seconds into a single mp4, like NVIDIA ShadowPlay or Xbox Game Bar's instant replay, but vendor-agnostic. Uses NVENC if you have an NVIDIA GPU, AMF for AMD, QSV for Intel, else libx264.
                 </p>
                 <div id="clipper-status" style="margin-bottom:14px;font-size:12.5px"></div>
                 <div class="toggle-row">
@@ -2301,7 +2301,7 @@
             <div class="card">
                 <div class="card-title">What to record</div>
                 <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;line-height:1.55">
-                    Pick which monitor Vispora should capture.  The choice locks in when you turn the buffer on — if you want to switch displays, toggle the buffer off + on after selecting.
+                    Pick which monitor Vispora should capture.  The choice locks in when you turn the buffer on. To switch displays, toggle the buffer off + on after selecting.
                 </p>
                 <div class="filter-row" style="flex-wrap:wrap;gap:14px;align-items:flex-end">
                     <label style="font-size:12.5px;color:var(--text-secondary);display:flex;flex-direction:column;gap:4px;min-width:220px">
@@ -2368,7 +2368,7 @@
                     </label>
                 </div>
                 <p style="margin-top:10px;font-size:11.5px;color:var(--text-tertiary);line-height:1.5">
-                    The buffer is always recording when the toggle above is on — saving a clip just grabs the most recent N seconds from what's already buffered.  It does <b>not</b> start a fresh recording, so you never miss the moment you wanted to capture.
+                    The buffer is always recording when the toggle above is on. Saving a clip just grabs the most recent N seconds from what's already buffered.  It does <b>not</b> start a fresh recording, so you never miss the moment you wanted to capture.
                 </p>
             </div>
 
@@ -2376,7 +2376,7 @@
             <div class="card">
                 <div class="card-title">Microphone + system audio</div>
                 <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;line-height:1.55">
-                    Adds audio tracks to your saved clips.  Microphone captures your voice; system audio captures whatever's playing through your default Windows output (speakers / headphones / HDMI).  Both can be on at once and will be mixed.  System audio uses native WASAPI loopback — no third-party driver required.
+                    Adds audio tracks to your saved clips.  Microphone captures your voice; system audio captures whatever's playing through your default Windows output (speakers / headphones / HDMI).  Both can be on at once and will be mixed.  System audio uses native WASAPI loopback, so no third-party driver is required.
                 </p>
                 <div class="toggle-row" style="padding-bottom:10px">
                     <div class="toggle-info">
@@ -2388,7 +2388,7 @@
                 <label style="font-size:12.5px;color:var(--text-secondary);display:flex;flex-direction:column;gap:4px;margin-bottom:14px">
                     <span style="color:var(--text-tertiary);font-size:10.5px;text-transform:uppercase;letter-spacing:0.04em">Microphone device</span>
                     <select id="clip-mic-device" onchange="saveClipperSettings()">
-                        <option value="">— refreshing… —</option>
+                        <option value="">Refreshing…</option>
                     </select>
                 </label>
                 <div class="toggle-row" style="padding-bottom:6px">
@@ -2404,7 +2404,7 @@
             </div>
 
             <div class="section-divider">Recorder backend</div>
-            <div class="card">
+            <div class="card" id="obs-backend-card">
                 <div class="card-title">OBS Studio backend (experimental)</div>
                 <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;line-height:1.55">
                     Drives a running OBS Studio instance via the built-in WebSocket plugin instead of Vispora's FFmpeg path.  OBS uses Windows Graphics Capture which handles fullscreen-exclusive games and high-refresh-rate captures better than FFmpeg's DXGI wrapper.  Requires OBS 28 or newer.
@@ -2453,7 +2453,7 @@
             <div class="card">
                 <div class="card-title">Global hotkeys</div>
                 <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;line-height:1.55">
-                    Click a button below and press the key (or combo) you want.  Escape cancels.  Hotkeys fire from anywhere — even when Vispora is minimized or you're focused on a game.
+                    Click a button below and press the key (or combo) you want.  Escape cancels.  Hotkeys fire from anywhere, even when Vispora is minimized or you're focused on a game.
                 </p>
                 <div class="filter-row" style="flex-wrap:wrap;gap:14px;align-items:flex-end">
                     <div style="display:flex;flex-direction:column;gap:4px;min-width:230px">
@@ -2513,7 +2513,7 @@
 
             <div style="margin-bottom:16px;display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text-secondary)">
                 <span class="live-dot"></span>
-                <span>Live — refreshing every 1.5 seconds</span>
+                <span>Live, refreshing every 1.5 seconds</span>
             </div>
 
             <div id="hw-alerts" style="margin-bottom:16px"></div>
@@ -2531,9 +2531,9 @@
                 <div class="card-section">
                     <div class="card-section-title">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 17 9 11 13 15 21 7"/><polyline points="14 7 21 7 21 14"/></svg>
-                        Live Performance — last 60s
+                        Live Performance (last 60s)
                     </div>
-                    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;line-height:1.55">Background sampler captures GPU clock, temp, util and power 5 times per second. Stability score weights clock variance, temperature range and util consistency — high score = boost is holding cleanly under load.</p>
+                    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;line-height:1.55">Background sampler captures GPU clock, temp, util and power 5 times per second. Stability score weights clock variance, temperature range and util consistency. A high score means boost is holding cleanly under load.</p>
                     <div id="perf-stability-row" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:14px">
                         <span style="font-size:12.5px;color:var(--text-secondary)">Stability:</span>
                         <span id="perf-stability-score" class="oc-slider-val" style="font-size:22px">—</span>
@@ -2572,7 +2572,7 @@
                 <div class="page-header-row">
                     <div>
                         <div class="section-title">Settings</div>
-                        <div class="section-subtitle">App preferences — startup behaviour, notifications, updates, drivers, GPU baseline, problem reporting.</div>
+                        <div class="section-subtitle">App preferences: startup behaviour, notifications, updates, drivers, GPU baseline, problem reporting.</div>
                     </div>
                 </div>
             </div>
@@ -2583,7 +2583,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
                         Startup Manager
                     </div>
-                    <div class="card-section-desc">Once Vispora is up, gracefully launch your chosen apps — staggered (one at a time), run as you (de-elevated, not as admin), and skipping anything already running. Opt-in; nothing starts unless you turn it on.</div>
+                    <div class="card-section-desc">Once Vispora is up, gracefully launch your chosen apps: staggered (one at a time), run as you (de-elevated, not as admin), and skipping anything already running. Opt-in; nothing starts unless you turn it on.</div>
                     <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:12px 0">
                         <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);cursor:pointer"><input type="checkbox" id="sm-enabled" onchange="smSaveSettings()"> Enable startup launching</label>
                         <span style="font-size:12px;color:var(--text-tertiary)">Initial delay <input type="number" id="sm-initial" min="0" max="120" value="8" onchange="smSaveSettings()" style="width:52px;padding:4px 6px;border-radius:5px;background:var(--bg-input);border:1px solid var(--border);color:var(--text);font-size:12px"> s</span>
@@ -2604,9 +2604,9 @@
                 <div class="card-section">
                     <div class="card-section-title">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/></svg>
-                        Idle Mode — cool &amp; quiet
+                        Idle Mode: cool &amp; quiet
                     </div>
-                    <div class="card-section-desc">When no game is detected for a while, Vispora eases the GPU power limit and switches to a Balanced power plan — cooler card, quieter fans, lower idle draw. Your PC stays fully usable for everything else; the instant a game launches, your exact overclock and power plan snap back. Opt-in.</div>
+                    <div class="card-section-desc">When no game is detected for a while, Vispora eases the GPU power limit and switches to a Balanced power plan: cooler card, quieter fans, lower idle draw. Your PC stays fully usable for everything else; the instant a game launches, your exact overclock and power plan snap back. Opt-in.</div>
                     <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:12px 0">
                         <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);cursor:pointer"><input type="checkbox" id="idle-enabled" onchange="idleSave()"> Enable Idle Mode</label>
                         <span style="font-size:12px;color:var(--text-tertiary)">Engage after <input type="number" id="idle-grace" min="1" max="120" value="5" onchange="idleSave()" style="width:52px;padding:4px 6px;border-radius:5px;background:var(--bg-input);border:1px solid var(--border);color:var(--text);font-size:12px"> min idle</span>
@@ -2676,7 +2676,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>
                         GPU Driver
                     </div>
-                    <div class="card-section-desc">Checks for new NVIDIA / AMD drivers on startup and every 12 hours. Downloads the official installer from the vendor — never auto-installs without your confirmation.</div>
+                    <div class="card-section-desc">Checks for new NVIDIA / AMD drivers on startup and every 12 hours. Downloads the official installer from the vendor and never auto-installs without your confirmation.</div>
                     <div id="settings-driver-info" style="font-size:13px;color:var(--text-secondary);padding:0 0 8px;line-height:1.55">
                         Loading…
                     </div>
@@ -2708,7 +2708,7 @@
                         Snapshots &amp; Restore
                     </div>
                     <div class="card-section-desc">
-                        A snapshot bundles every Vispora-touched registry path into a restorable backup. Vispora auto-snapshots before any bulk apply or full reset. You can also create snapshots manually before risky changes — restoring rolls everything back in one click. Reboot is recommended after a full restore.
+                        A snapshot bundles every Vispora-touched registry path into a restorable backup. Vispora auto-snapshots before any bulk apply or full reset. You can also create snapshots manually before risky changes. Restoring rolls everything back in one click. Reboot is recommended after a full restore.
                     </div>
                     <div class="form-row" style="margin-bottom:12px">
                         <div class="form-group" style="flex:2">

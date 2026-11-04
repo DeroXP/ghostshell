@@ -37,6 +37,7 @@ Persistence file: %APPDATA%\\Vispora\\tournament_mode.json
 """
 
 from __future__ import annotations
+import functools
 import json
 import os
 import re
@@ -165,10 +166,11 @@ def _launch_onedrive() -> bool:
     if not exe:
         return False
     try:
-        # Detached so it survives Vispora exiting
+        # Through explorer.exe, as the user (like startup_manager): started
+        # from this elevated process OneDrive refuses to run ("can't be run
+        # using full administrator rights").  explorer passes no arguments.
         import subprocess
-        subprocess.Popen([exe, "/background"], close_fds=True,
-                         creationflags=0x00000008)  # DETACHED_PROCESS
+        subprocess.Popen(["explorer.exe", exe], close_fds=True)
         return True
     except OSError:
         return False
@@ -187,6 +189,20 @@ def _set_toasts(enabled: bool) -> bool:
 # Enable / Disable
 # ────────────────────────────────────────────────────────────────────
 
+# One switch at a time.  The state is saved only once enable() is done, so a
+# second click meanwhile ran it again and took the first run's changes for the
+# user's baseline: disable() then "restored" the tournament settings.
+_switch_lock = threading.RLock()
+
+
+def _one_at_a_time(fn):
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        with _switch_lock:
+            return fn(*args, **kwargs)
+    return run
+
+
 def get_status() -> dict:
     state = _load_state()
     if state.get("enabled") and state.get("expires_at"):
@@ -196,6 +212,7 @@ def get_status() -> dict:
     return state
 
 
+@_one_at_a_time
 def enable(duration_min: int = 60) -> dict:
     """Capture baseline, apply every Tournament tweak, persist state.
 
@@ -303,11 +320,12 @@ def enable(duration_min: int = 60) -> dict:
     if expires:
         _start_timer_thread()
 
-    log.info(f"Tournament Mode ON — {len(actions)} actions taken, "
+    log.info(f"Tournament Mode ON: {len(actions)} actions taken, "
              f"expires {time.strftime('%H:%M:%S', time.localtime(expires)) if expires else 'never'}")
     return {"ok": True, "actions": actions, "status": get_status()}
 
 
+@_one_at_a_time
 def disable(reason: str = "manual") -> dict:
     """Roll back every change captured in baseline."""
     state = _load_state()
@@ -380,7 +398,7 @@ def disable(reason: str = "manual") -> dict:
 
     # Wipe state
     _wipe_state()
-    log.info(f"Tournament Mode OFF — {len(actions)} restore actions taken")
+    log.info(f"Tournament Mode OFF: {len(actions)} restore actions taken")
     return {"ok": True, "actions": actions}
 
 
@@ -401,7 +419,7 @@ def _timer_loop():
                 break
             exp = state.get("expires_at", 0) or 0
             if exp and time.time() >= exp:
-                log.info("Tournament Mode timer expired — auto-disabling")
+                log.info("Tournament Mode timer expired, auto-disabling")
                 disable(reason="timer")
                 break
         except Exception as e:
@@ -454,7 +472,7 @@ def recover_if_stale() -> dict:
     )
     if is_stale:
         log.warning("Tournament Mode: detected stale enabled state from previous "
-                    "run — auto-disabling now")
+                    "run, auto-disabling now")
         return disable(reason="stale-recovery")
 
     # Still valid — restart the timer thread so it fires on time

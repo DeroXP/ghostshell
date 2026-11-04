@@ -415,7 +415,7 @@ _engine = {
     "checks": [],
     "verified_at": 0.0,
     "power_applied": [],            # [(scheme, setting, value)] set for this session, for the re-checks
-    "streamer_prior": {},           # pid -> priority class a streaming app had before it was raised
+    "streamer_prior": {},           # pid -> (priority class a streaming app had before it was raised, created)
     "exit_ticks": 0,                # ticks since the last process of the game went away
     "tick": 0,
     # Background programs in efficiency mode for the session (see _eco_sweep).
@@ -426,6 +426,9 @@ _engine = {
     "eco_failed": 0,                # processes that did not read back as in efficiency mode
     "eco_moved": {},                # exe -> processes moved this session, exited ones included (the report)
     "ifeo_written": "",             # the exe whose launch priority was set during this session
+    # pid -> creation time of each process of a game the user forced normal
+    # mode back on mid-game: not taken up again while it runs (see _held_off).
+    "held_off": {},
 }
 # One session start, tick or restore at a time.  Two monitor threads used to
 # overlap for a moment when the monitor was restarted (adding a custom game
@@ -621,13 +624,13 @@ def _tune_game_processes(pids: list, recheck: bool = False) -> None:
         if len(rec["fixes"]) >= _REAPPLY_LIMIT:
             rec["gave_up"] = True
             rec["gave_up_on"] = drift
-            log.warning(f"  {exe} (PID {pid}) keeps changing its own {', '.join(drift)} — "
-                        f"no longer forced (re-applied {_REAPPLY_LIMIT}x in {_REAPPLY_WINDOW_S // 60} min)")
+            log.warning(f"  {exe} (PID {pid}) keeps changing its own {', '.join(drift)}. "
+                        f"No longer forced (re-applied {_REAPPLY_LIMIT}x in {_REAPPLY_WINDOW_S // 60} min)")
             continue
         rec["fixes"].append(now)
         for item in drift:
             rec["fixed"][item] = rec["fixed"].get(item, 0) + 1
-        log.info(f"  {exe} (PID {pid}): its {', '.join(drift)} had been changed back — re-applied")
+        log.info(f"  {exe} (PID {pid}): its {', '.join(drift)} had been changed back, re-applied")
         _tune_one(pid, rec, all_cores)
     for gone in [p for p in procs if p not in pids]:
         procs.pop(gone)
@@ -691,14 +694,14 @@ def _report_processes(all_cores: bool, at_launch: bool = False) -> None:
 
     def again(item):
         times = sum(r["fixed"].get(item, 0) for r in recs)
-        return f" — re-applied {times}x after the game changed it back" if times else ""
+        return f", re-applied {times}x after the game changed it back" if times else ""
 
     def given_up(item):
         return any(r["gave_up"] and item in r.get("gave_up_on", []) for r in recs)
 
     # priority
     if given_up("priority"):
-        _check("proc:priority", False, "Process priority: the game keeps setting its own — no longer forced")
+        _check("proc:priority", False, "Process priority: the game keeps setting its own, so it is no longer forced")
     elif all(r["result"].get("priority") for r in recs):
         _check("proc:priority", True, "Process priority -> High" + several + again("priority")
                + (" (Windows starts the game at High)" if _launch_high(exe) else ""))
@@ -706,13 +709,13 @@ def _report_processes(all_cores: bool, at_launch: bool = False) -> None:
         _check("proc:priority", None, "Process priority -> High (set through PowerShell; Windows does not let it be checked)")
     elif at_launch and _launch_high(exe):
         if _engine.get("ifeo_written") == exe.lower():
-            _check("proc:priority", None, "Process priority: blocked while the game runs — Windows will start it at "
+            _check("proc:priority", None, "Process priority: blocked while the game runs, so Windows will start it at "
                                           "High from the next launch")
         else:
             _check("proc:priority", False, "Process priority: Windows started the game at High, but the game or its "
                                            "anti-cheat lowered it again")
     elif at_launch and _engine.get("ifeo_tried") != exe.lower() and _set_launch_priority(exe):
-        _check("proc:priority", None, "Process priority: blocked while the game runs — Windows will start it at "
+        _check("proc:priority", None, "Process priority: blocked while the game runs, so Windows will start it at "
                                       "High from the next launch")
     else:
         hint = "" if at_launch else " (Settings → Game mode can have Windows start it at High instead)"
@@ -732,7 +735,7 @@ def _report_processes(all_cores: bool, at_launch: bool = False) -> None:
         main = _engine["game_procs"].get(_engine.get("active_pid")) or recs[0]
         aff = main["result"].get("affinity") or {}
         if given_up("CPU affinity"):
-            _check("proc:affinity", False, "CPU affinity: the game keeps restricting itself — no longer forced")
+            _check("proc:affinity", False, "CPU affinity: the game keeps restricting itself, so it is no longer forced")
         elif not opened:
             _check("proc:affinity", False, "CPU affinity: unchanged (the game's process is protected)")
         elif all((r["result"].get("affinity") or {}).get("ok") for r in opened):
@@ -746,7 +749,7 @@ def _report_processes(all_cores: bool, at_launch: bool = False) -> None:
     # power throttling
     if opened:
         if given_up("power throttling"):
-            _check("proc:throttle", False, "Power throttling: the game keeps opting back in — no longer forced")
+            _check("proc:throttle", False, "Power throttling: the game keeps opting back in, so it is no longer forced")
         elif all(r["result"].get("throttling") for r in opened):
             _check("proc:throttle", True, "Power throttling -> off for the game" + again("power throttling"))
         else:
@@ -790,14 +793,14 @@ def _apply_registry_tweaks(recheck: bool = False) -> None:
                 _check(f"reg:{name}", True, text)
             continue
         if recheck and not reg_originals.has_original(key, name, scope=_SCOPE):
-            _check(f"reg:{name}", None, f"{what}: changed since by another setting — left as it is")
+            _check(f"reg:{name}", None, f"{what}: changed since by another setting, so it was left as it is")
             continue
         reg_originals.remember(key, name, str(data), "REG_DWORD", scope=_SCOPE)
         run_cmd(["reg", "add", key, "/v", name, "/t", "REG_DWORD", "/d", str(data), "/f"])
         ok = _reads(key, name, data)
         if recheck and ok:
-            log.info(f"  {name} had been changed back — re-applied")
-            text += " — re-applied after it was changed back"
+            log.info(f"  {name} had been changed back, re-applied")
+            text += ", re-applied after it was changed back"
         _check(f"reg:{name}", ok, text if ok else f"{what}: could not be set")
 
 
@@ -883,8 +886,8 @@ def _apply_power_tweaks(recheck: bool = False) -> None:
     if len(good) == len(outcome):
         if not (recheck and not changed):
             _check("power:parking", True, "Core parking -> off (every core kept awake)"
-                   + (" — re-applied after it was changed back" if recheck and changed else "")
-                   + (" — after repairing the limit an old tweak had set to 0" if repaired else ""))
+                   + (", re-applied after it was changed back" if recheck and changed else "")
+                   + (", after repairing the limit an old tweak had set to 0" if repaired else ""))
     else:
         bad = [s for s in outcome if s not in good]
         why = []
@@ -905,13 +908,13 @@ def _apply_power_tweaks(recheck: bool = False) -> None:
         if not recheck:
             _check("power:idle", True, "CPU idle -> disabled")
     elif recheck and not reg_originals.has_power("SUB_PROCESSOR", "IdleDisable", scope=_SCOPE, scheme=scheme):
-        _check("power:idle", None, "CPU idle: changed since by another setting — left as it is")
+        _check("power:idle", None, "CPU idle: changed since by another setting, so it was left as it is")
     elif reg_originals.remember_power("SUB_PROCESSOR", "IdleDisable", scope=_SCOPE):
         run_cmd(["powercfg", "/setacvalueindex", scheme, "SUB_PROCESSOR", "IdleDisable", "1"])
         now = reg_originals.query_power(scheme, "SUB_PROCESSOR", "IdleDisable")
         ok = bool(now and now[0] == 1)
         changed = changed or ok
-        _check("power:idle", ok, ("CPU idle -> disabled" + (" — re-applied after it was changed back" if recheck else ""))
+        _check("power:idle", ok, ("CPU idle -> disabled" + (", re-applied after it was changed back" if recheck else ""))
                if ok else "CPU idle: Windows did not accept the change")
     else:
         _check("power:idle", False, "CPU idle: its current setting could not be read, so it was not changed")
@@ -927,7 +930,9 @@ def _raise_streamers(streamers: list) -> dict:
     for s in streamers:
         done, before = process_tuning.set_priority(s["pid"], process_tuning.ABOVE_NORMAL_PRIORITY_CLASS)
         if done and before and before != process_tuning.ABOVE_NORMAL_PRIORITY_CLASS:
-            _engine["streamer_prior"][s["pid"]] = before
+            # With its creation time: by the time the game closes the pid
+            # can belong to another process, which must not be "put back".
+            _engine["streamer_prior"][s["pid"]] = (before, process_tuning.identity(s["pid"]).get("created"))
         raised, total = counts.get(s["exe"], (0, 0))
         counts[s["exe"]] = (raised + bool(done), total + 1)
     return counts
@@ -1075,7 +1080,9 @@ def _eco_sweep() -> None:
         if seen.get(pid) == exe:
             continue
         seen[pid] = exe
-        if pid in (0, 4) or pid in tree or exe == game_exe or _eco_keep(exe):
+        # Another game running alongside is not a background program: the
+        # user may be playing it, or switch to it at any moment.
+        if pid in (0, 4) or pid in tree or exe == game_exe or _eco_keep(exe) or _is_game(exe):
             continue
         service = session is not None and process_tuning.session_of(pid) != session
         if service and exe not in _ECO_SERVICES:
@@ -1276,7 +1283,7 @@ def apply_target(exe: str) -> None:
                 competitive_latency.apply()
                 log.info("  Low-Latency target: engaged Competitive Latency for this session")
             else:
-                log.info("  Low-Latency target: Competitive Latency already on — leaving as-is")
+                log.info("  Low-Latency target: Competitive Latency already on, leaving as-is")
     except Exception as e:
         log.warning(f"apply_target({target}) failed: {e}")
     _target_restore = restore
@@ -1326,9 +1333,16 @@ def restore_normal_mode(reason: str = "game exit"):
         _restore_normal_mode(reason)
 
 
+# Normal mode put back by the user (the UI's button, the tray), with or
+# without a game running.
+_FORCED = ("manual", "user-tray")
+
+
 def _restore_normal_mode(reason: str):
     log.info(f"Restoring normal mode (reason: {reason})...")
     _exit_seen_ts = time.time()      # for crash detection, which runs after all of this
+    # Does game mode have anything applied: a session, or one cut short (the flag)?
+    applied = bool(_engine.get("gaming_mode")) or _is_gaming_flag_set()
     # beta.13 — reverse any per-game optimization-target posture first
     # (GPU OC / power plan / competitive latency), before the generic tweaks.
     restore_target()
@@ -1340,6 +1354,12 @@ def _restore_normal_mode(reason: str):
     if not procs and _engine.get("proc_prior") and _engine.get("active_pid"):
         procs = {_engine["active_pid"]: {"prior": _engine["proc_prior"], "created": None}}
     game_pids = set(procs)
+    # Forced back to normal mid-game: the next tick found the same game and
+    # applied everything again, seconds later.  Its processes are left alone
+    # now until they exit; a new launch of it applies as usual.
+    if reason in _FORCED and _engine.get("gaming_mode"):
+        _engine["held_off"].update({pid: rec.get("created") or process_tuning.identity(pid).get("created")
+                                    for pid, rec in procs.items()})
     _engine["proc_prior"] = None
     _engine["game_procs"] = {}
     if reason != "game exit":
@@ -1369,10 +1389,14 @@ def _restore_normal_mode(reason: str):
     sys_resp = baseline.get("sys_responsiveness", "14")  # 0x14 = 20 decimal = default
     net_throttle = baseline.get("net_throttle", "a")  # 0x0a = 10 = default
     cpu_idle_was_disabled = baseline.get("cpu_idle_disabled", False)
+    # Forced with nothing applied (no game running, no session cut short):
+    # the old saved values below are not game mode's to put back, and wrote
+    # over whatever the user or the optimizer had set since.
+    fallback = applied or reason not in _FORCED
 
     # 1-3. Registry values, from the baseline — only for a session started by
     #      a build that did not record them (they came back above otherwise).
-    if not recorded_registry:
+    if fallback and not recorded_registry:
         val = int(priority_sep, 16)
         run_cmd(["reg","add",r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl",
                  "/v","Win32PrioritySeparation","/t","REG_DWORD","/d",str(val),"/f"])
@@ -1389,7 +1413,7 @@ def _restore_normal_mode(reason: str):
     # 4. Restore CPU idle — only for a session started by a build that kept
     #    no records (otherwise it was put back above, or has since become the
     #    optimizer's own setting and is not ours to touch).
-    if not recorded_session and not cpu_idle_was_disabled:
+    if fallback and not recorded_session and not cpu_idle_was_disabled:
         run_cmd(["powercfg","/setacvalueindex","SCHEME_CURRENT","SUB_PROCESSOR","IdleDisable","0"])
         run_cmd(["powercfg","/setactive","SCHEME_CURRENT"])
         log.info("  Restored CPU idle -> enabled")
@@ -1405,9 +1429,10 @@ def _restore_normal_mode(reason: str):
     # had — not to Normal for everyone with that name, which also lowered
     # copies the user had raised themselves.
     raised = dict(_engine.get("streamer_prior") or {})
-    for pid, before in raised.items():
+    for pid, (before, created) in raised.items():
         try:
-            process_tuning.set_priority(pid, before)
+            if process_tuning.alive(pid, created) is not False:
+                process_tuning.set_priority(pid, before)
         except Exception as e:
             log.debug(f"could not put streaming process {pid} back: {e}")
     _engine["streamer_prior"] = {}
@@ -1432,8 +1457,15 @@ def _restore_normal_mode(reason: str):
     _prev_oc_core   = int(_engine.get("active_oc_core", 0) or 0)
     _prev_oc_mem    = int(_engine.get("active_oc_mem", 0) or 0)
 
+    # 6. Post-game refresh — clean up RAM/caches/orphan processes so the PC is
+    #    fresh for the next game session. Done in a background thread so the
+    #    notification fires immediately and we don't block.
+    #    (Started before the session is marked over: whoever sees game mode
+    #    end used to find the refresh not started yet, now and then.)
+    if reason in ("game exit",):
+        threading.Thread(target=_post_game_refresh, args=(_prev_game, game_pids), daemon=True).start()
+
     _clear_gaming_flag()
-    _engine["gaming_mode"] = False
     _engine["changes"] = []
     _engine["checks"] = []
     _engine["active_game"] = None
@@ -1446,6 +1478,7 @@ def _restore_normal_mode(reason: str):
     _engine["exit_ticks"] = 0
     _engine["active_oc_core"] = 0
     _engine["active_oc_mem"]  = 0
+    _engine["gaming_mode"] = False      # last: the session is over once all of the above is reset
     log.info("  Normal mode restored")
 
     # v3.4 — restore Vispora efficiency mode now that the game is
@@ -1481,12 +1514,6 @@ def _restore_normal_mode(reason: str):
                 log.info(f"  Resumed {len(r['resumed'])} background apps")
     except Exception as e:
         log.debug(f"background pauser resume hook failed: {e}")
-
-    # 6. Post-game refresh — clean up RAM/caches/orphan processes so the PC is
-    #    fresh for the next game session. Done in a background thread so the
-    #    notification fires immediately and we don't block.
-    if reason in ("game exit",):
-        threading.Thread(target=_post_game_refresh, args=(_prev_game, game_pids), daemon=True).start()
 
     # An update that was held back while the game ran installs now.
     try:
@@ -1530,6 +1557,7 @@ def _restore_normal_mode(reason: str):
                     exe=_prev_exe,
                     display_name=_prev_game,
                     was_crash=was_crash,
+                    exited_at=_exit_seen_ts,
                 )
             except Exception as e:
                 log.debug(f"adaptive_tuning.on_game_exit failed: {e}")
@@ -1633,7 +1661,7 @@ def _post_game_refresh(game_name: str = None, game_pids=None):
         try:
             mb = freed_total / (1024 * 1024)
             _notifier.toast(
-                "Vispora — PC Refreshed",
+                "Vispora: PC Refreshed",
                 f"Freed {mb:.0f} MB RAM, flushed caches. Ready for the next game.",
             )
         except Exception:
@@ -1651,7 +1679,7 @@ def check_and_restore_on_boot():
 
     # Check if gaming tweaks are stuck from a previous session
     if _is_gaming_flag_set():
-        log.info("Gaming flag detected from previous session — reverting to normal mode")
+        log.info("Gaming flag detected from previous session, reverting to normal mode")
         restore_normal_mode("boot recovery")
     else:
         # Even if no flag, verify the system is actually in normal state
@@ -1667,13 +1695,20 @@ def check_and_restore_on_boot():
 
 def _verify_normal_state(baseline: dict):
     """Check if system settings match baseline; fix if they don't."""
+    # A value another feature has on record (the optimizer's hard tweaks and
+    # the scheduler tweaks set 0x28, and the latter can turn idle off) is the
+    # user's choice, not a leftover of game mode: "restoring" it reverted
+    # them at the next start whenever no game had been played since.
+    prio = r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl"
     r = run_cmd(["reg","query",r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl","/v","Win32PrioritySeparation"])
     if r["ok"] and "0x" in r["out"]:
         current = r["out"].split("0x")[-1].strip().split()[0].lower()
         expected = baseline.get("priority_sep", "2").lower()
-        if current == "28" and expected != "28":
+        if current == "28" and expected != "28" and not (
+                reg_originals.on_record(prio, "Win32PrioritySeparation")
+                and not reg_originals.has_original(prio, "Win32PrioritySeparation", scope=_SCOPE)):
             # Gaming tweaks are still active!
-            log.info(f"Win32PrioritySeparation is 0x28 (gaming) but baseline is 0x{expected} — restoring")
+            log.info(f"Win32PrioritySeparation is 0x28 (gaming) but baseline is 0x{expected}, restoring")
             restore_normal_mode("stale gaming tweak detected")
             return
 
@@ -1682,8 +1717,10 @@ def _verify_normal_state(baseline: dict):
     # _cpu_idle_disabled): older ones say "enabled" unconditionally.
     idle_disabled = baseline.get("idle_probe") == "qh" and _cpu_idle_disabled()
     baseline_idle = baseline.get("cpu_idle_disabled", False)
-    if idle_disabled and not baseline_idle:
-        log.info("CPU idle is disabled but baseline says enabled — restoring")
+    if idle_disabled and not baseline_idle and not (
+            reg_originals.has_power("SUB_PROCESSOR", "IdleDisable", scope=None)
+            and not reg_originals.has_power("SUB_PROCESSOR", "IdleDisable", scope=_SCOPE)):
+        log.info("CPU idle is disabled but baseline says enabled, restoring")
         restore_normal_mode("stale CPU idle tweak detected")
 
 
@@ -1693,8 +1730,8 @@ def recapture_baseline():
         # What is on the system right now is the gaming profile, not the
         # user's normal state.  Saving it as the baseline would make every
         # later "restore" write the gaming values back.
-        log.warning("Baseline recapture refused — a gaming profile is applied")
-        return {"ok": False, "err": "A game profile is active — close the game first."}
+        log.warning("Baseline recapture refused: a gaming profile is applied")
+        return {"ok": False, "err": "A game profile is active. Close the game first."}
     log.info("Recapturing system baseline...")
     baseline = _capture_baseline()
     _save_baseline(baseline)
@@ -1829,6 +1866,16 @@ def _scan_game_candidates() -> list[dict]:
     return candidates
 
 
+def _held_off(candidates: list) -> list:
+    """The candidates, less the processes of a game the user forced normal
+    mode back on (see _restore_normal_mode).  One that has exited, or whose
+    pid is another process's by now, is no longer held."""
+    held = _engine["held_off"]
+    for pid in [p for p, created in list(held.items()) if process_tuning.alive(p, created) is False]:
+        held.pop(pid, None)
+    return [c for c in candidates if c["pid"] not in held]
+
+
 def _live_game_pids() -> list:
     """The processes of the tracked game's exe that are running now.  Read
     through the API, which cannot time out: the PowerShell check this used to
@@ -1862,6 +1909,15 @@ def _start_session(best: dict, gen: int) -> None:
         fg = " [foreground]" if best.get("foreground") else ""
         log.info(f"Game detected: {display} ({exe}, PID {pid}, {best.get('ws_mb', 0)} MB{fg}, "
                  f"score {best.get('score', 0)})")
+        # Idle Mode first: it notices the game only at its next poll, up to
+        # 20 s later.  Everything below used to record its Balanced plan and
+        # parked overclock as the user's own (a max_fps game then put
+        # Balanced back at exit, for good).
+        try:
+            from core import idle_mode
+            idle_mode.manual_release()
+        except Exception as e:
+            log.debug(f"idle mode release failed: {e}")
         # The baseline is only a fallback now, for a session left behind by a
         # build that kept no records.  Never taken while a session's gaming
         # values may still be in place.
@@ -2007,7 +2063,7 @@ def _session_tick() -> None:
     pids = _live_game_pids()
     if pids:
         if _engine.get("exit_ticks"):
-            log.info(f"  {exe} is running again (PID {', '.join(map(str, pids))}) — game mode stays on")
+            log.info(f"  {exe} is running again (PID {', '.join(map(str, pids))}), so game mode stays on")
             _engine["checks"] = [c for c in _engine["checks"] if c["key"] != "waiting"]
             _engine["changes"] = [c["text"] for c in _engine["checks"]]
         _engine["exit_ticks"] = 0
@@ -2029,14 +2085,14 @@ def _session_tick() -> None:
     _engine["exit_ticks"] = _engine.get("exit_ticks", 0) + 1
     if _engine["exit_ticks"] == 1:
         log.info(f"Tracked game exited: {_engine.get('active_game') or 'Unknown'} (PID {_engine.get('active_pid')})")
-        others = _scan_game_candidates()
+        others = _held_off(_scan_game_candidates())
         if others:
             _switch_game(others[0])
             return
         # Some games close and start again (an update, a restart after the
         # first launch, an anti-cheat handshake).  Normal mode used to come
         # back in between, and the game ran a minute without the profile.
-        _check("waiting", None, "Game closed — game mode stays on a few seconds in case it restarts")
+        _check("waiting", None, "Game closed: game mode stays on a few seconds in case it restarts")
     elif _engine["exit_ticks"] >= _EXIT_GRACE_TICKS:
         _restore_normal_mode("game exit")
 
@@ -2052,7 +2108,7 @@ def _monitor_loop(gen: int = 0):
                         _session_tick()
             else:
                 # No active game — scan for candidates and pick the best one.
-                candidates = _scan_game_candidates()
+                candidates = _held_off(_scan_game_candidates())
                 if candidates:
                     if len(candidates) > 1:
                         # Help the user understand why we picked X instead of Y
@@ -2070,11 +2126,14 @@ def _monitor_loop(gen: int = 0):
         time.sleep(_TICK_S)
 
     if _engine.get("monitor_gen", 0) != gen:
-        log.info("Game monitor thread superseded by a newer one — exiting quietly")
+        log.info("Game monitor thread superseded by a newer one, exiting quietly")
         return          # the newer thread owns the state; nothing here to clean up
-    # Cleanup on stop
-    if _engine["gaming_mode"]:
-        restore_normal_mode("monitor stopped")
+    # Cleanup on stop.  Checked under the lock: after a restore that was
+    # already under way (the tray, the app quitting) a second one found no
+    # records and wrote the old baseline over what the first had put back.
+    with _session_lock:
+        if _engine["gaming_mode"] and _engine.get("monitor_gen", 0) == gen:
+            _restore_normal_mode("monitor stopped")
     log.info("Game monitor stopped")
 
 

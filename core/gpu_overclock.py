@@ -639,7 +639,7 @@ def verify_oc_applied(
             )
         elif not nvapi_available:
             warnings.append(
-                f"Core: NVAPI unavailable — cannot verify offset. "
+                f"Core: NVAPI unavailable, cannot verify offset. "
                 f"nvidia-smi reports max {actual_core_max} MHz (expected {expected_core_max} MHz)"
             )
     if not mem_match and target_mem_offset != 0:
@@ -650,7 +650,7 @@ def verify_oc_applied(
             )
         elif not nvapi_available:
             warnings.append(
-                f"Memory: NVAPI unavailable — cannot verify."
+                f"Memory: NVAPI unavailable, cannot verify."
             )
     if not power_match and target_power_pct != 100:
         warnings.append(
@@ -747,6 +747,13 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0,
         power_pct = get_applied_oc()["power"]
     power_pct = _clamp(int(power_pct), MIN_POWER_PCT, MAX_POWER_PCT)
 
+    if core_offset_mhz == 0 and mem_offset_mhz == 0 and power_pct == 100:
+        # Stock was requested.  Without this the watchdog kept its previous
+        # target armed and wrote the old overclock straight back within 5 s.
+        # Disarmed before writing: a tick between the write and a later
+        # disarm put the old overclock back and then stopped watching it.
+        _deactivate_oc_watchdog()
+
     limits = cap["limits"]
     stock_core_max = limits["core_max_mhz"]
     stock_mem_max = limits["mem_max_mhz"]
@@ -820,7 +827,7 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0,
         else:
             steps.append({"name": f"NVAPI not available: {nvapi_avail.get('err', '?')}", "ok": False, "err": ""})
     else:
-        steps.append({"name": "NVAPI module failed to import — clock offsets unavailable", "ok": False, "err": ""})
+        steps.append({"name": "NVAPI module failed to import: clock offsets unavailable", "ok": False, "err": ""})
 
     # Verify the result against the pre-apply baselines.
     verification = verify_oc_applied(
@@ -858,7 +865,7 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0,
             f"or use MSI Afterburner / NVIDIA Inspector for core overclocking."
         )
         steps.append({
-            "name": "Verification failed — driver did not honor NVAPI write",
+            "name": "Verification failed: the driver did not honor the NVAPI write",
             "ok": False,
             "err": diag,
         })
@@ -883,10 +890,6 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0,
     # particular bug but it also won't make things worse.
     if core_offset_mhz != 0 or mem_offset_mhz != 0 or power_pct != 100:
         _activate_oc_watchdog(core_offset_mhz, mem_offset_mhz, power_pct)
-    else:
-        # Stock was requested.  Without this the watchdog kept its previous
-        # target armed and wrote the old overclock straight back within 5 s.
-        _deactivate_oc_watchdog()
     # This used to be True no matter what, and callers act on it: Adaptive
     # Tuning records the offset as applied and climbs on from there.  Without
     # a usable NVAPI the only thing this call can have changed is the power
@@ -896,7 +899,7 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0,
                        or (core_offset_mhz == 0 and mem_offset_mhz == 0 and not nvapi_usable))
     return {
         "ok": offsets_written,
-        "err": "" if offsets_written else "Clock offsets were not applied — see the step list",
+        "err": "" if offsets_written else "Clock offsets were not applied (see the step list)",
         "applied": {
             "core_offset_mhz": core_offset_mhz,
             "mem_offset_mhz": mem_offset_mhz,
@@ -979,6 +982,12 @@ def emergency_reset_oc(reason: str = "unspecified") -> dict:
     # a temp-ceiling trip or crash recovery on its next 5 s tick.
     try: _deactivate_oc_watchdog()
     except Exception: pass
+    # A stability probe running now is no longer measuring the offset it was
+    # started for, so it must not be able to end "stable" (a temperature
+    # ceiling trip mid-probe used to pass the offset it had just removed).
+    if _stability_session.get("active") and not _stability_session.get("aborted"):
+        _stability_session["aborted"] = True
+        _stability_session["abort_reason"] = f"Overclock reset to stock during the test ({reason})"
     started = time.time()
     steps = []
     TIME_BUDGET_S = 3.0     # hard wall-clock cap (docstring promise)
@@ -1022,7 +1031,7 @@ def emergency_reset_oc(reason: str = "unspecified") -> dict:
     for cmd, label in [(["nvidia-smi", "-rgc"], "nvidia-smi -rgc (core lock)"),
                         (["nvidia-smi", "-rmc"], "nvidia-smi -rmc (mem lock)")]:
         if _over_budget():
-            steps.append({"name": label, "ok": False, "err": "skipped — reset time budget exceeded"})
+            steps.append({"name": label, "ok": False, "err": "skipped (reset time budget exceeded)"})
             continue
         try:
             r = run_cmd(cmd, timeout=2)
@@ -1035,11 +1044,11 @@ def emergency_reset_oc(reason: str = "unspecified") -> dict:
     timed_out = elapsed > TIME_BUDGET_S
     _crash_state["recovery_attempted"] = True
 
-    log.warning(f"Emergency reset complete in {elapsed:.2f}s — "
+    log.warning(f"Emergency reset complete in {elapsed:.2f}s: "
                 f"any_ok={any_ok}, timed_out={timed_out}, "
                 f"steps={[s['name'] for s in steps if s['ok']]}")
     if not any_ok:
-        log.error("EMERGENCY RESET: NO reset path succeeded — card may still be OC'd!")
+        log.error("EMERGENCY RESET: NO reset path succeeded, so the card may still be OC'd!")
     return {
         "ok":          any_ok,
         "timed_out":   timed_out,
@@ -1092,13 +1101,20 @@ def reset_oc() -> dict:
     rejecting full-blob writes.  Each NVAPI sub-step is reported individually
     so the UI shows exactly which lever moved.
     """
-    cap = detect_gpu_oc_capability()
-    if cap["vendor"] != "nvidia":
-        return {"ok": False, "err": "Reset only supported on NVIDIA", "steps": []}
-
     # Tell the watchdog to stop re-asserting offsets BEFORE resetting them —
     # done afterwards, a tick landing mid-reset wrote the old offsets back.
+    # (Before anything else, so it stops even if the card can't be reset.)
     _deactivate_oc_watchdog()
+
+    cap = detect_gpu_oc_capability()
+    if cap["vendor"] != "nvidia":
+        # nvidia-smi not answering (hung after a crash, say) while NVAPI still
+        # reaches the card: reset the way crash recovery does, not refuse.
+        if _nvapi is not None and _nvapi.is_available().get("ok"):
+            er = emergency_reset_oc(reason="reset: nvidia-smi not answering")
+            return {"ok": bool(er.get("ok")), "steps": er.get("steps", []),
+                    "err": "" if er.get("ok") else "No reset path worked; the card may still be overclocked"}
+        return {"ok": False, "err": "Reset only supported on NVIDIA", "steps": []}
 
     steps = []
 
@@ -1113,7 +1129,7 @@ def reset_oc() -> dict:
             })
         if not r.get("ok"):
             steps.append({
-                "name": "NVAPI: nothing reset — try restarting Vispora as Administrator",
+                "name": "NVAPI: nothing reset. Try restarting Vispora as Administrator",
                 "ok": False, "err": r.get("err", ""),
             })
 
@@ -1258,12 +1274,12 @@ def _prune_expired_pauses() -> None:
     for s in expired:
         del _oc_watchdog_pause_sources[s]
         if s in _TUNING_PAUSE_SOURCES:
-            log.warning(f"OC watchdog pause source '{s}' auto-expired — the tuning run "
+            log.warning(f"OC watchdog pause source '{s}' auto-expired: the tuning run "
                         f"was abandoned mid-way; resetting to stock")
             threading.Thread(target=_abandon_orphaned_tuning, args=(s,),
                              daemon=True, name="oc-orphan-reset").start()
         else:
-            log.warning(f"OC watchdog pause source '{s}' auto-expired (orphaned session) — resuming")
+            log.warning(f"OC watchdog pause source '{s}' auto-expired (orphaned session), resuming")
 
 
 # How long a tuning run may go without asking for its next step before it
@@ -1282,7 +1298,7 @@ def _abandon_orphaned_tuning(source: str) -> None:
     if isinstance(sess, dict):
         sess["active"] = False
     ok, _detail = _reset_to_stock_hard(attempts=2)
-    log.warning(f"Abandoned {source} run cleaned up — reset to stock "
+    log.warning(f"Abandoned {source} run cleaned up: reset to stock "
                 f"{'confirmed' if ok else 'could NOT be confirmed'}")
 
 
@@ -1348,7 +1364,7 @@ def resume_oc_watchdog(source: str) -> dict:
         _oc_watchdog_pause_sources.pop(src, None)
         _prune_expired_pauses()
         sources = sorted(_oc_watchdog_pause_sources)
-    log.info(f"OC watchdog resume({src}) — remaining pause sources: {sources}")
+    log.info(f"OC watchdog resume({src}), remaining pause sources: {sources}")
     return {"ok": True, "paused": bool(sources), "sources": sources}
 
 
@@ -1382,10 +1398,14 @@ def _oc_watchdog_loop(stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             with _active_oc_lock:
-                if not _active_oc["active"]:
-                    stop.wait(_OC_WATCHDOG_INTERVAL_SEC); continue
+                active      = _active_oc["active"]
                 target_core = _active_oc["core"]
                 target_mem  = _active_oc["mem"]
+            # Wait outside the lock.  Waiting while holding it kept every
+            # other user of it (get_applied_oc, the activate / deactivate
+            # calls, emergency_reset_oc too) blocked for minutes on Python 3.12.
+            if not active:
+                stop.wait(_OC_WATCHDOG_INTERVAL_SEC); continue
 
             # beta.14 — skip drift checks entirely while another subsystem
             # (typically adaptive_tuning) owns the offsets.  Saves NVAPI
@@ -1429,8 +1449,15 @@ def _oc_watchdog_loop(stop: threading.Event) -> None:
                             f"(Δ {mem_drift_off:+d}). Re-asserting."
                         )
                         try:
-                            _nvapi.set_offsets(core_offset_mhz=target_core,
-                                                mem_offset_mhz=target_mem)
+                            # Re-checked and written under the lock that every
+                            # reset takes before it writes stock, so a re-assert
+                            # based on the read above can't land after a reset.
+                            with _active_oc_lock:
+                                if (_active_oc["active"] and not is_oc_watchdog_paused()
+                                        and _active_oc["core"] == target_core
+                                        and _active_oc["mem"] == target_mem):
+                                    _nvapi.set_offsets(core_offset_mhz=target_core,
+                                                        mem_offset_mhz=target_mem)
                         except Exception as e:
                             log.debug(f"OC watchdog re-assert raised: {e}")
                     stop.wait(_OC_WATCHDOG_INTERVAL_SEC); continue
@@ -1617,8 +1644,13 @@ def start_stability_probe(expected_core_max: int = 0) -> dict:
                            (sign of TDP throttling at this OC level).
     """
     # Snapshot driver event count NOW so we only count NEW events during the test
-    ev = check_driver_events(seconds_back=10)
+    # (over the same 5 s lead-in the later checks add: a longer one counted a
+    # TDR from 5-10 s before the start here but not there, hiding a new one).
+    ev = check_driver_events(seconds_back=5)
     tdr_baseline = ev.get("tdr_count", 0)
+    # The offsets under test, for the crash record: by the time a crash is
+    # reported here, the page's own emergency reset may have cleared them.
+    applied = get_applied_oc()
 
     _stability_session.update({
         "active": True,
@@ -1638,6 +1670,8 @@ def start_stability_probe(expected_core_max: int = 0) -> dict:
         "context_lost": False,
         "pixel_artifacts": 0,
         "tdr_event_count_at_start": tdr_baseline,
+        "oc_core": int(applied.get("core") or 0),
+        "oc_mem": int(applied.get("mem") or 0),
     })
     log.info(f"Stability probe started (target core max: {expected_core_max} MHz, TDR baseline: {tdr_baseline})")
     return {"ok": True, "target_core_max": expected_core_max}
@@ -1670,15 +1704,15 @@ def run_probe_tick(frame_time_ms: float = None, context_lost: bool = False, pixe
     if context_lost:
         sess["context_lost"] = True
         sess["aborted"] = True
-        sess["abort_reason"] = "WebGL context lost — GPU driver reset"
+        sess["abort_reason"] = "WebGL context lost: GPU driver reset"
         log.error("Stability probe: WebGL context lost (GPU crashed)")
         # v2.9.9.2 — IMMEDIATELY trigger emergency reset.  The user's display
         # may already be black/recovering; we want NVAPI offsets cleared
         # before the driver fully comes back so we don't crash again.
         try:
             mark_gpu_crashed("context_loss",
-                             offset_core=sess.get("target_core_max", 0),
-                             offset_mem=0)
+                             offset_core=sess.get("oc_core", 0),
+                             offset_mem=sess.get("oc_mem", 0))
         except Exception as e:
             log.warning(f"Emergency reset call failed: {e}")
         return {"ok": False, "abort": True, "reason": sess["abort_reason"], "kind": "context_loss"}
@@ -1694,11 +1728,15 @@ def run_probe_tick(frame_time_ms: float = None, context_lost: bool = False, pixe
             # the OC is corrupting memory accesses.  Reset to be safe.
             try:
                 mark_gpu_crashed("artifacts",
-                                 offset_core=sess.get("target_core_max", 0),
-                                 offset_mem=0)
+                                 offset_core=sess.get("oc_core", 0),
+                                 offset_mem=sess.get("oc_mem", 0))
             except Exception as e:
                 log.warning(f"Emergency reset call failed: {e}")
             return {"ok": False, "abort": True, "reason": sess["abort_reason"], "kind": "artifacts"}
+
+    # Aborted from outside (emergency_reset_oc): stop the load now.
+    if sess["aborted"]:
+        return {"ok": False, "abort": True, "reason": sess["abort_reason"], "kind": "reset"}
 
     # Read GPU state — also serves as a watchdog.  If nvidia-smi has been
     # silent too long, the driver is wedged even if we never got a
@@ -1714,8 +1752,8 @@ def run_probe_tick(frame_time_ms: float = None, context_lost: bool = False, pixe
         log.error("Stability probe: driver hang detected (nvidia-smi failed)")
         try:
             mark_gpu_crashed("hang",
-                             offset_core=sess.get("target_core_max", 0),
-                             offset_mem=0)
+                             offset_core=sess.get("oc_core", 0),
+                             offset_mem=sess.get("oc_mem", 0))
         except Exception as e:
             log.warning(f"Emergency reset call failed: {e}")
         return {"ok": False, "hang": True, "err": state.get("err", ""), "kind": "hang"}
@@ -1725,7 +1763,7 @@ def run_probe_tick(frame_time_ms: float = None, context_lost: bool = False, pixe
     # was probably mid-crash and just came back.  Treat as a soft signal
     # — don't abort, but log it so the user knows.
     if _crash_state["last_smi_ok_ts"] > 0 and (now_ts - _crash_state["last_smi_ok_ts"]) > 5:
-        log.warning(f"nvidia-smi gap of {now_ts - _crash_state['last_smi_ok_ts']:.1f}s — possible brief GPU stall")
+        log.warning(f"nvidia-smi gap of {now_ts - _crash_state['last_smi_ok_ts']:.1f}s (possible brief GPU stall)")
 
     sample = {"t": time.time() - sess["started"], **state}
     if frame_time_ms is not None:
@@ -1755,6 +1793,14 @@ def run_probe_tick(frame_time_ms: float = None, context_lost: bool = False, pixe
             sess["aborted"] = True
             sess["abort_reason"] = f"Driver TDR event(s) logged: {new_tdrs} new TDR/crash event(s) in Event Log"
             log.error(sess["abort_reason"])
+            # Reset like the other crash signals; left alone, the offset that
+            # just TDR'd stayed on the card.
+            try:
+                mark_gpu_crashed("tdr",
+                                 offset_core=sess.get("oc_core", 0),
+                                 offset_mem=sess.get("oc_mem", 0))
+            except Exception as e:
+                log.warning(f"Emergency reset call failed: {e}")
             return {"ok": False, "abort": True, "state": state, "reason": sess["abort_reason"], "kind": "tdr"}
 
     # Signal 5: Clock dip detection — only after warmup (sample 5+) and only if util is high
@@ -1803,6 +1849,12 @@ def end_stability_probe() -> dict:
         sess["aborted"] = True
         sess["abort_reason"] = f"Late TDR detected on probe end: {new_tdrs} driver TDR event(s)"
         log.warning(sess["abort_reason"])
+        try:
+            mark_gpu_crashed("tdr",
+                             offset_core=sess.get("oc_core", 0),
+                             offset_mem=sess.get("oc_mem", 0))
+        except Exception as e:
+            log.warning(f"Emergency reset call failed: {e}")
 
     # Frame time stats
     fts = sess["frame_time_ms"]
@@ -1826,7 +1878,7 @@ def end_stability_probe() -> dict:
     if variance_pct > 50 and len(fts) > 30:
         # Crazy frame variance with no thermal/TDR/hang explanation = very likely unstable
         stable = False
-        sess["abort_reason"] = sess["abort_reason"] or f"Excessive frame time variance ({variance_pct:.0f}% σ/mean) — probable hidden instability"
+        sess["abort_reason"] = sess["abort_reason"] or f"Excessive frame time variance ({variance_pct:.0f}% σ/mean): probable hidden instability"
 
     # beta.9 — NO-FRAMES GUARD.  A run that captured (almost) no frames did NOT
     # actually pass — the stress load never really ran (WebGL context died
@@ -1838,7 +1890,7 @@ def end_stability_probe() -> dict:
     if not frame_data_valid and stable:
         stable = False
         sess["abort_reason"] = sess["abort_reason"] or (
-            f"No frame data ({len(fts)} frames captured) — stress load did not "
+            f"No frame data ({len(fts)} frames captured): stress load did not "
             f"run; treating as unstable rather than a pass")
 
     # v3.1.1 — classify the failure kind so auto_oc_next can distinguish a
@@ -2022,8 +2074,15 @@ def auto_oc_start(core_step_mhz: int = 75, mem_step_mhz: int = 250, max_steps: i
         if max_w > default_w > 0:
             pct = int(max_w * 100 / default_w)
             r = apply_oc(core_offset_mhz=0, mem_offset_mhz=0, power_pct=pct)
-            log.info(f"Auto-OC pre-step: power limit maxed → {max_w}W ({pct}% of default {default_w}W)")
-            _auto_oc_session["pre_max_power_pct"] = pct
+            # Only a limit that really took is the one the probes run at, and
+            # the one that may be saved with the result.
+            if ((r.get("verification") or {}).get("power") or {}).get("ok"):
+                log.info(f"Auto-OC pre-step: power limit maxed → {max_w}W ({pct}% of default {default_w}W)")
+                _auto_oc_session["pre_max_power_pct"] = pct
+            else:
+                log.warning(f"Auto-OC pre-step: power limit could not be raised to {max_w}W; "
+                            f"tuning at the stock limit")
+                _auto_oc_session["pre_max_power_pct"] = 100
         else:
             _auto_oc_session["pre_max_power_pct"] = 100
     else:
@@ -2186,6 +2245,13 @@ def _next_test_value(current: int, stable: int, unstable, jump: int,
 
 def auto_oc_next(prev_result: dict = None) -> dict:
     """Advance auto-OC. See module docstring at top of section for the algorithm."""
+    # Never alongside auto_oc_cancel(): a cancel that arrived while a step was
+    # applying its offset reset first, and the probe offset landed after it.
+    with _session_lock:
+        return _auto_oc_next(prev_result)
+
+
+def _auto_oc_next(prev_result: dict = None) -> dict:
     sess = _auto_oc_session
     if not sess["active"]:
         return {"ok": False, "err": "No active auto-OC session"}
@@ -2216,7 +2282,7 @@ def auto_oc_next(prev_result: dict = None) -> dict:
         ).strip()
         log.error(f"Auto-OC: out-of-band crash detected at offset "
                   f"core+{sess.get('current_core', 0)} / mem+{sess.get('current_mem', 0)} "
-                  f"(kind={crash_state.get('kind')}) — forcing step-down")
+                  f"(kind={crash_state.get('kind')}), forcing step-down")
 
         # v3.1.1 — RETRACT stable_core / stable_mem if we can't trust them.
         # When a probe falsely reported a high offset as stable (e.g. TDR
@@ -2248,6 +2314,14 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                     f"(probe missed the actual crash boundary)"
                 )
                 sess["stable_mem"] = new_sm
+
+    # The probe measured whatever was on the card; if the step's offset could
+    # not be written, it says nothing about that offset.
+    if sess.pop("_apply_failed", False) and prev_result is not None:
+        prev_result = dict(prev_result)
+        prev_result["stable"] = False
+        prev_result["reason"] = ((prev_result.get("reason") or "") +
+                                 " [offset could not be applied]").strip()
 
     # Step 1: Process previous result (if any) — update bounds & log
     if prev_result is not None:
@@ -2311,14 +2385,14 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                 sess["baseline_proven"] = True
                 sess["stable_core"] = int(sess.get("baseline_core_seed", 0))
                 log.info(f"Auto-OC baseline proven: core+{sess['stable_core']}/"
-                         f"mem+{sess.get('baseline_mem_seed', 0)} — searching upward from there")
+                         f"mem+{sess.get('baseline_mem_seed', 0)}, searching upward from there")
             else:
                 # Saved profile didn't hold up — classic from-zero hunt.  Don't
                 # blame either axis (this was a combined probe).
                 sess["baseline_proven"] = False
                 sess["baseline_core_seed"] = 0
                 sess["baseline_mem_seed"]  = 0
-                log.warning("Auto-OC baseline check FAILED — saved profile isn't "
+                log.warning("Auto-OC baseline check FAILED: saved profile isn't "
                             "stable under stress; falling back to a from-zero hunt")
             sess["phase"] = "core_jump"
             sess["current_core"] = sess["stable_core"]
@@ -2331,7 +2405,7 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                 if floor is not None and sess["current_core"] >= floor:
                     log.warning(
                         f"Auto-OC: probe reported core+{sess['current_core']} "
-                        f"stable, but session crash floor is core+{floor} — "
+                        f"stable, but session crash floor is core+{floor}; "
                         f"treating as unstable (probe likely missed a TDR)"
                     )
                     stable = False
@@ -2358,7 +2432,7 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                         sess["stable_core"] > 0 and
                         sess["phase"] in ("core_jump", "core_refine")):
                     log.warning(
-                        f"Auto-OC: 3+ core crashes this session — "
+                        f"Auto-OC: 3+ core crashes this session, so "
                         f"locking core+{sess['stable_core']} and advancing to memory"
                     )
                     sess["phase"] = "_post_crash_settle_core"
@@ -2370,7 +2444,7 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                 elif is_hard_crash:
                     if sess["stable_core"] > 0:
                         log.warning(
-                            f"Hard crash at core+{sess['current_core']} — locking "
+                            f"Hard crash at core+{sess['current_core']}, so locking "
                             f"core+{sess['stable_core']} as winner and advancing to memory axis"
                         )
                         sess["phase"]     = "_post_crash_settle_core"
@@ -2381,7 +2455,7 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                         # short stress step, but new frontends can show a
                         # "Recovering from crash, locking core+X" status.
                     else:
-                        log.error("Hard crash at the very first core test — aborting session")
+                        log.error("Hard crash at the very first core test, aborting session")
                         sess["phase"] = "done"
                         sess["aborted"] = True
                         sess["abort_reason"] = (
@@ -2412,7 +2486,7 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                 if floor is not None and sess["current_mem"] >= floor:
                     log.warning(
                         f"Auto-OC: probe reported mem+{sess['current_mem']} "
-                        f"stable, but session crash floor is mem+{floor} — "
+                        f"stable, but session crash floor is mem+{floor}; "
                         f"treating as unstable (probe likely missed a TDR)"
                     )
                     stable = False
@@ -2434,7 +2508,7 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                         log.info(
                             f"Auto-OC: mem+{sess['current_mem']} is 'stable' but "
                             f"measured {_fps:.1f} fps vs {best_prior:.1f} at a lower "
-                            f"offset ({(1 - _fps / best_prior) * 100:.1f}% slower) — "
+                            f"offset ({(1 - _fps / best_prior) * 100:.1f}% slower): "
                             f"GDDR error-correction zone; treating as ceiling"
                         )
                         stable = False   # for search purposes only (soft fail)
@@ -2452,7 +2526,7 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                     sess["crash_count_mem"] = int(sess.get("crash_count_mem", 0)) + 1
                 if sess["crash_count_mem"] >= 3:
                     log.warning(
-                        f"Auto-OC: 3+ mem crashes this session — "
+                        f"Auto-OC: 3+ mem crashes this session, so "
                         f"locking mem+{sess['stable_mem']} and advancing to final validation"
                     )
                     sess["phase"] = "_post_crash_settle_mem"
@@ -2461,7 +2535,7 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                     # immediately — that just means the core OC interferes
                     # with memory at any positive offset; core-only is fine).
                     log.warning(
-                        f"Hard crash at mem+{sess['current_mem']} — locking "
+                        f"Hard crash at mem+{sess['current_mem']}, so locking "
                         f"mem+{sess['stable_mem']} as winner and advancing to final validation"
                     )
                     sess["phase"] = "_post_crash_settle_mem"
@@ -2482,13 +2556,13 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                 if retries < 2 and sess["stable_core"] > 0:
                     sess["core_confirm_retries"] = retries + 1
                     sess["stable_core"] = max(0, sess["stable_core"] - max(CORE_GUARD_BAND_MHZ, 15))
-                    log.warning(f"Auto-OC core confirm FAILED — dropping lock to "
+                    log.warning(f"Auto-OC core confirm FAILED: dropping lock to "
                                 f"+{sess['stable_core']} and re-confirming "
                                 f"({sess['core_confirm_retries']}/2)")
                     # stay in core_confirm; Step 3 re-emits at the new value
                 else:
                     sess["stable_core"] = max(0, sess["stable_core"] - sess["core_jump_mhz"] // 2)
-                    log.warning(f"Auto-OC core confirm failed twice — settling at "
+                    log.warning(f"Auto-OC core confirm failed twice: settling at "
                                 f"+{sess['stable_core']} and advancing to memory")
                     sess["phase"] = "mem_jump"
                     seed = int(sess.get("baseline_mem_seed", 0)) if sess.get("baseline_proven") else 0
@@ -2508,12 +2582,12 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                 if retries < 2 and sess["stable_mem"] > 0:
                     sess["mem_confirm_retries"] = retries + 1
                     sess["stable_mem"] = max(0, sess["stable_mem"] - MEM_GUARD_BAND_MHZ)
-                    log.warning(f"Auto-OC mem confirm FAILED — dropping lock to "
+                    log.warning(f"Auto-OC mem confirm FAILED: dropping lock to "
                                 f"+{sess['stable_mem']} and re-confirming "
                                 f"({sess['mem_confirm_retries']}/2)")
                 else:
                     sess["stable_mem"] = max(0, sess["stable_mem"] - sess["mem_jump_mhz"] // 2)
-                    log.warning(f"Auto-OC mem confirm failed twice — settling at "
+                    log.warning(f"Auto-OC mem confirm failed twice: settling at "
                                 f"+{sess['stable_mem']} and advancing to final validation")
                     sess["phase"]        = "final_validation"
                     sess["current_core"] = sess["stable_core"]
@@ -2522,7 +2596,7 @@ def auto_oc_next(prev_result: dict = None) -> dict:
             # Frontend just ran a 15s sanity probe at the last-stable offset.
             # If THAT crashed too, the GPU isn't in a recoverable state — bail.
             if is_hard_crash:
-                log.error("Last-stable offset crashed during post-crash sanity probe — aborting")
+                log.error("Last-stable offset crashed during post-crash sanity probe, aborting")
                 sess["phase"] = "done"
                 sess["aborted"] = True
                 sess["abort_reason"] = (
@@ -2552,12 +2626,12 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                 retries = int(sess.get("final_retries", 0))
                 if retries < 2:
                     sess["final_retries"] = retries + 1
-                    log.warning(f"Final validation unstable — backing off to "
+                    log.warning(f"Final validation unstable: backing off to "
                                 f"core+{sess['stable_core']} mem+{sess['stable_mem']} "
                                 f"and RE-validating ({sess['final_retries']}/2)")
                     # stay in final_validation; Step 3 re-emits at the new pair
                 else:
-                    log.warning(f"Final validation failed after {retries} backoffs — "
+                    log.warning(f"Final validation failed after {retries} backoffs: "
                                 f"finishing at core+{sess['stable_core']} "
                                 f"mem+{sess['stable_mem']} (validated=False)")
                     sess["phase"] = "done"
@@ -2626,7 +2700,7 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                         peak["fps"] > edge_fps * (1.0 + MEM_PERF_REGRESSION_PCT / 100.0)):
                     locked = int(peak["mem"])
                     log.info(f"Auto-OC mem: perf peak +{locked} ({peak['fps']:.1f} fps) beats "
-                             f"edge +{edge} ({edge_fps:.1f} fps) — locking the FASTER offset")
+                             f"edge +{edge} ({edge_fps:.1f} fps), so locking the FASTER offset")
                 elif sess["unstable_mem"] is not None:
                     locked = max(0, edge - MEM_GUARD_BAND_MHZ)
                     log.info(f"Auto-OC mem edge +{edge} → guard-banded lock +{locked}")
@@ -2710,7 +2784,7 @@ def auto_oc_next(prev_result: dict = None) -> dict:
                     "abort_reason": sess.get("abort_reason") or "",
                     "reset_ok": reset_ok,
                     "reset_warning": (None if reset_ok else
-                        "Could not confirm reset to stock — your card may still be "
+                        "Could not confirm reset to stock: your card may still be "
                         "overclocked. A reboot is recommended to be safe."),
                     "reset_detail": reset_detail,
                     "log":     sess["log"],
@@ -2745,11 +2819,12 @@ def auto_oc_next(prev_result: dict = None) -> dict:
     # maxed in the pre-step and saved with the result — passing 100 here put
     # it back to stock, so the saved core/mem/power combination was never
     # the one that had been tested.
-    apply_oc(
+    applied = apply_oc(
         core_offset_mhz=sess["current_core"],
         mem_offset_mhz=sess["current_mem"],
         power_pct=sess.get("pre_max_power_pct", 100),
     )
+    sess["_apply_failed"] = not applied.get("ok")
     # Still being driven — push the abandoned-run deadline out.
     try: pause_oc_watchdog("auto_oc", max_age_s=_TUNING_STEP_TIMEOUT_S)
     except Exception: pass
@@ -2798,18 +2873,19 @@ def _phase_label(sess: dict) -> str:
     # v2.9.9.7 — post-crash recovery probe.  Tells the user we're stepping
     # down rather than dying.
     if p == "_post_crash_settle_core":
-        return f"Recovering from core crash — locking core+{sess['stable_core']} and verifying"
+        return f"Recovering from core crash: locking core+{sess['stable_core']} and verifying"
     if p == "_post_crash_settle_mem":
-        return f"Recovering from memory crash — locking mem+{sess['stable_mem']} and verifying"
+        return f"Recovering from memory crash: locking mem+{sess['stable_mem']} and verifying"
     return p
 
 
 def auto_oc_cancel() -> dict:
     """Abort auto-OC and reset to stock.  Idempotent — safe to call with no
     active session (returns ok even so)."""
-    was_active = bool(_auto_oc_session.get("active"))
-    _auto_oc_session["active"] = False
-    _auto_oc_session["done"] = False
+    with _session_lock:     # waits out a step that is applying its offset
+        was_active = bool(_auto_oc_session.get("active"))
+        _auto_oc_session["active"] = False
+        _auto_oc_session["done"] = False
     # beta.9 — always hand the watchdog back, then fail-loud reset.
     try: resume_oc_watchdog("auto_oc")
     except Exception: pass
@@ -2819,7 +2895,7 @@ def auto_oc_cancel() -> dict:
         "ok": True,
         "reset_ok": reset_ok,
         "reset_warning": (None if reset_ok else
-            "Could not confirm reset to stock — your card may still be "
+            "Could not confirm reset to stock: your card may still be "
             "overclocked. A reboot is recommended to be safe."),
     }
 
@@ -3112,7 +3188,7 @@ def benchmark_oc_next(prev_result: Optional[dict] = None) -> dict:
         ).strip()
         log.error(f"Benchmark-Tune: out-of-band crash detected at offset "
                   f"core+{sess.get('_pending_core', 0)} / mem+{sess.get('_pending_mem', 0)} "
-                  f"(kind={crash_state.get('kind')}) — marking step unstable")
+                  f"(kind={crash_state.get('kind')}), marking step unstable")
 
     # ── Record previous step's verdict ──────────────────────────────────
     if prev_result is not None and phase != "idle":
@@ -3178,7 +3254,9 @@ def benchmark_oc_next(prev_result: Optional[dict] = None) -> dict:
             # rung-0 (+0/+0) that read "unstable" is a measurement miss (no
             # frames); using its 0 score as the baseline made every later rung's
             # gain_pct look enormous.
-            if sess["step_idx"] == 0 and stable:
+            # (By the offset: step_idx has already moved past the rung when
+            # its result arrives, so it was never 0 here and gain_pct was 0.)
+            if record["offset_core"] == 0 and stable:
                 sess["stock_score"] = record["score"]
             log.info(f"Benchmark-Tune core+{record['offset_core']}: "
                      f"score={record['score']} fps={record['avg_fps']} "
@@ -3211,7 +3289,7 @@ def benchmark_oc_next(prev_result: Optional[dict] = None) -> dict:
                         log.warning(
                             f"Benchmark-Tune: retroactively invalidating "
                             f"core+{r['offset_core']} (within {invalidation_window} "
-                            f"MHz of crash at core+{bad_off} — probe likely "
+                            f"MHz of crash at core+{bad_off}; probe likely "
                             f"missed an early-stage instability)"
                         )
                         r["stable"]     = False
@@ -3360,13 +3438,41 @@ def benchmark_oc_next(prev_result: Optional[dict] = None) -> dict:
             "apply_core":   sess["core_winner"],
             "apply_mem":    sess["mem_winner"],
             "recommended_duration_s": BENCH_FINAL_VALIDATION_S,
-            "current_label": f"Final validation — core +{sess['core_winner']}, mem +{sess['mem_winner']}",
+            "current_label": f"Final validation: core +{sess['core_winner']}, mem +{sess['mem_winner']}",
         }
 
     # done
     if sess["phase"] == "done":
         # Compose the final summary
         final = sess.get("final_record") or {}
+        if not final.get("stable"):
+            # The winners failed their final validation, so they are not a
+            # profile to hand the user: nothing is saved, the card goes back
+            # to stock (as an aborted Quick Tune does), and the run reports
+            # the failure instead of a result.
+            reset_ok, _ = _reset_to_stock_hard(attempts=3)
+            sess["best"]   = None
+            sess["active"] = False
+            sess["done"]   = True
+            try: resume_oc_watchdog("bench_oc")
+            except Exception: pass
+            why = final.get("abort_reason") or "not stable"
+            log.warning(f"Benchmark-Tune final validation FAILED at core+{sess['core_winner']} "
+                        f"mem+{sess['mem_winner']} ({why}); nothing saved, reset_ok={reset_ok}")
+            return {
+                "ok":        False,
+                "done":      True,
+                "validated": False,
+                "err": (f"Final validation failed at core+{sess['core_winner']} / "
+                        f"mem+{sess['mem_winner']} ({why}). Nothing was saved and the "
+                        f"card was reset to stock."
+                        + ("" if reset_ok else " The reset could not be confirmed, so the card "
+                                               "may still be overclocked; a reboot is the safe option.")),
+                "reset_ok":  reset_ok,
+                "core_results": sess["core_results"],
+                "mem_results":  sess["mem_results"],
+                "final": final,
+            }
         gain_pct = 0.0
         stock = sess.get("stock_score") or 0.0
         if stock > 0:
@@ -3428,7 +3534,7 @@ def benchmark_oc_cancel() -> dict:
         "ok": True,
         "reset_ok": reset_ok,
         "reset_warning": (None if reset_ok else
-            "Could not confirm reset to stock — your card may still be "
+            "Could not confirm reset to stock: your card may still be "
             "overclocked. A reboot is recommended to be safe."),
     }
 
@@ -3489,7 +3595,7 @@ def benchmark_start(saved_oc: dict = None) -> dict:
         "oc_result": None,
         "saved_profile": saved_oc,
     })
-    log.info(f"Benchmark started — stock first, then OC: {saved_oc}")
+    log.info(f"Benchmark started (stock first, then OC: {saved_oc})")
     return {
         "ok": True,
         "phase": "stock_measure",
@@ -3517,7 +3623,7 @@ def benchmark_record_result(result: dict) -> dict:
         # Brief settle delay (apply_oc returns fast but the GPU needs ~1s for clocks to stabilize)
         time.sleep(2)
         sess["phase"] = "oc_measure"
-        log.info(f"Benchmark stock done: {result.get('avg_fps')} FPS — applied OC, ready for OC measurement")
+        log.info(f"Benchmark stock done: {result.get('avg_fps')} FPS. Applied OC, ready for OC measurement")
         return {
             "ok": True,
             "phase": "oc_measure",
@@ -3538,7 +3644,7 @@ def benchmark_record_result(result: dict) -> dict:
         # Use a safe default before applying the +.1f format spec — None or
         # missing keys would otherwise raise TypeError inside the log call.
         _fps_pct = delta.get('fps_pct') or 0.0
-        log.info(f"Benchmark complete — stock {stock.get('avg_fps')} FPS vs OC {oc.get('avg_fps')} FPS (Δ {_fps_pct:+.1f}%)")
+        log.info(f"Benchmark complete: stock {stock.get('avg_fps')} FPS vs OC {oc.get('avg_fps')} FPS (Δ {_fps_pct:+.1f}%)")
         return {
             "ok": True,
             "phase": "done",

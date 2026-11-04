@@ -116,10 +116,22 @@ def _output_path(prefix: str) -> str:
     os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     safe = _sanitize(prefix).removesuffix(".exe")
-    return os.path.join(SCREENSHOTS_DIR, f"{safe}_{ts}.png")
+    path = os.path.join(SCREENSHOTS_DIR, f"{safe}_{ts}.png")
+    n = 2
+    while os.path.exists(path):         # a second shot within the same second
+        path = os.path.join(SCREENSHOTS_DIR, f"{safe}_{ts}-{n}.png")
+        n += 1
+    return path
 
 
 def take_screenshot(target: str = "foreground") -> dict:
+    """One capture at a time (each hotkey press runs on its own thread, and
+    two at once could pick the same file name); see _take_screenshot."""
+    with _mss_lock:
+        return _take_screenshot(target)
+
+
+def _take_screenshot(target: str = "foreground") -> dict:
     """Capture and save a PNG.  Returns {ok, path, target, exe, size}."""
     if not _ensure_mss():
         return {"ok": False, "err": "mss library unavailable"}

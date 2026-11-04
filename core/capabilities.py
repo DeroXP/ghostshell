@@ -26,7 +26,7 @@ hook for the rare hot-plug eGPU case.
 from __future__ import annotations
 
 import threading
-from core.utils import get_logger
+from core.utils import get_logger, run_cmd
 
 log = get_logger("capabilities")
 
@@ -141,26 +141,28 @@ def _detect_battery() -> bool:
     return False
 
 
-def _detect_nvenc() -> bool:
-    """Does the clipper's encoder probe find a hardware H.264 encoder?
-    Mirrors clipper._pick_encoder so capabilities stays in sync with
-    what capture will actually use.
+# The hardware H.264 encoders and the GPU vendor each one needs.
+_HW_ENCODER_VENDOR = {"h264_nvenc": "NVIDIA", "h264_amf": "AMD", "h264_qsv": "Intel"}
+
+
+def _detect_nvenc(vendors: set) -> bool:
+    """Does FFmpeg have a hardware H.264 encoder for a GPU this PC has?
+    The Gyan builds list NVENC, AMF and QSV on every PC, so a listed
+    encoder only counts when the vendor it needs is among `vendors`.
 
     3.4.0 fix: this used to call a non-existent clipper._select_encoder
     (the real function is _pick_encoder and it needs the ffmpeg path).
     The hasattr() guard meant the bug failed silently — hw_encode was
     ALWAYS False even on NVENC-capable cards, so clips fell back to
-    CPU libx264.  Now resolves ffmpeg via _find_ffmpeg and calls
-    _pick_encoder correctly."""
+    CPU libx264."""
     try:
         from core import clipper
         ff = clipper._find_ffmpeg()
         if not ff:
             return False     # no ffmpeg → no hw encode possible anyway
-        enc = clipper._pick_encoder(ff)
-        # hw encoders: h264_nvenc / hevc_nvenc / h264_amf / h264_qsv.
-        # Only libx264 (CPU) means no hardware path.
-        return bool(enc) and enc != "libx264"
+        r = run_cmd([ff, "-hide_banner", "-encoders"], timeout=8)
+        listed = (r.get("out") or "") + (r.get("err") or "")
+        return any(enc in listed and vendor in vendors for enc, vendor in _HW_ENCODER_VENDOR.items())
     except Exception as e:
         log.debug(f"nvenc probe failed: {e}")
     return False
@@ -228,7 +230,7 @@ def detect(force: bool = False) -> dict:
 
     # ── Per-vendor capability probes ──
     caps["has_nvidia_oc"]     = caps["has_nvidia"] and _detect_nvidia_oc()
-    caps["has_hw_encode"]     = _detect_nvenc()
+    caps["has_hw_encode"]     = _detect_nvenc({g.get("vendor") for g in gpus})
     # Telemetry: NVIDIA always (nvidia-smi); AMD/Intel via LHM when its
     # WMI namespace is live (we auto-install LHM in 3.3.3).
     if caps["has_nvidia"]:

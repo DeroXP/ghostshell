@@ -181,6 +181,9 @@ def setup_scene(active_game_exe: Optional[str] = None) -> dict:
 
     s = _load_settings()
     created = []
+    # obsws_python takes the next message on the socket as the reply, so
+    # the client shared with obs_backend must serve one caller at a time.
+    obs_backend._client_lock.acquire()
     try:
         # 1. Scene ────────────────────────────────────────────────
         obs_backend.adopt_legacy_names(
@@ -313,6 +316,8 @@ def setup_scene(active_game_exe: Optional[str] = None) -> dict:
         log.exception("Stream Helper setup_scene failed")
         return {"ok": False, "err": obs_backend._err_msg(e),
                 "scene": SH_SCENE_NAME, "sources_created": created}
+    finally:
+        obs_backend._client_lock.release()
 
 
 # ─── Foreground-game watcher (lands fully in beta.2; foundation here)
@@ -333,6 +338,10 @@ def update_for_game(exe: Optional[str]) -> dict:
         return {"ok": False, "err": "Stream Helper disabled"}
     if (exe or "") == _last_active_exe:
         return {"ok": True, "noop": True, "exe": exe or ""}
+    if _get_client() is None:
+        # Keep the change pending: marking it done now meant a game seen
+        # before OBS connected was never set up once it did.
+        return {"ok": False, "err": "Not connected to OBS"}
     _last_active_exe = exe or ""
     log.info(f"Stream Helper: active game → {exe or '(none)'}")
     return setup_scene(active_game_exe=exe or None)

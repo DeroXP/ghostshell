@@ -54,7 +54,6 @@ import ctypes
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections import deque
@@ -463,6 +462,16 @@ def _cleanup_stray_pm_sessions() -> None:
         log.debug(f"stray PM session cleanup skipped: {e}")
 
 
+def _tie_to_app(proc) -> None:
+    """PresentMon must not outlive the app either (a hard-killed app left it
+    running for up to an hour); the kill-on-close job lives in clipper."""
+    try:
+        from core.clipper import tie_to_app_lifetime
+        tie_to_app_lifetime(proc)
+    except Exception as e:
+        log.debug(f"PresentMon not tied to the app's lifetime: {e}")
+
+
 def _start_presentmon(pid: int, prefer_pm2: bool = True) -> Optional[dict]:
     """Spawn a PresentMon subprocess targeting the given PID.
 
@@ -494,30 +503,37 @@ def _start_presentmon(pid: int, prefer_pm2: bool = True) -> Optional[dict]:
     exe = _find_presentmon_path()
     if not exe:
         return None
-    csv_path = os.path.join(
-        tempfile.gettempdir(),
-        f"{_PM_SESSION_PREFIX}pm_{pid}_{int(time.time())}.csv",
-    )
+    # Streamed over stdout like 2.x: 1.10 also locks its -output_file while
+    # capturing, has no -no_console_stats, and takes -terminate_existing as
+    # "stop the session and exit".  stderr is dropped: an unread pipe fills.
     cmd = [
         exe,
         "-process_id", str(int(pid)),
         "-no_top",
-        "-no_console_stats",
-        "-terminate_existing",
+        "-output_stdout",
         "-terminate_after_timed",
         "-timed", str(PRESENTMON_TIMED_SEC),
-        "-output_file", csv_path,
+        "-session_name", f"{_PM_SESSION_PREFIX}frametelemetry",   # see _start_presentmon2
         "-stop_existing_session",
     ]
     try:
         proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             creationflags=_CREATE_NO_WINDOW,
+            text=True, bufsize=1, encoding="utf-8", errors="replace",
         )
-        log.info(f"PresentMon 1.x started: pid={pid} csv={csv_path}")
-        return {"proc": proc, "csv_path": csv_path, "variant": "pm1"}
+        _tie_to_app(proc)
+        reader_stop = threading.Event()
+        reader = threading.Thread(
+            target=_pm_stdout_reader, args=(proc, reader_stop),
+            daemon=True, name=f"pm1-stdout-reader-{pid}",
+        )
+        reader.start()
+        log.info(f"PresentMon 1.x started (stdout stream): pid={pid}")
+        return {"proc": proc, "variant": "pm1", "stream": True,
+                "reader_stop": reader_stop, "reader_thread": reader}
     except Exception as e:
         log.warning(f"PresentMon 1.x spawn failed: {e}")
         return None
@@ -584,6 +600,7 @@ def _start_presentmon2(pid: int, cli_path: str) -> Optional[dict]:
             creationflags=_CREATE_NO_WINDOW,
             text=True, bufsize=1, encoding="utf-8", errors="replace",
         )
+        _tie_to_app(proc)
         reader_stop = threading.Event()
         reader = threading.Thread(
             target=_pm_stdout_reader, args=(proc, reader_stop),
@@ -781,7 +798,7 @@ def _parse_presentmon_csv(handle: dict) -> int:
             if idx_ft is None:
                 log.warning(
                     "PresentMon CSV: no frame-time column (FrameTime / "
-                    f"msBetweenPresents) in header {header} — skipping"
+                    f"msBetweenPresents) in header {header}, skipping"
                 )
                 return 0
 
@@ -904,9 +921,9 @@ def is_available() -> dict:
         "service_name":      pm2_svc.get("name"),
         "reason":   (
             "" if (pm2_svc.get("installed") and pm2_svc.get("running") and pm2_cli) else
-            "service not installed — get the MSI from Microsoft's GitHub release"
+            "service not installed: get the MSI from Microsoft's GitHub release"
             if not pm2_svc.get("installed") else
-            "service installed but stopped — AT will start it on engage"
+            "service installed but stopped (AT will start it on engage)"
             if pm2_svc.get("installed") and not pm2_svc.get("running") else
             "service running but CLI not found in standard install paths"
         ),
@@ -919,7 +936,7 @@ def is_available() -> dict:
         "label":    "PresentMon 1.x (bundled, auto-downloaded)",
         "coverage": "D3D9/10/11/12, DXGI (no OpenGL/Vulkan)",
         "path":     pm1_path,
-        "reason":   ("" if pm1_path else "not installed — click 'Enable frame telemetry'"),
+        "reason":   ("" if pm1_path else "not installed: click 'Enable frame telemetry'"),
         "install_url": PRESENTMON_URL,
         "size":     "~380 KB",
     })
@@ -933,7 +950,7 @@ def is_available() -> dict:
             "coverage":      "D3D9/10/11/12, DXGI, OpenGL, Vulkan",
             "path":          pm2_cli,
             "service":       pm2_svc,
-            "reason":        ("" if pm2_svc.get("running") else "service stopped — will auto-start"),
+            "reason":        ("" if pm2_svc.get("running") else "service stopped (will auto-start)"),
             "sources_tried": sources_tried,
         }
     if pm1_path:
@@ -952,8 +969,8 @@ def is_available() -> dict:
         "source":        None,
         "reason":        (
             "No frame-timing source available.  Two options: "
-            "(1) Click 'Enable frame telemetry' for PresentMon 1.x — "
-            "~380 KB auto-download, covers all D3D9-12 / DXGI games "
+            "(1) Click 'Enable frame telemetry' for PresentMon 1.x, a "
+            "~380 KB auto-download that covers all D3D9-12 / DXGI games "
             "(no OpenGL/Vulkan).  "
             "(2) Install PresentMon 2.x (Microsoft MSI, ~122 MB) for "
             "first-party OpenGL/Vulkan support via a Windows service."
@@ -976,6 +993,10 @@ def start_tracking(pid: Optional[int] = None,
         _state["tracked_name"] = (exe_name or "").lower() or None
         if _state["running"]:
             log.info(f"frame_telemetry retargeted: pid={pid} exe={exe_name}")
+            # A new sampler is started below; the old one has to stop, or
+            # both keep restarting PresentMon over each other.
+            if _state.get("stop_event"):
+                _state["stop_event"].set()
             # Restart presentmon if we were using it (different PID = new instance)
             old = _state.get("pm_proc")
             if old:
@@ -1169,21 +1190,32 @@ def _sampler_loop(stop_event: threading.Event) -> None:
                     # the game closed).  Restart with the same PID.
                     proc = handle.get("proc")
                     if proc and proc.poll() is not None and time.time() > presentmon_restart_cooldown:
-                        log.info(f"PresentMon subprocess exited (rc={proc.returncode}) — restarting")
+                        log.info(f"PresentMon subprocess exited (rc={proc.returncode}), restarting")
                         with _state_lock:
                             pid = _state.get("tracked_pid")
-                            _state["pm_proc"]       = None
-                            _state["pm_csv_path"]   = None
-                            _state["pm_csv_pos"]    = 0
-                            _state["pm_csv_header"] = None
+                            if not (_state["running"] and _state.get("stop_event") is stop_event):
+                                pid = None      # stopped or retargeted meanwhile: not ours
+                            else:
+                                _state["pm_proc"]       = None
+                                _state["pm_csv_path"]   = None
+                                _state["pm_csv_pos"]    = 0
+                                _state["pm_csv_header"] = None
                         # Clean up old CSV first
                         _stop_presentmon(handle)
                         if pid:
                             new_h = _start_presentmon(int(pid))
                             if new_h:
                                 with _state_lock:
-                                    _state["pm_proc"]     = new_h
-                                    _state["pm_csv_path"] = new_h.get("csv_path")
+                                    # stop_tracking() or a retarget may have run
+                                    # while it started; untracked, it would run
+                                    # on for up to an hour.
+                                    current = (_state["running"]
+                                               and _state.get("stop_event") is stop_event)
+                                    if current:
+                                        _state["pm_proc"]     = new_h
+                                        _state["pm_csv_path"] = new_h.get("csv_path")
+                                if not current:
+                                    _stop_presentmon(new_h)
                         presentmon_restart_cooldown = time.time() + 5
                     else:
                         # PM 2.x streams frames via its own stdout reader thread

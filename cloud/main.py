@@ -62,7 +62,7 @@ install_privacy_filter()
 async def lifespan(app: FastAPI):
     log.info(f"Booting Vispora-Cloud v{settings.version}")
     if using_insecure_dev_peppers():
-        log.warning("Insecure dev peppers active — set FINGERPRINT_PEPPER, "
+        log.warning("Insecure dev peppers active: set FINGERPRINT_PEPPER, "
                     "EMAIL_PEPPER, LICENSE_KEY_PEPPER, IP_PEPPER before deploy")
     try:
         await init_pool()
@@ -109,7 +109,9 @@ async def _err_unhandled(request: Request, exc: Exception):
         status_code=500,
         content={
             "ok":   False,
-            "err":  f"{type(exc).__name__}: {exc}",
+            # The exception is logged above.  Its text can carry SQL,
+            # constraint names or the database host, so it stays server-side.
+            "err":  "internal server error",
             "path": str(request.url.path),
         },
     )

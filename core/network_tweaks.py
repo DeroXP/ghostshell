@@ -1,8 +1,9 @@
 """Network latency & adapter optimization."""
 import json
+import re
 from config import APP_NAME, LEGACY_APP_NAME
 from core import reg_originals, sys_state
-from core.utils import run_ps, run_cmd, get_logger, backup_registry, is_safe_ps_exe_name
+from core.utils import run_ps, run_cmd, get_logger, backup_registry, is_safe_ps_exe_name, is_safe_ps_literal
 
 log = get_logger("network")
 
@@ -42,7 +43,7 @@ def _reg(key, val, data, vtype="REG_DWORD"):
     # not vanish silently).
     if not r.get("ok"):
         err = (r.get("err") or r.get("out") or "").strip()[:160]
-        log.warning(f"reg write FAILED: {key}\\{val} = {data} ({vtype}) — {err}")
+        log.warning(f"reg write FAILED: {key}\\{val} = {data} ({vtype}): {err}")
     return r["ok"]
 
 
@@ -163,14 +164,29 @@ def disable_lso() -> list[dict]:
                 name = adapter.get("Name", "")
                 if not name:
                     continue
-                for version in ["V1IPv4", "V2IPv4", "V2IPv6"]:
-                    r2 = run_ps(
-                        f'Set-NetAdapterAdvancedProperty -Name "{name}" '
-                        f'-DisplayName "*Large Send Offload*{version}*" '
-                        f'-DisplayValue "Disabled" -ErrorAction SilentlyContinue'
-                    )
-                log.info(f"  ✓ LSO disabled: {name}")
-                results.append({"adapter": name, "ok": True})
+                # The name goes inside a double-quoted PowerShell string.
+                if not is_safe_ps_literal(name):
+                    log.warning(f"  LSO skipped, adapter name unsafe to script: {name!r}")
+                    results.append({"adapter": name, "ok": False})
+                    continue
+                # Only the settings that exist are set, and counted: none on
+                # this adapter matching is "not applicable", not done.  (A
+                # pattern that matches nothing also ends PowerShell with 1.)
+                r2 = run_ps(
+                    f'$p = @(Get-NetAdapterAdvancedProperty -Name "{name}" -DisplayName '
+                    + ",".join(f"'*Large Send Offload*{version}*'" for version in ["V1IPv4", "V2IPv4", "V2IPv6"])
+                    + " -ErrorAction SilentlyContinue); "
+                    "if ($p.Count) { $p | Set-NetAdapterAdvancedProperty -DisplayValue 'Disabled' -ErrorAction Stop }; "
+                    "$p.Count"
+                )
+                if r2["ok"] and r2["out"].strip() == "0":
+                    log.info(f"  - LSO: no matching setting on {name}, skipped")
+                    results.append({"adapter": name, "ok": None,
+                                    "name": f"{name}: no Large Send Offload setting matched (skipped)"})
+                    continue
+                ok = r2["ok"]
+                log.info(f"  {'✓' if ok else '✗'} LSO disabled: {name}")
+                results.append({"adapter": name, "ok": ok})
         except Exception:
             pass
     return results
@@ -199,7 +215,7 @@ def optimize_adapter_power() -> list[dict]:
         "} | ConvertTo-Json"
     )
     # Also disable via PowerShell device manager approach — Ethernet only
-    run_ps(
+    r2 = run_ps(
         'Get-NetAdapter | Where-Object {'
         '  $_.Status -eq "Up" -and ($_.MediaType -eq "802.3" -or $_.PhysicalMediaType -eq "802.3")'
         '} | ForEach-Object {'
@@ -210,9 +226,23 @@ def optimize_adapter_power() -> list[dict]:
         '  Set-NetAdapterAdvancedProperty -Name $_.Name -DisplayName "Interrupt Moderation" '
         '  -DisplayValue "Disabled" -ErrorAction SilentlyContinue;'
         '}'
+        # How many of those settings the adapters have at all (driver-given
+        # names): with none, nothing above was changed.
+        '; @(Get-NetAdapter | Where-Object {'
+        '  $_.Status -eq "Up" -and ($_.MediaType -eq "802.3" -or $_.PhysicalMediaType -eq "802.3")'
+        '} | Get-NetAdapterAdvancedProperty -DisplayName "Energy Efficient Ethernet","Green Ethernet",'
+        '"Interrupt Moderation" -ErrorAction SilentlyContinue).Count'
     )
+    if r["ok"] and not r["out"].strip():
+        # The first pass names every adapter it handled: none is wired.
+        log.info("  - No wired (Ethernet) adapter connected, adapter power tweaks skipped")
+        return [{"name": "Adapter Power Optimization: no wired (Ethernet) adapter connected (skipped)", "ok": None}]
     log.info("  ✓ Adapter power management & efficiency features disabled")
-    return [{"name": "Adapter Power Optimization", "ok": True}]
+    rows = [{"name": "Adapter Power Optimization", "ok": True}]
+    if r2["ok"] and r2["out"].strip() == "0":
+        rows.append({"name": "Energy Efficient Ethernet / Green Ethernet / Interrupt Moderation: "
+                             "no adapter setting by those names (skipped)", "ok": None})
+    return rows
 
 
 def disable_ipv6(enable: bool = False) -> dict:
@@ -248,10 +278,10 @@ def disable_ipv6(enable: bool = False) -> dict:
     )
     # 0 = default (IPv6 fully on);  32 = 0x20 = prefer IPv4, IPv6 still works.
     val = "0" if enable else "32"
-    _reg(r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters",
-         "DisabledComponents", val)
-    log.info(f"  ✓ IPv6 {'restored to default' if enable else 'softened (prefer IPv4, still functional)'}")
-    return {"ok": True, "ipv6_enabled": enable}
+    ok = _reg(r"HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters",
+              "DisabledComponents", val)
+    log.info(f"  {'✓' if ok else '✗'} IPv6 {'restored to default' if enable else 'softened (prefer IPv4, still functional)'}")
+    return {"ok": ok, "ipv6_enabled": enable}
 
 
 def ping_test(hosts: list[str] = None) -> list[dict]:
@@ -272,29 +302,17 @@ def ping_test(hosts: list[str] = None) -> list[dict]:
         max_ms = None
         loss = None
         if r["ok"] and r["out"]:
+            # The labels are localised ("Mittelwert", "perte"...), so by
+            # position: the round-trip line is the one with three
+            # "= <n><unit>" figures (minimum, maximum, average), and the loss
+            # is the percentage in brackets: "(0% loss)", "(perte 0%)", "(%0 kayip)".
             for line in r["out"].splitlines():
-                low = line.lower().strip()
-                if "average" in low:
-                    parts = line.split(",")
-                    for p in parts:
-                        p = p.strip()
-                        if "minimum" in p.lower() or "min" in p.lower():
-                            val = ''.join(c for c in p if c.isdigit())
-                            min_ms = int(val) if val else None
-                        elif "maximum" in p.lower() or "max" in p.lower():
-                            val = ''.join(c for c in p if c.isdigit())
-                            max_ms = int(val) if val else None
-                        elif "average" in p.lower() or "avg" in p.lower():
-                            val = ''.join(c for c in p if c.isdigit())
-                            avg_ms = int(val) if val else None
-                if "lost" in low:
-                    # "Packets: Sent = 10, Received = 10, Lost = 0 (0% loss)"
-                    if "(" in line and "%" in line:
-                        pct = line.split("(")[-1].split("%")[0].strip()
-                        try:
-                            loss = int(pct)
-                        except ValueError:
-                            pass
+                times = re.findall(r"=\s*(\d+)\s*(?=[^\W\d_])", line)
+                if len(times) == 3:
+                    min_ms, max_ms, avg_ms = (int(t) for t in times)
+            m = re.search(r"\((?:\D*?(\d+)\s*%|\s*%\s*(\d+))", r["out"])
+            if m:
+                loss = int(m.group(1) or m.group(2))
         results.append({
             "name": name, "ip": ip,
             "min_ms": min_ms, "max_ms": max_ms, "avg_ms": avg_ms,
@@ -424,8 +442,11 @@ def apply_rss_rsc_adapter_tweaks() -> list[dict]:
     results = []
 
     # Filter to 802.3 Ethernet only — leave WiFi, Bluetooth, cellular alone.
-    run_ps("""
+    # $hit counts the settings below the adapters have at all (the names are
+    # the driver's): with none, nothing was changed.
+    r = run_ps("""
 try {
+    $hit = 0
     Get-NetAdapter | Where-Object {
         $_.Status -eq 'Up' -and (
             $_.MediaType -eq '802.3' -or
@@ -433,6 +454,7 @@ try {
         )
     } | ForEach-Object {
         $n = $_.Name
+        $hit += @(Get-NetAdapterAdvancedProperty -Name $n -DisplayName 'Flow Control','Receive Side Scaling','Recv Segment Coalescing (IPv4)','Recv Segment Coalescing (IPv6)','TCP Checksum Offload (IPv4)','UDP Checksum Offload (IPv4)','IPv4 Checksum Offload','Jumbo Packet','Speed & Duplex' -ErrorAction SilentlyContinue).Count
         Set-NetAdapterAdvancedProperty -Name $n -DisplayName 'Flow Control' -DisplayValue 'Disabled' -ErrorAction SilentlyContinue
         Set-NetAdapterAdvancedProperty -Name $n -DisplayName 'Receive Side Scaling' -DisplayValue 'Enabled' -ErrorAction SilentlyContinue
         Set-NetAdapterAdvancedProperty -Name $n -DisplayName 'Recv Segment Coalescing (IPv4)' -DisplayValue 'Disabled' -ErrorAction SilentlyContinue
@@ -445,9 +467,15 @@ try {
         # it corrupted some Intel WiFi adapters; using DisplayValue is safer).
         Set-NetAdapterAdvancedProperty -Name $n -DisplayName 'Speed & Duplex' -DisplayValue 'Auto Negotiation' -ErrorAction SilentlyContinue
     }
+    $hit
 } catch {}
 """)
-    results.append({"name": "Per-Ethernet-adapter RSS/RSC/Checksum tuning", "ok": True})
+    if r["ok"] and r["out"].strip() == "0":
+        log.info("  - No wired adapter has these settings, per-adapter tuning skipped")
+        results.append({"name": "Per-Ethernet-adapter RSS/RSC/Checksum tuning: no wired adapter with these "
+                                "settings (skipped)", "ok": None})
+    else:
+        results.append({"name": "Per-Ethernet-adapter RSS/RSC/Checksum tuning", "ok": True})
 
     # Enable RSS globally
     sys_state.set_tcp_global("rss", "enabled", scope=_SCOPE)
@@ -503,7 +531,7 @@ def set_per_app_net_priority(exe_name: str, dscp: int = 46) -> dict:
     # block injection (a process named with a quote/semicolon would otherwise
     # execute in our elevated context).  Reject → no-op, not a broken rule.
     if not is_safe_ps_exe_name(exe_name):
-        log.warning(f"per-app net priority skipped — unsafe exe name: {exe_name!r}")
+        log.warning(f"per-app net priority skipped (unsafe exe name: {exe_name!r})")
         return {"ok": False, "err": "unsafe exe name", "exe": exe_name}
     rule_suffix = f"_Prio_{exe_name.replace('.exe', '').replace(' ', '_')}"
     rule_name = f"{APP_NAME}{rule_suffix}"
@@ -611,11 +639,11 @@ try {
     run_cmd(["ipconfig", "/flushdns"])
     results.append({"name": "DNS cache flushed", "ok": True})
 
-    log.info("═══ NETWORK RECOVERY COMPLETE — REBOOT recommended ═══")
+    log.info("═══ NETWORK RECOVERY COMPLETE (REBOOT recommended) ═══")
     return {"ok": True, "results": results,
             "reboot_recommended": True,
             "msg": "Networking restored.  Reboot for the Winsock reset "
-                   "to take full effect — WiFi toggle should be back."}
+                   "to take full effect.  WiFi toggle should be back."}
 
 
 def undo_network_tweaks() -> dict:

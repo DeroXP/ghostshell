@@ -51,16 +51,6 @@ def _check_refresh_rate() -> list[dict]:
     """Compare each monitor's current refresh rate to its max supported
     rate.  The classic 'I bought a 240 Hz monitor and it's running at
     60 Hz' miss."""
-    data = _ps_json(
-        "Get-CimInstance -Namespace 'root\\wmi' -ClassName 'WmiMonitorListedSupportedSourceModes' "
-        "-ErrorAction SilentlyContinue | "
-        "ForEach-Object { @{InstanceName=$_.InstanceName; "
-        "MaxRate=($_.MonitorSourceModes | Measure-Object VerticalActiveTime -Maximum).Maximum} } | "
-        "ConvertTo-Json"
-    )
-    # That WMI source returns vertical times not Hz directly — fall back to
-    # the simpler CIM_VideoController / Win32_VideoController which exposes
-    # current refresh rate, then read the max from each connected monitor.
     cur = _ps_json(
         "Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | "
         "Where-Object { $_.CurrentRefreshRate -gt 0 } | "
@@ -90,7 +80,7 @@ def _check_refresh_rate() -> list[dict]:
             out.append({
                 "id": f"display.refresh.{name}",
                 "category": "display",
-                "name": f"Refresh rate — {name}",
+                "name": f"Refresh rate ({name})",
                 "severity": "warn",
                 "current": f"{rate} Hz",
                 "expected": f"{max_} Hz",
@@ -102,7 +92,7 @@ def _check_refresh_rate() -> list[dict]:
             out.append({
                 "id": f"display.refresh.{name}",
                 "category": "display",
-                "name": f"Refresh rate — {name}",
+                "name": f"Refresh rate ({name})",
                 "severity": "ok",
                 "current": f"{rate} Hz",
                 "expected": None,
@@ -217,7 +207,7 @@ def _check_ram_speed() -> list[dict]:
     if rated_kit and running < rated_kit - 100:
         return [dict(row, severity="warn", expected=f"{rated_kit} MT/s (what the kit is rated for)",
                      detail=f"Your {kind} kit is rated {rated_kit} MT/s but runs at {running}.  Enable XMP / "
-                            f"EXPO / DOCP in the BIOS — it is a free and often large gain in CPU-bound games.")]
+                            f"EXPO / DOCP in the BIOS.  It is a free and often large gain in CPU-bound games.")]
     if base and running < base - 100:
         return [dict(row, severity="warn", expected=f"{base} MT/s (the modules' base speed)",
                      detail="The RAM runs below even its standard speed.  Check the memory settings in the BIOS.")]
@@ -228,7 +218,7 @@ def _check_ram_speed() -> list[dict]:
     if top and running <= top:
         return [dict(row, severity="warn", expected="Your kit's rated speed (on its label)",
                      detail=f"{running} MT/s is a standard {kind} speed, which is what XMP / EXPO being off looks "
-                            f"like — but this kit's rating cannot be read here.  If its label says faster, enable "
+                            f"like, but this kit's rating cannot be read here.  If its label says faster, enable "
                             f"XMP / EXPO in the BIOS.")]
     return [dict(row, severity="ok", expected=None,
                  detail=f"Running above the standard {kind} speeds, so XMP / EXPO is on.")]
@@ -263,7 +253,7 @@ def _check_vbs() -> list[dict]:
         "id": "gpu.vbs", "category": "gpu",
         "name": "VBS / Memory Integrity", "severity": "ok",
         "current": "Off", "expected": None,
-        "detail": "VBS + HVCI are off — gaming-friendly state.",
+        "detail": "VBS + HVCI are off (gaming-friendly state).",
     }]
 
 
@@ -345,7 +335,7 @@ def _check_gpu_driver_age() -> list[dict]:
                 "severity": "warn",
                 "current": f"{age_days} days old (v{ver})",
                 "expected": "≤ 180 days",
-                "detail": "Driver is old — newer versions usually have meaningful "
+                "detail": "Driver is old.  Newer versions usually have meaningful "
                           "perf + bug fixes.  Settings → GPU Driver → Check now.",
                 "fix": {"kind": "navigate", "page": "settings"},
             })
@@ -367,11 +357,13 @@ def _check_gpu_driver_age() -> list[dict]:
 def _check_power_plan() -> list[dict]:
     r = run_ps("(powercfg /getactivescheme)", timeout=4)
     out = (r.get("out") or "").strip()
-    is_balanced = "Balanced" in out and "Ultimate" not in out
-    is_power_saver = "Power saver" in out
+    # Plan names are localised ("Ausbalanciert", "Energiesparmodus"); the
+    # GUIDs of Windows' own plans are not.
+    is_balanced = "381b4222-f694-41f0-9685-ff5bb260df2e" in out.lower() or ("Balanced" in out and "Ultimate" not in out)
+    is_power_saver = "a1841308-3541-4fab-bc81-f71556f20b4a" in out.lower() or "Power saver" in out
     if is_power_saver:
         sev = "crit"; expected = "Ultimate Performance or High Performance"
-        detail = "Power saver mode is on — your CPU is throttled. Switch via Optimize → Power Plan."
+        detail = "Power saver mode is on, so your CPU is throttled. Switch via Optimize → Power Plan."
     elif is_balanced:
         sev = "warn"; expected = "Ultimate Performance"
         detail = "Balanced power plan limits CPU boost. Optimize tab → Power Plan applies the Ultimate plan."
@@ -407,7 +399,7 @@ def _check_trim_enabled() -> list[dict]:
         "expected": "Enabled",
         "detail": "TRIM keeps SSDs fast over time."
                   if enabled else
-                  "TRIM is off — SSD performance will degrade.  "
+                  "TRIM is off, so SSD performance will degrade.  "
                   "Run Optimize → Storage to re-enable.",
         "fix": {"kind": "route", "method": "POST",
                 "url": "/api/optimize/run",
@@ -432,7 +424,7 @@ def _check_vispora_state() -> list[dict]:
             "severity": "ok" if on else "warn",
             "current": "On" if on else "Off",
             "expected": "On",
-            "detail": "Watching for games — applies gaming profile automatically."
+            "detail": "Watching for games.  Applies gaming profile automatically."
                       if on else
                       "Vispora isn't watching for game launches.  "
                       "Toggle from the Settings tab or the system tray.",
@@ -471,12 +463,12 @@ def _check_vispora_state() -> list[dict]:
             "id": "vispora.adaptive", "category": "vispora",
             "name": "Adaptive Tuning",
             "severity": "ok" if global_on else "warn",
-            "current": (f"On — {enabled_n} game(s) opted in" if global_on
+            "current": (f"On, {enabled_n} game(s) opted in" if global_on
                         else "Off (master switch)"),
             "expected": None,
             "detail": "Tunes per-game OC offsets during real play."
                       if global_on else
-                      "Master switch is off — Vispora isn't learning per-game OC profiles.",
+                      "Master switch is off, so Vispora isn't learning per-game OC profiles.",
         })
     except Exception:
         pass

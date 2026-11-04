@@ -42,6 +42,9 @@ function _ensureApiToken() {
                 await new Promise(function (r) { setTimeout(r, 100); });
             }
             if (_apiToken) { try { sessionStorage.setItem('vsp-api-token', _apiToken); } catch (e) {} }
+            // Don't cache a failure: an empty answer used to stick, so every
+            // later request went out without a token for the whole session.
+            else _apiTokenPromise = null;
             return _apiToken;
         })();
     }
@@ -160,7 +163,9 @@ function _ensureToastInfra() {
             '.vsp-toast.vsp-error .vsp-toast-title{color:#f0888c}' +
             '.vsp-toast.vsp-warn .vsp-toast-title{color:#fbbf24}' +
             '.vsp-toast.vsp-info .vsp-toast-title{color:#c4c1ff}' +
-            '.vsp-toast .vsp-toast-msg{color:#c0c0c8;font-size:12px}' +
+            // pre-line: multi-line messages (device lists, action lists) keep
+            // their line breaks; spaces still collapse as before.
+            '.vsp-toast .vsp-toast-msg{color:#c0c0c8;font-size:12px;white-space:pre-line}' +
             '.vsp-toast .vsp-toast-sub{color:#7a7a82;font-size:11px;margin-top:6px;' +
                 'line-height:1.4;font-style:italic}' +
             '.vsp-toast .vsp-toast-close{position:absolute;top:6px;right:8px;background:none;' +
@@ -210,7 +215,7 @@ function _showToast(kind, title, message, opts) {
     const node = document.createElement('div');
     node.className = 'vsp-toast vsp-' + kind;
     const sub = (kind === 'error' && !opts.suppressDevHint)
-        ? '<div class="vsp-toast-sub">Sent to the devs &mdash; we\'re on it.</div>'
+        ? '<div class="vsp-toast-sub">Sent to the devs. We\'re on it.</div>'
         : '';
     const icon = ({
         error: '<svg class="vsp-toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="9"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>',
@@ -362,7 +367,7 @@ function showErrorReportModal(kind, message, detail) {
             d + '</pre></details>' : '') +
         '<div style="font-size:11px;color:var(--text-dim);line-height:1.5;margin-bottom:8px">' +
             'Vispora hit an unexpected error.  Send it to the maintainer ' +
-            '(via Railway) and it\'ll get triaged + patched — no GitHub account needed. ' +
+            '(via Railway) and it\'ll get triaged + patched. No GitHub account needed. ' +
             'Payload: your hardware, recent logs, this error.  No personal data.' +
         '</div>' +
         '<details style="margin-bottom:12px"><summary style="cursor:pointer;font-size:11px;color:var(--accent)">▸ What gets sent? (preview)</summary>' +
@@ -444,7 +449,7 @@ async function sendErrorReportToMaintainer() {
                 setTimeout(closeModal, 1800);
             }
         } else {
-            if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">Send failed: ' + escHtml((r && r.err) || 'unknown') + ' — saved locally so you can retry.</span>';
+            if (statusEl) statusEl.innerHTML = '<span style="color:var(--danger)">Send failed: ' + escHtml((r && r.err) || 'unknown') + '. Saved locally so you can retry.</span>';
             if (btn) { btn.disabled = false; btn.textContent = 'Retry →'; }
         }
     } catch (e) {
@@ -657,7 +662,7 @@ function showCloseChoiceModal() {
 // Hide UI to tray + start the game-profile monitor.
 async function closeAndStartGameMode() {
     closeModal();
-    addLog('Closing UI — Game Mode armed. Launch a game to apply gaming profile.');
+    addLog('Closing UI, Game Mode armed. Launch a game to apply gaming profile.');
     var api = _pywebviewApi();
     var hideOk = false;
     if (api && api.close_to_tray) {
@@ -740,12 +745,14 @@ async function loadSettingsPage() {
     var sEl = document.getElementById('settings-startup-rows');
     if (sEl) {
         var methodNote = autoStart.method === 'scheduled_task'
-            ? 'Uses a Windows Scheduled Task — runs silently with no popups, even at login.'
+            ? 'Uses a Windows Scheduled Task, so it runs silently with no popups, even at login.'
             : '';
+        // 0 is a valid delay (the input allows it); `|| 30` showed it as 30.
+        var delayS = autoStart.delay_seconds != null ? autoStart.delay_seconds : 30;
         sEl.innerHTML =
             _settingsToggle(
                 'Start Vispora at Windows login',
-                'Launches in the system tray ' + (autoStart.delay_seconds || 30) +
+                'Launches in the system tray ' + delayS +
                 's after login so it doesn\'t slow your boot. ' + methodNote,
                 !!autoStart.enabled,
                 'toggleAutostart(this)') +
@@ -753,7 +760,7 @@ async function loadSettingsPage() {
                 'Login launch delay',
                 'How many seconds after login Vispora waits before launching.',
                 '<input type="number" id="autostart-delay-input" min="0" max="600" value="' +
-                    (autoStart.delay_seconds || 30) + '" ' +
+                    delayS + '" ' +
                     'style="width:80px;background:var(--bg-input);border:1px solid var(--border);' +
                     'color:var(--text);padding:4px 8px;border-radius:4px;font-family:var(--mono)" ' +
                     'onchange="saveAutostartDelay(this.value)"> sec'
@@ -788,8 +795,8 @@ async function loadSettingsPage() {
             _settingsRow(
                 'Update channel',
                 (updaterS.channel === 'beta'
-                    ? 'Beta — newest builds.  Features land here first.'
-                    : 'Stable — confirmed-working builds only.'),
+                    ? 'Beta: newest builds.  Features land here first.'
+                    : 'Stable: confirmed-working builds only.'),
                 '<select id="updater-channel-select" onchange="setUpdaterChannel(this.value)" ' +
                   'style="background:var(--bg-input);border:1px solid var(--border);color:var(--text);' +
                   'padding:4px 8px;border-radius:4px;font-family:var(--mono);font-size:11px">' +
@@ -877,15 +884,18 @@ async function toggleAutostart(el) {
         el.setAttribute('aria-checked', String(!on));
         addLog('Could not ' + (on ? 'enable' : 'disable') + ' autostart: ' + ((r && r.err) || 'unknown'));
     } else {
-        addLog('Autostart ' + (on ? 'enabled — will launch ' + (r.delay_seconds || 30) +
+        addLog('Autostart ' + (on ? 'enabled, will launch ' + (r.delay_seconds != null ? r.delay_seconds : 30) +
                                     's after login' : 'disabled'));
     }
 }
 
 async function saveAutostartDelay(seconds) {
-    var n = Math.max(0, Math.min(600, parseInt(seconds) || 30));
+    // `parseInt(...) || 30` turned a typed 0 into 30.
+    var n = parseInt(seconds);
+    n = Math.max(0, Math.min(600, isNaN(n) ? 30 : n));
     var r = await apiPost('/api/autostart/delay', { delay_seconds: n });
     if (r && r.ok) addLog('Autostart delay set to ' + n + 's');
+    else addLog('Could not set autostart delay: ' + ((r && r.err) || 'unknown'));
 }
 
 async function toggleUpdaterField(el, key) {
@@ -922,6 +932,7 @@ async function setUpdaterChannel(channel) {
         loadSettingsPage();
     } else {
         addLog('Could not set channel: ' + ((r && r.err) || 'unknown'));
+        loadSettingsPage();   // the select still shows the channel that was not saved
     }
 }
 
@@ -970,7 +981,7 @@ async function setUpdaterLocalDir(dir) {
     var r = await apiPost('/api/updater/settings', { local_update_dir: dir });
     if (r && r.ok) {
         addLog(dir ? 'Updates now come from local folder: ' + dir
-                   : 'Local update mode off — back to the update server');
+                   : 'Local update mode off, back to the update server');
     } else {
         showErrorToast('Could not set local update folder: ' + ((r && r.err) || 'unknown'));
     }
@@ -1063,7 +1074,10 @@ async function loadSnapshots() {
 async function createSnapshot() {
     var nameEl = document.getElementById('snapshot-name');
     var name = (nameEl && nameEl.value || '').trim() || ('manual ' + new Date().toLocaleString());
-    var btn = nameEl && nameEl.parentElement && nameEl.parentElement.querySelector('button');
+    // The button sits in the next .form-group, not in the input's parent, so
+    // the old lookup never found it and repeat clicks took extra snapshots.
+    var row = nameEl && nameEl.closest('.form-row');
+    var btn = row && row.querySelector('button');
     if (btn) { btn.disabled = true; btn.textContent = 'Capturing…'; }
     var r = await apiPost('/api/snapshots', { name: name });
     if (btn) { btn.disabled = false; btn.textContent = 'Take snapshot now'; }
@@ -1097,13 +1111,16 @@ async function deleteSnapshotById(snapId, snapName) {
     if (!confirm('Permanently delete snapshot "' + snapName + '"?\n\nThis cannot be undone.')) return;
     var r = await apiDelete('/api/snapshots/' + encodeURIComponent(snapId));
     if (r && r.ok) addLog('Deleted snapshot ' + snapName);
+    else addLog('✗ Could not delete snapshot ' + snapName + ': ' + ((r && r.err) || 'unknown'));
     loadSnapshots();
 }
 
 async function pruneSnapshots() {
     if (!confirm('Delete all but the 10 most recent AUTO snapshots?\n\nManual snapshots are kept.')) return;
     var r = await apiPost('/api/snapshots/prune', { keep_last: 10 });
-    addLog('Pruned ' + (r && r.deleted || 0) + ' auto-snapshots.');
+    // A failed request used to log "Pruned 0 auto-snapshots."
+    if (r && r.ok) addLog('Pruned ' + (r.deleted || 0) + ' auto-snapshots.');
+    else addLog('✗ Prune failed: ' + ((r && r.err) || 'unknown'));
     loadSnapshots();
 }
 
@@ -1112,7 +1129,7 @@ function _renderGameModeSection(settings, status) {
     var el = document.getElementById('settings-gamemode-rows');
     if (!el) return;
     var monitoring = !!status.monitoring;
-    var activeGame = status.active_game ? (' — currently tracking: <b style="color:var(--accent)">' + escHtml(status.active_game) + '</b>') : '';
+    var activeGame = status.active_game ? (', currently tracking: <b style="color:var(--accent)">' + escHtml(status.active_game) + '</b>') : '';
     var dbCount = status.known_game_count != null ? status.known_game_count : '?';
     el.innerHTML =
         _settingsToggle(
@@ -1235,7 +1252,7 @@ function _renderDriverSection(driver) {
             var color = driver.update_available ? 'var(--orange)' : 'var(--accent)';
             infoHtml += '<div><b style="color:var(--text)">Latest available:</b> <span style="color:' + color + '">' +
                 escHtml(driver.latest_version) + '</span>' +
-                (driver.update_available ? ' — UPDATE AVAILABLE' : ' — up to date') + '</div>';
+                (driver.update_available ? ' (UPDATE AVAILABLE)' : ' (up to date)') + '</div>';
             if (driver.release_date) {
                 infoHtml += '<div style="color:var(--text-dim)">Released: ' + escHtml(driver.release_date) + '</div>';
             }
@@ -1313,10 +1330,12 @@ async function checkDriverUpdate() {
     if (r.update_available) {
         addLog('Driver update available: ' + r.current_version + ' -> ' + r.latest_version);
         showDriverUpdateToast(r);
+    } else if (r.error || r.err) {
+        // Checked before current_version: a failed lookup (offline, AMD)
+        // still carries the installed version and was logged as "up to date".
+        addLog('Driver check: ' + (r.error || r.err));
     } else if (r.current_version) {
         addLog('Driver up to date: v' + r.current_version);
-    } else if (r.error) {
-        addLog('Driver check: ' + r.error);
     }
     loadSettingsPage();
 }
@@ -1345,13 +1364,20 @@ async function downloadDriverFromToast() {
 }
 
 async function downloadDriver() {
+    // A second click (settings button or toast) mid-download logged "Download failed: Already downloading".
+    if (_alreadyRunning('driverDownload')) return;
     addLog('Downloading driver installer (this can take a few minutes)...');
-    var r = await apiPost('/api/driver/download', {}, { timeoutMs: 900000 });  // 15 min
+    _runsInFlight.driverDownload = true;
+    try {
+        var r = await apiPost('/api/driver/download', {}, { timeoutMs: 900000 });  // 15 min
+    } finally {
+        _runsInFlight.driverDownload = false;
+    }
     if (!r || !r.ok) {
         addLog('Download failed: ' + ((r && r.err) || 'unknown'));
         return;
     }
-    addLog('Driver downloaded (' + (r.size_mb || '?') + ' MB) — ready to install.');
+    addLog('Driver downloaded (' + (r.size_mb || '?') + ' MB), ready to install.');
     loadSettingsPage();
 }
 
@@ -1360,7 +1386,7 @@ async function installDriver() {
     addLog('Launching driver installer...');
     var r = await apiPost('/api/driver/install', {});
     if (r && r.ok) {
-        addLog('Installer launched. Follow the NVIDIA setup prompts — Vispora will confirm once the new driver is active.');
+        addLog('Installer launched. Follow the NVIDIA setup prompts. Vispora will confirm once the new driver is active.');
     } else {
         addLog('Install failed: ' + ((r && r.err) || 'unknown'));
     }
@@ -1373,7 +1399,8 @@ function toggleSwitch(el) {
 
 // ─── Escape HTML ───
 function escHtml(s) {
-    if (typeof s !== 'string') s = String(s || '');
+    // 0 renders as "0" (it used to vanish); null/undefined/false stay ''.
+    if (typeof s !== 'string') s = s === 0 ? '0' : String(s || '');
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
@@ -1394,7 +1421,9 @@ function jsArg(v) {
 }
 
 function escAttr(s) {
-    return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Same rule as escHtml: `s || ''` blanked a numeric 0 (value="0" inputs
+    // rendered empty); null/undefined/false still give ''.
+    return String(s === 0 ? '0' : (s || '')).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // ─── Terminal Log Helper ───
@@ -1405,6 +1434,12 @@ function termWrite(terminalId, msg, level) {
     var cls = level === 'error' ? ' error' : level === 'warning' ? ' warning' : '';
     term.innerHTML += '<div class="terminal-line"><span class="terminal-ts">' + ts + '</span><span class="terminal-msg' + cls + '">' + escHtml(msg) + '</span></div>';
     term.scrollTop = term.scrollHeight;
+}
+
+// Mark for one result row: ✓ done, ✗ failed, ○ skipped (the backend sends
+// ok: null for a tweak that found nothing on this PC to apply to).
+function _rowMark(ok) {
+    return ok === null ? '○' : (ok !== false ? '✓' : '✗');
 }
 
 function termLog(page, data) {
@@ -1508,7 +1543,8 @@ async function loadHealthAudit() {
         return;
     }
     // Sort: crit > warn > ok, then by category
-    var sevOrder = { crit: 0, warn: 1, ok: 2 };
+    // (starts at 1: with crit at 0, `|| 9` sorted critical checks last)
+    var sevOrder = { crit: 1, warn: 2, ok: 3 };
     data.checks.sort(function(a, b) {
         var s = (sevOrder[a.severity] || 9) - (sevOrder[b.severity] || 9);
         if (s !== 0) return s;
@@ -1576,6 +1612,14 @@ async function loadDebloatScan() {
     var data = await apiGet('/api/debloat/scan');
     debloatApps = data.apps || [];
     debloatServices = data.services || [];
+    if (data.ok === false) {
+        // Say so instead of showing two empty lists.  With the lists empty
+        // runDebloat refuses to run, so nothing unticked can be removed.
+        var failMsg = '<span style="color:var(--red)">Scan failed: ' + escHtml(data.err || 'unknown') + '</span>';
+        container.innerHTML = failMsg + ' <button class="btn btn-sm" onclick="loadDebloatScan()">Scan again</button>';
+        svcContainer.innerHTML = failMsg;
+        return;
+    }
 
     var appsHtml = '';
     debloatApps.forEach(function(a, i) {
@@ -1655,8 +1699,27 @@ function _debloatSelection() {
     };
 }
 
+// Multi-minute runs, by action.  The backend has no guard against parallel
+// runs, so a second click while one was in flight started another.
+var _runsInFlight = {};
+function _alreadyRunning(key) {
+    if (!_runsInFlight[key]) return false;
+    showWarnToast('Already running');
+    return true;
+}
+
 async function runDebloat() {
+    if (_alreadyRunning('debloat')) return;
     var sel = _debloatSelection();
+    // Only what is ticked may be removed from here.  With the lists not loaded
+    // (first scan still running, or it failed) the selection is null and the
+    // backend would fall back to its default removal list.
+    if (sel.apps === null || sel.services === null) {
+        var notLoaded = 'The app list hasn\'t loaded yet. Wait for the scan or run it again, then pick what to remove.';
+        termWrite('debloat-terminal', notLoaded, 'warning');
+        showWarnToast(notLoaded);
+        return;
+    }
     var appIds = sel.apps || [], svcIds = sel.services || [];
 
     var term = document.getElementById('debloat-terminal');
@@ -1665,7 +1728,12 @@ async function runDebloat() {
     setProgress('debloat', 10, 'Starting debloat...');
     termWrite('debloat-terminal', 'Removing ' + appIds.length + ' apps, ' + svcIds.length + ' services...');
 
-    var result = await apiPost('/api/debloat/run', sel, { timeoutMs: 20 * 60 * 1000 });   // removal takes minutes; the 60 s default reported "Complete" mid-run
+    _runsInFlight.debloat = true;
+    try {
+        var result = await apiPost('/api/debloat/run', sel, { timeoutMs: 20 * 60 * 1000 });   // removal takes minutes; the 60 s default reported "Complete" mid-run
+    } finally {
+        _runsInFlight.debloat = false;
+    }
 
     if (result && result.ok === false) {
         setProgress('debloat', 0, 'Failed');
@@ -1720,10 +1788,10 @@ async function loadProModeStatus() {
         if (box) {
             if (on) {
                 box.style.color = 'var(--warning, #e0b850)';
-                box.innerHTML = '<span style="color:var(--warning, #e0b850);font-weight:600">⚠ Pro Mode is ON</span> — Apply All will include HVCI / Spectre / HPET / MPO / USB MSI / TDR / Search / MemComp / hibernation tweaks.';
+                box.innerHTML = '<span style="color:var(--warning, #e0b850);font-weight:600">⚠ Pro Mode is ON</span>. Apply All will include HVCI / Spectre / HPET / MPO / USB MSI / TDR / Search / MemComp / hibernation tweaks.';
             } else {
                 box.style.color = 'var(--text-tertiary)';
-                box.innerHTML = 'Pro Mode is OFF — Apply All will skip risky tweaks (safe default).';
+                box.innerHTML = 'Pro Mode is OFF. Apply All will skip risky tweaks (safe default).';
             }
         }
     } catch (e) {}
@@ -1809,7 +1877,7 @@ function renderLatencyDoctor(s) {
         '<div style="display:flex;align-items:center;gap:14px;margin-bottom:6px">' +
           '<div style="font-size:30px;font-weight:700;color:' + gradeColor + ';line-height:1">' + escHtml(s.grade) + '</div>' +
           '<div style="flex:1"><div style="font-size:13px;color:var(--text)">Latency readiness: <b>' + s.score + '/100</b></div>' +
-          '<div style="font-size:11px;color:var(--text-tertiary)">Scored on the proven levers only — informational items don\'t affect the grade.</div></div>' +
+          '<div style="font-size:11px;color:var(--text-tertiary)">Scored on the proven levers only. Informational items don\'t affect the grade.</div></div>' +
           fixBtn +
         '</div>' + rows;
 }
@@ -1831,7 +1899,7 @@ async function fixLatencyDoctor() {
     if (fb) { fb.disabled = true; fb.textContent = 'Applying…'; }
     var r = await apiPost('/api/latency-doctor/fix', {});
     if (r && r.ok) {
-        showInfoToast('Applied the safe latency fixes. (Some — HID queue, flip-model — finish applying after a reboot.)', { title: 'Latency Doctor' });
+        showInfoToast('Applied the safe latency fixes. (Some finish applying after a reboot: HID queue, flip-model.)', { title: 'Latency Doctor' });
         if (r.rescan) renderLatencyDoctor(r.rescan);
         loadCompetitiveStatus();
     } else {
@@ -1855,7 +1923,8 @@ function _advisorChecklist(s) {
 
 function renderAdvisor(s) {
     var box = document.getElementById('advisor-results');
-    if (!box || !s) { if (box) box.innerHTML = 'Scan unavailable.'; return; }
+    // A failed request ({ok:false}) used to read as "No known competitive games detected".
+    if (!box || !s || s.ok === false) { if (box) box.innerHTML = 'Scan unavailable.'; return; }
     if (!s.detected || !s.detected.length) {
         box.innerHTML = '<div style="font-size:12px;color:var(--text-tertiary)">No known competitive games detected' +
             (s.total_installed ? (' among ' + s.total_installed + ' installed') : '') +
@@ -1887,7 +1956,9 @@ async function runAdvisor() {
 async function loadStartupManager() {
     try {
         var s = await apiGet('/api/startup/settings');
-        if (!s) return;
+        // On a failed read the fields went blank/unticked, and the next
+        // edit saved those blanks over the real settings.
+        if (!s || s.ok === false) return;
         var e = document.getElementById('sm-enabled'); if (e) e.checked = !!s.enabled;
         var i = document.getElementById('sm-initial'); if (i) i.value = s.initial_delay_s;
         var st = document.getElementById('sm-stagger'); if (st) st.value = s.stagger_s;
@@ -1897,7 +1968,7 @@ async function loadStartupManager() {
 }
 function smRenderRows(apps) {
     var box = document.getElementById('sm-list'); if (!box) return;
-    if (!apps.length) { box.innerHTML = '<div class="card-section-desc">No apps yet — add the apps you want Vispora to launch on startup.</div>'; return; }
+    if (!apps.length) { box.innerHTML = '<div class="card-section-desc">No apps yet. Add the apps you want Vispora to launch on startup.</div>'; return; }
     box.innerHTML = apps.map(function(a) {
         var warn = a.exists === false ? ' <span style="color:var(--warning);font-size:11px">(missing)</span>' : '';
         return '<div style="display:flex;align-items:center;gap:10px;padding:7px 0;border-top:1px solid var(--border-faint)">' +
@@ -1909,12 +1980,17 @@ function smRenderRows(apps) {
     }).join('');
 }
 async function smSaveSettings() {
-    await apiPost('/api/startup/settings', {
+    var r = await apiPost('/api/startup/settings', {
         enabled: document.getElementById('sm-enabled').checked,
         initial_delay_s: parseInt(document.getElementById('sm-initial').value) || 0,
         stagger_s: parseInt(document.getElementById('sm-stagger').value) || 0,
         skip_if_running: document.getElementById('sm-skip').checked,
     });
+    // A failed save was silent and the form kept showing what was not stored.
+    if (!r || !r.ok) {
+        showErrorToast('Could not save Startup Manager settings: ' + ((r && r.err) || 'unknown'));
+        loadStartupManager();
+    }
 }
 async function smAdd(path) {
     if (!path) return;
@@ -1923,7 +1999,9 @@ async function smAdd(path) {
     else showErrorToast('Could not add: ' + ((r && r.err) || 'unknown'));
 }
 async function smBrowse() {
-    var r = await apiPost('/api/startup/browse', {});
+    // The request stays open until the user closes the file dialog; the 60 s
+    // default gave up while they were still browsing and lost their pick.
+    var r = await apiPost('/api/startup/browse', {}, { timeoutMs: 10 * 60 * 1000 });
     if (r && r.ok && r.path) smAdd(r.path);
     else if (r && !r.ok) showErrorToast('File picker failed: ' + (r.err || ''));
 }
@@ -1931,11 +2009,24 @@ function smAddManual() {
     var el = document.getElementById('sm-manual-path');
     if (el && el.value.trim()) { smAdd(el.value.trim()); el.value = ''; }
 }
-async function smRemove(id) { await apiPost('/api/startup/remove', { id: id }); loadStartupManager(); }
-async function smToggle(id, enabled) { await apiPost('/api/startup/update', { id: id, enabled: enabled }); }
-async function smSetDelay(id, val) { await apiPost('/api/startup/update', { id: id, delay_s: parseInt(val) || 0 }); }
+// These used to ignore the answer: a failed change looked saved (checkbox,
+// delay) until the next reload.  On failure, say so and re-render the saved list.
+async function smRemove(id) {
+    var r = await apiPost('/api/startup/remove', { id: id });
+    if (!r || !r.ok) showErrorToast('Could not remove: ' + ((r && r.err) || 'unknown'));
+    loadStartupManager();
+}
+async function smToggle(id, enabled) {
+    var r = await apiPost('/api/startup/update', { id: id, enabled: enabled });
+    if (!r || !r.ok) { showErrorToast('Could not update: ' + ((r && r.err) || 'unknown')); loadStartupManager(); }
+}
+async function smSetDelay(id, val) {
+    var r = await apiPost('/api/startup/update', { id: id, delay_s: parseInt(val) || 0 });
+    if (!r || !r.ok) { showErrorToast('Could not update: ' + ((r && r.err) || 'unknown')); loadStartupManager(); }
+}
 async function smLaunchNow() {
-    await apiPost('/api/startup/launch-now', {});
+    var r = await apiPost('/api/startup/launch-now', {});
+    if (!r || !r.ok) { showErrorToast('Could not launch your startup apps: ' + ((r && r.err) || 'unknown')); return; }
     showInfoToast('Launching your startup apps now (staggered)…', { title: 'Startup Manager' });
 }
 
@@ -1965,14 +2056,21 @@ async function idleRefreshStatus() {
     var st = await apiGet('/api/idle/status');
     var el = document.getElementById('idle-status');
     if (!el) return;
+    if (st && st.ok === false) {
+        // A failed read used to show as "Armed · not engaged (idle 0/0 min)".
+        el.textContent = 'Could not read Idle Mode status: ' + (st.err || 'unknown');
+        el.style.color = 'var(--warning)';
+        return;
+    }
     if (!st || st.enabled === false) {
         el.textContent = 'Idle Mode is off.';
         el.style.color = 'var(--text-tertiary)';
         return;
     }
     if (st.engaged) {
-        el.innerHTML = '<span style="color:var(--accent)">● Engaged</span> — cooling posture active. '
+        el.innerHTML = '<span style="color:var(--accent)">● Engaged</span>: cooling posture active. '
             + escHtml(st.last_transition || '');
+        el.style.color = 'var(--text-tertiary)';   // undo the warning colour of a failed read
     } else {
         var mins = Math.floor((st.idle_seconds || 0) / 60);
         var need = Math.floor((st.grace_seconds || 0) / 60);
@@ -2001,6 +2099,8 @@ async function idleWake() {
 }
 
 async function runOptimize(categories) {
+    // One optimizer run at a time (Apply All, Apply selected and Reset share it).
+    if (_alreadyRunning('optimize')) return;
     var term = document.getElementById('optimize-terminal');
     term.innerHTML = '';
     termWrite('optimize-terminal', 'Starting optimization...');
@@ -2008,14 +2108,25 @@ async function runOptimize(categories) {
     var payload = categories ? { categories: categories } : {};
     // A full run is hundreds of commands; the 60 s default gave up on it
     // while the backend was still working.
-    var result = await apiPost('/api/optimize/run', payload, { timeoutMs: 10 * 60 * 1000 });
+    _runsInFlight.optimize = true;
+    try {
+        var result = await apiPost('/api/optimize/run', payload, { timeoutMs: 10 * 60 * 1000 });
+    } finally {
+        _runsInFlight.optimize = false;
+    }
+    // A failed request ({ok:false, err}) has no category keys; it used to
+    // print "complete" and mark the module done.
+    if (result && result.ok === false) {
+        termWrite('optimize-terminal', '✗ ' + (result.err || 'Request failed'));
+        return;
+    }
 
     Object.keys(result).forEach(function(cat) {
         var val = result[cat];
         if (Array.isArray(val)) {
             termWrite('optimize-terminal', '-- ' + cat.toUpperCase() + ' --');
             val.forEach(function(r) {
-                termWrite('optimize-terminal', '  ' + (r.ok !== false ? '✓' : '✗') + ' ' + (r.name || ''));
+                termWrite('optimize-terminal', '  ' + _rowMark(r.ok) + ' ' + (r.name || ''));
             });
         } else if (val && typeof val === 'object') {
             termWrite('optimize-terminal', '-- ' + cat.toUpperCase() + ': ' + (val.ok !== false ? '✓' : '✗') + ' --');
@@ -2026,6 +2137,7 @@ async function runOptimize(categories) {
 }
 
 async function resetOptimizations() {
+    if (_alreadyRunning('optimize')) return;
     if (!confirm('Undo ALL Optimizer tweaks?\n\nEvery setting the Optimizer changed goes back to what it was before '
                  + '(registry, power plan, services, scheduled tasks, boot and network settings, Windows features, '
                  + 'Defender).\nAnything changed by an older version, which kept no record, goes back to the '
@@ -2036,14 +2148,23 @@ async function resetOptimizations() {
     term.innerHTML = '';
     termWrite('optimize-terminal', 'Undoing all optimizations...');
 
-    var result = await apiPost('/api/optimize/reset', {}, { timeoutMs: 20 * 60 * 1000 });
+    _runsInFlight.optimize = true;
+    try {
+        var result = await apiPost('/api/optimize/reset', {}, { timeoutMs: 20 * 60 * 1000 });
+    } finally {
+        _runsInFlight.optimize = false;
+    }
+    if (result && result.ok === false) {
+        termWrite('optimize-terminal', '✗ ' + (result.err || 'Request failed'));
+        return;
+    }
 
     Object.keys(result).forEach(function(cat) {
         var val = result[cat];
         if (Array.isArray(val)) {
             termWrite('optimize-terminal', '-- RESET ' + cat.toUpperCase() + ' --');
             val.forEach(function(r) {
-                termWrite('optimize-terminal', '  ' + (r.ok !== false ? '✓' : '✗') + ' ' + (r.name || ''));
+                termWrite('optimize-terminal', '  ' + _rowMark(r.ok) + ' ' + (r.name || ''));
             });
         }
     });
@@ -2066,6 +2187,7 @@ function optSelectAll(yes) {
     _optUpdateCount();
 }
 async function optApplySelected() {
+    if (_alreadyRunning('optimize')) return;
     var cats = Array.from(document.querySelectorAll('.opt-cat.selected'))
         .map(function(el) { return el.getAttribute('data-cat'); });
     if (cats.length === 0) {
@@ -2087,7 +2209,12 @@ async function optApplySelected() {
     term.innerHTML = '';
     termWrite('optimize-terminal', 'Applying ' + cats.length + ' selected categories: ' + cats.join(', '));
     // The /api/optimize/run endpoint accepts the categories list
-    var result = await apiPost('/api/optimize/run', { categories: cats }, { timeoutMs: 10 * 60 * 1000 });
+    _runsInFlight.optimize = true;
+    try {
+        var result = await apiPost('/api/optimize/run', { categories: cats }, { timeoutMs: 10 * 60 * 1000 });
+    } finally {
+        _runsInFlight.optimize = false;
+    }
     if (result && result.ok === false) {
         termWrite('optimize-terminal', '✗ ' + (result.err || 'Request failed'));
         return;
@@ -2099,7 +2226,7 @@ async function optApplySelected() {
         if (!Array.isArray(entries)) return;
         termWrite('optimize-terminal', '── ' + cat.toUpperCase() + ' ──');
         entries.forEach(function(r) {
-            termWrite('optimize-terminal', '  ' + (r.ok !== false ? '✓' : '✗') + ' ' + (r.name || ''));
+            termWrite('optimize-terminal', '  ' + _rowMark(r.ok) + ' ' + (r.name || ''));
         });
     });
     termWrite('optimize-terminal', '=== Selected tweaks applied ===');
@@ -2117,6 +2244,11 @@ async function scanStartup() {
     var container = document.getElementById('startup-list');
     container.innerHTML = '<span class="pulse" style="color:var(--text-dim)">Scanning...</span>';
     var data = await apiGet('/api/optimize/startup');
+    if (data.ok === false) {
+        // A failed scan used to read as "No startup items found".
+        container.innerHTML = '<span style="color:var(--red)">Scan failed: ' + escHtml(data.err || 'unknown') + '</span>';
+        return;
+    }
     var items = data.items || [];
     if (items.length === 0) {
         container.innerHTML = '<span style="color:var(--text-dim)">No startup items found</span>';
@@ -2132,7 +2264,15 @@ async function scanStartup() {
 async function disableStartup(name, location, btn) {
     btn.disabled = true;
     btn.textContent = '...';
-    await apiPost('/api/optimize/disable-startup', { name: name, location: location });
+    var r = await apiPost('/api/optimize/disable-startup', { name: name, location: location });
+    // Startup-folder and per-user (HKU) items come back ok:false
+    // ("Unsupported location"); this used to say "Done" for them anyway.
+    if (!r || !r.ok) {
+        btn.disabled = false;
+        btn.textContent = 'Disable';
+        showWarnToast('Could not disable ' + name + ': ' + ((r && r.err) || 'unknown'));
+        return;
+    }
     btn.textContent = 'Done';
     btn.style.borderColor = 'var(--accent)';
     btn.style.color = 'var(--accent)';
@@ -2198,6 +2338,11 @@ async function _renderNetMon() {
                 (b.active_game ? ' while <b>' + escHtml(b.active_game) + '</b> is running.' : '.');
         }
         if (burstBtn) {
+            if (b.pid !== _netmonLastBurstPid) {
+                // A new burst: the button may still be "Suspended ✓" and disabled from the last one.
+                burstBtn.textContent = 'Pause this process';
+                burstBtn.disabled = false;
+            }
             burstBtn.onclick = (function(pid, name){
                 return async function(){
                     if (!confirm('Suspend ' + name + ' (PID ' + pid + ')?\n\n' +
@@ -2311,6 +2456,11 @@ var ADAPTER_KIND_META = {
 async function loadNetworkInfo() {
     var data = await apiGet('/api/network/info');
     var dnsEl = document.getElementById('current-dns');
+    if (data.ok === false) {
+        // A failed read used to show "No network adapters detected" and empty the presets.
+        dnsEl.textContent = 'Could not read network adapters: ' + (data.err || 'unknown');
+        return;
+    }
 
     // Show every adapter Windows recognizes, with type + status.
     // Active adapters are listed first with their current DNS settings;
@@ -2390,14 +2540,25 @@ async function testDnsLatency() {
 }
 
 async function runNetworkOptimize() {
+    if (_alreadyRunning('networkOptimize')) return;
     termWrite('network-terminal', 'Applying network optimizations...');
-    var result = await apiPost('/api/network/optimize');
+    // The route answers only when every adapter pass is done; 60 s could cut it off.
+    _runsInFlight.networkOptimize = true;
+    try {
+        var result = await apiPost('/api/network/optimize', {}, { timeoutMs: 10 * 60 * 1000 });
+    } finally {
+        _runsInFlight.networkOptimize = false;
+    }
+    if (result && result.ok === false) {
+        termWrite('network-terminal', '✗ ' + (result.err || 'Request failed'), 'error');
+        return;
+    }
     Object.keys(result).forEach(function(cat) {
         var items = result[cat];
         if (Array.isArray(items)) {
             termWrite('network-terminal', '── ' + cat.toUpperCase() + ' ──');
             items.forEach(function(r) {
-                termWrite('network-terminal', '  ' + (r.ok !== false ? '✓' : '✗') + ' ' + (r.name || r.guid || r.adapter || ''));
+                termWrite('network-terminal', '  ' + _rowMark(r.ok) + ' ' + (r.name || r.guid || r.adapter || ''));
             });
         }
     });
@@ -2417,7 +2578,7 @@ async function _undoTabTweaks(url, terminal, badge, what) {
         return;
     }
     r.results.forEach(function(row) {
-        termWrite(terminal, '  ' + (row.ok !== false ? '✓' : '✗') + ' ' + row.name);
+        termWrite(terminal, '  ' + _rowMark(row.ok) + ' ' + row.name);
     });
     termWrite(terminal, '═══ ' + (r.nothing ? 'Nothing to undo' : 'Tweaks undone') + ' ═══');
     updateBadge(badge, false);
@@ -2437,17 +2598,18 @@ async function restoreNetworking() {
                  'Use this if WiFi disappeared, DNS won\'t apply, or networking acts strange.')) return;
     termWrite('network-terminal', 'Running network recovery...');
     var r = await apiPost('/api/network/restore', {});
-    if (!r) {
-        termWrite('network-terminal', '✗ Recovery failed', 'error');
+    // apiPost returns {ok:false, err} on failure, never null; that printed "Recovery complete".
+    if (!r || r.ok === false) {
+        termWrite('network-terminal', '✗ Recovery failed' + (r && r.err ? ': ' + r.err : ''), 'error');
         return;
     }
     (r.results || []).forEach(function(step){
-        termWrite('network-terminal', '  ' + (step.ok ? '✓' : '✗') + ' ' + step.name);
+        termWrite('network-terminal', '  ' + (step.ok === null ? '○' : step.ok ? '✓' : '✗') + ' ' + step.name);
     });
     termWrite('network-terminal', '═══ ' + (r.msg || 'Recovery complete') + ' ═══');
     if (r.reboot_recommended) {
         showInfoToast('Network recovery complete. ' + (r.msg || '') +
-              ' Reboot recommended for full effect — particularly the Winsock reset.',
+              ' Reboot recommended for full effect, particularly the Winsock reset.',
               { timeoutMs: 9000 });
     }
     setTimeout(loadNetworkInfo, 500);
@@ -2458,7 +2620,8 @@ async function runPingTest() {
     // 10 pings × 5 hosts takes ~45 s — longer than the default 30 s GET timeout.
     var data = await apiGet('/api/network/ping', { timeoutMs: 120000 });
     (data.results || []).forEach(function(r) {
-        termWrite('network-terminal', '  ' + r.name + ' (' + r.ip + '): avg=' + (r.avg_ms || '?') + 'ms min=' + (r.min_ms || '?') + 'ms max=' + (r.max_ms || '?') + 'ms loss=' + (r.loss_pct || '?') + '%');
+        // != null, not ||: a healthy 0% loss printed as "loss=?%".
+        termWrite('network-terminal', '  ' + r.name + ' (' + r.ip + '): avg=' + (r.avg_ms != null ? r.avg_ms : '?') + 'ms min=' + (r.min_ms != null ? r.min_ms : '?') + 'ms max=' + (r.max_ms != null ? r.max_ms : '?') + 'ms loss=' + (r.loss_pct != null ? r.loss_pct : '?') + '%');
     });
 }
 
@@ -2477,8 +2640,12 @@ function toggleIPv6(el) {
 async function runNetshTweaks() {
     termWrite('network-terminal', 'Applying netsh TCP stack tweaks...');
     var r = await apiPost('/api/network/netsh');
+    if (r.ok === false) {
+        termWrite('network-terminal', '✗ ' + (r.err || 'Request failed'), 'error');
+        return;
+    }
     (r.results || []).forEach(function(x) {
-        termWrite('network-terminal', '  ' + (x.ok !== false ? '✓' : '✗') + ' ' + x.name);
+        termWrite('network-terminal', '  ' + _rowMark(x.ok) + ' ' + x.name);
     });
     termWrite('network-terminal', '=== netsh TCP tweaks applied ===');
 }
@@ -2486,8 +2653,12 @@ async function runNetshTweaks() {
 async function runNetbiosTeredo() {
     termWrite('network-terminal', 'Disabling NetBIOS / Teredo / LLMNR...');
     var r = await apiPost('/api/network/netbios');
+    if (r.ok === false) {
+        termWrite('network-terminal', '✗ ' + (r.err || 'Request failed'), 'error');
+        return;
+    }
     (r.results || []).forEach(function(x) {
-        termWrite('network-terminal', '  ' + (x.ok !== false ? '✓' : '✗') + ' ' + x.name);
+        termWrite('network-terminal', '  ' + _rowMark(x.ok) + ' ' + x.name);
     });
 }
 
@@ -2495,7 +2666,7 @@ async function runDoh() {
     termWrite('network-terminal', 'Enabling DNS-over-HTTPS...');
     var r = await apiPost('/api/network/doh');
     (r.results || []).forEach(function(x) {
-        termWrite('network-terminal', '  ' + (x.ok !== false ? '✓' : '✗') + ' ' + x.name);
+        termWrite('network-terminal', '  ' + _rowMark(x.ok) + ' ' + x.name);
     });
     termWrite('network-terminal', '(Apply DNS above for Cloudflare/Google/Quad9 to complete the DoH upgrade)');
 }
@@ -2503,14 +2674,20 @@ async function runDoh() {
 async function runGameQos() {
     termWrite('network-terminal', 'Applying DSCP 46 QoS to common game ports...');
     var r = await apiPost('/api/network/game-qos');
+    if (r.ok === false) {
+        termWrite('network-terminal', '✗ ' + (r.err || 'Request failed'), 'error');
+        return;
+    }
     (r.results || []).forEach(function(x) {
-        termWrite('network-terminal', '  ' + (x.ok !== false ? '✓' : '✗') + ' ' + x.name);
+        termWrite('network-terminal', '  ' + _rowMark(x.ok) + ' ' + x.name);
     });
 }
 
 async function applyAppPriority() {
     var exe = (document.getElementById('app-prio-exe').value || '').trim();
-    var dscp = parseInt(document.getElementById('app-prio-dscp').value, 10) || 46;
+    // DSCP 0 is valid (the input allows 0-63); `|| 46` turned it into 46.
+    var dscp = parseInt(document.getElementById('app-prio-dscp').value, 10);
+    if (isNaN(dscp)) dscp = 46;
     if (!exe) { showWarnToast('Enter an executable name (e.g. game.exe)'); return; }
     var r = await apiPost('/api/network/app-priority', { exe: exe, dscp: dscp });
     termWrite('network-terminal', r.ok ? '✓ Priority ' + dscp + ' set for ' + exe : '✗ ' + (r.err || 'Failed'));
@@ -2549,8 +2726,12 @@ async function runNvidiaTweaks() {
     var term = document.getElementById('gpu-terminal');
     termWrite('gpu-terminal', 'Applying NVIDIA-specific tweaks...');
     var r = await apiPost('/api/gpu/nvidia-tweaks');
+    if (r.ok === false) {
+        termWrite('gpu-terminal', '✗ ' + (r.err || 'Request failed'), 'error');
+        return;
+    }
     (r.results || []).forEach(function(x) {
-        termWrite('gpu-terminal', '  ' + (x.ok !== false ? '✓' : '✗') + ' ' + x.name);
+        termWrite('gpu-terminal', '  ' + _rowMark(x.ok) + ' ' + x.name);
     });
     termWrite('gpu-terminal', '=== NVIDIA tweaks complete ===');
     updateBadge('gpu', true);
@@ -2560,8 +2741,12 @@ async function runAmdTweaks() {
     var term = document.getElementById('gpu-terminal');
     termWrite('gpu-terminal', 'Applying AMD-specific tweaks...');
     var r = await apiPost('/api/gpu/amd-tweaks');
+    if (r.ok === false) {
+        termWrite('gpu-terminal', '✗ ' + (r.err || 'Request failed'), 'error');
+        return;
+    }
     (r.results || []).forEach(function(x) {
-        termWrite('gpu-terminal', '  ' + (x.ok !== false ? '✓' : '✗') + ' ' + x.name);
+        termWrite('gpu-terminal', '  ' + _rowMark(x.ok) + ' ' + x.name);
     });
     termWrite('gpu-terminal', '=== AMD tweaks complete ===');
     updateBadge('gpu', true);
@@ -2583,8 +2768,12 @@ async function prepareCleanInstall() {
 async function runGpuTweaks() {
     termWrite('gpu-terminal', 'Applying GPU tweaks...');
     var result = await apiPost('/api/gpu/tweaks');
+    if (result.ok === false) {
+        termWrite('gpu-terminal', '✗ ' + (result.err || 'Request failed'), 'error');
+        return;
+    }
     (result.tweaks || []).forEach(function(r) {
-        termWrite('gpu-terminal', '  ' + (r.ok !== false ? '✓' : '✗') + ' ' + (r.name || ''));
+        termWrite('gpu-terminal', '  ' + _rowMark(r.ok) + ' ' + (r.name || ''));
     });
     termWrite('gpu-terminal', '═══ GPU tweaks complete ═══');
     updateBadge('gpu', true);
@@ -2613,8 +2802,16 @@ async function scanCleaner() {
 }
 
 async function runCleaner() {
+    // Shared with the drive clean: both delete from the same temp folders.
+    if (_alreadyRunning('cleaner')) return;
     termWrite('cleaner-terminal', 'Cleaning all temp files...');
-    var result = await apiPost('/api/cleaner/run');
+    // The route answers only when every folder is emptied; big caches take minutes.
+    _runsInFlight.cleaner = true;
+    try {
+        var result = await apiPost('/api/cleaner/run', {}, { timeoutMs: 10 * 60 * 1000 });
+    } finally {
+        _runsInFlight.cleaner = false;
+    }
     if (result.ok) {
         termWrite('cleaner-terminal', '✓ Cleaned ' + result.total_files + ' files, freed ' + result.total_freed_str);
         (result.locations || []).forEach(function(l) {
@@ -2622,11 +2819,12 @@ async function runCleaner() {
                 termWrite('cleaner-terminal', '  ' + l.name + ': ' + l.files + ' files, ' + (l.freed_str || formatSize(l.freed || 0)));
             }
         });
+        // Only on success: a failed clean used to end "complete" and mark the module done.
+        termWrite('cleaner-terminal', '═══ Cleaning complete ═══');
+        updateBadge('cleaner', true);
     } else {
-        termWrite('cleaner-terminal', '✗ Clean failed', 'error');
+        termWrite('cleaner-terminal', '✗ Clean failed' + (result.err ? ': ' + result.err : ''), 'error');
     }
-    termWrite('cleaner-terminal', '═══ Cleaning complete ═══');
-    updateBadge('cleaner', true);
     scanCleaner();
 }
 
@@ -2637,7 +2835,7 @@ async function cleanRAM() {
     termWrite('cleaner-terminal', 'Cleaning RAM...');
     var result = await apiPost('/api/cleaner/ram');
     if (result.ok) {
-        termWrite('cleaner-terminal', '✓ RAM cleaned — freed ~' + result.freed_str);
+        termWrite('cleaner-terminal', '✓ RAM cleaned, freed ~' + result.freed_str);
         termWrite('cleaner-terminal', '  Before: ' + result.free_before_mb + ' MB free → After: ' + result.free_after_mb + ' MB free');
         if (el) el.innerHTML = '<span style="color:var(--accent)">✓ Freed ~' + escHtml(result.freed_str) + '</span> (' + result.free_before_mb + '→' + result.free_after_mb + ' MB free)';
     } else {
@@ -2683,17 +2881,25 @@ function _getSelectedDrives() {
 }
 
 async function scanSelectedDisks() {
+    if (_alreadyRunning('diskScan')) return;
     var drives = _getSelectedDrives();
     if (drives.length === 0) { termWrite('cleaner-terminal', 'No drives selected', 'warning'); return; }
     var el = document.getElementById('disk-scan-result');
     if (el) el.innerHTML = '<span class="pulse" style="color:var(--text-dim)">Scanning ' + drives.join(', ') + '...</span>';
     var allJunk = [];
-    for (var i = 0; i < drives.length; i++) {
-        var data = await apiPost('/api/cleaner/disk-scan', { drive: drives[i] });
-        (data.junk || []).forEach(function(j) {
-            j.drive = drives[i];
-            allJunk.push(j);
-        });
+    _runsInFlight.diskScan = true;
+    try {
+        for (var i = 0; i < drives.length; i++) {
+            // Walking a big drive can take minutes; with 60 s that drive was silently left out.
+            var data = await apiPost('/api/cleaner/disk-scan', { drive: drives[i] }, { timeoutMs: 10 * 60 * 1000 });
+            if (data.ok === false) termWrite('cleaner-terminal', '✗ Scan of ' + drives[i] + ' failed: ' + (data.err || 'unknown'), 'error');
+            (data.junk || []).forEach(function(j) {
+                j.drive = drives[i];
+                allJunk.push(j);
+            });
+        }
+    } finally {
+        _runsInFlight.diskScan = false;
     }
     if (el) {
         var totalSize = 0;
@@ -2707,15 +2913,25 @@ async function scanSelectedDisks() {
 }
 
 async function cleanSelectedDisks() {
+    if (_alreadyRunning('cleaner')) return;
     var drives = _getSelectedDrives();
     if (drives.length === 0) { termWrite('cleaner-terminal', 'No drives selected', 'warning'); return; }
     termWrite('cleaner-terminal', 'Cleaning drives: ' + drives.join(', ') + '...');
-    var result = await apiPost('/api/cleaner/disk-clean', { drives: drives });
+    _runsInFlight.cleaner = true;
+    try {
+        var result = await apiPost('/api/cleaner/disk-clean', { drives: drives }, { timeoutMs: 10 * 60 * 1000 });
+    } finally {
+        _runsInFlight.cleaner = false;
+    }
     if (result.ok) {
         termWrite('cleaner-terminal', '✓ Disk clean: ' + result.total_files + ' files, ' + result.total_freed_str + ' freed');
         (result.drives || []).forEach(function(d) {
             termWrite('cleaner-terminal', '  ' + d.drive + ': ' + d.files + ' files, ' + d.freed_str);
         });
+    } else {
+        // Used to fall through and show "✓ Cleaned 0 B" for a failed request.
+        termWrite('cleaner-terminal', '✗ Disk clean failed' + (result.err ? ': ' + result.err : ''), 'error');
+        return;
     }
     var el = document.getElementById('disk-scan-result');
     if (el) el.innerHTML = '<span style="color:var(--accent)">✓ Cleaned ' + (result.total_freed_str || '0 B') + '</span>';
@@ -2744,6 +2960,10 @@ async function runFullPrivacy() {
     term.innerHTML = '';
     termWrite('privacy-terminal', 'Running full privacy hardening...');
     var result = await apiPost('/api/privacy/run');
+    if (result && result.ok === false) {
+        termWrite('privacy-terminal', '✗ ' + (result.err || 'Request failed'), 'error');
+        return;
+    }
 
     if (result.telemetry) {
         var ok = result.telemetry.filter(function(r) { return r.ok; }).length;
@@ -2769,6 +2989,7 @@ function toggleDevice(device, el) {
     el.classList.toggle('on');
     var enable = el.classList.contains('on');
     apiPost('/api/privacy/' + device, { enable: enable }).then(function(r) {
+        if (!r.ok) el.classList.toggle('on');   // don't leave the switch showing a state that wasn't applied
         termWrite('privacy-terminal', r.ok ? '✓ ' + device + ' ' + (enable ? 'enabled' : 'disabled') : '✗ Failed');
     });
 }
@@ -2804,6 +3025,7 @@ function showVaultLocked(pinSet) {
     // the list was only being hidden, and an open edit form stayed open.
     var list = document.getElementById('vault-entries');
     if (list) list.innerHTML = '';
+    _vaultLoadSeq++;   // an entries request still in flight must not refill it
     var search = document.getElementById('vault-search');
     if (search) search.value = '';
     var mc = document.getElementById('modal-content');
@@ -2888,9 +3110,15 @@ async function lockVault() {
     checkVaultStatus();
 }
 
+// The search box reloads on every keystroke and the answers can arrive out
+// of order; only the newest request may render.
+var _vaultLoadSeq = 0;
+
 async function loadVaultEntries() {
+    var seq = ++_vaultLoadSeq;
     var search = (document.getElementById('vault-search') || {}).value || '';
     var data = await apiGet('/api/vault/entries?search=' + encodeURIComponent(search) + '&category=' + encodeURIComponent(vaultCategory));
+    if (seq !== _vaultLoadSeq) return;
     var el = document.getElementById('vault-entries');
     if (!data.ok) {
         // The backend auto-locks after a few idle minutes; show the PIN pad
@@ -2902,7 +3130,7 @@ async function loadVaultEntries() {
     var entries = data.entries || [];
     if (entries.length === 0) {
         if (data.had_decrypt_errors) {
-            el.innerHTML = '<div style="color:var(--red);text-align:center;padding:30px">Could not read any vault entries — they may be corrupted or encrypted under a different key. Check the app log for details.</div>';
+            el.innerHTML = '<div style="color:var(--red);text-align:center;padding:30px">Could not read any vault entries. They may be corrupted or encrypted under a different key. Check the app log for details.</div>';
         } else {
             el.innerHTML = '<div style="color:var(--text-dim);text-align:center;padding:30px">No entries yet. Click "Add Entry" to get started.</div>';
         }
@@ -2935,7 +3163,7 @@ async function copyPassword(id) {
             document.execCommand('copy');
             document.body.removeChild(ta);
         }
-        showInfoToast('Password copied — the clipboard is cleared in 30 seconds.');
+        showInfoToast('Password copied. The clipboard is cleared in 30 seconds.');
         // Don't leave it on the clipboard for good.  Only clear if it is still
         // there (reading can be refused; then leave the clipboard alone).
         var copied = data.password;
@@ -2992,7 +3220,11 @@ async function openEditEntry(id) {
     var data = await apiGet('/api/vault/entries');
     var entry = null;
     (data.entries || []).forEach(function(e) { if (e.id === id) entry = e; });
-    if (!entry) return;
+    if (!entry) {
+        // After the idle auto-lock the list comes back empty and Edit did nothing.
+        if (/locked/i.test(data.err || '')) showVaultLocked(true);
+        return;
+    }
     var pwData = await apiGet('/api/vault/entry/' + id + '/password');
     if (!pwData.ok) {
         // Opening the form with an empty password field and letting "Update"
@@ -3073,10 +3305,11 @@ async function genForField(fieldId) {
 // FULL SPECTRUM
 // ═══════════════════════════════════════════════════════════════
 async function runFullSpectrum() {
+    if (_alreadyRunning('fullSpectrum')) return;
     // Debloat runs with what is selected on the Debloat tab, the same as its own button.
     var deb = _debloatSelection();
     if (!confirm('⚡ FULL SPECTRUM MODE\n\nThis will run ALL modules:\n• Debloat (your Debloat-tab selections'
-                 + (deb.onedrive ? '; this UNINSTALLS OneDrive — switch that off on the Debloat tab to keep it' : '; OneDrive is kept')
+                 + (deb.onedrive ? '; this UNINSTALLS OneDrive, so switch that off on the Debloat tab to keep it' : '; OneDrive is kept')
                  + ')\n• Optimize\n• Network\n• GPU\n• Privacy\n• Cleaner\n\nCreate a restore point first!\nContinue?')) return;
 
     switchPage('logs');
@@ -3086,7 +3319,12 @@ async function runFullSpectrum() {
 
     // Runs every module back to back, which takes minutes.  With the default
     // 60 s timeout this printed "COMPLETE" while the backend was mid-debloat.
-    var result = await apiPost('/api/full-spectrum', { debloat: deb }, { timeoutMs: 45 * 60 * 1000 });
+    _runsInFlight.fullSpectrum = true;
+    try {
+        var result = await apiPost('/api/full-spectrum', { debloat: deb }, { timeoutMs: 45 * 60 * 1000 });
+    } finally {
+        _runsInFlight.fullSpectrum = false;
+    }
     if (result && result.ok === false) {
         termWrite('full-log', '');
         termWrite('full-log', '✗ Full Spectrum did not finish: ' + (result.err || 'request failed'));
@@ -3130,8 +3368,14 @@ function _trimTerminalToCap(term) {
     }
 }
 
+// One request at a time: when an answer took longer than the 2 s interval,
+// the next poll asked with the same `since` and the same lines were appended twice.
+var _pollLogsBusy = false;
+
 function pollLogs() {
+    if (_pollLogsBusy) return;
     if (currentPage === 'dashboard' || currentPage === 'logs') {
+        _pollLogsBusy = true;
         apiGet('/api/logs?since=' + lastLogCount).then(function(data) {
             if (data.entries && data.entries.length > 0) {
                 var termId = currentPage === 'dashboard' ? 'dash-terminal' : 'full-log';
@@ -3148,7 +3392,7 @@ function pollLogs() {
                 term.scrollTop = term.scrollHeight;
                 lastLogCount = data.total;
             }
-        });
+        }).finally(function() { _pollLogsBusy = false; });
     }
 }
 
@@ -3256,7 +3500,12 @@ function runBootSplash() {
 // KEYBOARD SHORTCUTS
 // ═══════════════════════════════════════════════════════════════
 document.addEventListener('keydown', function(e) {
-    if (currentPage === 'vault' && document.getElementById('vault-lock-screen').style.display !== 'none') {
+    // Keys typed into a text field (in a modal, say) are not PIN entry: Enter
+    // there used to submit the PIN and count toward the lockout.  The PIN pad
+    // has no field of its own.
+    var t = e.target;
+    var typing = !!t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''));
+    if (!typing && currentPage === 'vault' && document.getElementById('vault-lock-screen').style.display !== 'none') {
         if (e.key >= '0' && e.key <= '9') pinInput(e.key);
         else if (e.key === 'Backspace') { vaultPin = vaultPin.slice(0, -1); updatePinDots(); }
         else if (e.key === 'Enter') pinSubmit();
@@ -3340,6 +3589,11 @@ async function installUpdateFromToast() {
 function showUpdateModal() {
     apiGet('/api/updater/status').then(function(s) {
         if (!s) return;
+        if (s.ok === false) {
+            // Not "UP TO DATE": a failed read (even from the Update badge) opened that modal.
+            addLog('Could not read the update status: ' + (s.err || 'unknown'));
+            return;
+        }
         if (!s.update_available) {
             openModal(
                 '<div class="modal-title">UP TO DATE</div>' +
@@ -3410,20 +3664,30 @@ async function toggleUpdaterSetting(el, key) {
 }
 
 async function downloadAndInstall() {
+    // Reopening the modal from the Update badge mid-download and clicking again
+    // showed "Download failed: Download already in progress".
+    if (_alreadyRunning('updateDownload')) return;
     var modal = document.getElementById('modal-content');
     if (modal) modal.innerHTML =
         '<div class="modal-title">DOWNLOADING...</div>' +
         '<div class="progress-container"><div class="progress-bar"><div class="progress-fill" id="update-progress" style="width:30%"></div></div></div>' +
         '<p style="color:var(--text-dim);font-size:11px;text-align:center" id="update-msg">Fetching the new build...</p>';
 
-    var dl = await apiPost('/api/updater/download');
+    // The route returns only when the whole build (~44 MB) is down; on a slow
+    // line the 60 s default reported "Download failed" mid-download.
+    _runsInFlight.updateDownload = true;
+    try {
+        var dl = await apiPost('/api/updater/download', {}, { timeoutMs: 15 * 60 * 1000 });
+    } finally {
+        _runsInFlight.updateDownload = false;
+    }
     if (!dl || !dl.ok) {
         var msgEl = document.getElementById('update-msg');
         if (msgEl) msgEl.innerHTML = '<span style="color:var(--red)">Download failed: ' + escHtml((dl && dl.err) || 'unknown') + '</span>';
         addLog('Update download failed: ' + ((dl && dl.err) || 'unknown'));
         return;
     }
-    addLog('Update downloaded — installing & restarting...');
+    addLog('Update downloaded, installing & restarting...');
     return installUpdateNow();
 }
 
@@ -3446,7 +3710,7 @@ async function installUpdateNow(force) {
         return;
     }
     if (r && r.ok) {
-        addLog('Update install triggered — exiting in ~1s.');
+        addLog('Update install triggered, exiting in ~1s.');
         if (modal) modal.innerHTML =
             '<div class="modal-title" style="color:var(--accent)">UPDATING</div>' +
             '<p style="color:var(--text-dim);font-size:11px;text-align:center">' + escHtml(r.msg || 'Vispora is restarting.') + '</p>';
@@ -3531,7 +3795,7 @@ async function _pollIntegrityFindings() {
         // map to showErrorToast — for now everything is warn.
         if ((f.severity || 'warn') === 'warn') {
             showWarnToast(f.summary, {
-                title:     'Health check — needs attention',
+                title:     'Health check: needs attention',
                 timeoutMs: 15000,
             });
         }
@@ -3701,7 +3965,13 @@ async function loadNotifierStatus() {
 async function toggleNotifier(el) {
     el.classList.toggle('on');
     var enabled = el.classList.contains('on');
-    await apiPost('/api/notifier/toggle', { enabled: enabled });
+    var r = await apiPost('/api/notifier/toggle', { enabled: enabled });
+    if (!r || !r.ok) {
+        // Revert: the switch and the log used to claim a change that never happened.
+        el.classList.toggle('on');
+        addLog('Could not ' + (enabled ? 'enable' : 'disable') + ' notifications: ' + ((r && r.err) || 'unknown'));
+        return;
+    }
     addLog('Notifications ' + (enabled ? 'enabled' : 'disabled'));
 }
 
@@ -3724,7 +3994,7 @@ async function cleanupOnly() {
     var r = await apiPost('/api/power/cleanup');
     if (!resEl) return;
     if (r.ok !== false) {
-        var freed = r.freed_bytes ? ' — freed ' + formatSize(r.freed_bytes) : '';
+        var freed = r.freed_bytes ? ', freed ' + formatSize(r.freed_bytes) : '';
         resEl.textContent = 'Cleanup done in ' + (r.elapsed_sec || 0) + 's' + freed;
         addLog('Cleanup done' + freed);
     } else {
@@ -3758,6 +4028,14 @@ var _gamepadPollTimer = null;
 async function loadInputDevices() {
     var data = await apiGet('/api/kernel/input-devices');
     if (!data) return;
+    if (data.ok === false) {
+        // A failed read used to show "None detected." / "0 detected" in all three lists.
+        ['kb', 'mc', 'ct'].forEach(function(p) {
+            var listEl = document.getElementById(p + '-list');
+            if (listEl) listEl.textContent = 'Could not read devices: ' + (data.err || 'unknown');
+        });
+        return;
+    }
     _renderInputBucket('kb', data.keyboards || []);
     _renderInputBucket('mc', data.mice || []);
     _renderInputBucket('ct', data.controllers || []);
@@ -3788,9 +4066,11 @@ function _renderInputBucket(prefix, list) {
 async function boostAllKeyboards() {
     var r = await apiPost('/api/kernel/boost-keyboards', {});
     if (!r) return;
+    // A failed request ({ok:false}) printed "✓ Boosted 0 keyboard(s)".
+    if (r.ok === false) { termWrite('kernel-terminal', '✗ Boost failed: ' + (r.err || 'unknown')); return; }
     var n = (r.boosted || []).length;
     termWrite('kernel-terminal',
-              '✓ Boosted ' + n + ' keyboard(s) to High priority — reboot required');
+              '✓ Boosted ' + n + ' keyboard(s) to High priority, reboot required');
     if ((r.failed || []).length) {
         termWrite('kernel-terminal', '✗ ' + r.failed.length + ' failed (HKLM\\Enum write blocked?)');
     }
@@ -3800,9 +4080,10 @@ async function boostAllKeyboards() {
 async function boostAllMice() {
     var r = await apiPost('/api/kernel/boost-mice', {});
     if (!r) return;
+    if (r.ok === false) { termWrite('kernel-terminal', '✗ Boost failed: ' + (r.err || 'unknown')); return; }
     var n = (r.boosted || []).length;
     termWrite('kernel-terminal',
-              '✓ Boosted ' + n + ' mouse/mice to High priority — reboot required');
+              '✓ Boosted ' + n + ' mouse/mice to High priority, reboot required');
     if ((r.failed || []).length) {
         termWrite('kernel-terminal', '✗ ' + r.failed.length + ' failed (HKLM\\Enum write blocked?)');
     }
@@ -3931,7 +4212,7 @@ function resetIdentifiedController() {
 
 async function boostIdentifiedController() {
     if (!_identifiedController) {
-        showWarnToast('No controller identified yet — press a button on the controller you want to boost.');
+        showWarnToast('No controller identified yet. Press a button on the controller you want to boost.');
         return;
     }
 
@@ -3986,7 +4267,7 @@ async function boostIdentifiedController() {
         var n = (r.boosted || []).length;
         termWrite('kernel-terminal',
                   '✓ Boosted controller "' + _identifiedController.short +
-                  '" (' + n + ' interface' + (n === 1 ? '' : 's') + ') — reboot required');
+                  '" (' + n + ' interface' + (n === 1 ? '' : 's') + '), reboot required');
     } else {
         termWrite('kernel-terminal', '✗ Boost failed: ' + (r.err || 'unknown'));
     }
@@ -3997,19 +4278,26 @@ async function resetAllInputPriority() {
     if (!confirm('Reset interrupt priority on EVERY keyboard, mouse, and controller back to Windows default?\n\nReboot required.')) return;
     var r = await apiPost('/api/kernel/reset-input-priorities', {});
     if (!r) return;
+    if (r.ok === false) { termWrite('kernel-terminal', '✗ Reset failed: ' + (r.err || 'unknown')); return; }
     var nk = (r.keyboards && r.keyboards.cleared || []).length;
     var nm = (r.mice && r.mice.cleared || []).length;
     var nc = (r.controllers && r.controllers.cleared || []).length;
     termWrite('kernel-terminal',
-              '✓ Reset priorities — keyboards: ' + nk + ', mice: ' + nm +
-              ', controllers: ' + nc + ' — reboot required');
+              '✓ Reset priorities (keyboards: ' + nk + ', mice: ' + nm +
+              ', controllers: ' + nc + '), reboot required');
     setTimeout(loadInputDevices, 300);
 }
 
 async function loadVBSStatus() {
-    var data = await apiGet('/api/vbs/status');
+    // Three PowerShell calls on the backend can outlast the 30 s default
+    var data = await apiGet('/api/vbs/status', { timeoutMs: 60000 });
     var el = document.getElementById('vbs-status');
     if (!el) return;
+    // A failed read must not show the green "Off" badges
+    if (!data || data.ok === false) {
+        el.textContent = 'Could not read VBS status: ' + ((data && data.err) || 'unknown error');
+        return;
+    }
     var vbs = data.vbs_running ? '<span class="status-badge danger">VBS Running</span>' : '<span class="status-badge ok">VBS Off</span>';
     var hvci = data.hvci_running ? '<span class="status-badge danger">HVCI Running</span>' : '<span class="status-badge ok">HVCI Off</span>';
     el.innerHTML = vbs + ' ' + hvci + ' <span style="font-size:10px;color:var(--text-dim)">Est. impact if enabled: ' + escHtml(data.estimated_impact || '?') + '</span>';
@@ -4021,13 +4309,13 @@ async function disableVBS() {
     if (r.results) {
         r.results.forEach(function(x) { termWrite('kernel-terminal', '  ' + (x.ok ? '✓' : '✗') + ' ' + x.name); });
     }
-    termWrite('kernel-terminal', r.ok ? '✓ VBS disabled — REBOOT REQUIRED' : '✗ Failed');
+    termWrite('kernel-terminal', r.ok ? '✓ VBS disabled, REBOOT REQUIRED' : '✗ Failed');
     loadVBSStatus();
 }
 
 async function enableVBS() {
     var r = await apiPost('/api/vbs/enable-all');
-    termWrite('kernel-terminal', r.ok ? '✓ VBS re-enabled — reboot required' : '✗ Failed');
+    termWrite('kernel-terminal', r.ok ? '✓ VBS re-enabled, reboot required' : '✗ Failed');
     loadVBSStatus();
 }
 
@@ -4035,6 +4323,11 @@ async function loadTimerStatus() {
     var data = await apiGet('/api/timer/status');
     var el = document.getElementById('timer-status');
     if (!el) return;
+    // A failed read must not show "Dynamic Tick On / HPET On"
+    if (!data || data.ok === false) {
+        el.textContent = 'Could not read timer status: ' + ((data && data.err) || 'unknown error');
+        return;
+    }
     var dtick = data.dynamic_tick === false ? '<span class="status-badge ok">Dynamic Tick Off</span>' : '<span class="status-badge warn">Dynamic Tick On</span>';
     var hpet = data.hpet_enabled === false ? '<span class="status-badge ok">HPET Off</span>' : '<span class="status-badge warn">HPET On</span>';
     el.innerHTML = dtick + ' ' + hpet;
@@ -4050,8 +4343,9 @@ async function loadTimerStatus() {
 async function applyTimerTweaks() {
     termWrite('kernel-terminal', 'Applying timer tweaks...');
     var r = await apiPost('/api/timer/apply');
+    if (r.ok === false) { termWrite('kernel-terminal', '✗ ' + (r.err || 'Failed'), 'error'); return; }
     (r.results || []).forEach(function(x) { termWrite('kernel-terminal', '  ' + (x.ok ? '✓' : '✗') + ' ' + x.name); });
-    termWrite('kernel-terminal', '═══ Timer tweaks applied — reboot recommended ═══');
+    termWrite('kernel-terminal', '═══ Timer tweaks applied, reboot recommended ═══');
     loadTimerStatus();
 }
 
@@ -4078,12 +4372,18 @@ async function loadISLCStatus() {
 }
 
 async function toggleISLC() {
+    var r;
     if (_islcRunning) {
-        await apiPost('/api/timer/islc/stop');
-        termWrite('kernel-terminal', 'ISLC stopped');
+        r = await apiPost('/api/timer/islc/stop');
+        if (r.ok) termWrite('kernel-terminal', 'ISLC stopped');
     } else {
-        await apiPost('/api/timer/islc/start', { free_threshold: 1024, standby_threshold: 1024, interval: 10 });
-        termWrite('kernel-terminal', 'ISLC started (free<1024MB & standby>1024MB)');
+        r = await apiPost('/api/timer/islc/start', { free_threshold: 1024, standby_threshold: 1024, interval: 10 });
+        if (r.ok) termWrite('kernel-terminal', 'ISLC started (free<1024MB & standby>1024MB)');
+    }
+    // Nothing changed on failure, so the flag must not flip either
+    if (!r.ok) {
+        termWrite('kernel-terminal', '✗ ISLC ' + (_islcRunning ? 'stop' : 'start') + ' failed: ' + (r.err || 'unknown'), 'error');
+        return;
     }
     _islcRunning = !_islcRunning;
     loadISLCStatus();
@@ -4092,6 +4392,7 @@ async function toggleISLC() {
 async function runSchedulerOptimize() {
     termWrite('kernel-terminal', 'Applying scheduler optimizations...');
     var r = await apiPost('/api/scheduler/run');
+    if (r.ok === false) { termWrite('kernel-terminal', '✗ ' + (r.err || 'Failed'), 'error'); return; }
     Object.keys(r).forEach(function(cat) {
         var val = r[cat];
         if (Array.isArray(val)) {
@@ -4107,6 +4408,7 @@ function toggleCpuIdle(el) {
     el.classList.toggle('on');
     var disable = el.classList.contains('on');
     apiPost('/api/scheduler/cpu-idle', { disable: disable }).then(function(r) {
+        if (!r.ok) el.classList.toggle('on', !disable);   // the setting did not change
         termWrite('kernel-terminal', r.ok ? '✓ CPU idle ' + (disable ? 'disabled' : 'enabled') : '✗ Failed');
     });
 }
@@ -4115,7 +4417,8 @@ function toggleSpectre(el) {
     el.classList.toggle('on');
     var disable = el.classList.contains('on');
     apiPost('/api/scheduler/spectre', { disable: disable }).then(function(r) {
-        termWrite('kernel-terminal', r.ok ? '✓ Spectre/Meltdown mitigations ' + (disable ? 'disabled' : 'enabled') + ' — reboot required' : '✗ Failed');
+        if (!r.ok) el.classList.toggle('on', !disable);   // the setting did not change
+        termWrite('kernel-terminal', r.ok ? '✓ Spectre/Meltdown mitigations ' + (disable ? 'disabled' : 'enabled') + ', reboot required' : '✗ Failed');
     });
 }
 
@@ -4124,6 +4427,11 @@ async function loadIRQDevices() {
     if (!el) return;
     el.innerHTML = '<span class="pulse" style="color:var(--text-dim)">Scanning PCI devices...</span>';
     var data = await apiGet('/api/irq/devices');
+    // A failed read is not "No PCI devices found"
+    if (!data || data.ok === false) {
+        el.textContent = 'Could not load PCI devices: ' + ((data && data.err) || 'unknown error');
+        return;
+    }
     var devs = data.devices || [];
     if (devs.length === 0) {
         el.innerHTML = '<span style="color:var(--text-dim)">No PCI devices found</span>';
@@ -4140,10 +4448,11 @@ async function loadIRQDevices() {
 async function autoOptimizeIRQ() {
     termWrite('kernel-terminal', 'Auto-optimizing interrupts...');
     var r = await apiPost('/api/irq/auto-optimize');
+    if (r.ok === false) { termWrite('kernel-terminal', '✗ ' + (r.err || 'Failed'), 'error'); return; }
     (r.results || []).forEach(function(x) {
         termWrite('kernel-terminal', '  ' + (x.ok ? '✓' : '✗') + ' ' + (x.name || ''));
     });
-    termWrite('kernel-terminal', '═══ Interrupt optimization complete — reboot required ═══');
+    termWrite('kernel-terminal', '═══ Interrupt optimization complete, reboot required ═══');
     loadIRQDevices();
 }
 
@@ -4220,13 +4529,14 @@ var _gpmMacroEditorSteps = [];
 
 function _vkLabel(vk) {
     var found = GPM_KEY_OPTIONS.find(function(o){ return o.vk === vk; });
-    return found ? found.label : ('VK 0x' + vk.toString(16).toUpperCase());
+    // An imported mapping can lack vk; throwing here stopped the mapper page render midway
+    return found ? found.label : ('VK 0x' + (vk || 0).toString(16).toUpperCase());
 }
 
 async function loadGamepadMapper() {
     var statusLine = document.getElementById('gpm-status-line');
     var data = await apiGet('/api/gamepad/status');
-    if (!data) {
+    if (!data || data.ok === false) {
         if (statusLine) statusLine.textContent = 'Failed to load gamepad mapper status.';
         return;
     }
@@ -4243,7 +4553,7 @@ async function loadGamepadMapper() {
     var sel = document.getElementById('gpm-profile-select');
     if (sel) {
         var prev = data.active_profile || '';
-        sel.innerHTML = '<option value="">— none —</option>' +
+        sel.innerHTML = '<option value="">(none)</option>' +
             (data.profiles || []).map(function(name){
                 return '<option value="' + escAttr(name) + '"' + (name === prev ? ' selected' : '') + '>' + escHtml(name) + '</option>';
             }).join('');
@@ -4285,6 +4595,10 @@ async function loadGamepadMapper() {
     _refreshGpmInstallBanner();
 }
 
+// install-status plugs in and removes a test virtual pad (games and Windows
+// see it), so once it has passed it is not asked again on every re-render.
+var _gpmViGEmAvailable = false;
+
 async function _refreshGpmInstallBanner() {
     var vBanner = document.getElementById('gpm-vigembus-banner');
     var hBanner = document.getElementById('gpm-hidhide-banner');
@@ -4293,11 +4607,12 @@ async function _refreshGpmInstallBanner() {
     // ── ViGEmBus banner (shown when virtual mode active + driver missing)
     var needsViGEm = prof && prof.remap_mode === 'virtual_controller';
     if (vBanner) {
-        if (!needsViGEm) {
+        if (!needsViGEm || _gpmViGEmAvailable) {
             vBanner.style.display = 'none';
         } else {
             var inst = await apiGet('/api/gamepad/install-status');
             if (inst && inst.available) {
+                _gpmViGEmAvailable = true;
                 vBanner.style.display = 'none';
             } else {
                 vBanner.style.display = 'block';
@@ -4476,10 +4791,10 @@ async function _updateHidHideStatusBadge() {
             el.innerHTML = '<a href="#" onclick="forceEngageHidHide();return false" ' +
                 'title="Click to retry HidHide engagement now" ' +
                 'style="color:var(--orange,#fbbf24);text-decoration:underline;cursor:pointer">' +
-                '○ HidHide installed but not engaged — click to retry' + padTypeLabel + errDetail + '</a>' + diagLink;
+                '○ HidHide installed but not engaged: click to retry' + padTypeLabel + errDetail + '</a>' + diagLink;
         }
     } else {
-        el.innerHTML = '<span style="color:var(--orange,#fbbf24)">⚠ HidHide not installed — game may see both pads</span>' + diagLink;
+        el.innerHTML = '<span style="color:var(--orange,#fbbf24)">⚠ HidHide not installed, so the game may see both pads</span>' + diagLink;
     }
 }
 
@@ -4500,11 +4815,11 @@ async function showHidHideDiagnostic() {
     });
     var msg =
         'Controller-class devices Windows currently sees:\n\n' +
-        (lines.length ? lines.join('\n\n') : '(none — connect a controller and try again)') +
+        (lines.length ? lines.join('\n\n') : '(none: connect a controller and try again)') +
         '\n\n──────────────────────────────────────────\n' +
         '✓ = our ViGEmBus virtual pad (kept visible)\n' +
         '◉ = will be hidden when HidHide engages\n' +
-        '○ = not in hide list (rare — usually means the device looked safe to leave visible)\n\n' +
+        '○ = not in hide list (rare, and usually means the device looked safe to leave visible)\n\n' +
         'If you see your real controller plus a "Razer Virtual XInput Game Pad" or similar,\n' +
         'they all need to be hidden so the game only sees ours.  Re-engage HidHide if not yet engaged.';
     showInfoToast(msg);
@@ -4698,11 +5013,11 @@ async function runLatencyProbe() {
     if (!r || !r.ok) {
         var hint = '';
         if (r && /disabled/.test(r.err || '')) {
-            hint = ' — flip the master switch on first';
+            hint = '. Flip the master switch on first';
         } else if (r && /virtual_controller/.test(r.err || '')) {
-            hint = ' — set this profile to Virtual controller mode first';
+            hint = '. Set this profile to Virtual controller mode first';
         } else if (r && /not running/.test(r.err || '')) {
-            hint = ' — the mapper polling loop isn\'t running';
+            hint = ' (the mapper polling loop isn\'t running)';
         }
         label.innerHTML = '<span style="color:var(--orange,#fbbf24)">probe failed: ' +
             escHtml((r && r.err) || 'unknown') + escHtml(hint) + '</span>';
@@ -4792,7 +5107,7 @@ async function installHidHide() {
     if (btn) { btn.disabled = true; btn.textContent = 'Installing…'; }
     if (prog) prog.style.display = 'block';
     var r = await apiPost('/api/gamepad/install-hidhide', {});
-    if (!r) {
+    if (!r || !r.ok) {
         if (btn) { btn.disabled = false; btn.textContent = 'Install now'; }
         if (prog) prog.textContent = 'Install kickoff failed.';
         return;
@@ -4806,7 +5121,7 @@ async function installViGEmBus() {
     if (btn) { btn.disabled = true; btn.textContent = 'Installing…'; }
     if (prog) prog.style.display = 'block';
     var r = await apiPost('/api/gamepad/install-vigembus', {});
-    if (!r) {
+    if (!r || !r.ok) {
         if (btn) { btn.disabled = false; btn.textContent = 'Install now'; }
         if (prog) prog.textContent = 'Install kickoff failed.';
         return;
@@ -4895,17 +5210,17 @@ function _renderMappingRow(m) {
             return '<option value="' + b + '"' + (trig === b ? ' selected' : '') + '>' + escHtml(b) + '</option>';
         }).join('');
         trigPicker = '<select onchange="onMappingTriggerChange(' + jsArg(mid) + ', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:110px">' +
-            '<option value="">— pick —</option>' + opts + '</select>';
+            '<option value="">(pick)</option>' + opts + '</select>';
     } else if (src === 'mouse') {
         var mopts = GPM_MOUSE_TRIGGERS.map(function(b){
             return '<option value="' + b + '"' + (trig === b ? ' selected' : '') + '>' + b + '</option>';
         }).join('');
         trigPicker = '<select onchange="onMappingTriggerChange(' + jsArg(mid) + ', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:120px">' +
-            '<option value="">— pick —</option>' + mopts + '</select>';
+            '<option value="">(pick)</option>' + mopts + '</select>';
     } else { // keyboard
         // Keyboard has many keys — show captured value as text + capture button
         trigPicker = '<span style="font-family:var(--font-mono,monospace);color:var(--accent);font-size:12px;min-width:80px;display:inline-block">' +
-            (trig ? escHtml(trig) : '— press a key →') + '</span>';
+            (trig ? escHtml(trig) : '(press a key) →') + '</span>';
     }
 
     // ── Target dropdown
@@ -4996,7 +5311,7 @@ function _renderMappingRow(m) {
         }).join('');
         behaviorExtra = '<label style="font-size:11px;color:var(--text-tertiary)" title="Mapping fires only when this PARTNER input is also held simultaneously">+</label>' +
             '<select onchange="onMappingBehaviorField(' + jsArg(mid) + ', \'chord_with\', this.value)" style="padding:3px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:11px">' +
-            '<option value="">— pick —</option>' + partnerOpts + '</select>';
+            '<option value="">(pick)</option>' + partnerOpts + '</select>';
     }
 
     return '<div style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--bg-elevated);border-radius:6px;font-size:12.5px;flex-wrap:wrap">' +
@@ -5132,7 +5447,10 @@ async function captureMappingTrigger(mid) {
     if (modal) modal.style.display = 'none';
     if (_gpmCaptureCancelled) return;
     if (!r || !r.ok) {
-        showErrorToast(r && r.err ? r.err : 'Capture failed.');
+        // No press within the window (the backend's err starts with "timeout")
+        // is not an error to report to the devs; captureModifier warns the same way.
+        if (r && /^timeout/.test(r.err || '')) showWarnToast('No input detected within timeout.');
+        else showErrorToast(r && r.err ? r.err : 'Capture failed.');
         return;
     }
     // r.button is "source:trigger"
@@ -5141,7 +5459,10 @@ async function captureMappingTrigger(mid) {
         showWarnToast('Unexpected capture format: ' + r.button);
         return;
     }
-    m.input = {source: captured[0], trigger: captured[1]};
+    // Keep the rest of the input (behavior, turbo_hz, chord_with)
+    m.input = m.input || {};
+    m.input.source = captured[0];
+    m.input.trigger = captured[1];
     _gpmAutoSave();
     _gpmRenderBindingsLocal();
 }
@@ -5197,7 +5518,11 @@ function onMacroRepeatCountChange() {
 async function _gpmAutoSave() {
     if (!_gpmCurrentProfile) return;
     try {
-        await apiPost('/api/gamepad/profiles', _gpmCurrentProfile);
+        var r = await apiPost('/api/gamepad/profiles', _gpmCurrentProfile);
+        // apiPost never throws; a failed save comes back as ok:false
+        if (!r || !r.ok) {
+            showWarnToast('Your last gamepad change was not saved: ' + ((r && r.err) || 'unknown error'));
+        }
     } catch (e) {
         console.error('gamepad profile autosave failed', e);
     }
@@ -5283,8 +5608,14 @@ var _gpmActiveSource = "none";   // "browser" | "backend" | "none"
 function _gpmStartBackendPoll() {
     if (_gpmBackendPollTimer) return;
     var lastLogT = 0;
+    var inFlight = false;
     var poll = function() {
         if (currentPage !== 'profiles' || !_gpmSvgVisible) return;
+        // One request at a time: when the backend answers slower than the
+        // 33 ms tick, requests would otherwise pile up and starve every
+        // other API call behind the browser's per-host connection limit.
+        if (inFlight) return;
+        inFlight = true;
         apiGet('/api/gamepad/live-state').then(function(r){
             if (r && r.controllers && r.controllers.length) {
                 var newState = r.controllers[0].state;
@@ -5323,6 +5654,8 @@ function _gpmStartBackendPoll() {
             }
         }).catch(function(e){
             console.error('[gpm-backend] live-state poll failed:', e);
+        }).finally(function(){
+            inFlight = false;
         });
     };
     poll();
@@ -5414,10 +5747,10 @@ function _gpmSvgRenderTick() {
             if (noctrl) {
                 var xinputSeesIt = !!(_gpmState && _gpmState.connected_slots && _gpmState.connected_slots.length);
                 if (xinputSeesIt) {
-                    noctrl.textContent = 'XInput sees your controller — backend feed will appear shortly';
+                    noctrl.textContent = 'XInput sees your controller. Backend feed will appear shortly';
                     noctrl.setAttribute('fill', 'var(--orange,#fbbf24)');
                 } else {
-                    noctrl.textContent = 'No controller detected — plug in or wake yours';
+                    noctrl.textContent = 'No controller detected. Plug in or wake yours';
                     noctrl.setAttribute('fill', 'var(--text-tertiary)');
                 }
                 noctrl.style.display = '';
@@ -5710,7 +6043,7 @@ function _renderMacroSteps() {
     var stepsEl = document.getElementById('gpm-macro-steps');
     if (!stepsEl) return;
     if (!_gpmMacroEditorSteps.length) {
-        stepsEl.innerHTML = '<div style="color:var(--text-tertiary);font-style:italic;padding:12px 0">No steps yet — click <b>● Record</b> to capture a sequence, or <b>+ Add step manually</b>.</div>';
+        stepsEl.innerHTML = '<div style="color:var(--text-tertiary);font-style:italic;padding:12px 0">No steps yet. Click <b>● Record</b> to capture a sequence, or <b>+ Add step manually</b>.</div>';
         return;
     }
     stepsEl.innerHTML = _gpmMacroEditorSteps.map(function(step, i){
@@ -5982,9 +6315,9 @@ async function openRecoilPresetPicker() {
                     '<b style="color:var(--text-bright)">Capture your own pattern</b><br/>' +
                     'Pick a method.  Counter-pull is the simplest: fire + manually compensate, we record what you do.' +
                 '</div>' +
-                '<button class="btn btn-sm" onclick="openCaptureCounterPullModal()" title="Fire + counter-pull manually with your mouse or right stick — we record what you do as the pattern.  Works in any game; quality depends on your counter-pull technique.">✋ Counter-pull</button>' +
-                '<button class="btn btn-sm" onclick="openCaptureScreenModal()" title="Fire while we screenshot the foreground window — phase correlation extracts the camera drift">📹 From gameplay</button>' +
-                '<button class="btn btn-sm" onclick="openCaptureBulletModal()" title="Snapshot before + after firing — we diff and detect bullet hole positions on the wall">🎯 From bullet holes</button>' +
+                '<button class="btn btn-sm" onclick="openCaptureCounterPullModal()" title="Fire + counter-pull manually with your mouse or right stick. We record what you do as the pattern.  Works in any game; quality depends on your counter-pull technique.">✋ Counter-pull</button>' +
+                '<button class="btn btn-sm" onclick="openCaptureScreenModal()" title="Fire while we screenshot the foreground window. Phase correlation extracts the camera drift">📹 From gameplay</button>' +
+                '<button class="btn btn-sm" onclick="openCaptureBulletModal()" title="Snapshot before + after firing. We diff and detect bullet hole positions on the wall">🎯 From bullet holes</button>' +
             '</div>';
     } else if (avail && !avail.available) {
         captureRow = '<div style="padding:8px 12px;background:var(--bg-elevated);border-radius:6px;margin-bottom:14px;font-size:11px;color:var(--text-tertiary)">' +
@@ -5993,7 +6326,7 @@ async function openRecoilPresetPicker() {
     }
 
     if (!_gpmRecoilPresets.length) {
-        listEl.innerHTML = captureRow + '<div style="color:var(--text-tertiary);font-style:italic">No presets yet — capture one above, or check the bundled list.</div>';
+        listEl.innerHTML = captureRow + '<div style="color:var(--text-tertiary);font-style:italic">No presets yet. Capture one above, or check the bundled list.</div>';
         return;
     }
     // Group by game, render cards.  User-captured presets get an extra
@@ -6081,7 +6414,7 @@ function openCaptureScreenModal() {
     if (m) m.style.display = 'flex';
     _captureScreenState = {captured: null, pollTimer: null};
     var status = document.getElementById('gpm-capture-screen-status');
-    if (status) status.innerHTML = '<span style="color:var(--text-tertiary)">Idle — fill in details and click Start.</span>';
+    if (status) status.innerHTML = '<span style="color:var(--text-tertiary)">Idle. Fill in details and click Start.</span>';
     var saveBtn = document.getElementById('gpm-capture-screen-save');
     if (saveBtn) saveBtn.disabled = true;
 }
@@ -6089,10 +6422,11 @@ function openCaptureScreenModal() {
 function closeCaptureScreenModal() {
     var m = document.getElementById('gpm-capture-screen-modal');
     if (m) m.style.display = 'none';
-    if (_captureScreenState.pollTimer) {
-        clearInterval(_captureScreenState.pollTimer);
-        _captureScreenState.pollTimer = null;
-    }
+    // Closing ends a running capture the way Stop does (it also clears the
+    // poll); left running, auto-fire held RT for the whole max_duration_sec.
+    // A start still in its countdown sees `closed` and does not begin.
+    _captureScreenState.closed = true;
+    if (_captureScreenState.pollTimer) stopCaptureScreen();
 }
 
 async function startCaptureScreen() {
@@ -6104,12 +6438,14 @@ async function startCaptureScreen() {
     var saveBtn = document.getElementById('gpm-capture-screen-save');
     var startBtn = document.getElementById('gpm-capture-screen-start');
     var stopBtn  = document.getElementById('gpm-capture-screen-stop');
+    var st = _captureScreenState;   // closeCaptureScreenModal marks it closed
     if (saveBtn) saveBtn.disabled = true;
 
     if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">3… 2… 1… alt-tab to your game now' +
         (autoFire ? ' (we\'ll fire RT for you)' : ' and FIRE') + '</span>';
     // Brief countdown so the user has time to focus the game window
     await new Promise(function(res){ setTimeout(res, 3000); });
+    if (st.closed) return;   // dialog closed during the countdown: don't start firing
 
     var r = await apiPost('/api/gamepad/capture/screen/start',
                           {rpm: rpm, max_duration_sec: dur, capture_hz: 120,
@@ -6118,18 +6454,22 @@ async function startCaptureScreen() {
         if (status) status.innerHTML = '<span style="color:var(--danger,#f87171)">Failed: ' + escHtml((r && r.err) || 'unknown') + '</span>';
         return;
     }
+    if (st.closed) { stopCaptureScreen(); return; }   // closed while it was starting
     if (autoFire && !r.autofire_engaged) {
         // Asked for autofire, didn't get it — warn but continue (user
         // can still fire manually).  Don't block the capture; the
         // common case is "user enabled the box but mapper isn't on".
-        if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">Auto-fire couldn\'t engage (virtual pad not running) — fire RT manually instead.  Capturing…</span>';
+        if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">Auto-fire couldn\'t engage (virtual pad not running). Fire RT manually instead.  Capturing…</span>';
     }
     if (startBtn) startBtn.disabled = true;
     if (stopBtn)  stopBtn.disabled  = false;
 
     if (_captureScreenState.pollTimer) clearInterval(_captureScreenState.pollTimer);
-    _captureScreenState.pollTimer = setInterval(async function(){
+    var pollId = _captureScreenState.pollTimer = setInterval(async function(){
         var s = await apiGet('/api/gamepad/capture/status');
+        // Stopped (or the modal reopened) while this poll was in flight.  A
+        // second stop call answers "no capture in progress" over the result.
+        if (_captureScreenState.pollTimer !== pollId) { clearInterval(pollId); return; }
         if (!s || !s.active) {
             // Capture ended on its own — pull final result
             clearInterval(_captureScreenState.pollTimer);
@@ -6150,6 +6490,7 @@ async function stopCaptureScreen(autoTriggered) {
         clearInterval(_captureScreenState.pollTimer);
         _captureScreenState.pollTimer = null;
     }
+    if (stopBtn) stopBtn.disabled = true;   // a double click would send a second stop
     var r = await apiPost('/api/gamepad/capture/screen/stop', {});
     if (startBtn) startBtn.disabled = false;
     if (stopBtn)  stopBtn.disabled  = true;
@@ -6170,7 +6511,7 @@ async function stopCaptureScreen(autoTriggered) {
 }
 
 function _summarizeBinnedTrace(binned) {
-    if (!binned.length) return 'No shots binned — try a higher RPM or longer duration';
+    if (!binned.length) return 'No shots binned. Try a higher RPM or longer duration';
     var maxAbsX = 0, maxAbsY = 0, sumDx = 0, sumDy = 0;
     binned.forEach(function(b){
         if (Math.abs(b.dx) > maxAbsX) maxAbsX = Math.abs(b.dx);
@@ -6244,7 +6585,7 @@ function openCaptureCounterPullModal() {
     if (m) m.style.display = 'flex';
     _captureCounterPullState = {captured: null, pollTimer: null};
     var status = document.getElementById('gpm-capture-cp-status');
-    if (status) status.innerHTML = '<span style="color:var(--text-tertiary)">Idle — fill in the form and click Start.</span>';
+    if (status) status.innerHTML = '<span style="color:var(--text-tertiary)">Idle. Fill in the form and click Start.</span>';
     var saveBtn = document.getElementById('gpm-capture-cp-save');
     if (saveBtn) saveBtn.disabled = true;
 }
@@ -6252,10 +6593,10 @@ function openCaptureCounterPullModal() {
 function closeCaptureCounterPullModal() {
     var m = document.getElementById('gpm-capture-cp-modal');
     if (m) m.style.display = 'none';
-    if (_captureCounterPullState.pollTimer) {
-        clearInterval(_captureCounterPullState.pollTimer);
-        _captureCounterPullState.pollTimer = null;
-    }
+    // Same as the screen capture: closing ends a running capture like Stop,
+    // and a start still in its countdown does not begin.
+    _captureCounterPullState.closed = true;
+    if (_captureCounterPullState.pollTimer) stopCaptureCounterPull();
 }
 
 async function startCaptureCounterPull() {
@@ -6268,10 +6609,12 @@ async function startCaptureCounterPull() {
     var saveBtn = document.getElementById('gpm-capture-cp-save');
     var startBtn = document.getElementById('gpm-capture-cp-start');
     var stopBtn  = document.getElementById('gpm-capture-cp-stop');
+    var st = _captureCounterPullState;   // closeCaptureCounterPullModal marks it closed
     if (saveBtn) saveBtn.disabled = true;
 
     if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">3… 2… 1… alt-tab to your game now and FIRE while compensating</span>';
     await new Promise(function(res){ setTimeout(res, 3000); });
+    if (st.closed) return;   // dialog closed during the countdown: don't start firing
 
     var r = await apiPost('/api/gamepad/capture/counter-pull/start', {
         rpm: rpm, max_duration_sec: dur, source: source, auto_fire: autoFire
@@ -6280,15 +6623,18 @@ async function startCaptureCounterPull() {
         if (status) status.innerHTML = '<span style="color:var(--danger,#f87171)">Failed: ' + escHtml((r && r.err) || 'unknown') + '</span>';
         return;
     }
+    if (st.closed) { stopCaptureCounterPull(); return; }   // closed while it was starting
     if (autoFire && !r.autofire_engaged) {
-        if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">Auto-fire couldn\'t engage — fire RT manually.  Recording…</span>';
+        if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">Auto-fire couldn\'t engage. Fire RT manually.  Recording…</span>';
     }
     if (startBtn) startBtn.disabled = true;
     if (stopBtn)  stopBtn.disabled  = false;
 
     if (_captureCounterPullState.pollTimer) clearInterval(_captureCounterPullState.pollTimer);
-    _captureCounterPullState.pollTimer = setInterval(async function(){
+    var pollId = _captureCounterPullState.pollTimer = setInterval(async function(){
         var s = await apiGet('/api/gamepad/capture/status');
+        // Stopped (or the modal reopened) while this poll was in flight
+        if (_captureCounterPullState.pollTimer !== pollId) { clearInterval(pollId); return; }
         if (!s || !s.active) {
             clearInterval(_captureCounterPullState.pollTimer);
             _captureCounterPullState.pollTimer = null;
@@ -6300,7 +6646,7 @@ async function startCaptureCounterPull() {
             var color = n > 0 ? 'var(--accent)' : 'var(--orange,#fbbf24)';
             var hint = n > 0
                 ? ''
-                : ' — no input arriving yet, are you actually moving the stick / mouse?';
+                : '. No input arriving yet, are you actually moving the stick / mouse?';
             status.innerHTML = '<span style="color:' + color + '">Recording counter-pull… ' + (s.elapsed_sec || 0).toFixed(1) + 's · ' + n + ' samples' + hint + '</span>';
         }
     }, 200);
@@ -6315,6 +6661,7 @@ async function stopCaptureCounterPull(autoTriggered) {
         clearInterval(_captureCounterPullState.pollTimer);
         _captureCounterPullState.pollTimer = null;
     }
+    if (stopBtn) stopBtn.disabled = true;   // a double click would send a second stop
     var r = await apiPost('/api/gamepad/capture/counter-pull/stop', {});
     if (startBtn) startBtn.disabled = false;
     if (stopBtn)  stopBtn.disabled  = true;
@@ -6360,7 +6707,7 @@ async function saveCaptureCounterPull() {
 async function autoFireMag() {
     var dur = parseFloat(document.getElementById('gpm-capture-bullet-fire-dur').value) || 3.0;
     var status = document.getElementById('gpm-capture-bullet-status');
-    if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">Alt-tab to your game now — firing RT for ' + dur + 's…</span>';
+    if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">Alt-tab to your game now. Firing RT for ' + dur + 's…</span>';
     // Give the user a brief moment to focus the game window
     await new Promise(function(res){ setTimeout(res, 1500); });
     var r = await apiPost('/api/gamepad/capture/auto-fire-mag', {duration_sec: dur});
@@ -6496,6 +6843,8 @@ async function _startMacroRecordingWith(filters, delaySec) {
     if (_gpmRecordingTimer) clearInterval(_gpmRecordingTimer);
     _gpmRecordingTimer = setInterval(async function(){
         var s = await apiGet('/api/gamepad/macro/record/status');
+        // A failed read has no phase and used to stop this poll for good
+        if (!s || s.ok === false) return;
         var lbl = document.getElementById('gpm-macro-rec-timer');
         if (lbl && s) {
             if (s.phase === 'countdown') {
@@ -6536,7 +6885,7 @@ async function stopMacroRecording(append) {
     }
     var newSteps = r.steps || [];
     if (!newSteps.length) {
-        showWarnToast('No mappable events captured. Try again — make sure to press at least one key, button, or click.');
+        showWarnToast('No mappable events captured. Try again, and make sure to press at least one key, button, or click.');
         return;
     }
     if (append) {
@@ -6562,7 +6911,12 @@ async function cancelMacroRecording() {
 // ═══ Background Pauser ═══
 async function loadPauser() {
     var data = await apiGet('/api/pauser/status');
-    if (!data) return;
+    // A failed read must not render the switches OFF: keep them and say why
+    if (!data || data.ok === false) {
+        var errEl = document.getElementById('pauser-status-detail');
+        if (errEl) errEl.textContent = 'Could not load pauser status: ' + ((data && data.err) || 'unknown error');
+        return;
+    }
     var s = data.settings || {};
 
     // Global toggle
@@ -6631,7 +6985,8 @@ async function togglePauserGlobal(el) {
     var newOn = !el.classList.contains('on');
     el.classList.toggle('on');
     var r = await apiPost('/api/pauser/settings', { enabled: newOn });
-    if (!r) {
+    // Success returns the settings (no `ok`); a failed request returns ok:false
+    if (!r || r.ok === false) {
         el.classList.toggle('on');
         return;
     }
@@ -6677,7 +7032,7 @@ var _tournamentTimer = null;
 
 async function loadTournament() {
     var s = await apiGet('/api/tournament/status');
-    if (!s) return;
+    if (!s || s.ok === false) return;   // failed read: don't render it as OFF
     _renderTournament(s);
     if (s.enabled && s.expires_at) {
         _startTournamentCountdown();
@@ -6742,6 +7097,7 @@ function _startTournamentCountdown() {
     if (_tournamentTimer) clearInterval(_tournamentTimer);
     _tournamentTimer = setInterval(async function(){
         var s = await apiGet('/api/tournament/status');
+        if (s && s.ok === false) return;   // request failed: keep counting, retry next tick
         if (!s || !s.enabled) {
             // Server-side auto-disable fired — refresh full UI
             _stopTournamentCountdown();
@@ -6808,7 +7164,8 @@ async function loadLibrary(forceScan) {
     } else {
         data = await apiGet(url);
     }
-    if (!data) {
+    // A failed request (ok:false) would otherwise replace the cache and read as "No scan yet"
+    if (!data || data.ok === false) {
         summary.textContent = 'Library scan unavailable.';
         return;
     }
@@ -6823,7 +7180,7 @@ function _renderLibrary() {
     if (!summary || !list) return;
 
     if (!data.scanned_at) {
-        summary.innerHTML = 'No scan yet — click <b>Scan now</b> to discover installed games.';
+        summary.innerHTML = 'No scan yet. Click <b>Scan now</b> to discover installed games.';
         list.innerHTML = '';
         return;
     }
@@ -6862,7 +7219,7 @@ function _renderLibrary() {
             var isOn = atState && atState.enabled;
             var hint = g.mode_hint ? '<span style="color:var(--accent);font-size:11px;text-transform:uppercase;letter-spacing:0.04em;margin-left:8px">' + g.mode_hint + '</span>' : '';
             var knownBadge = g.known ? '' : '<span style="color:var(--text-tertiary);font-size:11px;margin-left:8px">unrecognized</span>';
-            var btnLabel = isOn ? 'AT enabled — click to disable' : (g.known ? 'Enable AT' : 'Add as custom + enable AT');
+            var btnLabel = isOn ? 'AT enabled (click to disable)' : (g.known ? 'Enable AT' : 'Add as custom + enable AT');
             var btnClass = isOn ? 'btn btn-sm' : 'btn btn-sm btn-primary';
             return '<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border-faint);gap:10px">' +
                 '<div style="min-width:0;flex:1">' +
@@ -6947,7 +7304,11 @@ var _adaptivePollTimer = null;
 
 async function loadAdaptiveSettings() {
     var s = await apiGet('/api/adaptive/settings');
-    if (!s) return;
+    // A failed read must not render the master switch OFF
+    if (!s || s.ok === false) {
+        addLog('Could not load Adaptive Tuning settings: ' + ((s && s.err) || 'unknown error'));
+        return;
+    }
     var t = document.getElementById('toggle-adaptive-global');
     if (t) {
         if (s.enabled_globally) t.classList.add('on');
@@ -6958,7 +7319,10 @@ async function loadAdaptiveSettings() {
 async function toggleAdaptiveGlobal(el) {
     var newOn = !el.classList.contains('on');
     el.classList.toggle('on');
-    await apiPost('/api/adaptive/settings', { enabled_globally: newOn });
+    var r = await apiPost('/api/adaptive/settings', { enabled_globally: newOn });
+    // Success returns the settings (no `ok`).  Not saved: undo the flip, since
+    // a failed reload below now leaves the switch as it is.
+    if (r && r.ok === false) el.classList.toggle('on', !newOn);
     loadAdaptiveSettings();
 }
 
@@ -6980,7 +7344,7 @@ async function _refreshAdaptiveLive() {
               && !window._pm2NudgeShown) {
             window._pm2NudgeShown = true;
             showInfoToast(s.pm2_install_hint.msg,
-                { title: 'Adaptive Tuning — recommendation',
+                { title: 'Adaptive Tuning: recommendation',
                   timeoutMs: 14000 });
         }
     } catch (_e) { /* nudge is cosmetic */ }
@@ -7013,17 +7377,17 @@ async function _refreshAdaptiveLive() {
                         'AT confidence in this game\'s learned profile. Low = exploring, Medium = settling, High = converged.">' +
                         conf + '</span>';
         var pausedBadge = s.paused
-            ? '<span class="status-badge danger" title="AT paused — sources: ' +
-              ((s.pause_sources||[]).join(', ') || 'unknown') + '">paused</span>'
+            ? '<span class="status-badge danger" title="AT paused (sources: ' +
+              ((s.pause_sources||[]).join(', ') || 'unknown') + ')">paused</span>'
             : '';
         var openingBadge = s.in_opening_phase
-            ? '<span class="status-badge" style="background:var(--accent-soft);color:var(--accent)" title="First 5 min of a fresh session — AT explores faster with halved thresholds.">opening</span>'
+            ? '<span class="status-badge" style="background:var(--accent-soft);color:var(--accent)" title="First 5 min of a fresh session: AT explores faster with halved thresholds.">opening</span>'
             : '';
         var hotBadge = (s.hot_streak || 0) >= 3
             ? '<span class="status-badge" style="background:var(--warning-soft,#ffaa0022);color:var(--warning)" title="Hot streak: ' + s.hot_streak + ' consecutive step-ups without instability. Step size is doubled.">🔥' + s.hot_streak + '</span>'
             : '';
         var dryBadge = s.dry_run
-            ? '<span class="status-badge neutral" title="Dry-run mode — AT logs steps but does not apply them to the GPU.">dry-run</span>'
+            ? '<span class="status-badge neutral" title="Dry-run mode: AT logs steps but does not apply them to the GPU.">dry-run</span>'
             : '';
         // v3.2-beta.3 — gameplay-vs-menu pill.  Reading the pill tells
         // the user at a glance why AT may not be making decisions
@@ -7085,7 +7449,7 @@ async function _refreshAdaptiveLive() {
             statusStr = 'warmup ' + Math.round(s.warmup_remaining) + 's remaining';
         } else if (verdict === 'idle') {
             statusStr = 'GPU at ' + (s.last_util != null ? s.last_util + '%' : '?') +
-                        ' — waiting for ≥15% sustained load';
+                        ', waiting for ≥15% sustained load';
         } else if (verdict === 'no-data') {
             statusStr = 'collecting samples…';
         } else {
@@ -7234,13 +7598,13 @@ async function loadAdaptiveGames() {
         var confPill = '<span class="status-badge" style="margin-left:6px;background:' + confColor +
                        '22;color:' + confColor + '" title="' + escHtml(confTitle) + '">conf: ' + conf + '</span>';
         var dryPill = g.dry_run
-            ? '<span class="status-badge neutral" style="margin-left:6px" title="Dry-run mode — AT logs steps but does not push to GPU">dry-run</span>'
+            ? '<span class="status-badge neutral" style="margin-left:6px" title="Dry-run mode: AT logs steps but does not push to GPU">dry-run</span>'
             : '';
         var baselineCore = g.baseline_core || 0;
         var baselineMem  = g.baseline_mem  || 0;
         var hotPill = (g.hot_streak || 0) >= 3
             ? '<span class="status-badge" style="margin-left:6px;background:var(--warning-soft,#ffaa0022);color:var(--warning)" title="' +
-              g.hot_streak + ' consecutive step-ups without trouble — step size temporarily doubled">🔥' + g.hot_streak + '</span>'
+              g.hot_streak + ' consecutive step-ups without trouble, so step size is temporarily doubled">🔥' + g.hot_streak + '</span>'
             : '';
         // Default knob values (matching adaptive_tuning._empty_state)
         var thermal = (g.thermal_limit_c != null) ? g.thermal_limit_c : 82;
@@ -7288,7 +7652,7 @@ async function loadAdaptiveGames() {
               (hasBest
                 ? '<button class="btn btn-sm" onclick="applyAdaptiveBest(' + jsArg(exe) + ')">Apply best now</button>'
                 : '') +
-              '<button class="btn btn-sm" onclick="reseedAdaptiveGame(' + jsArg(exe) + ')" title="Restart this game\'s exploration from your CURRENT manual OC profile.  Keeps session count + warned offsets — just bumps the floor so AT doesn\'t crawl up from 0.">Reseed from current OC</button>' +
+              '<button class="btn btn-sm" onclick="reseedAdaptiveGame(' + jsArg(exe) + ')" title="Restart this game\'s exploration from your CURRENT manual OC profile.  Keeps session count + warned offsets. It just bumps the floor so AT doesn\'t crawl up from 0.">Reseed from current OC</button>' +
               '<button class="btn btn-sm" onclick="toggleAtKnobs(' + jsArg(knobsId) + ')">Advanced…</button>' +
               '<button class="btn btn-sm" onclick="clearAdaptiveBlacklist(' + jsArg(exe) + ')" style="margin-left:auto">Clear blacklist</button>' +
               '<button class="btn btn-sm btn-danger" onclick="resetAdaptiveGame(' + jsArg(exe) + ')">Reset</button>' +
@@ -7371,9 +7735,9 @@ async function setAdaptiveGameTarget(exe, target) {
     var r = await apiPost('/api/adaptive/game-target', { exe: exe, target: target });
     if (r && r.ok) {
         addLog('Optimization target for ' + exe + ' → ' + target
-            + (r.at_enabled === false ? ' (adaptive tuning off — target owns the posture)' : ''));
+            + (r.at_enabled === false ? ' (adaptive tuning off, so the target owns the posture)' : ''));
         if (target === 'max_fps') showInfoToast('Max FPS: full GPU power + Ultimate power plan, and Adaptive Tuning climbs your OC above baseline for more frames (stability-gated).', { title: exe });
-        else if (target === 'low_latency') showInfoToast('Low Latency: engages the competitive-latency tweaks while this game runs (GPU OC left alone — these titles are CPU-bound).', { title: exe });
+        else if (target === 'low_latency') showInfoToast('Low Latency: engages the competitive-latency tweaks while this game runs (GPU OC left alone, since these titles are CPU-bound).', { title: exe });
     } else {
         showErrorToast((r && r.err) || 'Could not set target');
     }
@@ -7382,7 +7746,7 @@ async function setAdaptiveGameTarget(exe, target) {
 }
 
 async function applyAdaptiveBest(exe) {
-    if (!confirm('Apply ' + exe + '\'s best-known-stable offsets to your GPU now?\n\nThis is the same OC AT would apply at the next game launch — no risk beyond what you\'ve already played at.')) return;
+    if (!confirm('Apply ' + exe + '\'s best-known-stable offsets to your GPU now?\n\nThis is the same OC AT would apply at the next game launch. No risk beyond what you\'ve already played at.')) return;
     var r = await apiPost('/api/adaptive/apply-best', { exe: exe });
     if (r && r.ok) {
         addLog('Applied best OC for ' + exe + ': core+' + r.core + ' / mem+' + r.mem);
@@ -7393,14 +7757,15 @@ async function applyAdaptiveBest(exe) {
 }
 
 async function clearAdaptiveBlacklist(exe) {
-    if (!confirm('Clear the crash blacklist for ' + exe + '?\n\nKeeps best-stable + session counts.  Useful after a driver update — old crashed offsets may now be stable.')) return;
+    if (!confirm('Clear the crash blacklist for ' + exe + '?\n\nKeeps best-stable + session counts.  Useful after a driver update: old crashed offsets may now be stable.')) return;
     var r = await apiPost('/api/adaptive/clear-blacklist', { exe: exe });
-    addLog('Blacklist cleared for ' + exe);
+    if (r && r.ok) addLog('Blacklist cleared for ' + exe);
+    else addLog('Clear blacklist failed: ' + ((r && r.err) || 'unknown'));
     loadAdaptiveGames();
 }
 
 async function resetAdaptiveAll() {
-    if (!confirm('Wipe ALL learned per-game profiles?\n\nThis is permanent — every game will start from scratch.')) return;
+    if (!confirm('Wipe ALL learned per-game profiles?\n\nThis is permanent. Every game will start from scratch.')) return;
     await apiPost('/api/adaptive/reset', {});
     loadAdaptiveGames();
 }
@@ -7533,7 +7898,7 @@ async function _refreshAdaptiveDiagnostics() {
                       ' · <button class="btn btn-sm" style="margin-left:8px;padding:2px 8px;font-size:11px" ' +
                       'onclick="addThisGameToAt(' + jsArg(d.foreground.exe) + ')">Track this game</button>');
     } else {
-        html += '<span style="color:var(--text-tertiary)">none — game_profiles polls every 3 s</span>';
+        html += '<span style="color:var(--text-tertiary)">none (game_profiles polls every 3 s)</span>';
     }
     html += '</div>';
 
@@ -7556,7 +7921,7 @@ async function _refreshAdaptiveDiagnostics() {
                                  'none';
     html += '<div style="margin-bottom:10px;font-family:var(--font-mono);font-size:12px;line-height:1.7">' +
               '<span style="color:var(--text-tertiary);font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase;display:block;margin-bottom:4px">Frame telemetry' +
-              ' — <span style="color:' + (ftAvail ? 'var(--accent-bright)' : 'var(--warning)') + '">' +
+              ': <span style="color:' + (ftAvail ? 'var(--accent-bright)' : 'var(--warning)') + '">' +
               escHtml(sourceLabel) + '</span></span>';
     if (ftAvail) {
         var live = ft.live || {};
@@ -7591,7 +7956,7 @@ async function _refreshAdaptiveDiagnostics() {
                         '⚠ PresentMon is running but no frame events are coming through. ' +
                         'This usually means the game uses OpenGL or an older Vulkan path that ' +
                         'PresentMon 1.x can\'t capture (e.g. Minecraft Java). AT will fall back to ' +
-                        'GPU-metrics-only scoring — still works, just without frametime variance signals.' +
+                        'GPU-metrics-only scoring (still works, just without frametime variance signals).' +
                         '</span>';
             }
         }
@@ -7635,7 +8000,7 @@ async function _refreshAdaptiveDiagnostics() {
                     '</div></div>';
         } else if (ftInstall.state === 'installed' || ftInstall.path) {
             html += '<br><span style="color:var(--accent);font-size:11.5px">' +
-                    'PresentMon installed — will activate next time AT engages on a game.' +
+                    'PresentMon installed. It will activate next time AT engages on a game.' +
                     '</span>';
         } else if (ftInstall.state === 'error') {
             html += '<br><span style="color:var(--danger);font-size:11.5px">' +
@@ -7697,7 +8062,7 @@ async function _refreshAdaptiveDiagnostics() {
             html += '</div>';
         });
         html += '<div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border);font-size:10.5px;color:var(--text-tertiary);line-height:1.5">' +
-                '<b>Quick guide:</b> For most modern D3D9-12 / DXGI games (almost every AAA), <b>PresentMon 1.x</b> is zero-config and tiny.  For OpenGL / Vulkan titles (Minecraft Java, Quake, DOOM Eternal Vulkan, etc), install <b>PresentMon 2.x</b> — Microsoft first-party, ~122 MB but covers everything PresentMon 1.x can\'t.' +
+                '<b>Quick guide:</b> For most modern D3D9-12 / DXGI games (almost every AAA), <b>PresentMon 1.x</b> is zero-config and tiny.  For OpenGL / Vulkan titles (Minecraft Java, Quake, DOOM Eternal Vulkan, etc), install <b>PresentMon 2.x</b> (Microsoft first-party, ~122 MB but covers everything PresentMon 1.x can\'t).' +
                 '</div>' +
                 '</div>';
     }
@@ -7729,10 +8094,10 @@ async function _refreshAdaptiveDiagnostics() {
                                        'var(--text-tertiary)';
     var gpDesc =
         gp === 'gameplay'           ? 'AT is making decisions normally.' :
-        gp === 'menu'               ? 'AT is HOLDING — menu / lobby / loading screen detected. Decisions resume when gameplay returns.' :
-        gp === 'transitional'       ? 'Recently switched states — waiting for ' + (3 - (rt.consecutive_alt || 0)) + ' more consistent ticks before changing.' :
+        gp === 'menu'               ? 'AT is HOLDING: menu / lobby / loading screen detected. Decisions resume when gameplay returns.' :
+        gp === 'transitional'       ? 'Recently switched states. Waiting for ' + (3 - (rt.consecutive_alt || 0)) + ' more consistent ticks before changing.' :
         gp === 'baseline-building'  ? 'Gathering reference samples (need ~60 s of any activity).' :
-                                       'Unknown — no telemetry yet.';
+                                       'Unknown: no telemetry yet.';
     html += '<div style="margin-bottom:10px;font-family:var(--font-mono);font-size:12px;line-height:1.7">' +
               '<span style="color:var(--text-tertiary);font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase;display:block;margin-bottom:4px">Gameplay vs menu classifier</span>' +
               '<span style="color:' + gpColor + ';font-weight:600">' + escHtml(gp) + '</span>' +
@@ -7840,7 +8205,7 @@ async function markCurrentAsMenu(exe) {
             addLog('Menu signature learned for ' + exe + ': fps≈' +
                    r.signature.fps + ', util≈' + r.signature.util);
         } else if (r.duplicate_of) {
-            addLog('Already matched an existing signature — nothing new to learn');
+            addLog('Already matched an existing signature. Nothing new to learn');
         }
         _refreshAdaptiveDiagnostics();
     } else {
@@ -7880,7 +8245,7 @@ async function installPresentMon() {
         _refreshAdaptiveDiagnostics();
         if (prog.state === 'installed') {
             clearInterval(pollInterval);
-            addLog('PresentMon installed successfully — frame telemetry will activate on next game launch');
+            addLog('PresentMon installed successfully. Frame telemetry will activate on next game launch');
         } else if (prog.state === 'error') {
             clearInterval(pollInterval);
             addLog('PresentMon install error: ' + (prog.err || 'unknown'));
@@ -7896,7 +8261,7 @@ async function addThisGameToAt(exe) {
     if (!exe) return;
     var r = await apiPost('/api/profiles/add-game', { exe: exe });
     if (r && r.ok) {
-        addLog('Added ' + exe + ' to known games — enabling AT for it');
+        addLog('Added ' + exe + ' to known games, enabling AT for it');
         // Tracking just got added; flip per-game AT switch on AND try to
         // retroactively engage so the user doesn't have to relaunch the game.
         await apiPost('/api/adaptive/game-toggle', { exe: exe, enabled: true });
@@ -7971,7 +8336,7 @@ function _startAdaptivePoll() {
         _gpmStatsTimer = setInterval(function(){
             if (currentPage !== 'profiles') return;
             apiGet('/api/gamepad/status').then(function(s){
-                if (!s) return;
+                if (!s || s.ok === false) return;   // keep the last reading, not "undefined Hz"
                 var hzEl  = document.getElementById('gpm-actual-hz');
                 var p99El = document.getElementById('gpm-p99');
                 if (hzEl)  hzEl.textContent  = s.actual_hz ? (s.actual_hz.toFixed(1) + ' Hz / ' + s.target_hz + ' target') : (s.target_hz + ' Hz target');
@@ -7991,6 +8356,8 @@ function _stopAdaptivePoll() {
 
 async function loadProfileEngineStatus() {
     var data = await apiGet('/api/profiles/status');
+    // A failed read would show "Stopped" and flip the Start/Stop button
+    if (!data || data.ok === false) return;
     _profileEngineRunning = data.monitoring;
     var el = document.getElementById('profile-engine-status');
     var btn = document.getElementById('btn-profile-engine');
@@ -8050,8 +8417,10 @@ async function toggleProfileEngine() {
         addLog('Game monitor stopped');
     } else {
         await apiPost('/api/profiles/start');
-        _profilePollTimer = setInterval(function() { if (currentPage === 'profiles') loadProfileEngineStatus(); }, 3000);
-        addLog('Game monitor started — watching for games');
+        // Still set when game mode was stopped elsewhere (Settings) and is
+        // started again here; a second interval would never be cleared.
+        if (!_profilePollTimer) _profilePollTimer = setInterval(function() { if (currentPage === 'profiles') loadProfileEngineStatus(); }, 3000);
+        addLog('Game monitor started, watching for games');
     }
     _profileEngineRunning = !_profileEngineRunning;
     loadProfileEngineStatus();
@@ -8095,7 +8464,7 @@ async function forceRestoreNormal() {
     addLog('Forcing normal mode...');
     var r = await apiPost('/api/profiles/restore-normal');
     if (r.ok) {
-        addLog('Normal mode restored — all gaming tweaks reverted');
+        addLog('Normal mode restored: all gaming tweaks reverted');
     }
     loadProfileEngineStatus();
 }
@@ -8109,10 +8478,10 @@ async function recaptureBaseline() {
 }
 
 async function refreshPC() {
-    addLog('🔄 Manual PC refresh started — clearing RAM, flushing DNS, killing orphans...');
+    addLog('🔄 Manual PC refresh started: clearing RAM, flushing DNS, killing orphans...');
     var r = await apiPost('/api/profiles/refresh');
     if (r.ok) {
-        addLog('✓ Refresh started in background — check the log for details (takes ~10s)');
+        addLog('✓ Refresh started in background. Check the log for details (takes ~10s)');
     } else {
         addLog('✗ Refresh failed: ' + (r.err || 'unknown'));
     }
@@ -8128,6 +8497,8 @@ async function loadHWMonPage() {
     _monitorRunning = data.running;
     document.getElementById('btn-monitor').textContent = _monitorRunning ? 'Stop Monitor' : 'Start Monitor';
     if (_monitorRunning) updateHWMonDisplay(data);
+    // Already left the page: leaving released the perf poll, so don't start it.
+    if (currentPage !== 'hwmon') return;
     // v3 — also kick the perf sampler.  It refcounts so the game-mode
     // consumer keeps it alive even after we leave this page.
     apiPost('/api/perf/start', { consumer: 'hwmon-page' });
@@ -8357,6 +8728,11 @@ async function runBenchmark() {
     if (el) el.innerHTML = '<span class="pulse" style="color:var(--text-dim)">Running benchmark (30-60 seconds)...</span>';
     var data = await apiPost('/api/monitor/benchmark');
     if (!el) return;
+    // Timed out or failed: say so rather than show a score of 0.
+    if (data.ok === false) {
+        el.innerHTML = '<span style="color:var(--red)">✗ ' + escHtml(data.err || 'Benchmark failed') + '</span>';
+        return;
+    }
     var html = '<div style="font-size:13px;color:var(--accent);margin-bottom:8px">Composite Score: <strong>' + (data.composite_score || 0) + '</strong></div>';
     if (data.cpu_single) html += '<div style="font-size:11px;color:var(--text-dim)">CPU: ' + data.cpu_single.score + ' (primes in ' + data.cpu_single.elapsed_ms + 'ms)</div>';
     if (data.memory) html += '<div style="font-size:11px;color:var(--text-dim)">Memory: ' + data.memory.bandwidth_mbps + ' MB/s</div>';
@@ -8407,6 +8783,9 @@ switchPage = function(page) {
         // v3 — also pause the perf-monitor poll + release consumer slot
         _stopPerfPoll();
     }
+    // Left before /api/monitor/start answered: no hwmon timer existed yet,
+    // but the perf poll may already be running.
+    if (page !== 'hwmon' && _perfPollTimer) _stopPerfPoll();
 
     // Poll profile status periodically
     if (page === 'profiles' && _profileEngineRunning) {
@@ -8455,6 +8834,7 @@ var _ocState = {
     profile: null,
     liveTimer: null,
     liveActive: false,
+    livePollBusy: false,    // a live poll is still waiting on nvidia-smi
     stressActive: false,
     stressWebGL: null,      // { gl, program, canvas, rafId, frameCount, lastTick }
     stressPollTimer: null,
@@ -8462,6 +8842,10 @@ var _ocState = {
     stressDuration: 60,
     stressAborted: false,
     autoActive: false,
+    // Quick Tune / Benchmark Tune run number, bumped on every start and
+    // cancel.  A loop whose number is no longer current stops, so Cancel
+    // then Start can't leave the old loop driving the GPU next to the new.
+    autoRun: 0,
     // v2.9.5 — benchmark uses _runAutoStabilityStep() too; without its own
     // flag the loop's `if (!_ocState.autoActive) break` would exit immediately
     // and produce a zero-data verdict (the bug from your screenshot).
@@ -8484,8 +8868,8 @@ async function loadOcCapability() {
             '<div style="color:var(--text-secondary)">Overclocking isn\'t available for your GPU.</div>' +
             '<div style="margin-top:4px;font-size:11px;color:var(--text-tertiary)">' +
               'Vispora\'s OC + Adaptive Tuning are NVIDIA-only right now. ' +
-              'Detected: <b>' + escHtml((cap.vendor || 'unknown').toUpperCase()) + '</b> — ' +
-              escHtml(cap.name || 'unknown') + '. ' +
+              'Detected: <b>' + escHtml((cap.vendor || 'unknown').toUpperCase()) + '</b> (' +
+              escHtml(cap.name || 'unknown') + '). ' +
               'Temperature, load, and clock telemetry still work for your GPU.' +
             '</div>';
         // Dim the manual card
@@ -8516,8 +8900,8 @@ async function loadOcCapability() {
     // attribute means manual edits to the slider tag also survive.
     var coreSlider = document.getElementById('oc-core-slider');
     var memSlider  = document.getElementById('oc-mem-slider');
-    var coreMax = (lim.core_max_offset != null) ? lim.core_max_offset : (data.core_max_offset || 950);
-    var memMax  = (lim.mem_max_offset  != null) ? lim.mem_max_offset  : (data.mem_max_offset  || 4500);
+    var coreMax = (lim.core_max_offset != null) ? lim.core_max_offset : (cap.core_max_offset || 950);
+    var memMax  = (lim.mem_max_offset  != null) ? lim.mem_max_offset  : (cap.mem_max_offset  || 4500);
     if (coreSlider) coreSlider.max = coreMax;
     if (memSlider)  memSlider.max  = memMax;
 
@@ -8571,7 +8955,7 @@ function onOcSliderChange() {
 async function applyOcSliders() {
     // Debounce: ignore extra clicks while a request is in flight.
     if (_ocState.applyInFlight) {
-        termWrite('gpu-terminal', '⏳ Apply already in progress — please wait...');
+        termWrite('gpu-terminal', '⏳ Apply already in progress, please wait...');
         return;
     }
     var core = parseInt(document.getElementById('oc-core-slider').value);
@@ -8590,12 +8974,12 @@ async function applyOcSliders() {
             power_pct: power,
         });
         (r.steps || []).forEach(function(s) {
-            termWrite('gpu-terminal', '  ' + (s.ok !== false ? '✓' : '✗') + ' ' + s.name);
+            termWrite('gpu-terminal', '  ' + _rowMark(s.ok) + ' ' + s.name);
         });
         if (!r.ok) {
             termWrite('gpu-terminal', '✗ ' + (r.err || 'OC apply failed'), 'error');
         } else {
-            termWrite('gpu-terminal', '=== OC applied — auto-verifying that the GPU accepted it... ===');
+            termWrite('gpu-terminal', '=== OC applied, auto-verifying that the GPU accepted it... ===');
             await new Promise(function(res) { setTimeout(res, 1500); });
             await verifyAppliedOc();
         }
@@ -8610,8 +8994,12 @@ async function resetOc() {
     termWrite('gpu-terminal', 'Resetting GPU to stock...');
     var r = await apiPost('/api/gpu/oc/reset');
     (r.steps || []).forEach(function(s) {
-        termWrite('gpu-terminal', '  ' + (s.ok !== false ? '✓' : '✗') + ' ' + s.name);
+        termWrite('gpu-terminal', '  ' + _rowMark(s.ok) + ' ' + s.name);
     });
+    if (!r.ok) {
+        termWrite('gpu-terminal', '✗ ' + (r.err || 'Reset failed'), 'error');
+        return;
+    }
     termWrite('gpu-terminal', '=== Reset to stock complete ===');
     // Reset sliders
     var cs = document.getElementById('oc-core-slider'); if (cs) cs.value = 0;
@@ -8646,7 +9034,9 @@ var _tempCeilingDirtyTimer = null;
 
 async function loadTempCeilingStatus() {
     var data = await apiGet('/api/gpu/temp-ceiling/status');
-    if (!data) return;
+    // A failed poll has no settings: keep the controls as they are rather
+    // than reset them to defaults that the next slider save would store.
+    if (!data || data.ok === false) return;
     var s = data.settings || {};
     // Settings → controls (only if user isn't actively dragging)
     var slider1 = document.getElementById('temp-ceiling-slider');
@@ -8733,7 +9123,7 @@ async function testTempCeilingTrip() {
     var r = await apiPost('/api/gpu/temp-ceiling/test');
     if (r && r.ok) {
         termWrite('gpu-terminal',
-            '✓ Test trip fired — check the bottom-right corner for the toast notification.');
+            '✓ Test trip fired. Check the bottom-right corner for the toast notification.');
     }
     loadTempCeilingStatus();
 }
@@ -8797,7 +9187,7 @@ async function loadCrashRecoveryHistory() {
     var lastEl = document.getElementById('crash-recovery-last');
     if (countEl) countEl.textContent = history.length;
     if (history.length === 0) {
-        if (lastEl) lastEl.textContent = 'No crashes recorded — nice.';
+        if (lastEl) lastEl.textContent = 'No crashes recorded. Nice.';
         if (c) c.innerHTML = '<div class="empty-state">No crashes recorded yet. The blacklist is empty too.</div>';
         return;
     }
@@ -8834,7 +9224,7 @@ async function loadCrashRecoveryHistory() {
 }
 
 async function clearCrashRecoveryHistory() {
-    if (!confirm('Clear the crash history? This does NOT clear the blacklist — failed offsets stay banned.')) return;
+    if (!confirm('Clear the crash history? This does NOT clear the blacklist, so failed offsets stay banned.')) return;
     await apiDelete('/api/gpu/crash-recovery/history');
     loadCrashRecoveryHistory();
 }
@@ -8847,7 +9237,7 @@ async function clearCrashRecoveryBlacklist() {
 }
 
 async function testCrashRecovery() {
-    if (!confirm('Fire a TEST crash-recovery event?\n\nThis writes a fake entry to the blacklist + history and fires the toast notification — but does NOT actually step down your saved profile.')) return;
+    if (!confirm('Fire a TEST crash-recovery event?\n\nThis writes a fake entry to the blacklist + history and fires the toast notification, but does NOT actually step down your saved profile.')) return;
     // Use core+1/mem+1 sentinel values so the test doesn't touch real blacklist entries.
     var r = await apiPost('/api/gpu/crash-recovery/test',
         { exe: '__test__.exe', display_name: 'Vispora Test', core: 1, mem: 1 });
@@ -8857,7 +9247,7 @@ async function testCrashRecovery() {
     } else {
         termWrite('gpu-terminal',
             '⚠ Test ran but no crash signal was found in the event log. ' +
-            'On a real crash you would see TDR events here — that means the toast / blacklist / step-down logic is working but there was nothing to react to.');
+            'On a real crash you would see TDR events here. That means the toast / blacklist / step-down logic is working but there was nothing to react to.');
     }
     loadCrashRecoveryHistory();
 }
@@ -8902,7 +9292,7 @@ async function verifyAppliedOc() {
     var rowHtml = function(label, ok, expected, actual, msg) {
         var color = ok ? 'var(--accent)' : 'var(--red)';
         var icon = ok ? '✓' : '✗';
-        return '<div style="padding:3px 0;color:' + color + '">' + icon + ' <b>' + label + ':</b> requested ' + expected + ', GPU reports ' + actual + ' — ' + escHtml(msg || '') + '</div>';
+        return '<div style="padding:3px 0;color:' + color + '">' + icon + ' <b>' + label + ':</b> requested ' + expected + ', GPU reports ' + actual + '. ' + escHtml(msg || '') + '</div>';
     };
 
     // v2.9.3 — render a prominent banner if other OC tools are running.
@@ -8919,7 +9309,7 @@ async function verifyAppliedOc() {
                 '<b>⚠ Conflicting OC tool detected:</b> ' + names + '<br>' +
                 '<span style="color:var(--text-dim);font-size:10px">' +
                 'Close it (and disable its "Apply at Windows startup" option) before ' +
-                'applying OC in Vispora — it re-asserts its own offsets every few ' +
+                'applying OC in Vispora. It re-asserts its own offsets every few ' +
                 'seconds and silently overrides our writes.</span></div>';
         }
     } catch (e) { /* silent */ }
@@ -8927,7 +9317,7 @@ async function verifyAppliedOc() {
     var html = '<div style="padding:8px;background:var(--bg-void);border:1px solid var(--border);border-radius:4px">';
     html += conflictBanner;
     html += '<div style="font-size:11px;font-weight:600;margin-bottom:6px;color:' + (v.verified ? 'var(--accent)' : 'var(--red)') + '">';
-    html += v.verified ? '✓ All values verified — OC is actively applied to the GPU' : '⚠ Some values did not stick — see below';
+    html += v.verified ? '✓ All values verified: OC is actively applied to the GPU' : '⚠ Some values did not stick (see below)';
     html += '</div>';
     html += rowHtml('Core',  core_.ok,
         '+' + (core_.requested_offset || 0) + ' MHz (target ' + (core_.expected_max || '?') + ')',
@@ -8978,7 +9368,7 @@ async function runBenchmarkComparison() {
     benchEl.style.display = 'block';
     contentEl.innerHTML = '<div class="pulse" style="color:var(--text-dim)">▶ Resetting to stock for baseline measurement...</div>';
 
-    termWrite('gpu-terminal', '📊 Benchmark started — stock baseline first');
+    termWrite('gpu-terminal', '📊 Benchmark started, stock baseline first');
 
     // v2.9.5 — gate the stability-step loop with our new benchmark flag so
     // _runAutoStabilityStep() actually iterates instead of bailing on tick 1.
@@ -8993,6 +9383,14 @@ async function runBenchmarkComparison() {
         // Phase 1: Stock measurement
         contentEl.innerHTML = '<div class="pulse" style="color:var(--accent)">▶ Measuring STOCK performance for ' + startResp.duration_s + 's...</div>';
         var stockVerdict = await _runAutoStabilityStep(startResp.duration_s);
+        // Cleared when the user leaves the GPU page, which also cuts the step
+        // short: cancel instead of scoring a half-measured run.
+        if (!_ocState.benchmarkActive) {
+            await apiPost('/api/gpu/oc/benchmark/cancel');
+            benchEl.style.display = 'none';
+            termWrite('gpu-terminal', '⏹ Benchmark cancelled');
+            return;
+        }
         termWrite('gpu-terminal', '  Stock: ' + (stockVerdict.avg_fps || 0) + ' FPS, max temp ' + (stockVerdict.max_temp_c || 0) + '°C');
 
         // Submit verdict; backend applies OC and tells us to do phase 2
@@ -9003,8 +9401,14 @@ async function runBenchmarkComparison() {
         }
 
         // Phase 2: OC measurement
-        contentEl.innerHTML = '<div class="pulse" style="color:var(--accent)">▶ Stock: ' + (stockVerdict.avg_fps || 0) + ' FPS — applying OC, measuring ' + phase2.duration_s + 's...</div>';
+        contentEl.innerHTML = '<div class="pulse" style="color:var(--accent)">▶ Stock: ' + (stockVerdict.avg_fps || 0) + ' FPS. Applying OC, measuring ' + phase2.duration_s + 's...</div>';
         var ocVerdict = await _runAutoStabilityStep(phase2.duration_s);
+        if (!_ocState.benchmarkActive) {
+            await apiPost('/api/gpu/oc/benchmark/cancel');
+            benchEl.style.display = 'none';
+            termWrite('gpu-terminal', '⏹ Benchmark cancelled');
+            return;
+        }
         termWrite('gpu-terminal', '  OC: ' + (ocVerdict.avg_fps || 0) + ' FPS, max temp ' + (ocVerdict.max_temp_c || 0) + '°C');
 
         var finalResp = await apiPost('/api/gpu/oc/benchmark/record', ocVerdict);
@@ -9129,8 +9533,15 @@ function toggleOcLive() {
         if (lbl) lbl.textContent = 'Start Live Monitor';
     } else {
         _ocState.liveActive = true;
-        pollOcLiveOnce();
-        _ocState.liveTimer = setInterval(pollOcLiveOnce, 1000);
+        // nvidia-smi can stall for seconds: skip a tick while the last poll
+        // is still out instead of stacking requests behind it.
+        var poll = function() {
+            if (_ocState.livePollBusy) return;
+            _ocState.livePollBusy = true;
+            pollOcLiveOnce().finally(function() { _ocState.livePollBusy = false; });
+        };
+        poll();
+        _ocState.liveTimer = setInterval(poll, 1000);
         if (lbl) lbl.textContent = 'Stop Live Monitor';
     }
 }
@@ -9279,7 +9690,7 @@ function startWebGLStress() {
     if (!canvas) return null;
     var gl = canvas.getContext('webgl', { powerPreference: 'high-performance', antialias: false, preserveDrawingBuffer: true });
     if (!gl) {
-        termWrite('gpu-terminal', '✗ WebGL not available — stress test cannot run');
+        termWrite('gpu-terminal', '✗ WebGL not available, so the stress test cannot run');
         return null;
     }
     var vs = _compileShader(gl, gl.VERTEX_SHADER, OC_STRESS_VERT);
@@ -9332,10 +9743,13 @@ function startWebGLStress() {
     // We use sendBeacon-style fetch (fire-and-forget) because the WebGL
     // event handler may run before/during a display recovery and we don't
     // want to await anything inside it.
-    canvas.addEventListener('webglcontextlost', function(ev) {
+    // The canvas is reused by every run: drop the previous run's listener,
+    // or one context loss fires an emergency reset per run so far.
+    if (canvas._ocLostListener) canvas.removeEventListener('webglcontextlost', canvas._ocLostListener, false);
+    canvas._ocLostListener = function(ev) {
         ev.preventDefault();
         state.contextLost = true;
-        console.warn('WebGL context lost during stress test — triggering emergency reset');
+        console.warn('WebGL context lost during stress test, triggering emergency reset');
         try {
             // No await — let it complete in the background.  apiPost
             // already swallows network errors so this can't throw.
@@ -9343,7 +9757,8 @@ function startWebGLStress() {
                     { reason: 'webgl_context_lost' },
                     { timeoutMs: 5000 });
         } catch (e) { /* never block on a crash recovery path */ }
-    }, false);
+    };
+    canvas.addEventListener('webglcontextlost', canvas._ocLostListener, false);
 
     var pixBuf  = new Uint8Array(64);  // 4x4 RGBA = 64 bytes (pixel-correctness)
     var syncBuf = new Uint8Array(4);   // v2.9.9.4 — single-pixel sync (see frame())
@@ -9452,7 +9867,7 @@ function startWebGLStress() {
             if (badPixels >= 2 || totalDiff > 200) {
                 state.pixelCheckBadCount++;
                 state.pixelCheckFailed = true;
-                console.warn('OC pixel check FAILED — totalDiff=' + totalDiff + ' badPixels=' + badPixels);
+                console.warn('OC pixel check FAILED: totalDiff=' + totalDiff + ' badPixels=' + badPixels);
                 return false;
             }
             return true;
@@ -9523,15 +9938,26 @@ async function runStabilityTest(durationSec) {
     var expectedCoreMax = liveBefore.ok ? (liveBefore.core_max_mhz || 0) : 0;
 
     await apiPost('/api/gpu/oc/probe/start', { expected_core_max: expectedCoreMax });
+    // Aborted (or the page left) while those requests ran: finishStabilityTest
+    // is done already, so a workload started now would never be stopped.
+    // Close the probe again in case it opened after that finish closed it.
+    if (!_ocState.stressActive) {
+        apiPost('/api/gpu/oc/probe/end');
+        return;
+    }
     _ocState.stressWebGL = startWebGLStress();
 
     var maxTemp = 0;
     var lastFrameCount = 0;
     var lastSecond = Date.now();
     var tickCount = 0;
+    var tickBusy = false;
 
     _ocState.stressPollTimer = setInterval(async function() {
         if (!_ocState.stressActive) return;
+        // The last tick's request is still out (every 5th one scans the event
+        // log): skip, so ticks never overlap on the backend or log twice.
+        if (tickBusy) return;
         tickCount++;
         var elapsed = (Date.now() - _ocState.stressStarted) / 1000;
         var pct = Math.min(100, (elapsed / durationSec) * 100);
@@ -9565,19 +9991,21 @@ async function runStabilityTest(durationSec) {
         }
 
         // Probe GPU state — sends WebGL signals to backend
+        tickBusy = true;
         var tick = await apiPost('/api/gpu/oc/probe/tick', {
             frame_time_ms: frameStats.avg || null,
             context_lost: contextLost,
             pixel_check_failed: pixelFailed,
         });
+        tickBusy = false;
         if (tick.ok && tick.state) {
             maxTemp = Math.max(maxTemp, tick.state.temp_c);
             document.getElementById('oc-stress-max-temp').textContent = maxTemp + '°C';
             document.getElementById('oc-stress-cur-core').textContent = tick.state.core_mhz;
             // Status line shows the most-relevant info
-            var status = 'Running — ' + tick.state.gpu_util_pct + '% GPU, ' + tick.state.temp_c + '°C, ' + Math.round(frameStats.avg || 0) + 'ms avg frame';
+            var status = 'Running: ' + tick.state.gpu_util_pct + '% GPU, ' + tick.state.temp_c + '°C, ' + Math.round(frameStats.avg || 0) + 'ms avg frame';
             if (tick.state.temp_c >= 80) {
-                status = '⚠ High temp: ' + tick.state.temp_c + '°C — ' + status;
+                status = '⚠ High temp: ' + tick.state.temp_c + '°C. ' + status;
             }
             document.getElementById('oc-stress-status').textContent = status;
         } else if (tick.abort) {
@@ -9614,12 +10042,12 @@ async function finishStabilityTest() {
     if (verdict.ok) {
         var stable = verdict.stable && !_ocState.stressAborted;
         var line = stable
-            ? '✓ STABLE — ' + verdict.duration_s + 's | ' + verdict.avg_fps + ' avg FPS | ' + verdict.frame_variance_pct + '% variance | max ' + verdict.max_temp_c + '°C | core ' + verdict.min_core_mhz + '–' + verdict.max_core_mhz + ' MHz'
-            : '✗ UNSTABLE — ' + (verdict.abort_reason || 'Test failed');
+            ? '✓ STABLE: ' + verdict.duration_s + 's | ' + verdict.avg_fps + ' avg FPS | ' + verdict.frame_variance_pct + '% variance | max ' + verdict.max_temp_c + '°C | core ' + verdict.min_core_mhz + '–' + verdict.max_core_mhz + ' MHz'
+            : '✗ UNSTABLE: ' + (verdict.abort_reason || 'Test failed');
         termWrite('gpu-terminal', line, stable ? '' : 'error');
         // Detail breakdown
         if (verdict.thermal_throttle) {
-            termWrite('gpu-terminal', '  ⚠ Thermal throttle / clock dips detected — GPU is power/temp limited');
+            termWrite('gpu-terminal', '  ⚠ Thermal throttle / clock dips detected: GPU is power/temp limited');
         }
         if (verdict.tdr_count > 0) {
             termWrite('gpu-terminal', '  ✗ ' + verdict.tdr_count + ' driver TDR event(s) logged during test', 'error');
@@ -9631,7 +10059,7 @@ async function finishStabilityTest() {
             termWrite('gpu-terminal', '  ✗ ' + verdict.pixel_artifacts + ' frame(s) with visual artifacts (pixel check failed)', 'error');
         }
         if (verdict.frame_variance_pct > 30 && stable) {
-            termWrite('gpu-terminal', '  ⚠ High frame time variance (' + verdict.frame_variance_pct + '%) — borderline stability');
+            termWrite('gpu-terminal', '  ⚠ High frame time variance (' + verdict.frame_variance_pct + '%): borderline stability');
         }
     }
     return verdict;
@@ -9650,13 +10078,15 @@ async function startAutoOc() {
         showErrorToast('Auto-OC requires an NVIDIA GPU.');
         return;
     }
-    if (!confirm('Auto-OC v3 — Robust Binary Search\n\n• Maxes power limit FIRST (more clock headroom)\n• Jumps +75 MHz core / +250 MHz memory until first crash\n• Binary searches to within 5 MHz core / 15 MHz mem of true ceiling\n• Stability checked via: driver TDR events, WebGL context loss, pixel artifacts, frame variance, clock dips, thermal throttle\n• Final 60s validation pass\n• ~5-8 minutes total\n\nContinue?')) return;
+    if (!confirm('Auto-OC v3: Robust Binary Search\n\n• Maxes power limit FIRST (more clock headroom)\n• Jumps +75 MHz core / +250 MHz memory until first crash\n• Binary searches to within 5 MHz core / 15 MHz mem of true ceiling\n• Stability checked via: driver TDR events, WebGL context loss, pixel artifacts, frame variance, clock dips, thermal throttle\n• Final 60s validation pass\n• ~5-8 minutes total\n\nContinue?')) return;
 
     var coreStep = parseInt(document.getElementById('auto-core-step').value) || 75;
     var memStep = parseInt(document.getElementById('auto-mem-step').value) || 250;
     var maxSteps = parseInt(document.getElementById('auto-max-steps').value) || 14;
 
     _ocState.autoActive = true;
+    var run = ++_ocState.autoRun;
+    var owns = function() { return _ocState.autoActive && _ocState.autoRun === run; };
     _ocState.autoLog = [];
     document.getElementById('auto-oc-start-btn').style.display = 'none';
     document.getElementById('auto-oc-cancel-btn').style.display = '';
@@ -9679,10 +10109,11 @@ async function startAutoOc() {
     var finished = false;
 
     for (var iter = 0; iter < totalIters; iter++) {
-        if (!_ocState.autoActive) break;
+        if (!owns()) break;
 
         var body = prev ? Object.assign({ reported: true }, prev) : {};
         var nxt = await apiPost('/api/gpu/oc/auto/next', body);
+        if (!owns()) break;
         if (!nxt.ok) {
             termWrite('gpu-terminal', '✗ Auto-OC error: ' + (nxt.err || 'unknown'), 'error');
             break;
@@ -9697,12 +10128,12 @@ async function startAutoOc() {
                     'error');
                 await _showCrashBanner('Auto-tune aborted',
                     nxt.abort_reason || 'GPU crashed and could not be recovered. Offsets reset to stock.');
-                updateAutoOcStatus('🛑 Aborted — see crash banner');
+                updateAutoOcStatus('🛑 Aborted (see crash banner)');
                 break;
             }
             var b = nxt.best || {};
             var validatedTag = nxt.validated ? ' ✓ validated' : ' (validation failed; backed off)';
-            termWrite('gpu-terminal', '🏆 Auto-OC complete: core+' + b.core_offset_mhz + ' MHz, mem+' + b.mem_offset_mhz + ' MHz' + validatedTag + ' — saved as profile');
+            termWrite('gpu-terminal', '🏆 Auto-OC complete: core+' + b.core_offset_mhz + ' MHz, mem+' + b.mem_offset_mhz + ' MHz' + validatedTag + ', saved as profile');
             updateAutoOcStatus('✓ Auto-tune complete! Saved: core+' + b.core_offset_mhz + ' / mem+' + b.mem_offset_mhz + validatedTag);
             document.getElementById('oc-auto-progress-fill').style.width = '100%';
             loadOcProfile();
@@ -9713,7 +10144,7 @@ async function startAutoOc() {
         var stepLabel = '[' + phaseShort + '] ' + (nxt.step_label || ('core+' + nxt.current_core + ' mem+' + nxt.current_mem));
         var dur = nxt.recommended_duration_s || 25;
 
-        termWrite('gpu-terminal', '▶ ' + stepLabel + ' — running ' + dur + 's stability check...');
+        termWrite('gpu-terminal', '▶ ' + stepLabel + ': running ' + dur + 's stability check...');
         updateAutoOcStatus(stepLabel);
 
         // Progress bar — phase-weighted estimate
@@ -9721,8 +10152,8 @@ async function startAutoOc() {
         document.getElementById('oc-auto-progress-fill').style.width = progressPct + '%';
 
         // Phase-aware stability test
-        var verdict = await _runAutoStabilityStep(dur);
-        if (!_ocState.autoActive) break;
+        var verdict = await _runAutoStabilityStep(dur, run);
+        if (!owns()) break;
 
         prev = {
             stable: verdict.stable && !verdict.aborted,
@@ -9740,7 +10171,7 @@ async function startAutoOc() {
         var entry = document.createElement('div');
         entry.className = 'oc-auto-step ' + (prev.stable ? 'stable' : 'unstable');
         var resultStr = prev.stable ? 'stable' : ('unstable: ' + (prev.reason || 'crash/hang'));
-        entry.textContent = (prev.stable ? '✓' : '✗') + ' [' + phaseShort + '] core+' + nxt.current_core + ' mem+' + nxt.current_mem + ' — ' + resultStr + ' (max ' + verdict.max_temp_c + '°C, ' + verdict.duration_s + 's)';
+        entry.textContent = (prev.stable ? '✓' : '✗') + ' [' + phaseShort + '] core+' + nxt.current_core + ' mem+' + nxt.current_mem + ', ' + resultStr + ' (max ' + verdict.max_temp_c + '°C, ' + verdict.duration_s + 's)';
         var statusEl = document.getElementById('oc-auto-status');
         statusEl.appendChild(entry);
         statusEl.scrollTop = statusEl.scrollHeight;
@@ -9767,7 +10198,7 @@ async function startAutoOc() {
         // top of the loop catches that.
         if (!prev.stable && /context|hang|tdr|crash|artifact/i.test(prev.reason)) {
             termWrite('gpu-terminal',
-                '⚠ Crash at ' + stepLabel + ' — GPU recovering, will step down to last stable',
+                '⚠ Crash at ' + stepLabel + '. GPU recovering, will step down to last stable',
                 'error');
             await new Promise(function(r){ setTimeout(r, 5000); });   // GPU TDR settle
             // Do NOT break.  Fall through — next iteration sends `prev`
@@ -9778,12 +10209,15 @@ async function startAutoOc() {
     // Any exit other than "backend said done" or "user pressed Cancel" (which
     // cancels by itself) leaves a session open with a test offset on the
     // card.  Tell the backend, so it resets to stock.
-    if (!finished && _ocState.autoActive) {
-        termWrite('gpu-terminal', '⚠ Auto-OC stopped before finishing — resetting to stock', 'error');
-        updateAutoOcStatus('Stopped early — reset to stock');
+    if (!finished && owns()) {
+        termWrite('gpu-terminal', '⚠ Auto-OC stopped before finishing, resetting to stock', 'error');
+        updateAutoOcStatus('Stopped early, reset to stock');
         await apiPost('/api/gpu/oc/auto/cancel');
     }
 
+    // Cancelled: cancelAutoOc has reset the flag and buttons already, and a
+    // run started since then owns them now.
+    if (_ocState.autoRun !== run) return;
     _ocState.autoActive = false;
     document.getElementById('auto-oc-start-btn').style.display = '';
     document.getElementById('auto-oc-cancel-btn').style.display = 'none';
@@ -9828,13 +10262,17 @@ function _estimateAutoProgress(nxt) {
     return Math.min(99, (step / maxStep) * 100);
 }
 
-async function _runAutoStabilityStep(durationSec) {
+async function _runAutoStabilityStep(durationSec, run) {
+    // Quick Tune / Benchmark Tune pass their run number: once that run is
+    // cancelled the step stops and leaves alone what a newer run may own.
+    var superseded = function() { return !!run && run !== _ocState.autoRun; };
     // Get expected core max for clock-dip detection
     var live = await apiGet('/api/gpu/oc/live');
     var expectedCoreMax = live.ok ? (live.core_max_mhz || 0) : 0;
+    if (superseded()) return {};
 
     await apiPost('/api/gpu/oc/probe/start', { expected_core_max: expectedCoreMax });
-    var webgl = startWebGLStress();
+    var webgl = superseded() ? null : startWebGLStress();
     var ticks = 0;
     var startMs = Date.now();
     var aborted = false;
@@ -9845,6 +10283,9 @@ async function _runAutoStabilityStep(durationSec) {
         // benchmarks return immediately with all zeros.
         if (!_ocState.autoActive && !_ocState.benchmarkActive) break;
         await new Promise(function(r) { setTimeout(r, 1000); });
+        // After the wait: a run cancelled (and maybe restarted) meanwhile
+        // must not send this tick into the probe.
+        if (superseded()) break;
         ticks++;
 
         // Snapshot WebGL signals
@@ -9875,6 +10316,9 @@ async function _runAutoStabilityStep(durationSec) {
         }
     }
     stopWebGLStress(webgl);
+    // Cancelled and a new run already started: the probe session is that
+    // run's now, so leave it open.
+    if (superseded() && _ocState.autoActive) return {};
     var verdict = await apiPost('/api/gpu/oc/probe/end');
     return verdict;
 }
@@ -9882,6 +10326,9 @@ async function _runAutoStabilityStep(durationSec) {
 async function cancelAutoOc() {
     if (!_ocState.autoActive) return;
     _ocState.autoActive = false;
+    // The running loop no longer owns the run, so a Start right after this
+    // can't bring it back.
+    var run = ++_ocState.autoRun;
     // v2.9.9.0 — both modes share this cancel handler.  Try both endpoints
     // since we don't track which was started — whichever isn't active
     // returns ok:false harmlessly.
@@ -9889,6 +10336,8 @@ async function cancelAutoOc() {
         apiPost('/api/gpu/oc/auto/cancel'),
         apiPost('/api/gpu/oc/benchmark-tune/cancel'),
     ]);
+    // A run started while those were out: its buttons are not ours to reset.
+    if (_ocState.autoRun !== run) return;
     document.getElementById('auto-oc-start-btn').style.display = '';
     var benchBtn = document.getElementById('bench-tune-start-btn');
     if (benchBtn) benchBtn.style.display = '';
@@ -9914,7 +10363,7 @@ async function startBenchmarkTune() {
     }
     // v2.9.9.1 — finer steps + much longer per-step measurement to find the
     // actual performance peak instead of just the rough one Quick Tune finds.
-    if (!confirm('Benchmark Tune — Performance-Optimised Auto-OC\n\n' +
+    if (!confirm('Benchmark Tune: Performance-Optimised Auto-OC\n\n' +
         '• Maxes power limit FIRST\n' +
         '• Walks the CORE ladder in 25 MHz steps (0, 25, 50 ... up to 600 MHz)\n' +
         '   Per step: 90s WebGL benchmark → records FPS, 1% lows, frametime σ, temp\n' +
@@ -9928,6 +10377,8 @@ async function startBenchmarkTune() {
         'Continue?')) return;
 
     _ocState.autoActive = true;
+    var run = ++_ocState.autoRun;
+    var owns = function() { return _ocState.autoActive && _ocState.autoRun === run; };
     _ocState.autoLog = [];
     document.getElementById('auto-oc-start-btn').style.display = 'none';
     document.getElementById('bench-tune-start-btn').style.display = 'none';
@@ -9936,13 +10387,19 @@ async function startBenchmarkTune() {
     document.getElementById('oc-auto-status').innerHTML = '';
     updateAutoOcStatus('▶ Starting Benchmark Tune...');
 
-    termWrite('gpu-terminal', '🏁 Benchmark Tune started — measures real performance per offset');
+    termWrite('gpu-terminal', '🏁 Benchmark Tune started (measures real performance per offset)');
 
     var startResp = await apiPost('/api/gpu/oc/benchmark-tune/start', {
         core_max_offset: 600,    // v2.9.9.1 — was 300 (matches new defaults)
         mem_max_offset:  2500,   // v2.9.9.1 — was 1500
         max_power: true,
     });
+    if (!owns()) {
+        // Cancelled while starting: the run may have opened after that cancel
+        // reached the backend, so close it again (unless a new run is going).
+        if (startResp && startResp.ok && !_ocState.autoActive) apiPost('/api/gpu/oc/benchmark-tune/cancel');
+        return;
+    }
     if (!startResp || !startResp.ok) {
         termWrite('gpu-terminal', '✗ Benchmark Tune failed to start: ' + ((startResp && startResp.err) || 'unknown'), 'error');
         cancelAutoOc();
@@ -9954,23 +10411,41 @@ async function startBenchmarkTune() {
 
     var prev = null;
     var safetyCap = (startResp.core_ladder.length + startResp.mem_ladder.length + 5);
+    var finished = false;
+    // Cancel can land while a request that applies an offset is still out
+    // (/apply, or /next for the final pass): that offset then arrives after
+    // the cancel's reset and the watchdog keeps it.  Once such a request has
+    // returned, cancel again, unless a newer run has started.
+    var recancel = function() {
+        return _ocState.autoActive ? null : apiPost('/api/gpu/oc/benchmark-tune/cancel');
+    };
 
     for (var iter = 0; iter < safetyCap; iter++) {
-        if (!_ocState.autoActive) break;
+        if (!owns()) break;
 
         var body = prev ? Object.assign({ reported: true }, prev) : {};
         var nxt = await apiPost('/api/gpu/oc/benchmark-tune/next', body);
+        if (!owns()) { await recancel(); break; }
         if (!nxt || !nxt.ok) {
+            if (nxt && nxt.validated === false) {
+                // The final validation failed.  The backend has already reset
+                // the card to stock and closed the run: nothing to cancel.
+                finished = true;
+                termWrite('gpu-terminal', '✗ ' + (nxt.err || 'Final validation failed'), 'error');
+                updateAutoOcStatus('✗ Final validation failed, nothing saved');
+                break;
+            }
             termWrite('gpu-terminal', '✗ Benchmark step error: ' + ((nxt && nxt.err) || 'unknown'), 'error');
             break;
         }
         if (nxt.done) {
+            finished = true;
             var b = nxt.best || {};
             termWrite('gpu-terminal', '🏆 Benchmark Tune complete!');
             termWrite('gpu-terminal', '   Winner: core+' + b.core_offset_mhz + ' MHz / mem+' + b.mem_offset_mhz + ' MHz');
             termWrite('gpu-terminal', '   Score: ' + b.best_score + ' (gain: ' + (b.gain_pct >= 0 ? '+' : '') + b.gain_pct + '% vs stock)');
             termWrite('gpu-terminal', '   FPS: ' + b.avg_fps + ' avg, ' + b.min_fps + ' 1% low, frametime σ: ' + b.frametime_std_ms + ' ms');
-            updateAutoOcStatus('✓ Benchmark Tune complete — saved: core+' + b.core_offset_mhz + ' / mem+' + b.mem_offset_mhz +
+            updateAutoOcStatus('✓ Benchmark Tune complete. Saved: core+' + b.core_offset_mhz + ' / mem+' + b.mem_offset_mhz +
                 ' (+' + b.gain_pct + '% vs stock)');
             document.getElementById('oc-auto-progress-fill').style.width = '100%';
             _renderBenchmarkLadder(nxt.core_results || [], nxt.mem_results || [], b);
@@ -9980,7 +10455,7 @@ async function startBenchmarkTune() {
 
         var dur = nxt.recommended_duration_s || 23;
         var label = nxt.current_label || (nxt.phase + ' step ' + nxt.step_idx);
-        termWrite('gpu-terminal', '▶ [' + nxt.phase.toUpperCase() + ' ' + nxt.step_idx + '/' + totalSteps + '] ' + label + ' — benchmarking ' + dur + 's...');
+        termWrite('gpu-terminal', '▶ [' + nxt.phase.toUpperCase() + ' ' + nxt.step_idx + '/' + totalSteps + '] ' + label + ': benchmarking ' + dur + 's...');
         updateAutoOcStatus('[' + nxt.phase + '] ' + label);
 
         var pct = Math.min(99, Math.floor((nxt.step_idx / totalSteps) * 100));
@@ -9992,6 +10467,7 @@ async function startBenchmarkTune() {
             mem_offset_mhz: nxt.apply_mem,
             power_pct: null,    // leave the limit the run maxed at its start; 100 would reset it to stock
         });
+        if (!owns()) { await recancel(); break; }
         // v2.9.9.4 — bumped from 1.5s to 3s.  When the previous offset
         // was hammering the GPU at full bore, NVAPI applying a new offset
         // can take a moment to actually take effect (boost curve transition,
@@ -10001,8 +10477,8 @@ async function startBenchmarkTune() {
         await new Promise(function(r) { setTimeout(r, 3000); });
 
         // Re-use the auto-stability step (same WebGL stress + verdict pipeline)
-        var verdict = await _runAutoStabilityStep(dur);
-        if (!_ocState.autoActive) break;
+        var verdict = await _runAutoStabilityStep(dur, run);
+        if (!owns()) break;
 
         // v2.9.9.4 — clamp the verdict values before they get displayed
         // OR scored.  If something slipped through the per-draw filter,
@@ -10032,7 +10508,7 @@ async function startBenchmarkTune() {
         var entry = document.createElement('div');
         entry.className = 'oc-auto-step ' + (prev.stable ? 'stable' : 'unstable');
         entry.textContent = (prev.stable ? '✓' : '✗') + ' ' + label +
-            ' — fps ' + (prev.avg_fps || 0) + ' / 1%low ' +
+            ': fps ' + (prev.avg_fps || 0) + ' / 1%low ' +
             (prev.p99_frame_time_ms ? Math.round(1000 / prev.p99_frame_time_ms) : 0) +
             ' / σ ' + (prev.frame_variance_pct || 0) + '% / ' + (prev.max_temp_c || 0) + '°C';
         var statusEl = document.getElementById('oc-auto-status');
@@ -10045,7 +10521,7 @@ async function startBenchmarkTune() {
         // mem-axis steps when a core-axis offset just black-screened the
         // whole machine.  Send the user back to safety.
         if (!prev.stable && /context|hang|tdr|crash/i.test(prev.abort_reason)) {
-            termWrite('gpu-terminal', '🛑 Hard crash during benchmark — stopping (GPU recovering)', 'error');
+            termWrite('gpu-terminal', '🛑 Hard crash during benchmark, stopping (GPU recovering)', 'error');
             await _showCrashBanner('Benchmark Tune stopped',
                 'GPU crash at ' + label + ': ' + (prev.abort_reason || 'unknown') +
                 '. Offsets reset to stock to let the GPU recover. ' +
@@ -10055,6 +10531,18 @@ async function startBenchmarkTune() {
         }
     }
 
+    // Stopped early (step error, crash stop, step limit): the backend run is
+    // still open, with a test offset on the card.  Cancel it, as Quick Tune
+    // does, so it resets to stock.
+    if (!finished && owns()) {
+        termWrite('gpu-terminal', '⚠ Benchmark Tune stopped before finishing, resetting to stock', 'error');
+        updateAutoOcStatus('Stopped early, reset to stock');
+        await apiPost('/api/gpu/oc/benchmark-tune/cancel');
+    }
+
+    // Cancelled: cancelAutoOc has reset the flag and buttons already, and a
+    // run started since then owns them now.
+    if (_ocState.autoRun !== run) return;
     _ocState.autoActive = false;
     document.getElementById('auto-oc-start-btn').style.display = '';
     document.getElementById('bench-tune-start-btn').style.display = '';
@@ -10081,7 +10569,7 @@ function _renderBenchmarkLadder(coreResults, memResults, best) {
             '<td style="padding:2px 8px">' + (r.min_fps || 0) + '</td>' +
             '<td style="padding:2px 8px">' + (r.frametime_std_ms || 0) + '</td>' +
             '<td style="padding:2px 8px">' + (r.max_temp_c || 0) + '°C</td>' +
-            '<td style="padding:2px 8px">' + (r.stable ? '✓' : '✗ ' + (r.abort_reason || 'crash')) + '</td>' +
+            '<td style="padding:2px 8px">' + (r.stable ? '✓' : '✗ ' + escHtml(r.abort_reason || 'crash')) + '</td>' +
             '<td style="padding:2px 8px;color:var(--accent)">' + marker + '</td>' +
             '</tr>';
     };
@@ -10215,7 +10703,7 @@ async function _refreshDependencyBanner() {
               '<span style="color:var(--warning);font-weight:600">⟳ Restart needed</span>' +
               '<span style="color:var(--text-secondary);font-size:12px;flex:1">' +
                 'New drivers were installed (' + escHtml(sources.join(', ')) + '). ' +
-                'A restart finishes the install — your virtual gamepad / frame telemetry won\'t work fully until then.' +
+                'A restart finishes the install. Your virtual gamepad / frame telemetry won\'t work fully until then.' +
               '</span>' +
               '<button class="btn btn-sm btn-primary" onclick="restartNowAfterDeps()">Restart now (10 s)</button>' +
               '<button class="btn btn-sm" onclick="restartLater()">Later</button>' +
@@ -10247,7 +10735,7 @@ async function restartNowAfterDeps() {
 async function restartLater() {
     var r = await apiPost('/api/dependencies/restart-later', {});
     if (r && r.ok) {
-        addLog('Restart deferred — will re-prompt on next Vispora launch');
+        addLog('Restart deferred, will re-prompt on next Vispora launch');
         _refreshDependencyBanner();
     }
 }
@@ -10284,7 +10772,7 @@ function _showRecoveryApologyToast(report) {
         '<div class="post-install-toast-msg">' +
         'An earlier version of Vispora applied ' + n + ' setting' + (n !== 1 ? 's' : '') +
         ' that turned out to cause problems (Bluetooth audio glitches, SSD wear, broken Outlook search, etc.).  ' +
-        'Sorry — we\'ve reverted them on your system.  ' +
+        'Sorry, we\'ve reverted them on your system.  ' +
         '<a href="#" onclick="_showRecoveryDetailsModal();return false;" style="color:var(--accent-bright);text-decoration:underline">' +
         'See what changed →</a>' +
         '</div>' +
@@ -10313,7 +10801,7 @@ function _showRecoveryDetailsModal() {
             '<div style="padding:18px 22px;max-width:680px">' +
             '<h2 style="margin:0 0 8px;color:var(--text-bright);font-size:18px">A quick apology + what we changed</h2>' +
             '<p style="color:var(--text-secondary);font-size:13px;line-height:1.55;margin-bottom:14px">' +
-            'A pre-stable audit of Vispora\'s optimizer caught several tweaks that older builds applied which actively cause problems on modern Windows.  We removed them from Apply All — and for users like you who already ran an older build, Vispora scanned the registry on startup and reverted whatever it found.  Below is the full list of what changed on your machine.' +
+            'A pre-stable audit of Vispora\'s optimizer caught several tweaks that older builds applied which actively cause problems on modern Windows.  We removed them from Apply All, and for users like you who already ran an older build, Vispora scanned the registry on startup and reverted whatever it found.  Below is the full list of what changed on your machine.' +
             '</p>' +
             '<div style="background:var(--bg-overlay);border-radius:6px;padding:6px 0;margin-bottom:14px">';
         r.reverted.forEach(function(item) {
@@ -10386,6 +10874,9 @@ async function loadCaptureStatus() {
         try {
             var a = await apiGet('/api/clipper/audio-devices');
             if (a && a.ok) _populateAudioDevices(a.audio || []);
+            // e.g. FFmpeg not installed yet: try again on the next poll
+            // instead of leaving the mic list empty until a restart.
+            else _audioDevicesLoaded = false;
         } catch (e) {}
     }
     // NOW it's safe to set the dropdown values from settings.
@@ -10411,7 +10902,7 @@ function _renderClipperStatus(c) {
 
     var pieces = [];
     if (!c.ffmpeg_installed) {
-        pieces.push('<span style="color:var(--warning)">⚠ FFmpeg not installed</span> — open the Dependencies banner to auto-install.');
+        pieces.push('<span style="color:var(--warning)">⚠ FFmpeg not installed</span>. Open the Dependencies banner to auto-install.');
     } else if (c.running) {
         var enc = c.encoder_used || 'unknown';
         var up = Math.round(c.uptime_s || 0);
@@ -10423,7 +10914,7 @@ function _renderClipperStatus(c) {
             pieces.push('<br>Foreground game: <span style="color:var(--text-bright);font-weight:600">' + escHtml(c.foreground_game.name || c.foreground_game.exe) + '</span>');
         }
     } else {
-        pieces.push('<span style="color:var(--text-tertiary)">○ Buffer not running</span> — turn it on below to start capturing.');
+        pieces.push('<span style="color:var(--text-tertiary)">○ Buffer not running</span>. Turn it on below to start capturing.');
         if (c.last_err) {
             pieces.push('<br><span style="color:var(--danger)">' + escHtml(c.last_err) + '</span>');
         }
@@ -10475,7 +10966,7 @@ function _renderTargetStatus(c) {
         pieces.push('engine: ' + tag);
     } else if (!c.running && c.ddagrab_avail) {
         pieces.push('<span style="color:var(--text-tertiary)">' +
-                    'ddagrab available — will use GPU capture when running</span>');
+                    'ddagrab available, will use GPU capture when running</span>');
     }
     if (c.buffered_seconds != null && c.running) {
         var max = (c.settings && c.settings.max_buffer_seconds) || 60;
@@ -10503,7 +10994,7 @@ function _populateMonitorOptions(monitors) {
         opt.value = 'monitor:' + i;
         var w = m.physical_w || m.w;
         var h = m.physical_h || m.h;
-        opt.textContent = 'Monitor ' + (i + 1) + ' — ' + w + '×' + h +
+        opt.textContent = 'Monitor ' + (i + 1) + ': ' + w + '×' + h +
                           (m.primary ? ' (primary)' : '');
         sel.appendChild(opt);
     });
@@ -10541,7 +11032,7 @@ function _populateAudioDevices(devices) {
     var realInputs = (devices || []).filter(function(d) { return !isLoopback(d.name); });
 
     var micWas = mic.value;
-    mic.innerHTML = '<option value="">— pick microphone —</option>';
+    mic.innerHTML = '<option value="">(pick microphone)</option>';
     realInputs.forEach(function(d) {
         var opt = document.createElement('option');
         opt.value = d.name;
@@ -10566,7 +11057,7 @@ function _renderSystemAudioInfo(c) {
     if (!s.system_audio_enabled) {
         box.style.color = 'var(--text-tertiary)';
         box.innerHTML = 'Toggle on to capture whatever\'s playing through your default Windows output (speakers / headphones / HDMI).  ' +
-                        'Uses native WASAPI loopback — no VB-CABLE / Voicemeeter / Stereo Mix needed.';
+                        'Uses native WASAPI loopback, so no VB-CABLE / Voicemeeter / Stereo Mix is needed.';
         return;
     }
     // Buffer running with sys audio actually flowing — best case
@@ -10680,7 +11171,7 @@ function _renderObsStatus(d) {
         var recLine;
         if (rec.scene_ready && rec.buffer_running) {
             recLine = '<span style="color:var(--accent);font-weight:600">● Replay buffer active</span>' +
-                      ' <span style="color:var(--text-tertiary)">— save-clip hotkey saves from OBS.</span>';
+                      ' <span style="color:var(--text-tertiary)">(save-clip hotkey saves from OBS)</span>';
         } else if (rec.scene_ready) {
             recLine = '<span style="color:var(--accent-bright);font-weight:600">○</span> ' +
                       '<span style="color:var(--text-bright)">Scene ready</span>' +
@@ -10702,7 +11193,7 @@ function _renderObsStatus(d) {
                         recLine;
     } else {
         box.style.color = 'var(--warning, #e0b850)';
-        var err = conn.connect_err || 'Not connected yet — click "Connect to OBS" below.';
+        var err = conn.connect_err || 'Not connected yet. Click "Connect to OBS" below.';
         box.innerHTML = '<span style="color:var(--warning, #e0b850);font-weight:600">⚠</span> ' +
                         '<span style="color:var(--text-bright)">Toggle on, but no WebSocket connection.</span><br>' +
                         '<span style="color:var(--text-tertiary);font-size:11px">' +
@@ -10783,7 +11274,7 @@ async function launchObs() {
     addLog('Launching OBS…');
     var r = await apiPost('/api/obs/launch', {});
     if (r && r.ok) {
-        addLog('OBS spawned — give it 3-5 seconds to come online, then click Connect');
+        addLog('OBS spawned. Give it 3-5 seconds to come online, then click Connect');
     } else if (r) {
         addLog('OBS launch failed: ' + (r.err || 'unknown'));
     }
@@ -10868,9 +11359,11 @@ function _renderStreamHelperStatus(d) {
     // elements after legacy-capture-divider.  Simpler: just toggle
     // a class on the parent <div class="page"> that hides everything
     // matching a `data-legacy-capture` attribute.
+    // The OBS backend card stays: the "not connected" message below sends
+    // the user to it.
     var legacyEls = document.querySelectorAll(
         '#page-capture .section-divider:not(:first-of-type), ' +
-        '#page-capture .card:not(#stream-helper-card)'
+        '#page-capture .card:not(#stream-helper-card):not(#obs-backend-card)'
     );
     legacyEls.forEach(function(el) {
         el.style.display = s.enabled ? 'none' : '';
@@ -10879,7 +11372,7 @@ function _renderStreamHelperStatus(d) {
     if (!box) return;
     if (!s.enabled) {
         box.style.color = 'var(--text-tertiary)';
-        box.innerHTML = 'Off — flip the toggle to let Vispora take over OBS setup.';
+        box.innerHTML = 'Off. Flip the toggle to let Vispora take over OBS setup.';
         return;
     }
     if (!d.obs_connected) {
@@ -10912,8 +11405,8 @@ function _renderStreamHelperStatus(d) {
     }
     box.style.color = 'var(--text-secondary)';
     box.innerHTML = '<span style="color:var(--accent);font-weight:600">● Active</span> ' +
-                    '<span style="color:var(--text-tertiary)">— foreground game tracker is ' +
-                    escHtml(watcher) + '.</span><br>' +
+                    '<span style="color:var(--text-tertiary)">(foreground game tracker is ' +
+                    escHtml(watcher) + ')</span><br>' +
                     '<span style="color:var(--text-bright)">Currently following:</span> ' +
                     (active
                         ? '<span style="font-family:var(--font-mono);color:var(--accent-bright)">' + escHtml(active) + '</span>'
@@ -10992,10 +11485,12 @@ var _captureRenderSig = { clips: '', screenshots: '' };
 
 function _mediaSignature(items) {
     if (!items || !items.length) return '';
-    // length + first item's mtime/size is enough — any new save lands
-    // at the top with a fresh mtime, deletions drop the length.
-    var first = items[0] || {};
-    return items.length + '|' + (first.mtime || 0) + '|' + (first.size || 0) + '|' + (first.name || '');
+    // Every item, not just the first: the list is capped at the newest 20,
+    // so deleting one further down keeps the length and the first item the
+    // same, and the stale rows' buttons then act on the wrong file by index.
+    return items.map(function(x) {
+        return (x.name || '') + '|' + (x.mtime || 0) + '|' + (x.size || 0);
+    }).join('/');
 }
 
 function _renderRecentClips(clips) {
@@ -11006,7 +11501,7 @@ function _renderRecentClips(clips) {
     if (sig === _captureRenderSig.clips) return;  // no change — skip DOM work
     _captureRenderSig.clips = sig;
     if (!clips.length) {
-        box.innerHTML = '<div class="empty-state" style="padding:14px">No clips saved yet — turn on the buffer, play, hit your hotkey.</div>';
+        box.innerHTML = '<div class="empty-state" style="padding:14px">No clips saved yet. Turn on the buffer, play, hit your hotkey.</div>';
         return;
     }
     var html = '';
@@ -11354,7 +11849,7 @@ async function diskAnalyzerRefresh() {
             opt.value = d.drive;
             opt.textContent = d.drive
                 + (d.label ? '  (' + d.label + ')' : '')
-                + ' — ' + d.free_gb + '/' + d.total_gb + ' GB free'
+                + ', ' + d.free_gb + '/' + d.total_gb + ' GB free'
                 + ' · ' + d.used_pct + '% used';
             sel.appendChild(opt);
         });
@@ -11380,6 +11875,9 @@ async function diskAnalyzerStart() {
     document.getElementById('da-result').style.display   = 'none';
     document.getElementById('da-cancel-btn').style.display = '';
     _daSetProgress({label: 'Scanning ' + drive + '…', counters: '0 files · 0 GB'});
+    // A scan started while the last one is still cancelling: the old poll
+    // never sees its end state and would keep running.
+    if (_da.pollTimer) clearInterval(_da.pollTimer);
     _da.pollTimer = setInterval(_daPoll, 500);
 }
 
@@ -11695,7 +12193,9 @@ function _daSquarify(items, rect, total) {
 
     while (pending.length) {
         var length = Math.min(w, h);
-        var isHorizontal = (h <= w);
+        // A row runs along the shorter side, so it is a horizontal strip
+        // only when the space left is taller than wide.
+        var isHorizontal = (w <= h);
         if (!row.length) {
             row.push(pending.shift());
             continue;
@@ -11712,7 +12212,7 @@ function _daSquarify(items, rect, total) {
         }
     }
     if (row.length) {
-        layoutRow(row, Math.min(w, h), (h <= w));
+        layoutRow(row, Math.min(w, h), (w <= h));
     }
     return out;
 }
@@ -11863,7 +12363,7 @@ function _daUpdateDeleteBar() {
     sumEl.innerHTML = '<b>' + keys.length + '</b> selected · '
         + '<b>' + _daFormatBytes(total) + '</b> total'
         + (overCap
-            ? ' <span style="color:#f0888c">— exceeds cap (max 100 paths per call)</span>'
+            ? ' <span style="color:#f0888c">(exceeds cap: max 100 paths per call)</span>'
             : '');
 }
 
@@ -11884,7 +12384,7 @@ async function diskAnalyzerDeleteSelected() {
     keys.forEach(function(k){ total += _da.selected[k].size || 0; });
     var toRecycle = document.getElementById('da-to-recycle').checked;
     if (keys.length > 100) {
-        showWarnToast('Too many selected (max 100 per delete call — split into batches).');
+        showWarnToast('Too many selected (max 100 per delete call). Split into batches.');
         return;
     }
     // beta.20 — 50 GB total cap removed.  User asked for "any size";
@@ -11931,7 +12431,7 @@ async function diskAnalyzerDeleteSelected() {
     showInfoToast('Deleted ' + r.deleted + ' item(s), freed '
                   + _daFormatBytes(r.bytes_freed)
                   + (r.errors && r.errors.length ? ' (' + r.errors.length + ' error(s))' : '')
-                  + (r.rejected && r.rejected.length ? ' — ' + r.rejected.length + ' rejected by safety filter' : ''),
+                  + (r.rejected && r.rejected.length ? ', ' + r.rejected.length + ' rejected by safety filter' : ''),
                   { title: 'Disk analyzer', timeoutMs: 9000 });
     if (r.rejected && r.rejected.length) {
         var first = r.rejected[0];

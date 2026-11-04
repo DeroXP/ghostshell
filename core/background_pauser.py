@@ -31,8 +31,10 @@ a reboot — at worst the user has to launch Vispora once more.
 
 from __future__ import annotations
 import ctypes
+import functools
 import json
 import os
+import threading
 import time
 from ctypes import wintypes
 
@@ -66,7 +68,7 @@ TARGETS: dict[str, dict] = {
     },
     "browsers": {
         "label": "Browsers",
-        "desc":  "Each renderer / tab is its own process — collectively the "
+        "desc":  "Each renderer / tab is its own process.  Collectively they're the "
                  "biggest non-game RAM sink on most systems.",
         "exes": [
             "chrome.exe",
@@ -279,6 +281,35 @@ def _list_target_processes() -> list[dict]:
     return out
 
 
+# One change to the record at a time.  Two pauses running together (a game
+# starting while Tournament Mode switches on) both found the record empty and
+# suspended the same processes twice, and the one resume left them frozen.
+_lock = threading.RLock()
+
+
+def _serialized(fn):
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        with _lock:
+            return fn(*args, **kwargs)
+    return run
+
+
+def _same_process(psutil, rec: dict) -> bool:
+    """Is the process at this PID still the one we suspended?  A PID goes to
+    another process once its own exits; after a crash and a restart every
+    PID on record names some other process."""
+    try:
+        p = psutil.Process(rec["pid"])
+        if rec.get("name") and p.name().lower() != str(rec["name"]).lower():
+            return False
+        return not rec.get("ts") or p.create_time() <= float(rec["ts"]) + 1
+    except psutil.NoSuchProcess:
+        return False
+    except Exception:
+        return True             # cannot tell: resume it, as before
+
+
 def _recorded_pids() -> list:
     """The PIDs we currently hold suspended, as persisted on disk."""
     return list((_load_json(PAUSED_PIDS_PATH, None) or {}).get("pids") or [])
@@ -294,6 +325,7 @@ def _write_recorded_pids(pids: list) -> None:
             pass
 
 
+@_serialized
 def pause_pid(pid: int, name: str = "", reason: str = "manual") -> bool:
     """Suspend one specific process and record it alongside the auto-paused
     ones, so "Resume now" and next-launch orphan recovery cover it too."""
@@ -304,8 +336,10 @@ def pause_pid(pid: int, name: str = "", reason: str = "manual") -> bool:
         return False
     try:
         import psutil
-        if psutil.Process(pid).name().lower() in NEVER_PAUSE_EXES:
+        live = psutil.Process(pid).name().lower()
+        if live in NEVER_PAUSE_EXES:
             return False
+        name = name or live         # on record, so a resume can tell this process from a later one
     except Exception:
         pass
     recorded = _recorded_pids()
@@ -320,6 +354,7 @@ def pause_pid(pid: int, name: str = "", reason: str = "manual") -> bool:
     return False
 
 
+@_serialized
 def pause_now(reason: str = "manual") -> dict:
     """Suspend every running process matching an enabled target exe.
 
@@ -363,6 +398,10 @@ def pause_now(reason: str = "manual") -> dict:
             paused.append(p)
         else:
             failed.append(p)
+    if failed:
+        # Never suspended, so off the record again (as pause_pid does): left
+        # on it, they showed as paused and got resumed until they exited.
+        _write_recorded_pids(recorded + paused)
 
     total_mb = sum(p["rss"] for p in paused) // (1024 * 1024)
     log.info(f"Background pauser: suspended {len(paused)} process(es), "
@@ -375,6 +414,7 @@ def pause_now(reason: str = "manual") -> dict:
             "total_freed_mb": total_mb}
 
 
+@_serialized
 def resume_now(reason: str = "manual") -> dict:
     """Resume every PID we suspended.  Safe to call even if nothing was paused."""
     state = _load_json(PAUSED_PIDS_PATH, None)
@@ -387,7 +427,7 @@ def resume_now(reason: str = "manual") -> dict:
     still_frozen: list[dict] = []
     for p in state["pids"]:
         try:
-            if not psutil.pid_exists(p["pid"]):
+            if not psutil.pid_exists(p["pid"]) or not _same_process(psutil, p):
                 not_alive.append(p)
                 continue
             if _resume_pid(p["pid"]):
@@ -407,6 +447,18 @@ def resume_now(reason: str = "manual") -> dict:
     return {"ok": True, "resumed": resumed, "not_alive": not_alive}
 
 
+@_serialized
+def resume_pid(pid: int) -> bool:
+    """Resume one process and take it off the record.  Left on it, a later
+    pause_pid() of the same process took it for still suspended and did
+    nothing."""
+    pid = int(pid)
+    if not _resume_pid(pid):
+        return False
+    _write_recorded_pids([p for p in _recorded_pids() if p.get("pid") != pid])
+    return True
+
+
 def recover_orphans() -> dict:
     """Called at Vispora startup.  If a previous run died mid-game and
     left processes suspended, resume them now so the user isn't stuck with
@@ -415,7 +467,7 @@ def recover_orphans() -> dict:
     if not state or not state.get("pids"):
         return {"ok": True, "orphans": 0}
     log.warning(f"Background pauser: detected {len(state['pids'])} orphan(s) "
-                f"from previous run — resuming now")
+                f"from previous run, resuming now")
     return resume_now(reason="orphan-recovery")
 
 

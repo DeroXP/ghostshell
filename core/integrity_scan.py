@@ -603,6 +603,24 @@ def _phase_a2_prune_driver_cache(deadline_ts: float) -> dict:
 
 # ─── Phase B: Windows temp + Recycle Bin ─────────────────────────────
 
+def _too_broad_for_temp(real: str) -> bool:
+    """A drive root, or a folder holding the user profile or the app's data.
+    TEMP set to one of those (a second drive's root, say) would have Phase B
+    deleting every week-old file under 100 MB in it."""
+    p = os.path.normcase(real).rstrip("\\/")
+    if not os.path.splitdrive(p)[1]:
+        return True
+    for keep in (os.environ.get("USERPROFILE"), os.environ.get("LOCALAPPDATA"), APPDATA_DIR):
+        if keep:
+            try:
+                k = os.path.normcase(os.path.realpath(keep)).rstrip("\\/")
+            except OSError:
+                continue
+            if k == p or k.startswith(p + os.sep):
+                return True
+    return False
+
+
 def _phase_b_temp_cleanup(deadline_ts: float, settings: dict) -> dict:
     """Clean OS temp files older than 7 days that we can open for write.
     Skips locked / in-use files (those are by definition still relevant
@@ -634,7 +652,9 @@ def _phase_b_temp_cleanup(deadline_ts: float, settings: dict) -> dict:
     except OSError:
         win_dir_real = win_dir.lower()
     for d in temp_dirs:
-        if not d or not os.path.isdir(d):
+        # (isabs: with LOCALAPPDATA empty the third entry is just "Temp", a
+        # folder of whatever the working directory happens to be)
+        if not d or not os.path.isabs(d) or not os.path.isdir(d):
             continue
         try:
             real = os.path.realpath(d)
@@ -645,6 +665,10 @@ def _phase_b_temp_cleanup(deadline_ts: float, settings: dict) -> dict:
         if real.lower().startswith(win_dir_real + os.sep) or real.lower() == win_dir_real:
             log.info(f"skipping system-owned temp dir {real}")
             skipped["system_dir_blocked"] = skipped.get("system_dir_blocked", 0) + 1
+            continue
+        if _too_broad_for_temp(real):
+            log.info(f"skipping temp dir {real}: a drive root or a folder holding the user's data")
+            skipped["too_broad_blocked"] = skipped.get("too_broad_blocked", 0) + 1
             continue
         seen_real.add(real)
         candidates.append(real)
@@ -803,9 +827,12 @@ def _phase_c_health_probe(deadline_ts: float) -> dict:
 
     # ---- Disk SMART status (WMIC) ----
     try:
+        # The same Win32_DiskDrive rows through PowerShell: wmic.exe is not on
+        # current Windows 11, and there this check never ran at all.
         r = subprocess.run(
-            ["wmic", "diskdrive", "get", "Model,Status", "/format:csv"],
-            capture_output=True, text=True, timeout=8,
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-CimInstance Win32_DiskDrive | ForEach-Object { '{0},{1},{2}' -f $_.SystemName, $_.Model, $_.Status }"],
+            capture_output=True, text=True, timeout=15,
             creationflags=_CREATE_NO_WINDOW,
         )
         bad = []
@@ -880,9 +907,11 @@ def _phase_c_health_probe(deadline_ts: float) -> dict:
     # ---- Recent service crashes (event log) ----
     try:
         # Last 1 day, system log, errors only.  Limit to 100 records.
+        # (Level 2 is Error.  LevelDisplayName is translated, so the old
+        # 'Error' match found nothing on a non-English Windows.)
         ps = (
             "Get-WinEvent -LogName System -MaxEvents 200 -ErrorAction SilentlyContinue "
-            "| Where-Object { $_.LevelDisplayName -eq 'Error' "
+            "| Where-Object { $_.Level -eq 2 "
             "                 -and $_.TimeCreated -gt (Get-Date).AddHours(-24) } "
             "| Group-Object ProviderName "
             "| Sort-Object Count -Descending "
@@ -1053,7 +1082,7 @@ def run_once() -> dict:
     cycle["findings_count"] = findings_count
     cycle["mb_freed"]       = round(bytes_freed / (1024**2), 2)
     log.info(
-        f"integrity scan complete in {cycle['duration_sec']:.1f}s — "
+        f"integrity scan complete in {cycle['duration_sec']:.1f}s: "
         f"deleted {files_deleted} files freeing {cycle['mb_freed']:.1f} MB, "
         f"{findings_count} actionable finding(s)"
     )

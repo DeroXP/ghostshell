@@ -117,7 +117,7 @@ class PublicLicenseView(BaseModel):
     slots:        list[SlotView]
     note:         str = (
         "This is the complete server-side record for this license. "
-        "We have no other data — no email, no IP, no raw hardware IDs."
+        "We have no other data: no email, no IP, no raw hardware IDs."
     )
 
 
@@ -208,7 +208,7 @@ async def activate(
     if used >= settings.license_max_devices:
         raise HTTPException(
             409,
-            f"all {settings.license_max_devices} device slots in use — "
+            f"all {settings.license_max_devices} device slots in use: "
             "deactivate one from your portal first",
         )
     slot = await _next_free_slot(db, lic["id"])
@@ -232,7 +232,7 @@ async def activate(
         # generic 500.
         raise HTTPException(
             409,
-            f"all {settings.license_max_devices} device slots in use — "
+            f"all {settings.license_max_devices} device slots in use: "
             "deactivate one from your portal first",
         )
     log.info(f"License {lic['id']} activated on new slot {slot} "
@@ -272,7 +272,7 @@ async def validate(
     if slot_row is None:
         raise HTTPException(
             403,
-            "this hardware is not activated against this license — "
+            "this hardware is not activated against this license: "
             "call /activate first",
         )
 

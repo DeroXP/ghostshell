@@ -6,6 +6,12 @@ from core import cleaner, game_profiles
 
 log = get_logger("power")
 
+# Requests still in their cleanup pass.  cancel() empties this: Cancel pressed
+# during the cleanup found no shutdown to abort yet (`shutdown /a` fails), and
+# the forced shutdown went ahead once the pass was over.
+_waiting: set = set()
+_waiting_lock = threading.Lock()
+
 
 def _quick_cleanup() -> dict:
     """Fast cleanup pass — temp files, caches, RAM, DNS, prefetch. ~5-15s."""
@@ -55,20 +61,28 @@ def _quick_cleanup() -> dict:
 
     elapsed = round(time.time() - start, 1)
     result["elapsed_sec"] = elapsed
-    log.info(f"=== CLEANUP DONE in {elapsed}s — freed {cleaner._format_size(result['freed_bytes'])} ===")
+    log.info(f"=== CLEANUP DONE in {elapsed}s, freed {cleaner._format_size(result['freed_bytes'])} ===")
     return result
 
 
 def shutdown(delay_sec: int = 10, clean: bool = True) -> dict:
     """Run cleanup, then shut down the PC."""
     log.info(f"Shutdown requested (clean={clean}, delay={delay_sec}s)")
+    token = object()
+    with _waiting_lock:
+        _waiting.add(token)
 
     def _run():
         if clean:
             _quick_cleanup()
-        log.info(f"Issuing shutdown in {delay_sec}s...")
-        run_cmd(["shutdown", "/s", "/f", "/t", str(max(1, delay_sec)),
-                 "/c", "Vispora: cleanup complete — shutting down"], timeout=10)
+        with _waiting_lock:
+            if token not in _waiting:
+                log.info("Shutdown cancelled during the cleanup pass")
+                return
+            _waiting.discard(token)
+            log.info(f"Issuing shutdown in {delay_sec}s...")
+            run_cmd(["shutdown", "/s", "/f", "/t", str(max(1, delay_sec)),
+                     "/c", "Vispora: cleanup complete, shutting down"], timeout=10)
 
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "action": "shutdown", "delay": delay_sec, "clean": clean}
@@ -77,13 +91,21 @@ def shutdown(delay_sec: int = 10, clean: bool = True) -> dict:
 def restart(delay_sec: int = 10, clean: bool = True) -> dict:
     """Run cleanup, then restart the PC."""
     log.info(f"Restart requested (clean={clean}, delay={delay_sec}s)")
+    token = object()
+    with _waiting_lock:
+        _waiting.add(token)
 
     def _run():
         if clean:
             _quick_cleanup()
-        log.info(f"Issuing restart in {delay_sec}s...")
-        run_cmd(["shutdown", "/r", "/f", "/t", str(max(1, delay_sec)),
-                 "/c", "Vispora: cleanup complete — restarting"], timeout=10)
+        with _waiting_lock:
+            if token not in _waiting:
+                log.info("Restart cancelled during the cleanup pass")
+                return
+            _waiting.discard(token)
+            log.info(f"Issuing restart in {delay_sec}s...")
+            run_cmd(["shutdown", "/r", "/f", "/t", str(max(1, delay_sec)),
+                     "/c", "Vispora: cleanup complete, restarting"], timeout=10)
 
     threading.Thread(target=_run, daemon=True).start()
     return {"ok": True, "action": "restart", "delay": delay_sec, "clean": clean}
@@ -91,9 +113,13 @@ def restart(delay_sec: int = 10, clean: bool = True) -> dict:
 
 def cancel() -> dict:
     """Cancel a pending shutdown/restart (if the delay hasn't elapsed)."""
+    with _waiting_lock:         # (waits for a shutdown being issued right now, so /a catches it)
+        cleaning = bool(_waiting)
+        _waiting.clear()
     r = run_cmd(["shutdown", "/a"], timeout=5)
-    log.info("Shutdown/restart cancelled" if r["ok"] else "No pending shutdown to cancel")
-    return {"ok": r["ok"]}
+    ok = r["ok"] or cleaning
+    log.info("Shutdown/restart cancelled" if ok else "No pending shutdown to cancel")
+    return {"ok": ok}
 
 
 def cleanup_only() -> dict:

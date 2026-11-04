@@ -141,7 +141,7 @@ def probe_default_loopback() -> dict:
                 return {"ok": False, "name": dev["name"], "channels": 0,
                         "rate": 0, "index": -1,
                         "err": f"no loopback analogue for {dev['name']!r} "
-                               f"— device may not support shared-mode loopback"}
+                               f"(device may not support shared-mode loopback)"}
             dev = picked
         return {
             "ok":       True,

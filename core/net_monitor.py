@@ -303,7 +303,7 @@ def pause_process(pid: int) -> dict:
 def resume_process(pid: int) -> dict:
     try:
         from core import background_pauser
-        ok = background_pauser._resume_pid(int(pid))
+        ok = background_pauser.resume_pid(int(pid))
         if ok:
             return {"ok": True, "pid": int(pid)}
         return {"ok": False, "err": f"NtResumeProcess failed for PID {pid}"}

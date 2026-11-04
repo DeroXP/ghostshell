@@ -102,6 +102,7 @@ _thread: Optional[threading.Thread]   = None
 _stop:   Optional[threading.Event]    = None
 _lock                                  = threading.Lock()
 _bindings: dict = {}    # hotkey_id -> {hotkey_str, callback}
+_registered: dict = {}  # hotkey_id -> hotkey string Windows actually holds for us
 _last_err: str   = ""
 
 # Hotkey IDs — small integers passed to RegisterHotKey.  We map our
@@ -164,6 +165,7 @@ def _hotkey_loop(stop_event: threading.Event):
     _refresh_event = threading.Event()
 
     # First registration pass
+    _last_err = ""      # this pass's failures only; an old one outlived a good rebind
     registered = _register_all()
 
     msg = wintypes.MSG()
@@ -185,6 +187,7 @@ def _hotkey_loop(stop_event: threading.Event):
                 # re-register everything.
                 if _refresh_event and _refresh_event.is_set():
                     _refresh_event.clear()
+                    _last_err = ""
                     _unregister_all(registered)
                     registered = _register_all()
                 # Brief sleep so we don't busy-spin
@@ -209,12 +212,16 @@ def _register_all() -> list:
             continue
         if user32.RegisterHotKey(None, hk_id, mods, vk):
             out.append((hk_id, info["hotkey"]))
+            with _lock:
+                _registered[hk_id] = info["hotkey"]
             log.info(f"hotkey registered: {info['name']} = {info['hotkey']}")
         else:
-            err = ctypes.get_last_error()
+            # windll functions don't save the error for get_last_error(),
+            # which therefore always said "WinErr 0"
+            err = ctypes.GetLastError()
             _last_err = (f"RegisterHotKey({info['hotkey']}) failed: "
                           f"WinErr {err} (probably already grabbed by "
-                          f"another app — pick a different key)")
+                          f"another app, so pick a different key)")
             log.warning(_last_err)
     return out
 
@@ -233,12 +240,14 @@ def _unregister_all(registered: list) -> None:
     for hk_id, hotkey_str in registered:
         try:
             if not user32.UnregisterHotKey(None, hk_id):
-                err = ctypes.get_last_error()
+                err = ctypes.GetLastError()
                 _last_err = (f"UnregisterHotKey(id={hk_id}, {hotkey_str}) failed: "
-                             f"WinErr {err} — this hotkey may stay stuck registered")
+                             f"WinErr {err}, so this hotkey may stay stuck registered")
                 log.warning(_last_err)
         except Exception as e:
             log.warning(f"UnregisterHotKey(id={hk_id}, {hotkey_str}) raised: {e}")
+        with _lock:
+            _registered.pop(hk_id, None)
 
 
 def _fire_callback(hotkey_id: int) -> None:
@@ -319,9 +328,12 @@ def stop() -> dict:
 
 def get_status() -> dict:
     with _lock:
+        # The UI shows these as "Registered": leave out a key Windows refused
+        # (or one not re-registered yet after a rebind).
         bindings = [
             {"name": v["name"], "hotkey": v["hotkey"]}
-            for v in _bindings.values()
+            for k, v in _bindings.items()
+            if _registered.get(k) == v["hotkey"]
         ]
     return {
         "running":   bool(_thread and _thread.is_alive()),

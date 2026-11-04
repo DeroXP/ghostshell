@@ -333,6 +333,9 @@ _runtime: dict[str, Any] = {
     "climb_target":        None,       # (core, mem) remembered offset above baseline
 }
 _lock = threading.Lock()
+# One session start or end at a time, and no offset written by a tuning loop
+# whose session has ended (see _one_session_change and _loop_apply).
+_session_lock = threading.RLock()
 
 
 # ─── Persistence helpers (shared with crash_recovery + temp_ceiling pattern) ─
@@ -436,7 +439,7 @@ def resume(source: str) -> dict:
     with _pause_lock:
         _pause_sources.discard(src)
         sources = set(_pause_sources)
-    log.info(f"AT resume({src}) — remaining sources: {sources}")
+    log.info(f"AT resume({src}), remaining sources: {sources}")
     return {"ok": True, "paused": bool(sources), "sources": sorted(sources)}
 
 
@@ -460,7 +463,7 @@ def _load_cross_game_blacklist() -> list:
 
 
 def _save_cross_game_blacklist(entries: list) -> None:
-    _save_json(CROSS_GAME_BLACKLIST_PATH, entries[:500])   # cap to last 500
+    _save_json(CROSS_GAME_BLACKLIST_PATH, entries[-500:])   # cap to last 500
 
 
 def add_cross_game_blacklist(core: int, mem: int,
@@ -999,7 +1002,7 @@ def clear_runtime_if_orphaned() -> dict:
     if _target_process_alive(cur_exe):
         return {"orphan": False, "active_exe": cur_exe}
     log.warning(f"AT orphan detected: runtime says '{cur_exe}' is active but "
-                f"no such process is running — clearing runtime")
+                f"no such process is running, clearing runtime")
     with _lock:
         _runtime["active_exe"]      = None
         _runtime["active_display"]  = None
@@ -1185,7 +1188,7 @@ def get_diagnostics() -> dict:
             "level": "info",
             "code":  "no_foreground_game",
             "msg":   "No game detected in the foreground.",
-            "fix":   "Launch a game (windowed/borderless) — Vispora scans the foreground window every 3 s.",
+            "fix":   "Launch a game (windowed/borderless). Vispora scans the foreground window every 3 s.",
         })
     elif not fg_known:
         blockers.append({
@@ -1205,7 +1208,7 @@ def get_diagnostics() -> dict:
         blockers.append({
             "level": "info",
             "code":  "paused",
-            "msg":   f"AT is currently paused — sources: {', '.join(get_pause_sources()) or 'unknown'}",
+            "msg":   f"AT is currently paused (sources: {', '.join(get_pause_sources()) or 'unknown'})",
             "fix":   "Click 'Resume AT' once the active capture/measurement is done.",
         })
 
@@ -1225,7 +1228,7 @@ def get_diagnostics() -> dict:
             next_action = {
                 "phase":     "warmup",
                 "remaining": round(eff_warmup - seconds_in, 1),
-                "msg":       f"In warmup — {round(eff_warmup - seconds_in, 1)} s left "
+                "msg":       f"In warmup: {round(eff_warmup - seconds_in, 1)} s left "
                              f"before AT starts scoring stability.",
             }
         elif rt.get("last_score") is None:
@@ -1239,8 +1242,8 @@ def get_diagnostics() -> dict:
                 "phase":         "tuning",
                 "consecutive_good": cg,
                 "consecutive_required": eff_cg,
-                "msg": f"Score {rt.get('last_score')} ({rt.get('last_verdict')}) — "
-                       f"need {eff_cg} consecutive 'healthy' polls to step up "
+                "msg": f"Score {rt.get('last_score')} ({rt.get('last_verdict')}). "
+                       f"Need {eff_cg} consecutive 'healthy' polls to step up "
                        f"({cg}/{eff_cg} so far).",
             }
 
@@ -1347,8 +1350,8 @@ def _is_safe_to_step_to(exe: str, core: int, mem: int,
     if (axis == "core" and health["power_pct"] > 0
             and health["power_pct"] >= power_bound):
         return False, (f"power-bound: {health['power_pct']}% of "
-                       f"{int(health['power_max_w'])}W ≥ {power_bound}% "
-                       "— additional core would throttle")
+                       f"{int(health['power_max_w'])}W ≥ {power_bound}%, "
+                       "so additional core would throttle")
     return True, "ok"
 
 
@@ -1480,6 +1483,15 @@ def _at_check_offset_drift(exe: str, target_core: int, target_mem: int) -> dict:
                    or abs(mem_off_drift) > _AT_DRIFT_TOLERANCE_MHZ)
         if drifted:
             out["drifted"] = True
+            # The temperature ceiling resets the card to stock on purpose, and
+            # cannot trip again during its cooldown: re-asserting here put the
+            # overclock back on a card that was too hot, unprotected.
+            try:
+                from core import temp_ceiling
+                if temp_ceiling.get_status().get("cooldown_remaining_s") is not None:
+                    return out
+            except Exception:
+                pass
             log.info(
                 f"AT drift detected ({exe}): core +{actual_core} vs "
                 f"+{int(target_core)} (Δ {core_off_drift:+d}), mem "
@@ -1522,7 +1534,7 @@ def _apply_offsets(exe: str, core: int, mem: int, reason: str) -> bool:
             from core import temp_ceiling
             tc = temp_ceiling.get_status()
             if tc.get("cooldown_remaining_s") is not None:
-                log.warning(f"AT skipping apply — temp_ceiling in cooldown for "
+                log.warning(f"AT skipping apply: temp_ceiling in cooldown for "
                             f"{tc['cooldown_remaining_s']}s")
                 return False
         except Exception:
@@ -1562,6 +1574,27 @@ def _apply_offsets(exe: str, core: int, mem: int, reason: str) -> bool:
         return False
 
 
+def _one_session_change(fn):
+    """Session starts and ends one at a time.  Interleaved, an end could wipe
+    the session that had just started (its loop then ran on out of reach), or
+    close one session twice."""
+    def locked(*a, **k):
+        with _session_lock:
+            return fn(*a, **k)
+    locked.__name__, locked.__doc__ = fn.__name__, fn.__doc__
+    return locked
+
+
+def _loop_apply(stop_event: threading.Event, exe: str, core: int, mem: int, reason: str) -> bool:
+    """_apply_offsets for the tuning loop: nothing once its session has ended.
+    A loop mid-poll when on_game_exit ran used to write its offset after the
+    card had been put back, and it stayed there."""
+    with _session_lock:
+        if stop_event.is_set():
+            return False
+        return _apply_offsets(exe, core, mem, reason)
+
+
 # ─── Tuning loop ─────────────────────────────────────────────────────────
 def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> None:
     """Per-session loop.  Sleeps WARMUP, then evaluates the stability
@@ -1572,7 +1605,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
     the default mode is visual."""
     p = _preset_for(exe)
     mode = _get_mode(exe)
-    log.info(f"AT loop started for {display_name} ({exe}) — mode={mode}, "
+    log.info(f"AT loop started for {display_name} ({exe}): mode={mode}, "
              f"step={p['core_step_mhz']}/{p['mem_step_mhz']}, "
              f"thresholds={p['max_score_to_step_down']}/{p['min_score_to_step_up']}")
     # v3.1 — opening-phase aware warmup + consecutive-good threshold.
@@ -1609,10 +1642,26 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
         if stop_event.wait(remaining):
             return  # game exited during the guard — never applied the climb
     if climb_target:
+        # The main loop checks the pause requests (a capture or latency
+        # measurement under way) and the off switch before it changes
+        # anything; the jump did not.  Paused or off: no jump.
+        paused = is_paused()
+        try:
+            still_on = bool(get_settings().get("enabled_globally")
+                            and get_game_state(exe).get("enabled"))
+        except Exception:
+            still_on = True          # can't tell, so not switched off
+        if paused or not still_on:
+            log.info(f"AT startup guard: no jump to core+{climb_target[0]}/mem+{climb_target[1]} "
+                     f"({'paused' if paused else 'switched off'}), holding baseline")
+            with _lock:
+                _runtime["climb_target"] = None
+            climb_target = None
+    if climb_target:
         tc, tm = int(climb_target[0]), int(climb_target[1])
         safe, why = _is_safe_to_step_to(exe, tc, tm, "core")
         if safe:
-            if _apply_offsets(exe, tc, tm, "post-startup-ffwd"):
+            if _loop_apply(stop_event, exe, tc, tm, "post-startup-ffwd"):
                 st = get_game_state(exe)
                 st["current_core"] = tc
                 st["current_mem"]  = tm
@@ -1621,7 +1670,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                     _runtime["current_core"] = tc
                     _runtime["current_mem"]  = tm
                     _runtime["climb_target"] = None
-                log.info(f"AT survived startup guard — fast-forwarded to "
+                log.info(f"AT survived startup guard, fast-forwarded to "
                          f"remembered core+{tc}/mem+{tm}")
         else:
             # The remembered offset can't be fast-forwarded right now.  Split the
@@ -1642,7 +1691,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                 _runtime["climb_target"] = None
             if transient:
                 log.info(f"AT startup guard: deferring fast-forward to core+{tc}/"
-                         f"mem+{tm} (transient: {why}) — holding baseline, keeping "
+                         f"mem+{tm} (transient: {why}). Holding baseline, keeping "
                          f"the learned offset for later this session / next launch")
             else:
                 st = get_game_state(exe)
@@ -1655,7 +1704,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                     _runtime["current_core"] = bcore
                     _runtime["current_mem"]  = bmem
                 log.warning(f"AT startup guard: remembered core+{tc}/mem+{tm} no "
-                            f"longer safe ({why}) — reset to baseline core+{bcore}/"
+                            f"longer safe ({why}). Reset to baseline core+{bcore}/"
                             f"mem+{bmem}, will re-explore")
 
     # Alternate which axis we bump first — start with core (more visible
@@ -1688,7 +1737,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
         if not _target_process_alive(exe):
             missed_proc_polls += 1
             if missed_proc_polls >= MISSED_PROC_THRESHOLD:
-                log.info(f"AT self-clean: {exe} no longer running — releasing engagement")
+                log.info(f"AT self-clean: {exe} no longer running, releasing engagement")
                 # Defer to the normal exit handler so session totals + notify
                 # logic run.  Pass was_crash=False since we don't know.
                 try:
@@ -1698,11 +1747,13 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                     log.warning(f"AT self-clean on_game_exit failed: {e}")
                 # Even if on_game_exit failed, force the runtime back to
                 # idle so the UI stops showing 'playing now' forever.
+                # (Not when it is a newer session's by now.)
                 with _lock:
-                    _runtime["active_exe"]      = None
-                    _runtime["active_display"]  = None
-                    _runtime["loop_thread"]     = None
-                    _runtime["loop_stop"]       = None
+                    if _runtime["loop_stop"] is stop_event:
+                        _runtime["active_exe"]      = None
+                        _runtime["active_display"]  = None
+                        _runtime["loop_thread"]     = None
+                        _runtime["loop_stop"]       = None
                 return
         else:
             missed_proc_polls = 0
@@ -1715,13 +1766,35 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
         except Exception:
             still_on = True          # can't tell — don't tear the session down
         if not still_on:
-            log.info(f"AT switched off mid-session for {exe} — ending session")
+            log.info(f"AT switched off mid-session for {exe}, ending session")
             try:
                 on_game_exit(exe, display_name, was_crash=False,
                              reason="disabled mid-session")
             except Exception as e:
                 log.warning(f"AT mid-session shutdown failed: {e}")
             return
+
+        # The game can restart into a new process (an anti-cheat bootstrap,
+        # an update) and game mode follows it.  Frame telemetry and the
+        # gameplay classifier have to as well: left on the old PID, the game
+        # never counted as in the foreground and no decision was made.
+        try:
+            from core import game_profiles
+            info = game_profiles.get_active_game_info() or {}
+            new_pid = info.get("pid")
+            if (new_pid and new_pid != _runtime.get("target_pid")
+                    and _norm_exe(info.get("exe") or "") == _norm_exe(exe)):
+                with _session_lock:
+                    if not stop_event.is_set() and new_pid != _runtime.get("target_pid"):
+                        from core import frame_telemetry, gameplay_state
+                        log.info(f"AT: {exe} is now PID {new_pid}, following it")
+                        with _lock:
+                            _runtime["target_pid"] = new_pid
+                        frame_telemetry.stop_tracking()
+                        frame_telemetry.start_tracking(pid=new_pid, exe_name=_norm_exe(exe))
+                        gameplay_state.set_target(_norm_exe(exe), new_pid)
+        except Exception as e:
+            log.debug(f"AT could not follow the game's new process: {e}")
 
         # v3.1.2 — Out-of-band crash detection.  Did a TDR / driver crash
         # / BSOD fire since this AT session started, BUT after the last
@@ -1794,7 +1867,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                                   "mem":  max(0, cm - floor_mem)},
                     "reason": f"out-of-band crash detected: {cs.get('kind') or 'unknown'}",
                 })
-                if _apply_offsets(exe, floor_core, floor_mem, "oob-step-down"):
+                if _loop_apply(stop_event, exe, floor_core, floor_mem, "oob-step-down"):
                     with _lock:
                         _runtime["current_core"] = floor_core
                         _runtime["current_mem"]  = floor_mem
@@ -1802,7 +1875,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                         _runtime["step_count"] += 1
                 log.error(
                     f"AT OOB step-down: {exe} crashed at core+{cc}/mem+{cm} "
-                    f"(kind={cs.get('kind')}) — reverted to baseline "
+                    f"(kind={cs.get('kind')}), reverted to baseline "
                     f"core+{floor_core}/mem+{floor_mem}"
                 )
                 # Clear the crash state so we don't re-fire on the next
@@ -1822,7 +1895,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
         if is_paused():
             with _lock:
                 _runtime["last_reason"] = f"paused: {', '.join(sorted(_pause_sources)) or 'unknown'}"
-            log.debug(f"AT loop paused — sources: {sorted(_pause_sources)}")
+            log.debug(f"AT loop paused (sources: {sorted(_pause_sources)})")
             if stop_event.wait(poll):
                 return
             continue
@@ -1840,12 +1913,21 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
             # In dry-run the "current" offsets are only what AT WOULD have
             # applied; re-asserting them here wrote them to the GPU for real.
             if not bool(get_game_state(exe).get("dry_run")):
-                _at_check_offset_drift(exe, _at_target_core, _at_target_mem)
+                with _session_lock:     # (it writes too: not once the session has ended)
+                    if not stop_event.is_set():
+                        _at_check_offset_drift(exe, _at_target_core, _at_target_mem)
         except Exception as _e:
             log.debug(f"AT drift check failed: {_e}")
 
         try:
             from core import perf_monitor
+            # A mode changed mid-session (set_game_mode, tournament mode)
+            # applies from this poll on, as set_game_mode promises; the
+            # preset used to be read once, at loop start.
+            p = _preset_for(exe)
+            poll = int(p["score_poll_interval_s"])
+            good_threshold = int(p["min_score_to_step_up"])
+            bad_threshold  = int(p["max_score_to_step_down"])
             score_data = perf_monitor.compute_stability_score(seconds=poll + 5)
             score = score_data.get("score")
             verdict = score_data.get("verdict", "no-data")
@@ -1872,15 +1954,15 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                 if ft_var_pct >= 40 and verdict in ("healthy", "warn"):
                     verdict = "unstable"
                     frame_downgrade_reason = (
-                        f"frametime σ {ft_var_pct:.0f}% of mean — "
-                        f"game is stuttering badly even though GPU looks OK"
+                        f"frametime σ {ft_var_pct:.0f}% of mean. "
+                        f"Game is stuttering badly even though GPU looks OK"
                     )
                     log.warning(f"AT verdict downgrade: {frame_downgrade_reason}")
                 elif ft_var_pct >= 25 and verdict == "healthy":
                     # Soft downgrade — hold instead of stepping up
                     verdict = "warn"
                     frame_downgrade_reason = (
-                        f"frametime σ {ft_var_pct:.0f}% — holding "
+                        f"frametime σ {ft_var_pct:.0f}%, holding "
                         f"(no step-up while frames are uneven)"
                     )
                     log.info(f"AT verdict softened: {frame_downgrade_reason}")
@@ -1944,17 +2026,17 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                 with _lock:
                     if gameplay_phase == "baseline-building":
                         _runtime["last_reason"] = (
-                            f"baseline-building — gathering reference samples "
+                            f"baseline-building: gathering reference samples "
                             f"for this game ({gs_result.get('reasons', [''])[0] if gs_result.get('reasons') else ''})"
                         )
                     elif gameplay_phase == "menu":
                         _runtime["last_reason"] = (
-                            "menu detected — skipping tuning decisions "
+                            "menu detected, skipping tuning decisions "
                             f"({gs_result.get('reasons', [''])[0] if gs_result.get('reasons') else ''})"
                         )
                     elif gameplay_phase == "transitional":
                         _runtime["last_reason"] = (
-                            "transitional state — waiting for stable classification"
+                            "transitional state: waiting for stable classification"
                         )
                 log.debug(f"AT skipping decision: phase={gameplay_phase} "
                           f"conf={gs_result.get('confidence', 0):.2f}")
@@ -1965,7 +2047,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
             if score is None:
                 # Idle / no data → just keep sampling, don't change anything.
                 # Surface util in the log so the user can see why.
-                log.debug(f"AT poll: no score ({verdict}) — "
+                log.debug(f"AT poll: no score ({verdict}), "
                           f"util={score_data.get('last_util')}% "
                           f"avg={score_data.get('avg_util')}% "
                           f"max={score_data.get('max_util')}%")
@@ -2024,7 +2106,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                     "reason": "score below threshold",
                 })
 
-                if _apply_offsets(exe, new_core, new_mem, "step-down"):
+                if _loop_apply(stop_event, exe, new_core, new_mem, "step-down"):
                     with _lock:
                         _runtime["current_core"] = new_core
                         _runtime["current_mem"]  = new_mem
@@ -2133,7 +2215,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
 
                     # Apply!  v3.1 records step metadata for the rich
                     # decision log + ticks hot_streak.
-                    if _apply_offsets(exe, proposed_core, proposed_mem, "step-up"):
+                    if _loop_apply(stop_event, exe, proposed_core, proposed_mem, "step-up"):
                         state = get_game_state(exe)
                         state["current_core"] = proposed_core
                         state["current_mem"]  = proposed_mem
@@ -2227,6 +2309,7 @@ def on_game_start(exe: str, display_name: str | None) -> dict:
     return _engage(exe, display_name, state)
 
 
+@_one_session_change
 def _engage(exe: str, display_name: str | None, state: dict) -> dict:
     """Apply this game's saved offsets + spin up the tuning loop.
     Shared by `on_game_start` (called from game_profiles when a game
@@ -2244,7 +2327,7 @@ def _engage(exe: str, display_name: str | None, state: dict) -> dict:
     if revert is not None:
         rc, rm = revert
         log.warning(f"AT auto-revert for {display_name}: crash after step-up at "
-                    f"core+{state.get('current_core',0)}/mem+{state.get('current_mem',0)} — "
+                    f"core+{state.get('current_core',0)}/mem+{state.get('current_mem',0)}, "
                     f"reverting to core+{rc}/mem+{rm}")
         state["current_core"]    = rc
         state["current_mem"]     = rm
@@ -2292,8 +2375,13 @@ def _engage(exe: str, display_name: str | None, state: dict) -> dict:
         from core import gpu_overclock
         # Remember what was on the card before AT touched it, so the session
         # can hand back exactly that when it ends (see on_game_exit).
+        # A session still open (game mode restored and detected the game
+        # again, or its next launch came before the exit was handled) keeps
+        # its own: the card holds that session's offset now, which used to
+        # be handed back as "before AT" when the game closed.
         with _lock:
-            _runtime["pre_engage_oc"] = gpu_overclock.get_applied_oc()
+            if not (_runtime.get("active_exe") and _runtime.get("pre_engage_oc")):
+                _runtime["pre_engage_oc"] = gpu_overclock.get_applied_oc()
         gpu_overclock.pause_oc_watchdog("adaptive_tuning")
     except Exception as e:
         log.warning(f"pause_oc_watchdog failed: {e}")
@@ -2355,6 +2443,9 @@ def _engage(exe: str, display_name: str | None, state: dict) -> dict:
             if info and (info.get("exe") or "").lower() == _norm_exe(exe):
                 target_pid = info.get("pid")
         except Exception: pass
+        with _lock:
+            _runtime["target_pid"] = target_pid     # (the loop follows the game to a new PID)
+        frame_telemetry.stop_tracking()     # (a session still open: start_tracking leaves its sampler running)
         frame_telemetry.start_tracking(pid=target_pid, exe_name=_norm_exe(exe))
     except Exception as e:
         log.debug(f"frame_telemetry.start_tracking failed: {e}")
@@ -2368,7 +2459,7 @@ def _engage(exe: str, display_name: str | None, state: dict) -> dict:
     except Exception as e:
         log.debug(f"gameplay_state.set_target failed: {e}")
 
-    log.info(f"AT engaged for {display_name} — applied core+{engage_core}/"
+    log.info(f"AT engaged for {display_name}: applied core+{engage_core}/"
              f"mem+{engage_mem}"
              + (f" (holding baseline; will climb to core+{cc}/mem+{cm} after "
                 f"startup guard)" if climb_target else "")
@@ -2456,8 +2547,10 @@ def end_active_session(reason: str = "") -> dict:
     return on_game_exit(exe, name, was_crash=False, reason=reason)
 
 
+@_one_session_change
 def on_game_exit(exe: str, display_name: str | None,
-                 was_crash: bool = False, reason: str = "") -> dict:
+                 was_crash: bool = False, reason: str = "",
+                 exited_at: Optional[float] = None) -> dict:
     """Called by game_profiles when a tracked game exits, OR by the
     tuning loop's self-clean path when it detects the game's process is
     gone but no exit event arrived (game_profiles missed it).  Stops the
@@ -2465,6 +2558,8 @@ def on_game_exit(exe: str, display_name: str | None,
 
     `reason` lets callers distinguish e.g. 'self-clean: process gone'
     from a normal exit — only used for logging and the notification text.
+    `exited_at`: when the game was seen gone.  A session started after
+    that is its next launch, which this call must leave running.
     """
     with _lock:
         ev = _runtime["loop_stop"]
@@ -2480,6 +2575,11 @@ def on_game_exit(exe: str, display_name: str | None,
         log.debug(f"on_game_exit({exe}): AT not active here "
                   f"(runtime active_exe={active_exe})")
         return {"updated": False, "reason": "AT not active for this game"}
+    if exited_at and started and started > exited_at:
+        # Relaunched (after a crash, typically) before the crash check
+        # behind this call was done: that used to end the new session.
+        log.debug(f"on_game_exit({exe}): a newer session is running, left alone")
+        return {"updated": False, "reason": "a newer session is running"}
 
     if ev is not None:
         try: ev.set()

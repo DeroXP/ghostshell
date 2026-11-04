@@ -123,10 +123,10 @@ def _launch_one(app, skip_if_running) -> dict:
     name = app.get("name") or app.get("path")
     path = app.get("path", "")
     if not path or not os.path.exists(path):
-        log.warning(f"startup: '{name}' path missing — skip")
+        log.warning(f"startup: '{name}' path missing, skipping")
         return {"name": name, "ok": False, "reason": "missing"}
     if skip_if_running and _is_running(path):
-        log.info(f"startup: '{name}' already running — skip")
+        log.info(f"startup: '{name}' already running, skipping")
         return {"name": name, "ok": True, "reason": "already-running"}
     try:
         # De-elevate via explorer.exe — runs at the user's normal integrity
@@ -142,7 +142,7 @@ def _launch_one(app, skip_if_running) -> dict:
 
 def launch_all(manual=False) -> dict:
     if not _launch_lock.acquire(blocking=False):
-        log.info("startup: launch already in progress — skipping duplicate run")
+        log.info("startup: launch already in progress, skipping duplicate run")
         return {"ok": True, "skipped": "already-running"}
     try:
         s = _load()
@@ -154,7 +154,9 @@ def launch_all(manual=False) -> dict:
         results = []
         for i, a in enumerate(apps):
             if a.get("delay_s"):
-                time.sleep(a["delay_s"])
+                # The UI saves whatever is typed; a negative delay made sleep()
+                # raise, and no app after this one was ever launched.
+                time.sleep(max(0, int(a["delay_s"])))
             results.append(_launch_one(a, skip))
             if i < len(apps) - 1 and stagger:
                 time.sleep(stagger)
@@ -166,7 +168,7 @@ def launch_all(manual=False) -> dict:
 
 def launch_all_async(manual=False):
     if _launch_lock.locked():
-        log.info("startup: launch already in progress — ignoring extra trigger")
+        log.info("startup: launch already in progress, ignoring extra trigger")
         return {"ok": True, "started": False, "reason": "already-running"}
     threading.Thread(target=lambda: launch_all(manual=manual), daemon=True).start()
     return {"ok": True, "started": True}

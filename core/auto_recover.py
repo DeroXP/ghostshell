@@ -54,6 +54,7 @@ import time
 from typing import Optional
 
 from config import APPDATA_DIR
+from core import reg_originals
 from core.utils import run_cmd, run_ps, get_logger, atomic_write_json
 
 log = get_logger("auto_recover")
@@ -64,36 +65,53 @@ log = get_logger("auto_recover")
 _REPORT_PATH       = os.path.join(APPDATA_DIR, "recovery_report.json")
 _REPORT_SEEN_PATH  = _REPORT_PATH + ".seen"
 
+# The checks that have completed on this machine: looked and found nothing,
+# or reverted what they found.  Each runs until it gets there once, and then
+# never again: a value the user sets themselves later is theirs.  (They used
+# to run at every launch and revert the user's own settings, Reset All's
+# exact restores included.)  A check added in a later version is not on the
+# list, so it runs too.
+_DONE_PATH = os.path.join(APPDATA_DIR, "recovery_checks_done.json")
+
+
+def _load_done() -> set:
+    try:
+        with open(_DONE_PATH, "r", encoding="utf-8") as f:
+            return {str(x) for x in (json.load(f) or {}).get("done", [])}
+    except (OSError, ValueError, AttributeError, TypeError):
+        return set()
+
 
 # ─── Recovery primitives ───────────────────────────────────────────
+# A probe that cannot tell, and a revert that fails, raise: the check then
+# counts as not done and runs again at the next launch.
 
 def _reg_query(key: str, value: str) -> Optional[str]:
-    """Read a registry value.  Returns the value's data string, or
-    None if the key/value doesn't exist."""
-    r = run_cmd(["reg", "query", key, "/v", value], timeout=5)
-    if not r.get("ok"):
+    """Read a registry value.  Returns the value's data string (a DWORD as
+    `reg query` prints it, "0x1"), or None if the key/value doesn't exist."""
+    # (winreg, not `reg query`: that fails the same way for "not there"
+    # and for "could not look", and only the first one is "found nothing".)
+    cur = reg_originals.read_value(key, value)
+    if cur is None:
+        raise OSError(f"could not read {key}\\{value}")
+    if cur["type"] == reg_originals.ABSENT:
         return None
-    # Output looks like:
-    #   <key>
-    #       <value>    REG_DWORD    0x1
-    for line in (r.get("out") or "").splitlines():
-        line = line.strip()
-        if line.startswith(value + " ") or line.startswith(value + "\t"):
-            parts = line.split()
-            if len(parts) >= 3:
-                return parts[-1]
-    return None
+    return f"0x{cur['data']:x}" if isinstance(cur["data"], int) else str(cur["data"])
 
 
 def _reg_delete(key: str, value: str) -> bool:
     r = run_cmd(["reg", "delete", key, "/v", value, "/f"], timeout=5)
-    return bool(r.get("ok"))
+    if not r.get("ok"):
+        raise OSError(f"could not remove {key}\\{value}: {r.get('err') or r.get('out')}")
+    return True
 
 
 def _reg_set_dword(key: str, value: str, data: str) -> bool:
     r = run_cmd(["reg", "add", key, "/v", value, "/t", "REG_DWORD",
                   "/d", data, "/f"], timeout=5)
-    return bool(r.get("ok"))
+    if not r.get("ok"):
+        raise OSError(f"could not set {key}\\{value}: {r.get('err') or r.get('out')}")
+    return True
 
 
 # ─── Individual tweak checks ───────────────────────────────────────
@@ -113,7 +131,7 @@ def _check_bluetooth_absolute_volume() -> Optional[dict]:
         return {
             "id":             "bluetooth_absolute_volume",
             "label":          "Bluetooth absolute volume re-enabled",
-            "explanation":    "An older Vispora build disabled this — caused "
+            "explanation":    "An older Vispora build disabled this, which caused "
                               "audio stutter and one-channel-only playback on "
                               "modern headsets (AirPods, Sony XM, HyperX QuadCast, etc).",
             "action":         "removed registry value DisableAbsoluteVolume",
@@ -124,18 +142,19 @@ def _check_bluetooth_absolute_volume() -> Optional[dict]:
 def _check_recoveryenabled() -> Optional[dict]:
     r = run_cmd(["bcdedit", "/enum", "{current}"], timeout=5)
     if not r.get("ok"):
-        return None
+        raise OSError("the boot configuration could not be read")
     for line in (r.get("out") or "").splitlines():
         line = line.strip().lower()
         if line.startswith("recoveryenabled") and "no" in line:
-            run_cmd(["bcdedit", "/set", "{current}", "recoveryenabled", "Yes"], timeout=5)
+            if not run_cmd(["bcdedit", "/set", "{current}", "recoveryenabled", "Yes"], timeout=5).get("ok"):
+                raise OSError("recoveryenabled could not be set back to Yes")
             return {
                 "id":          "winre_disabled",
                 "label":       "Windows Recovery Environment re-enabled",
                 "explanation": "An older Vispora build set `recoveryenabled No` "
                                "in the boot config.  That prevented you from accessing "
                                "Startup Repair / Reset this PC / System Restore when "
-                               "a bad update broke boot — you'd have needed a Windows "
+                               "a bad update broke boot.  You'd have needed a Windows "
                                "installation USB to recover.",
                 "action":      "bcdedit /set {current} recoveryenabled Yes",
             }
@@ -147,19 +166,22 @@ def _check_ssd_defrag_task() -> Optional[dict]:
         "(Get-ScheduledTask -TaskName 'ScheduledDefrag' -ErrorAction SilentlyContinue).State",
         timeout=8,
     )
+    if not r.get("ok"):         # (a task that is not there prints nothing and exits 0)
+        raise OSError(f"the ScheduledDefrag task could not be read: {r.get('err')}")
     out = (r.get("out") or "").strip()
     if out and out.lower() == "disabled":
-        run_ps(
+        if not run_ps(
             "Get-ScheduledTask -TaskName 'ScheduledDefrag' -ErrorAction SilentlyContinue | "
             "Enable-ScheduledTask -ErrorAction SilentlyContinue",
             timeout=8,
-        )
+        ).get("ok"):
+            raise OSError("the ScheduledDefrag task could not be enabled")
         return {
             "id":          "ssd_defrag_disabled",
             "label":       "Weekly SSD TRIM schedule re-enabled",
             "explanation": "An older Vispora build disabled the 'ScheduledDefrag' "
                            "task, thinking it was defragging your SSD.  It actually "
-                           "runs TRIM/Retrim — the operation SSDs need to maintain "
+                           "runs TRIM/Retrim, the operation SSDs need to maintain "
                            "long-term performance.  Disabling it silently degrades "
                            "SSD speed over months.",
             "action":      "Enable-ScheduledTask ScheduledDefrag",
@@ -178,7 +200,7 @@ def _check_fso_global() -> Optional[dict]:
             "explanation": "An older Vispora build set GameDVR_FSEBehaviorMode=2 "
                            "(global FSO disable).  That breaks viewport rendering in "
                            "Roblox Studio, Unity Editor, Unreal Editor, and most 3D "
-                           "modeling tools — they render at black or wrong scale.",
+                           "modeling tools.  They render at black or wrong scale.",
             "action":      "GameDVR_FSEBehaviorMode 2 → 0 (Windows default)",
         }
     return None
@@ -196,7 +218,7 @@ def _check_prevent_indexing_outlook() -> Optional[dict]:
             "explanation": "An older Vispora build set PreventIndexingOutlook=1 "
                            "with a label claiming 'search indexer auto-throttle'.  "
                            "The actual effect was just to break Outlook's inbox "
-                           "search — emails wouldn't show up in search results.",
+                           "search: emails wouldn't show up in search results.",
             "action":      "removed PreventIndexingOutlook policy",
         }
     return None
@@ -262,7 +284,7 @@ def _check_memory_placebos() -> list[dict]:
             "explanation": "An older Vispora build set this to 1 with a 'perf' "
                            "label.  It's actually a security/forensics setting "
                            "that adds 30-120 seconds to shutdown by zeroing the "
-                           "entire pagefile — opposite of a perf tweak.",
+                           "entire pagefile, the opposite of a perf tweak.",
             "action":      "ClearPageFileAtShutdown 1 → 0",
         })
     return reverted
@@ -284,7 +306,7 @@ def _check_system_responsiveness() -> Optional[dict]:
             "label":       "Audio service breathing room restored",
             "explanation": "An older Vispora build set SystemResponsiveness=0, "
                            "which dedicated 100% of multimedia bandwidth to "
-                           "foreground threads — starving the Windows audio "
+                           "foreground threads, starving the Windows audio "
                            "service.  Symptoms: Discord crackling, in-game voice "
                            "stuttering under CPU load.  Microsoft's recommended "
                            "gaming value is 10 (= 90% foreground, 10% audio).",
@@ -296,16 +318,17 @@ def _check_system_responsiveness() -> Optional[dict]:
 def _check_useplatformtick() -> Optional[dict]:
     r = run_cmd(["bcdedit", "/enum", "{current}"], timeout=5)
     if not r.get("ok"):
-        return None
+        raise OSError("the boot configuration could not be read")
     if "useplatformtick" in (r.get("out") or "").lower():
-        run_cmd(["bcdedit", "/deletevalue", "{current}", "useplatformtick"], timeout=5)
+        if not run_cmd(["bcdedit", "/deletevalue", "{current}", "useplatformtick"], timeout=5).get("ok"):
+            raise OSError("useplatformtick could not be removed")
         return {
             "id":          "useplatformtick",
             "label":       "Platform-tick BCD flag removed",
             "explanation": "An older Vispora build set `useplatformtick yes` "
                            "in the boot config.  On Zen2+/Skylake+ systems this "
                            "forces the kernel to use HPET/ACPI for tick interrupts "
-                           "instead of TSC — RAISES idle wakeups instead of "
+                           "instead of TSC, which RAISES idle wakeups instead of "
                            "lowering them.  Removed.",
             "action":      "bcdedit /deletevalue useplatformtick",
         }
@@ -323,7 +346,7 @@ def _check_hubmode() -> Optional[dict]:
             "explanation": "An older Vispora build set HubMode=1 to hide Quick "
                            "Access from File Explorer's nav pane.  Microsoft removed "
                            "honoring of this registry value in Win11 23H2+, so the "
-                           "value just sits as an orphan policy — removed cleanly.",
+                           "value just sits as an orphan policy.  Removed cleanly.",
             "action":      "removed HubMode value",
         }
     return None
@@ -351,20 +374,29 @@ def recover_legacy_bad_tweaks() -> dict:
         _check_useplatformtick,
         _check_hubmode,
     ]
+    done = _load_done()
+    finished = set()
     reverted: list[dict] = []
     for fn in checks:
+        if fn.__name__ in done:
+            continue
         try:
             r = fn()
             if r:
                 reverted.append(r)
                 log.info(f"  reverted: {r['label']}")
+            finished.add(fn.__name__)
         except Exception as e:
             log.debug(f"  recovery check {fn.__name__} raised: {e}")
     # Memory placebos return a list, handle separately
-    try:
-        reverted.extend(_check_memory_placebos())
-    except Exception as e:
-        log.debug(f"  memory placebo check raised: {e}")
+    if _check_memory_placebos.__name__ not in done:
+        try:
+            reverted.extend(_check_memory_placebos())
+            finished.add(_check_memory_placebos.__name__)
+        except Exception as e:
+            log.debug(f"  memory placebo check raised: {e}")
+    if finished:
+        atomic_write_json(_DONE_PATH, {"done": sorted(done | finished)})
 
     if reverted:
         try:

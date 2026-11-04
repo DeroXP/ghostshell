@@ -67,7 +67,7 @@ async def cmd_mint(args: argparse.Namespace) -> int:
     print(f"  Email:        {args.email or '(none)'}")
     print(f"  Paid at:      {row['paid_at']}")
     print()
-    print("  Save the license key — it cannot be recovered if lost.")
+    print("  Save the license key: it cannot be recovered if lost.")
     print("  Paste it into the Vispora client to activate.")
     return 0
 

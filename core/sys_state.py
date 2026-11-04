@@ -66,7 +66,9 @@ def set_service_start(name: str, mode: str, stop: bool = False, scope: str = "op
     type it had first."""
     allow("service", [name])
     cur = service_start(name)
-    if cur is not None and cur != mode:
+    if cur is None:
+        return False        # not installed, or its start type could not be read: nothing changed
+    if cur != mode:
         reg_originals.remember_state("service", name, cur, scope)
     if stop:
         run_cmd(["sc", "stop", name])
@@ -76,6 +78,8 @@ def set_service_start(name: str, mode: str, stop: bool = False, scope: str = "op
 def _put_service(name: str, prior) -> bool:
     if prior not in SERVICE_MODES:
         return False
+    if (reg_originals.read_value(rf"{_SVC_ROOT}\{name}", "Start") or {}).get("type") == reg_originals.ABSENT:
+        return True         # uninstalled since: nothing to put back (kept, it would fail at every reset)
     if not _ok(run_cmd(["sc", "config", name, "start=", prior])):
         return False
     if prior in ("auto", "delayed-auto"):
@@ -99,7 +103,10 @@ def task_enabled(path: str) -> Optional[bool]:
 
 def disable_task(path: str, scope: str = "optimizer") -> bool:
     allow("task", [path])
-    if task_enabled(path):      # only a task that is enabled now is ours to switch back on later
+    enabled = task_enabled(path)
+    if enabled is None:
+        return False            # not there, or its state could not be read: nothing changed
+    if enabled:                 # only a task that is enabled now is ours to switch back on later
         reg_originals.remember_state("task", path, True, scope)
     return _ok(run_cmd(["schtasks", "/Change", "/TN", path, "/Disable"]))
 
@@ -143,10 +150,11 @@ def set_bcd(name: str, value: str, scope: str = "optimizer", current: Optional[d
     call when setting several."""
     allow("bcd", [name])
     vals = current if current is not None else bcd_values()
-    if vals is not None:
-        cur = vals.get(name.lower())
-        if cur is None or not bcd_same(cur, value):
-            reg_originals.remember_state("bcd", name, cur, scope)
+    if vals is None:
+        return False            # the boot entry could not be read: nothing changed (it could not be undone)
+    cur = vals.get(name.lower())
+    if cur is None or not bcd_same(cur, value):
+        reg_originals.remember_state("bcd", name, cur, scope)
     return _ok(run_cmd(["bcdedit", "/set", "{current}", name, value]))
 
 
@@ -184,7 +192,9 @@ def set_tcp_global(name: str, value, scope: str = "optimizer", current: Optional
     allow("tcp", [name])
     vals = current if current is not None else tcp_globals()
     cur = (vals or {}).get(name.lower())
-    if cur is not None and cur.lower() != str(value).lower():
+    if cur is None:
+        return False            # not readable, or not a parameter this Windows has: nothing changed
+    if cur.lower() != str(value).lower():
         reg_originals.remember_state("tcp", name, cur, scope)
     return _ok(run_cmd(["netsh", "int", "tcp", "set", "global", f"{name}={value}"]))
 
@@ -268,20 +278,27 @@ def enabled_features() -> Optional[set]:
     return on if rows else None
 
 
-def disable_features(names, scope: str = "optimizer") -> int:
-    """Switch optional features off; returns how many were actually on.  A
-    feature that is already off is skipped — each DISM call takes seconds."""
+def disable_features(names, scope: str = "optimizer") -> Optional[int]:
+    """Switch optional features off; returns how many were switched off, or
+    None when DISM could not say which are on (then none is touched: the
+    change could not be undone).  A feature that is already off is skipped —
+    each DISM call takes seconds."""
     names = list(names)
     allow("feature", names)
     on = enabled_features()
+    if on is None:
+        return None
     changed = 0
     for n in names:
-        if on is not None:
-            if n.lower() not in on:
-                continue
-            reg_originals.remember_state("feature", n, True, scope)
-        changed += 1
-        run_cmd(["dism", "/online", "/disable-feature", f"/featurename:{n}", "/norestart"], timeout=600)
+        if n.lower() not in on:
+            continue
+        reg_originals.remember_state("feature", n, True, scope)
+        r = run_cmd(["dism", "/online", "/english", "/disable-feature", f"/featurename:{n}", "/norestart"],
+                    timeout=600)
+        # Counted only when it worked.  DISM exits 3010, not 0, when the
+        # change needs a restart to finish.
+        if _ok(r) or "completed successfully" in (r.get("out") or "").lower():
+            changed += 1
     return changed
 
 
@@ -305,7 +322,9 @@ def fsutil_behavior(name: str) -> Optional[int]:
 def set_fsutil_behavior(name: str, value: int, scope: str = "optimizer") -> bool:
     allow("fsutil", [name])
     cur = fsutil_behavior(name)
-    if cur is not None and cur != int(value):
+    if cur is None:
+        return False            # its current value could not be read: nothing changed
+    if cur != int(value):
         reg_originals.remember_state("fsutil", name, cur, scope)
     return _ok(run_cmd(["fsutil", "behavior", "set", name, str(int(value))]))
 
@@ -343,7 +362,9 @@ def set_defender_pref(name: str, value: str, reads_back_as, scope: str = "optimi
     """`Set-MpPreference -<name> <value>`.  `reads_back_as` is how that value
     looks in defender_prefs() (an int for the enums, "HH:MM:SS" for times)."""
     allow("defender", [name])
-    if current and current.get(name) is not None and current[name] != reads_back_as:
+    if not current or current.get(name) is None:
+        return False            # its current value could not be read: nothing changed
+    if current[name] != reads_back_as:
         reg_originals.remember_state("defender", name, current[name], scope)
     return _ok(run_ps(f"Set-MpPreference -{name} {value} -ErrorAction SilentlyContinue"))
 
@@ -369,10 +390,11 @@ def add_defender_exclusion(kind: str, value: str, scope: str = "optimizer",
         return False
     name = f"{kind}:{value}"
     allow("defender-exclusion", [name])
-    if current is not None:
-        have = {str(x).lower() for x in (current.get(kind) or [])}
-        if value.lower() not in have:
-            reg_originals.remember_state("defender-exclusion", name, True, scope)
+    if current is None:
+        return False            # the exclusions could not be read: nothing changed (it could not be undone)
+    have = {str(x).lower() for x in (current.get(kind) or [])}
+    if value.lower() not in have:
+        reg_originals.remember_state("defender-exclusion", name, True, scope)
     return _ok(run_ps(f'Add-MpPreference -{kind} "{value}" -ErrorAction SilentlyContinue'))
 
 

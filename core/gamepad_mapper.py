@@ -515,7 +515,7 @@ def _load_state(use_cache: bool = True) -> dict:
         # the damaged copy so the user's work can still be recovered.
         try:
             os.replace(PROFILES_PATH, PROFILES_PATH + ".corrupt")
-            log.warning(f"gamepad profiles file was unreadable — kept as "
+            log.warning(f"gamepad profiles file was unreadable: kept as "
                         f"{PROFILES_PATH}.corrupt, starting from defaults")
         except OSError:
             pass
@@ -1124,9 +1124,11 @@ def set_capture_autofire(value: float) -> bool:
     applied (virtual pad is up), False otherwise — caller should surface
     a user-visible "you'll need to fire manually" hint in the latter
     case."""
-    if not is_virtual_pad_active():
-        return False
     v = max(0.0, min(1.0, float(value or 0.0)))
+    # A release always goes through: if the pad was down at that moment the
+    # pull stayed in the contributions and fired RT on the next pad.
+    if v > 0.0 and not is_virtual_pad_active():
+        return False
     with _outputs_lock:
         if v > 0.0:
             _vtrigger_contrib["rt"][_CAPTURE_AUTOFIRE_MID] = v
@@ -1197,7 +1199,7 @@ def calibrate_sticks_at_rest(duration_sec: float = 2.0,
 
     if samples == 0:
         return {"ok": False, "err": "no controller detected during the "
-                                    "calibration window — connect a pad first"}
+                                    "calibration window: connect a pad first"}
 
     dz_l = max(0.0, min(0.95, max_l + margin))
     dz_r = max(0.0, min(0.95, max_r + margin))
@@ -1229,7 +1231,7 @@ def calibrate_sticks_at_rest(duration_sec: float = 2.0,
                      f"(saved to profile '{pname}')")
         else:
             log.info(f"calibrated sticks at rest: L={dz_l:.4f} R={dz_r:.4f} "
-                     "(no active profile — not saved)")
+                     "(no active profile, so not saved)")
 
     return {
         "ok":          True,
@@ -1263,7 +1265,7 @@ def measure_latency(samples: int = 50) -> dict:
         return {"ok": False, "err": "mapper not running"}
     state = _load_state()
     if not state.get("enabled"):
-        return {"ok": False, "err": "mapper disabled — flip the master switch on"}
+        return {"ok": False, "err": "mapper disabled: flip the master switch on"}
     pname = state.get("active_profile")
     profile = state["profiles"].get(pname) if pname else None
     if not profile or profile.get("remap_mode") != "virtual_controller":
@@ -1924,6 +1926,7 @@ _virtual_pad_type = None         # "x360" | "ds4" — recreate when profile flip
 _hidhide_last_retry_ts = 0.0     # last time we tried to (re-)engage; throttle retries to once per N seconds
 _hidhide_retry_interval = 5.0
 _hidhide_last_engage_err: str = ""    # most recent engage failure detail, surfaced via status
+_hidhide_retry_thread: Optional[threading.Thread] = None    # retry engage in flight, if any
 
 # HidHide engagement state.  Set when we cloak the physical controller
 # from games; cleared on disengage so we always restore the user's prior
@@ -1936,8 +1939,14 @@ _pad_generation = 0
 # After a failed creation (ViGEmBus missing), don't try again before this.
 _vpad_retry_after = 0.0
 _VPAD_RETRY_BACKOFF_S = 10.0
+# The device scan taken before a pad is created runs on its own thread; the
+# poll loop creates the pad on a later tick, once the scan has finished.
+_vpad_scan_thread: Optional[threading.Thread] = None
+_vpad_scan: Optional[tuple] = None      # (finished at, gamepad-class instance IDs)
 # XInput slots occupied by our own virtual X360 pad — never read as input.
 _virtual_slots: set = set()
+# ...and those of the temporary pad test_virtual_pad() creates.
+_test_pad_slots: set = set()
 _hidhide_prior_state: dict | None = None
 _hidhide_hidden_ours: list[str] = []
 _hidhide_whitelisted_app: str = ""
@@ -1959,6 +1968,19 @@ def _hidhide_engage_if_needed(profile: dict):
         _hidhide_engage_locked(profile)
 
 
+def _hidhide_engage_for_pad(profile: dict, gen: int):
+    """Engage for the virtual pad of generation `gen`, unless that pad has
+    been closed or replaced since or the mapper is stopping.  Checked under
+    the lock every disengage takes, so an engage running off the poll thread
+    can't land after the pad's own undo and leave the controller hidden."""
+    try:
+        with _hidhide_lock:
+            if gen == _pad_generation and _virtual_pad is not None and not _stop.is_set():
+                _hidhide_engage_locked(profile)
+    except Exception as e:
+        log.debug(f"HidHide engage failed: {e}")
+
+
 def _hidhide_engage_locked(profile: dict):
     global _hidhide_engaged, _hidhide_prior_state
     global _hidhide_hidden_ours, _hidhide_whitelisted_app
@@ -1971,7 +1993,7 @@ def _hidhide_engage_locked(profile: dict):
     except Exception:
         return
     if not hidhide.is_installed().get("installed"):
-        log.debug("virtual_controller mode active but HidHide not installed — "
+        log.debug("virtual_controller mode active but HidHide not installed, so "
                   "games will see both physical and virtual pads")
         return
 
@@ -2096,13 +2118,27 @@ def _resolve_physical_controller_ids(profile: dict) -> list[str]:
     return instance_ids
 
 
+def _scan_before_pad_create():
+    """Snapshot the gamepad-class devices before a virtual pad is created
+    (see _ensure_virtual_pad).  A PowerShell call: seconds, at times."""
+    global _vpad_scan
+    try:
+        from core import interrupt_affinity as ia
+        ids = {d.get("instance_id") for d in ia.list_gamepad_class_instance_ids()
+               if d.get("instance_id")}
+    except Exception:
+        ids = set()
+    _vpad_scan = (time.time(), ids)
+
+
 def _ensure_virtual_pad(remap_mode: str, profile_name: Optional[str],
                         profile: Optional[dict]):
     """Lazy-create / tear-down the ViGEmBus virtual pad based on the
     active profile's remap_mode + virtual_pad_type.  Also engages /
     disengages HidHide based on the profile's hide_physical flag."""
     global _virtual_pad, _virtual_pad_for_profile, _virtual_pad_type
-    global _pad_generation, _vpad_retry_after, _virtual_slots, _hidhide_last_retry_ts
+    global _pad_generation, _vpad_retry_after, _virtual_slots, _hidhide_last_retry_ts, _hidhide_retry_thread
+    global _vpad_scan, _vpad_scan_thread
     want = (remap_mode == "virtual_controller")
     have = _virtual_pad is not None
     desired_pad_type = (profile or {}).get("virtual_pad_type", "x360")
@@ -2118,6 +2154,19 @@ def _ensure_virtual_pad(remap_mode: str, profile_name: Optional[str],
             # PowerShell device scan each time — the loop crawled at ~1 Hz,
             # and the hook queue overflowed and dropped key-ups meanwhile.
             return
+        # The pre-creation device scan used to run right here and stalled
+        # the loop the same way for every pad created.  It runs on its own
+        # thread now; this returns until it is done.  A result older than a
+        # moment may predate devices plugged in since, so it is taken again.
+        scan = _vpad_scan
+        if scan is None or time.time() - scan[0] > 2.0:
+            if not (_vpad_scan_thread and _vpad_scan_thread.is_alive()):
+                _vpad_scan = None
+                _vpad_scan_thread = threading.Thread(target=_scan_before_pad_create,
+                                                     daemon=True, name="vpad-pre-scan")
+                _vpad_scan_thread.start()
+            return
+        _vpad_scan = None
         if have:
             try: _virtual_pad.close()
             except Exception: pass
@@ -2130,11 +2179,7 @@ def _ensure_virtual_pad(remap_mode: str, profile_name: Optional[str],
             # Pre-creation snapshot so we can identify which gamepad-class
             # devices belong to the virtual pad we're about to create.  The
             # set-diff after creation IS our virtual pad's PnP InstanceIDs.
-            try:
-                pre_ids = {d.get("instance_id") for d in ia.list_gamepad_class_instance_ids()
-                           if d.get("instance_id")}
-            except Exception:
-                pre_ids = set()
+            pre_ids = scan[1]
             pre_slots = set(xi.get_connected_slots() or [])
             _virtual_pad = vg.create(pad_type=desired_pad_type)
             _virtual_pad_for_profile = profile_name
@@ -2178,7 +2223,7 @@ def _ensure_virtual_pad(remap_mode: str, profile_name: Optional[str],
                         except Exception as e:
                             log.debug(f"ViGEmBus instance-ID recording failed: {e}")
                         if profile is not None and gen == _pad_generation and _virtual_pad is not None:
-                            _hidhide_engage_if_needed(profile)
+                            _hidhide_engage_for_pad(profile, gen)
                     except Exception as e:
                         log.debug(f"post-pad-create settle failed: {e}")
                 threading.Thread(target=_post_create_settle,
@@ -2187,7 +2232,7 @@ def _ensure_virtual_pad(remap_mode: str, profile_name: Optional[str],
                                  name="vpad-post-create").start()
             else:
                 _vpad_retry_after = time.time() + _VPAD_RETRY_BACKOFF_S
-                log.warning("virtual pad creation failed — falling back to key emulation "
+                log.warning("virtual pad creation failed, falling back to key emulation "
                             f"(next attempt in {_VPAD_RETRY_BACKOFF_S:.0f}s)")
         except Exception as e:
             log.warning(f"virtual pad init failed: {e}")
@@ -2202,7 +2247,14 @@ def _ensure_virtual_pad(remap_mode: str, profile_name: Optional[str],
         now = time.time()
         if now - _hidhide_last_retry_ts >= _hidhide_retry_interval:
             _hidhide_last_retry_ts = now
-            _hidhide_engage_if_needed(profile)
+            # Off this thread: the engage shells out (sc, PowerShell, the
+            # HidHide CLI) and froze the loop, and with it the virtual pad
+            # and the hook queue, for as long as that took.
+            if not (_hidhide_retry_thread and _hidhide_retry_thread.is_alive()):
+                _hidhide_retry_thread = threading.Thread(
+                    target=_hidhide_engage_for_pad, args=(profile, _pad_generation),
+                    daemon=True, name="hidhide-retry")
+                _hidhide_retry_thread.start()
     elif (not want) and have:
         try: _virtual_pad.close()
         except Exception: pass
@@ -2426,7 +2478,12 @@ def _polling_loop():
                 # overhead per tick, which alone breaks the 125 µs budget.
                 now = time.perf_counter()
                 if now - _slot_cache_ts >= _slot_cache_ttl:
-                    _slot_cache = xi.get_connected_slots() or list(range(4))
+                    # Slots that were live stay in: a pad that vanished just
+                    # before this refresh must still be polled once and seen
+                    # gone, or the buttons it held are never released.
+                    _slot_cache = sorted(set(xi.get_connected_slots())
+                                         | {i for i in range(4) if last_packets[i] != -1}) \
+                        or list(range(4))
                     _slot_cache_ts = now
                 # If nothing's connected, still scan one slot occasionally
                 # so plug-in is detected.  Empty list means rotate slot 0.
@@ -2439,7 +2496,7 @@ def _polling_loop():
                 _first_live_slot_this_tick = None
 
                 for slot in slots_to_poll:
-                    if slot in _virtual_slots:
+                    if slot in _virtual_slots or slot in _test_pad_slots:
                         continue        # our own virtual pad, not an input
                     s = xi.get_state(slot)
                     if s is None:
@@ -2454,6 +2511,15 @@ def _polling_loop():
                             except Exception as e:
                                 log.debug(f"release on disconnect failed: {e}")
                             _prev_buttons[slot] = set()
+                        if last_packets[slot] != -1 and _virtual_pad is not None \
+                                and remap_mode == "virtual_controller" and in_foreground_ok:
+                            # Its last frame (sticks, triggers, passthrough
+                            # buttons) is still on the virtual pad, and the game
+                            # keeps acting on it until the controller is back.
+                            try:
+                                _virtual_pad.set_state(_build_virtual_pad_snapshot({}, profile), {})
+                            except Exception as e:
+                                log.debug(f"virtual pad reset on disconnect failed: {e}")
                         _prev_triggers[slot] = {"LT": False, "RT": False}
                         last_packets[slot] = -1
                         # Drop stale slot from cache so we re-probe next refresh
@@ -2637,10 +2703,19 @@ def shutdown() -> None:
     the poll loop, release every key / button / virtual-stick output we are
     holding, and undo the HidHide cloak.  Safe to call when nothing is running."""
     _stop.set()
+    # Let the poll loop finish its tick, so nothing it dispatches lands after
+    # the release below.
+    if _thread is not None:
+        _thread.join(1.0)
     try:
         _release_all_held()
     except Exception as e:
         log.debug(f"release held outputs failed: {e}")
+    # Macros let go of their keys in their own `finally`.  Every quit path
+    # ends in os._exit, which used to kill them before they got there.
+    deadline = time.time() + 0.5
+    while _active_macros and time.time() < deadline:
+        time.sleep(0.01)
     _hidhide_disengage()
 
 
@@ -2783,7 +2858,7 @@ def force_hidhide_engage() -> dict:
     """User-triggered HidHide engagement.  Bypasses the throttle and
     re-attempts engagement immediately, returning detailed diagnostics
     if it fails.  Use case: user clicked the status badge to retry."""
-    global _hidhide_last_retry_ts, _hidhide_engaged
+    global _hidhide_last_retry_ts
     state = _load_state()
     pname = state.get("active_profile")
     profile = state["profiles"].get(pname) if pname else None
@@ -2798,10 +2873,17 @@ def force_hidhide_engage() -> dict:
     inst = hidhide.is_installed()
     if not inst.get("installed"):
         return {"ok": False, "err": "HidHide not installed", "install_url": inst.get("install_url")}
-    # Reset state and retry
-    _hidhide_engaged = False     # force the engage logic to actually run
+    if _virtual_pad is None:
+        # Hiding the controller with no virtual pad up leaves the game with
+        # no controller at all, and nothing undoes it before the app exits.
+        return {"ok": False, "err": "The virtual pad is not running (turn the mapper on; "
+                                    "ViGEmBus must be installed)"}
+    # Retry now.  This used to clear the engaged flag first, so a click on a
+    # stale "retry" badge engaged again on top of our own engage: that
+    # recorded our hidden devices and cloak as the user's prior state, and
+    # disengaging then left them in place.
     _hidhide_last_retry_ts = 0.0
-    _hidhide_engage_if_needed(profile)
+    _hidhide_engage_for_pad(profile, _pad_generation)
     if _hidhide_engaged:
         return {"ok": True, "engaged": True,
                 "hidden_count": len(_hidhide_hidden_ours)}
@@ -2941,12 +3023,22 @@ def test_virtual_pad() -> dict:
         own_pad = False
         global _virtual_pad
         pad = _virtual_pad
+        test_slots: set = set()
         if pad is None:
+            pre_slots = set(xi.get_connected_slots() or [])
             pad = virtual_gamepad.create()
             own_pad = True
             if pad is None:
                 log.warning("test: virtual pad creation failed")
                 return
+            # Keep the poll loop off this pad's XInput slot before pressing
+            # anything: read back as a controller, the sequence below fired
+            # the user's own mappings into whatever window had focus.
+            deadline = time.time() + 2.0
+            while not test_slots and time.time() < deadline:
+                time.sleep(0.05)
+                test_slots = set(xi.get_connected_slots() or []) - pre_slots
+            _test_pad_slots.update(test_slots)
 
         pad_type = getattr(pad, "pad_type", "x360")
         # Order = "common buttons first" so the user sees something
@@ -3006,10 +3098,11 @@ def test_virtual_pad() -> dict:
             if own_pad and pad is not None:
                 try: pad.close()
                 except Exception: pass
+            _test_pad_slots.difference_update(test_slots)
 
     threading.Thread(target=_runner, daemon=True, name="vpad-test").start()
     return {"ok": True,
-            "msg": "Test sequence started — cycles every button + sticks + triggers "
+            "msg": "Test sequence started: cycles every button + sticks + triggers "
                    "(~12 sec total).  Open joy.cpl's controller test tab and watch "
                    "each numbered button light up in sequence.  Especially watch "
                    "for OPTIONS (button 10 on DS4) when 'START' is announced in the log."}
@@ -3267,4 +3360,4 @@ def capture_next_button(timeout_sec: float = 8.0) -> dict:
             "trigger": trigger,
             "vk":      vk,
         }
-    return {"ok": False, "err": "timeout — no button pressed"}
+    return {"ok": False, "err": "timeout: no button pressed"}

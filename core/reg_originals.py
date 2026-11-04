@@ -31,6 +31,7 @@ import json
 import os
 import re
 import threading
+import time
 import winreg
 from typing import Optional
 
@@ -42,6 +43,7 @@ log = get_logger("originals")
 _PATH = os.path.join(APPDATA_DIR, "originals.json")
 _lock = threading.RLock()
 _cache: Optional[dict] = None
+_unread = False            # the file is there but could not be read: saving now would replace it
 _tls = threading.local()   # .suspended: set, per thread, while a reset is running — resets must never record
 
 ABSENT = "ABSENT"
@@ -88,22 +90,72 @@ _TYPE_NAMES = {
 _TYPE_IDS = {v: k for k, v in _TYPE_NAMES.items()}
 
 
-def _load() -> dict:
-    global _cache
-    if _cache is None:
+def _set_aside():
+    """A damaged records file is moved aside, never overwritten: {} once it is
+    out of the way, None if it could not be moved."""
+    bad = f"{_PATH}.corrupt-{int(time.time() * 1000)}"
+    try:
+        os.replace(_PATH, bad)
+    except OSError as e:
+        log.warning(f"{_PATH} is damaged and could not be moved aside: {e}")
+        return None
+    log.warning(f"{_PATH} was damaged: moved to {bad}, starting with no records")
+    return {}
+
+
+def _read_file(tries: int = 5):
+    """The records on disk: a dict ({} when there is no file yet), or None
+    while the file is there but cannot be read."""
+    err = None
+    for attempt in range(tries):
         try:
             with open(_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            _cache = data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            _cache = {}
+        except FileNotFoundError:
+            return {}
+        except ValueError:
+            return _set_aside()
+        except OSError as e:
+            err = e
+            if attempt + 1 < tries:
+                time.sleep(0.1)     # held for a moment (an antivirus scan, a backup)
+            continue
+        return data if isinstance(data, dict) else _set_aside()
+    log.warning(f"could not read {_PATH}: {err}")
+    return None
+
+
+def _load() -> dict:
+    global _cache, _unread
+    if _cache is None:
+        data = _read_file()
+        _unread = data is None
+        if _unread:
+            log.warning("records made now are kept in memory and not saved until that file can be read")
+        _cache = data or {}
         for section in ("registry", "power", "notes", "state"):
             _cache.setdefault(section, {})
     return _cache
 
 
 def _save() -> None:
-    atomic_write_json(_PATH, _load())
+    global _unread
+    data = _load()
+    if _unread:
+        disk = _read_file(tries=1)
+        if disk is None:
+            log.debug(f"records not saved: {_PATH} could not be read, and saving would replace it")
+            return
+        # Readable again.  What it holds was recorded first, so it wins; what
+        # this session recorded meanwhile is kept beside it.  (Merged into
+        # the sections in place: callers hold on to them.)
+        for section, recs in disk.items():
+            if isinstance(recs, dict) and isinstance(data.get(section), dict):
+                data[section].update(recs)
+            else:
+                data.setdefault(section, recs)
+        _unread = False
+    atomic_write_json(_PATH, data)
 
 
 def _split(key_path: str):
@@ -237,6 +289,13 @@ def _active_scheme() -> str:
         if len(part) == 36 and part.count("-") == 4:
             return part
     return ""
+
+
+def scheme_gone(scheme: str) -> bool:
+    """True only when powercfg lists the power plans and `scheme` is not one
+    of them.  A failed listing says nothing about the plan."""
+    r = run_cmd(["powercfg", "/list"])
+    return bool(r.get("ok")) and scheme.lower() not in (r.get("out") or "").lower()
 
 
 def query_power(scheme: str, sub: str, setting: str) -> Optional[tuple]:
@@ -449,6 +508,11 @@ def restore_all(scope: str = "optimizer") -> dict:
             if ok_ac and ok_dc:
                 data["power"].pop(ident); done += 1
                 touched_schemes.add(scheme)
+            elif scheme_gone(scheme):
+                # The plan was deleted since: nothing left to put back, and
+                # kept, the record would fail at every reset for good.
+                data["power"].pop(ident)
+                log.info(f"[{scope}] dropped a power setting record: plan {scheme} no longer exists")
             else:
                 failed += 1
         if touched_schemes:         # (nothing to ask powercfg about otherwise)

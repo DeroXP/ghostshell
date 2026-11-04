@@ -576,13 +576,13 @@ def classify(exe: str, sample: Optional[dict] = None) -> dict:
         if ratio >= FPS_MENU_HIGH_RATIO:
             menu_score += W_FPS_MENU_HIGH
             reasons.append(
-                f"FPS {fps:.0f} is {ratio:.1f}× baseline ({b_fps:.0f}) — "
+                f"FPS {fps:.0f} is {ratio:.1f}× baseline ({b_fps:.0f}): "
                 f"menus often uncap to higher framerates"
             )
         elif ratio <= FPS_MENU_LOW_RATIO:
             menu_score += W_FPS_MENU_LOW
             reasons.append(
-                f"FPS {fps:.0f} is {ratio:.1f}× baseline ({b_fps:.0f}) — "
+                f"FPS {fps:.0f} is {ratio:.1f}× baseline ({b_fps:.0f}): "
                 f"lobbies / menus can run lower than active play"
             )
         elif FPS_GAMEPLAY_LOW_RATIO <= ratio <= FPS_GAMEPLAY_HIGH_RATIO:
@@ -611,7 +611,7 @@ def classify(exe: str, sample: Optional[dict] = None) -> dict:
         if vratio < FT_VAR_MENU_QUIET:
             menu_score += W_FTVAR_MENU
             reasons.append(
-                f"frametime variance collapsed ({vratio:.0%} of baseline) — "
+                f"frametime variance collapsed ({vratio:.0%} of baseline): "
                 f"vsync'd static menu UI"
             )
         elif FT_VAR_GAMEPLAY_BAND[0] <= vratio <= FT_VAR_GAMEPLAY_BAND[1]:
@@ -643,7 +643,7 @@ def classify(exe: str, sample: Optional[dict] = None) -> dict:
             menu_score += W_CPU_MENU_DROP
             reasons.append(
                 f"game CPU usage {cpu:.0f}% is {cratio:.0%} of baseline "
-                f"({b_cpu:.0f}%) — physics/AI/network paused?"
+                f"({b_cpu:.0f}%): physics/AI/network paused?"
             )
         elif abs(cratio - 1.0) <= CPU_GAMEPLAY_BAND:
             gameplay_score += W_CPU_GAMEPLAY
@@ -660,7 +660,7 @@ def classify(exe: str, sample: Optional[dict] = None) -> dict:
         if mratio < MEMBW_MENU_FLAT_RATIO:
             menu_score += W_MEMBW_MENU
             reasons.append(
-                f"VRAM-bandwidth variance collapsed ({mratio:.0%} of baseline) — "
+                f"VRAM-bandwidth variance collapsed ({mratio:.0%} of baseline): "
                 f"no active texture streaming"
             )
         elif MEMBW_GAMEPLAY_BAND[0] <= mratio <= MEMBW_GAMEPLAY_BAND[1]:
@@ -736,7 +736,7 @@ def _commit_state(exe: str, new_state: str, confidence: float,
         ticks = prev["ticks_in_state"] + 1
     else:
         log.info(f"gameplay_state[{exe}]: {prev['state']} → {new_state}  "
-                 f"(conf {confidence:.2f}) — {reasons[0] if reasons else '?'}")
+                 f"(conf {confidence:.2f}), {reasons[0] if reasons else '?'}")
         ticks = 1
     _state_cache[exe] = {
         "state":          new_state,

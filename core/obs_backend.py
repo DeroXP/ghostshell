@@ -203,7 +203,7 @@ def detect_obs(force_refresh: bool = False) -> dict:
         version_ok = vtuple >= _OBS_MIN_VERSION
         err = ""
         if not version_ok and version:
-            err = (f"OBS {version} is too old — need {_OBS_MIN_VERSION[0]}.0+ "
+            err = (f"OBS {version} is too old: need {_OBS_MIN_VERSION[0]}.0+ "
                     f"for the built-in WebSocket plugin. "
                     f"Update from obsproject.com.")
         result = {
@@ -301,17 +301,24 @@ def _err_msg(e: Exception) -> str:
     s = str(e) or e.__class__.__name__
     low = s.lower()
     if "connection refused" in low or "actively refused" in low:
-        return ("Connection refused — OBS WebSocket server isn't listening.  "
+        return ("Connection refused: OBS WebSocket server isn't listening.  "
                 "In OBS go to Tools → WebSocket Server Settings and tick "
                 "'Enable WebSocket server'.")
     if "timed out" in low or "timeout" in low:
-        return ("Connection timed out — OBS is unreachable at the configured "
+        return ("Connection timed out: OBS is unreachable at the configured "
                 "host/port.  Is OBS running?")
     if "authentication" in low or "auth" in low or "password" in low:
-        return ("Authentication failed — the configured WebSocket password "
+        return ("Authentication failed: the configured WebSocket password "
                 "doesn't match OBS's.  Open OBS → Tools → WebSocket Server "
                 "Settings → 'Show Connect Info' to copy the current password.")
     return s
+
+
+def _connection_lost(e: Exception) -> bool:
+    """True for a dropped or dead socket (OBS closed or restarted), as
+    opposed to a request OBS answered with an error (OBSSDKRequestError)."""
+    name = type(e).__name__
+    return isinstance(e, OSError) or "WebSocket" in name or "Timeout" in name
 
 
 def connect(force_reconnect: bool = False) -> dict:
@@ -351,6 +358,9 @@ def connect(force_reconnect: bool = False) -> dict:
         log.info(f"OBS connect attempt: {host}:{port} (auth={'yes' if passwd else 'no'})")
 
         try:
+            # A forced reconnect replaces a live client: close its socket
+            # rather than leave it open in OBS.
+            _safe_close_unlocked()
             _client = obs.ReqClient(host=host, port=port, password=passwd,
                                       timeout=timeout)
             _refresh_version_unlocked()
@@ -359,7 +369,7 @@ def connect(force_reconnect: bool = False) -> dict:
             log.info(f"OBS connected: v{_conn_state['obs_version']} "
                      f"ws v{_conn_state['ws_version']} on {_conn_state['platform']}")
         except Exception as e:
-            _client = None
+            _safe_close_unlocked()      # the new client, if only GetVersion failed
             _conn_state["connected"]   = False
             _conn_state["connect_err"] = _err_msg(e)
             log.warning(f"OBS connect failed: {_conn_state['connect_err']}")
@@ -737,7 +747,7 @@ def save_replay(target_dir: Optional[str] = None,
             status = _client.get_replay_buffer_status()
             if not getattr(status, "output_active", False):
                 return {"ok": False, "path": "",
-                        "err": "OBS replay buffer isn't running — "
+                        "err": "OBS replay buffer isn't running: "
                                 "turn the Vispora buffer toggle on first."}
             try:
                 prev = _client.get_last_replay_buffer_replay()
@@ -781,9 +791,10 @@ def save_replay(target_dir: Optional[str] = None,
                 stem = (prefix or os.path.splitext(base)[0])
                 final = os.path.join(target_dir, stem + ext)
                 # Avoid clobber on rapid double-save (same second)
-                if os.path.exists(final):
-                    final = os.path.join(target_dir,
-                                          f"{stem}_{int(time.time())}{ext}")
+                n = 2
+                while os.path.exists(final):
+                    final = os.path.join(target_dir, f"{stem}-{n}{ext}")
+                    n += 1
                 _shutil.move(new_path, final)
                 log.info(f"OBS replay moved: {new_path} → {final}")
                 new_path = final
@@ -821,6 +832,11 @@ def get_recording_status() -> dict:
             return out
         except Exception as e:
             out["err"] = _err_msg(e)
+            if _connection_lost(e):
+                # Nothing else notices OBS going away; until "connected"
+                # drops, _maybe_auto_reconnect() never runs.
+                _safe_close_unlocked()
+                _conn_state["connected"] = False
             return out
 
 

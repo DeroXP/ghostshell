@@ -296,7 +296,7 @@ def test_a_game_that_keeps_resetting_itself_is_not_fought_forever():
         time.sleep(0.3)
         assert len([c for c in m.K.calls if c[0] == "priority"]) == sets, "no longer forced"
     assert sets <= 1 + GP._REAPPLY_LIMIT
-    assert check("proc:priority")["text"] == "Process priority: the game keeps setting its own — no longer forced"
+    assert check("proc:priority")["text"] == "Process priority: the game keeps setting its own, so it is no longer forced"
     stop()
 
 
@@ -562,7 +562,7 @@ def test_the_old_tweaks_parking_cap_is_repaired_by_game_mode():
     assert launch()
     assert m.rdata(PARK_CAP, "ValueMax") == 100
     assert check("power:parking") == {"key": "power:parking", "ok": True, "text":
-                                      "Core parking -> off (every core kept awake) — after repairing the limit an "
+                                      "Core parking -> off (every core kept awake), after repairing the limit an "
                                       "old tweak had set to 0"}
     assert m.cell(m.BALANCED, m.PARK_E)[0] == 100
     assert quit_game()
@@ -952,7 +952,7 @@ def test_a_protected_game_is_started_at_high_from_its_next_launch():
     assert launch(protected=True)
     assert m.rdata(IFEO_KEY, "CpuPriorityClass") == 3
     want = {"key": "proc:priority", "ok": None, "text":
-            "Process priority: blocked while the game runs — Windows will start it at High from the next launch"}
+            "Process priority: blocked while the game runs, so Windows will start it at High from the next launch"}
     assert check("proc:priority") == want
     time.sleep(0.2)
     assert check("proc:priority") == want, "and the ticks after it say the same, not 'lowered it again'"

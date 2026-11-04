@@ -72,6 +72,12 @@ def main(argv: list) -> int:
         sys.stdout.flush()
         os._exit(code)      # no exit hooks, no waiting on the app's daemon threads
 
+    # A failure message with a character the console can't show (cp1252 here)
+    # must not crash the runner and hide the rest of the results.
+    try:
+        sys.stdout.reconfigure(errors="backslashreplace")
+    except (AttributeError, ValueError):
+        pass
     verbose = "-v" in argv
     wanted = [a.lower() for a in argv if not a.startswith("-")]
     files = sorted(f for f in os.listdir(HERE) if f.startswith("test_") and f.endswith(".py"))
@@ -87,7 +93,8 @@ def main(argv: list) -> int:
     for f in files:
         t0 = time.time()
         proc = subprocess.run([sys.executable, "-u", os.path.abspath(__file__), "--file", os.path.join(HERE, f)],
-                              capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=REPO)
+                              capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=REPO,
+                              env=dict(os.environ, PYTHONIOENCODING="utf-8"))   # the child writes what we decode
         lines = (proc.stdout or "").splitlines()
         counts = {k: sum(1 for ln in lines if ln.startswith(k + " ")) for k in totals}
         for k in totals:

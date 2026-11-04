@@ -128,6 +128,17 @@ def set_done() -> None:
         _state["ended_at"]    = time.time()
 
 
+def stop_install() -> None:
+    """Cancel the install, if one is running, and wait until it has stopped.
+    A cancel does not interrupt the exe swap, and exiting in the middle of
+    it can leave neither the old exe nor the new one in place."""
+    t = _install_thread
+    if t is not None and t.is_alive():
+        with _state_lock:
+            _state["cancelled"] = True
+        t.join()
+
+
 # ─── Flask app ───────────────────────────────────────────────────────
 
 # Path that points into the updater package — when running frozen,
@@ -245,6 +256,7 @@ def api_quit():
     """Tear down the updater process.  Used by the 'Close' button."""
     def _exit():
         time.sleep(0.3)
+        stop_install()
         os._exit(0)
     threading.Thread(target=_exit, daemon=True).start()
     return jsonify({"ok": True})

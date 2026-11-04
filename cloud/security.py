@@ -48,12 +48,12 @@ def _decode_pepper(name: str, raw: str) -> bytes:
             decoded = base64.b64decode(raw, validate=True)
             if len(decoded) >= 32:
                 return decoded
-            log.error(f"{name} is shorter than 32 bytes — generate a real one")
+            log.error(f"{name} is shorter than 32 bytes: generate a real one")
         except Exception:
-            log.error(f"{name} is not valid base64 — generate a real one")
+            log.error(f"{name} is not valid base64: generate a real one")
     # Dev-only fallback.  In production this gets caught by the
     # startup check in main.py, which refuses to boot.
-    log.warning(f"{name} is unset — using INSECURE deterministic fallback. "
+    log.warning(f"{name} is unset, so using INSECURE deterministic fallback. "
                 f"Set this env var before deploying!")
     return hashlib.sha256(f"INSECURE-DEV-{name}".encode()).digest()
 
@@ -231,7 +231,7 @@ def install_privacy_filter() -> None:
     for name in ("uvicorn.access", "uvicorn.error", "uvicorn",
                  "vispora-cloud", "fastapi"):
         logging.getLogger(name).addFilter(f)
-    log.info("Privacy log filter installed — client IPs will be scrubbed")
+    log.info("Privacy log filter installed: client IPs will be scrubbed")
     if using_insecure_dev_peppers():
         log.warning(
             "RUNNING WITH INSECURE DEV PEPPERS.  This is fine for local "

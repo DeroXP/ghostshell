@@ -107,6 +107,8 @@ _updater_install_state = {
     "total":      0,
     "err":        None,
     "path":       None,
+    "failures":   0,        # downloads failed in a row (automatic retries back off)
+    "failed_at":  0.0,
 }
 _updater_install_lock = threading.Lock()
 
@@ -191,7 +193,7 @@ def ensure_updater_up_to_date_async() -> dict:
     # self-contained bat swap).  Skip quietly.
     try:
         if (_load_settings().get("local_update_dir") or "").strip():
-            log.info("Updater self-refresh skipped — local update mode")
+            log.info("Updater self-refresh skipped (local update mode)")
             return {"ok": True, "skipped": "local update mode"}
     except Exception:
         pass
@@ -232,9 +234,9 @@ def _updater_refresh_worker() -> None:
                 log.debug(f"updater is up to date (local={local_ver})")
                 return
             log.info(f"Updater on disk is v{local_ver}, "
-                     f"v{remote_ver} available — refreshing")
+                     f"v{remote_ver} available; refreshing")
         else:
-            log.info(f"Updater on disk has no version sidecar — "
+            log.info(f"Updater on disk has no version sidecar; "
                      f"refreshing to v{remote_ver}")
     except Exception as e:
         log.debug(f"updater-refresh comparison failed: {e}")
@@ -274,12 +276,16 @@ def _download_updater_worker(remote_version: str = "") -> None:
             vreq = urllib.request.Request(base + "/version/updater", headers={
                 "User-Agent": f"{APP_NAME}/{APP_VERSION}-updater-bootstrap"})
             with urllib.request.urlopen(vreq, timeout=15) as vr:
-                expected_sha = ((json.loads(vr.read()) or {}).get("sha256") or "").lower()
+                meta = json.loads(vr.read()) or {}
+            expected_sha = (meta.get("sha256") or "").lower()
+            # A first install has no version from a refresh check: record the
+            # one this hash belongs to, or the next boot downloads it again.
+            remote_version = remote_version or str(meta.get("version") or "")
         except Exception as e:
             log.debug(f"updater version pre-fetch failed: {e}")
         if not expected_sha:
             raise RuntimeError("server did not provide a SHA-256 for the "
-                               "updater — refusing to install an unverified binary")
+                               "updater; refusing to install an unverified binary")
 
         os.makedirs(UPDATER_DIR, exist_ok=True)
         tmp = UPDATER_EXE + ".part"
@@ -305,13 +311,13 @@ def _download_updater_worker(remote_version: str = "") -> None:
         if sz < 1024 * 1024:    # <1 MB = clearly wrong
             os.remove(tmp)
             raise RuntimeError(
-                f"updater download too small ({sz} B) — Railway might not "
+                f"updater download too small ({sz} B): Railway might not "
                 f"have the updater hosted yet, or returned an error page")
         if h.hexdigest().lower() != expected_sha:
             os.remove(tmp)
             raise RuntimeError(
                 f"updater download failed SHA-256 check (expected "
-                f"{expected_sha[:16]}…, got {h.hexdigest()[:16]}…) — refusing "
+                f"{expected_sha[:16]}…, got {h.hexdigest()[:16]}…), so refusing "
                 f"to install; will retry next boot")
         os.replace(tmp, UPDATER_EXE)
         if remote_version:
@@ -319,8 +325,9 @@ def _download_updater_worker(remote_version: str = "") -> None:
         with _updater_install_lock:
             _updater_install_state["path"] = UPDATER_EXE
             _updater_install_state["running"] = False
+            _updater_install_state["failures"] = 0
         log.info(f"Updater installed at {UPDATER_EXE} ({sz} B)"
-                 + (f" — v{remote_version}" if remote_version else ""))
+                 + (f", v{remote_version}" if remote_version else ""))
     except Exception as e:
         # Clean up a partial .part so a network drop mid-download doesn't
         # leave stale bytes on disk for the next boot's retry to trip over.
@@ -333,6 +340,8 @@ def _download_updater_worker(remote_version: str = "") -> None:
         with _updater_install_lock:
             _updater_install_state["err"] = str(e)
             _updater_install_state["running"] = False
+            _updater_install_state["failures"] += 1
+            _updater_install_state["failed_at"] = time.time()
         log.warning(f"Updater bootstrap failed: {e}")
 
 
@@ -816,7 +825,7 @@ def _prune_old_cached_installers(keep: str = "") -> int:
             except OSError:
                 continue
         if freed:
-            log.info(f"Pruned old cached installers — freed "
+            log.info(f"Pruned old cached installers: freed "
                      f"{freed / (1024*1024):.0f} MB from {UPDATE_DIR}")
     except Exception as e:
         log.debug(f"installer prune failed: {e}")
@@ -878,7 +887,7 @@ def download_update() -> dict:
     _update_state["download_complete"] = False
     try:
         if cached:
-            log.info(f"  Update already downloaded: {dest} — re-verifying")
+            log.info(f"  Update already downloaded: {dest}, re-verifying")
             ok = True
         elif url.startswith("local:"):
             # beta.11 — local source: "download" = copy the exe from the local
@@ -913,7 +922,7 @@ def download_update() -> dict:
     # sha256; there is no legacy-server case left to accommodate.)
     expected_sha = _update_state.get("latest_sha256") or ""
     if not expected_sha:
-        err = ("Server did not provide a SHA-256 hash for this build — "
+        err = ("Server did not provide a SHA-256 hash for this build; "
                "refusing to install an unverified binary.")
         log.warning(err)
         _update_state["error"] = err
@@ -932,7 +941,7 @@ def download_update() -> dict:
         except OSError: pass
         return {"ok": False, "err": _update_state["error"]}
     if actual_sha.lower() != expected_sha.lower():
-        err = (f"Downloaded file failed SHA-256 check — "
+        err = (f"Downloaded file failed SHA-256 check: "
                f"expected {expected_sha[:16]}…, got {actual_sha[:16]}…. "
                "File may be corrupted; download will retry on next check.")
         log.warning(err)
@@ -946,7 +955,7 @@ def download_update() -> dict:
     _update_state["download_complete"] = True
     _update_state["pending_install_path"] = dest
     size_mb = os.path.getsize(dest) / (1024 * 1024)
-    log.info(f"  Downloaded {size_mb:.1f} MB — ready to install")
+    log.info(f"  Downloaded {size_mb:.1f} MB, ready to install")
     return {"ok": True, "path": dest, "size_mb": round(size_mb, 1), "cached": cached}
 
 
@@ -974,7 +983,7 @@ def on_game_closed() -> None:
         if _game_running():
             return                      # another game has started: wait for that one too
         _update_state["install_after_game"] = False
-        log.info("The game has closed — installing the update that was waiting for it")
+        log.info("The game has closed; installing the update that was waiting for it")
         try:
             install_update_now()
         except Exception as e:
@@ -996,7 +1005,7 @@ def install_update_now(force: bool = False) -> dict:
     game = "" if force else _game_running()
     if game:
         _update_state["install_after_game"] = True
-        log.info(f"Install held back: {game} is running — it installs when the game closes")
+        log.info(f"Install held back: {game} is running, so it installs when the game closes")
         return {"ok": True, "deferred": True,
                 "msg": f"{game} is running. The update installs as soon as it closes."}
     path = _update_state.get("pending_install_path")
@@ -1025,7 +1034,7 @@ def install_update_now(force: bool = False) -> dict:
         if (_update_state.get("latest_url") or "").startswith("local:"):
             if not getattr(sys, "frozen", False):
                 return {"ok": True,
-                        "msg": "Update staged. Running from source — no exe swap."}
+                        "msg": "Update staged. Running from source, so no exe swap."}
             return _apply_exe_update_via_bat(path, sys.executable)
         return _apply_exe_update_async(path)
     if path.lower().endswith(".zip"):
@@ -1099,7 +1108,7 @@ def _apply_exe_update_async(new_exe: str) -> dict:
 
     if not getattr(sys, "frozen", False):
         # Running from source — no in-place swap possible
-        log.info("  Running from source — skipping in-place swap")
+        log.info("  Running from source, skipping in-place swap")
         return {
             "ok": True,
             "msg": f"Update available. Build a new exe to apply.",
@@ -1110,7 +1119,7 @@ def _apply_exe_update_async(new_exe: str) -> dict:
     # manually triggered an install before that finished, do it now
     # (blocking — only takes a few seconds).
     if not is_updater_installed():
-        log.info("  Updater not installed — fetching from Railway now")
+        log.info("  Updater not installed, fetching from Railway now")
         ensure_updater_installed_async()
         # Wait up to 60s for the download to complete
         deadline = time.time() + 60
@@ -1156,14 +1165,26 @@ def _apply_exe_update_async(new_exe: str) -> dict:
         DETACHED_PROCESS = 0x00000008
         CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         CREATE_NEW_PROCESS_GROUP = 0x00000200
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
         # NOTE: we do NOT set CREATE_NO_WINDOW here — the updater is a
         # GUI app and the user needs to see its window.  DETACHED_PROCESS
         # is what we care about; that ensures the updater outlives us.
-        subprocess.Popen(
-            args,
-            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-            close_fds=True,
-        )
+        # Breakaway as for the swap script below: started by the autostart
+        # task, the app runs inside the task's job object.
+        try:
+            subprocess.Popen(
+                args,
+                creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                               | CREATE_BREAKAWAY_FROM_JOB),
+                close_fds=True,
+            )
+        except OSError:
+            # Job denies breakaway: spawn without it.
+            subprocess.Popen(
+                args,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                close_fds=True,
+            )
     except Exception as e:
         log.error(f"  Could not spawn standalone updater: {e}")
         return {"ok": False, "err": f"Could not spawn updater: {e}"}
@@ -1176,7 +1197,7 @@ def _apply_exe_update_async(new_exe: str) -> dict:
     threading.Thread(target=_exit_for_update, daemon=True).start()
 
     return {"ok": True,
-            "msg": f"{APP_NAME} Updater launching — this window will close and "
+            "msg": f"{APP_NAME} Updater launching. This window will close and "
                    "the updater will handle the rest.",
             "restart_required": True,
             "method": "standalone-updater"}
@@ -1257,7 +1278,7 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
         '  goto try_copy\r\n'
         ')\r\n'
         f'echo FAIL: copy failed after 20 retries > "{status_path}"\r\n'
-        f'echo *** Update copy failed — opening existing {APP_NAME}. ***\r\n'
+        f'echo *** Update copy failed, opening existing {APP_NAME}. ***\r\n'
         'goto launch\r\n'
         ':copy_ok\r\n'
         f'echo OK > "{status_path}"\r\n'
@@ -1266,7 +1287,10 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
         f'start "" "{current_exe}"\r\n'
         '(goto) 2>nul & del "%~f0"\r\n'
     )
-    with open(bat_path, "w", encoding="ascii", errors="replace", newline="") as f:
+    # cmd.exe reads a batch file in the console (OEM) code page.  Written as
+    # ASCII, an "ö" in a path (a user name, say) became "?" and every command
+    # using that path failed: the copy, the status file, the restart.
+    with open(bat_path, "w", encoding="oem", errors="replace", newline="") as f:
         f.write(bat)
 
     try:
@@ -1295,7 +1319,7 @@ def _apply_exe_update_via_bat(new_exe: str, current_exe: str) -> dict:
     _update_state["installing"] = True
     threading.Thread(target=_exit_for_update, daemon=True).start()
     return {"ok": True,
-            "msg": f"Update installing — {APP_NAME} will restart in a moment.",
+            "msg": f"Update installing. {APP_NAME} will restart in a moment.",
             "restart_required": True,
             "method": "legacy-bat"}
 
@@ -1326,7 +1350,7 @@ def _apply_zip_update(zip_path: str) -> dict:
                 break
 
         if not os.path.exists(os.path.join(source_dir, "app.py")):
-            return {"ok": False, "err": "Invalid update — app.py not found"}
+            return {"ok": False, "err": "Invalid update: app.py not found"}
 
         updated = 0
         for cur, dirs, files in os.walk(source_dir):
@@ -1406,6 +1430,7 @@ def get_update_status() -> dict:
 
 USER_IDLE_THRESHOLD_SEC = 5 * 60      # 5 minutes of no input
 SAFETY_GATE_RECHECK_SEC = 120          # try again every 2 min when deferred
+UPDATER_RETRY_MAX_SEC   = 6 * 3600     # longest wait between automatic tries of a failing updater download
 
 
 def _get_user_idle_sec() -> float:
@@ -1492,6 +1517,19 @@ def _maybe_auto_download():
         _try_auto_install()
 
 
+def _updater_retry_wait() -> float:
+    """Seconds an automatic install still has to wait before downloading the
+    standalone updater again.  Every download that failed in a row doubles
+    the wait, from SAFETY_GATE_RECHECK_SEC up to UPDATER_RETRY_MAX_SEC."""
+    with _updater_install_lock:
+        failures = _updater_install_state["failures"]
+        failed_at = _updater_install_state["failed_at"]
+    if not failures:
+        return 0.0
+    wait = min(SAFETY_GATE_RECHECK_SEC * 2 ** (failures - 1), UPDATER_RETRY_MAX_SEC)
+    return max(0.0, failed_at + wait - time.time())
+
+
 def _try_auto_install(quiet: bool = False) -> dict:
     """Auto-install the staged update IF it's safe to do so right now.
     Otherwise returns {ok: False, deferred: True, reason: str} and the
@@ -1507,6 +1545,16 @@ def _try_auto_install(quiet: bool = False) -> dict:
         if not quiet:
             log.info(f"Auto-install deferred: {safety['reason']}")
         return {"ok": False, "deferred": True, "reason": safety["reason"]}
+    # Server mode installs through the standalone updater.  While it is not
+    # on disk and its download keeps failing, don't fetch it again every
+    # couple of minutes.  (Install now from the UI still tries at once.)
+    if not (s.get("local_update_dir") or "").strip() and not is_updater_installed():
+        wait = _updater_retry_wait()
+        if wait > 0:
+            reason = f"the updater download keeps failing; next try in {int(wait)}s"
+            if not quiet:
+                log.info(f"Auto-install deferred: {reason}")
+            return {"ok": False, "deferred": True, "reason": reason}
     log.info(f"Auto-install proceeding: {safety['reason']}")
     return install_update_now()
 

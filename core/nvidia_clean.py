@@ -6,6 +6,7 @@ now handles all three major GPU vendors and dispatches internally based on
 """
 import json
 import os
+import re
 from config import APPDATA_DIR
 from core import reg_originals, sys_state
 from core.utils import run_ps, run_cmd, get_logger, backup_registry
@@ -74,11 +75,36 @@ def _find_gpu_class_key(vendor_match: str, or_first: bool = True) -> str:
                     log.info(f"Resolved {vendor_match} display-class key: {idx.strip()} ({desc.strip()})")
                     return reg_base + "\\" + idx.strip()
         if or_first:
-            log.warning(f"Could not find a {vendor_match} adapter under the display class — "
+            log.warning(f"Could not find a {vendor_match} adapter under the display class, "
                         f"falling back to \\0000 (tweaks may target the wrong device)")
     except Exception as e:
         log.debug(f"GPU class-key probe failed: {e}")
     return reg_base + r"\0000" if or_first else ""
+
+
+def _find_gpu_class_keys(desc_pattern: str) -> list:
+    r"""Every display-adapter Class\{GUID}\NNNN subkey whose DriverDesc
+    matches the regex `desc_pattern` (the enumeration _find_gpu_class_key
+    uses), and none when the class cannot be read: no guessing at \0000."""
+    reg_base = r"HKLM\SYSTEM\CurrentControlSet\Control\Class" + "\\" + _DISPLAY_CLASS_GUID
+    ps_base  = r"HKLM:\SYSTEM\CurrentControlSet\Control\Class" + "\\" + _DISPLAY_CLASS_GUID
+    keys = []
+    try:
+        r = run_ps(
+            "Get-ChildItem '" + ps_base + "' -ErrorAction SilentlyContinue | "
+            "Where-Object { $_.PSChildName -match '^[0-9]{4}$' } | "
+            "ForEach-Object { "
+            "$d=(Get-ItemProperty $_.PSPath -Name DriverDesc -ErrorAction SilentlyContinue).DriverDesc; "
+            "if ($d) { ('{0}|{1}' -f $_.PSChildName, $d) } }"
+        )
+        if r.get("ok") and r.get("out"):
+            for line in r["out"].splitlines():
+                idx, sep, desc = line.partition("|")
+                if sep and re.search(desc_pattern, desc, re.IGNORECASE):
+                    keys.append(reg_base + "\\" + idx.strip())
+    except Exception as e:
+        log.debug(f"GPU class-key probe failed: {e}")
+    return keys
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -89,7 +115,7 @@ def detect_gpu() -> dict:
     # Try nvidia-smi first — most reliable for NVIDIA
     r = run_cmd(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader,nounits"])
     if r["ok"] and r["out"]:
-        parts = r["out"].split(",")
+        parts = r["out"].splitlines()[0].split(",")    # one line per GPU
         if len(parts) >= 3:
             return {
                 "vendor": "nvidia",
@@ -184,7 +210,7 @@ def prepare_clean_install() -> dict:
     log.info("Preparing NVIDIA clean install...")
     gpu = detect_gpu()
     if gpu["vendor"] != "nvidia":
-        return {"ok": False, "err": "No NVIDIA GPU detected — clean install helper is NVIDIA-only", "gpu": gpu}
+        return {"ok": False, "err": "No NVIDIA GPU detected. The clean install helper is NVIDIA-only", "gpu": gpu}
 
     steps_done = []
 
@@ -207,6 +233,9 @@ def prepare_clean_install() -> dict:
     steps_done.append("Stopped NVIDIA services")
     log.info("  ✓ Stopped NVIDIA services")
 
+    # Only packages whose provider is NVIDIA go to pnputil /delete-driver.  The
+    # loop here used to pass it every "Published Name" line, i.e. every
+    # third-party driver on the PC (chipset, network, audio, storage), with /force.
     script_content = """@echo off
 chcp 65001 >nul 2>nul
 echo ============================================
@@ -227,10 +256,7 @@ net stop NvTelemetryContainer 2>nul
 
 echo Removing NVIDIA drivers via pnputil...
 pnputil /enum-drivers | findstr /i "nvidia" > "%TEMP%\\nvidia_drivers.txt"
-for /f "tokens=1,2 delims=:" %%a in ('pnputil /enum-drivers ^| findstr /i "Published Name"') do (
-    echo Removing %%b
-    pnputil /delete-driver %%b /force 2>nul
-)
+powershell -NoProfile -Command "Get-WindowsDriver -Online | Where-Object { $_.ProviderName -like '*NVIDIA*' } | ForEach-Object { Write-Host ('Removing ' + $_.Driver); pnputil /delete-driver $_.Driver /force 2>$null | Out-Null }"
 
 echo Cleaning leftover NVIDIA files...
 rd /s /q "C:\\Program Files\\NVIDIA Corporation" 2>nul
@@ -263,7 +289,7 @@ pause
             "For the cleanest install, run the generated batch script as Administrator.",
             "After the script completes, restart your PC.",
             "Then install your new NVIDIA driver with 'Custom Install' > 'Clean Install' checked.",
-            "Only install the Graphics Driver — skip GeForce Experience, PhysX (unless needed), and telemetry.",
+            "Only install the Graphics Driver: skip GeForce Experience, PhysX (unless needed), and telemetry.",
         ]
     }
 
@@ -294,8 +320,8 @@ def _apply_msi_mode(vendor_filter: str) -> list[dict]:
                 results.append({"name": f"{name} MSI Mode", "ok": ok})
 
                 affinity_key = rf"HKLM\SYSTEM\CurrentControlSet\Enum\{instance_id}\Device Parameters\Interrupt Management\Affinity Policy"
-                _reg(affinity_key, "DevicePriority", "3")
-                results.append({"name": f"{name} Interrupt Priority", "ok": True})
+                ok = _reg(affinity_key, "DevicePriority", "3")
+                results.append({"name": f"{name} Interrupt Priority", "ok": ok})
         except Exception as e:
             log.warning(f"  MSI mode enum failed: {e}")
             results.append({"name": "MSI Mode", "ok": False})
@@ -381,23 +407,28 @@ def apply_amd_tweaks() -> list[dict]:
         r"HKLM\SOFTWARE\AMD\CN",
         r"HKCU\SOFTWARE\AMD\CN",
     ]
+    ueip_ok = ulps_ok = True
     for key in amd_ueip_keys:
-        _reg(key, "PhysicalAutoUpdateStatus", "0")
-        _reg(key, "UEPNotificationStatus", "0")
-        _reg(key, "EnableULPS", "0")  # ULPS off — can cause black-screen stutters
-    results.append({"name": "AMD Telemetry (UEIP) disabled", "ok": True})
-    results.append({"name": "AMD ULPS disabled", "ok": True})
+        ueip_ok &= _reg(key, "PhysicalAutoUpdateStatus", "0")
+        ueip_ok &= _reg(key, "UEPNotificationStatus", "0")
+        ulps_ok &= _reg(key, "EnableULPS", "0")  # ULPS off — can cause black-screen stutters
+    results.append({"name": "AMD Telemetry (UEIP) disabled", "ok": ueip_ok})
+    results.append({"name": "AMD ULPS disabled", "ok": ulps_ok})
 
     # Tasks AMD installs
+    tasks_ok = True
     for task in _AMD_TASKS:
-        sys_state.disable_task(task, scope=_SCOPE)
-    results.append({"name": "AMD Scheduled Tasks disabled", "ok": True})
+        # (a task this driver version does not install is not a failure)
+        if not sys_state.disable_task(task, scope=_SCOPE) and sys_state.task_enabled(task):
+            tasks_ok = False
+    results.append({"name": "AMD Scheduled Tasks disabled", "ok": tasks_ok})
 
     # AMD display class — enable Hardware Scheduling + set power to max
-    amd_class_candidates = [
-        r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000",
-        r"HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0001",
-    ]
+    # Only the keys of AMD adapters: \0000 and \0001 used to be written
+    # whatever they held (a virtual monitor, an Intel iGPU).
+    amd_class_candidates = _find_gpu_class_keys(r"\b(amd|ati|radeon)\b")
+    if not amd_class_candidates:
+        results.append({"name": "AMD PowerPlay: no AMD adapter found in the display class", "ok": False})
     for amd_class in amd_class_candidates:
         # Only try keys that exist
         q = run_cmd(["reg", "query", amd_class])
@@ -405,16 +436,16 @@ def apply_amd_tweaks() -> list[dict]:
             continue
         backup_registry(amd_class, "amd_class")
         # EnableUlps = 0: force GPU to full power (prevents "ultra low power state")
-        _reg(amd_class, "EnableUlps", "0")
-        _reg(amd_class, "EnableUlps_NA", "0")
+        ok = _reg(amd_class, "EnableUlps", "0")
+        ok &= _reg(amd_class, "EnableUlps_NA", "0")
         # PP_* = PowerPlay table overrides (performance bias)
-        _reg(amd_class, "PP_ThermalAutoThrottlingEnable", "0")
-        _reg(amd_class, "DisableFullScreenOpt", "1")
+        ok &= _reg(amd_class, "PP_ThermalAutoThrottlingEnable", "0")
+        ok &= _reg(amd_class, "DisableFullScreenOpt", "1")
         # DisableBlockWrite = 0, KMD_DeLagEnabled = 1 (Radeon Anti-Lag enabled globally)
-        _reg(amd_class, "KMD_DeLagEnabled", "1")
+        ok &= _reg(amd_class, "KMD_DeLagEnabled", "1")
         # AMD Chill off (global Chill is on by default; off = max FPS)
-        _reg(amd_class, "KMD_FRTEnabled", "0")
-        results.append({"name": f"AMD PowerPlay tuned: {amd_class[-4:]}", "ok": True})
+        ok &= _reg(amd_class, "KMD_FRTEnabled", "0")
+        results.append({"name": f"AMD PowerPlay tuned: {amd_class[-4:]}", "ok": ok})
 
     # Stop AMD telemetry services
     amd_svcs_to_stop = ["AMD Crash Defender Service", "AMD External Events Utility"]
@@ -481,7 +512,7 @@ def undo_gpu_tweaks() -> dict:
         rows.append({"name": "NVIDIA driver settings could not be restored", "ok": False})
     if not rows:
         return {"ok": True, "nothing": True,
-                "results": [{"name": "Nothing on record to undo — tweaks applied by an earlier "
+                "results": [{"name": "Nothing on record to undo: tweaks applied by an earlier "
                                      "version kept no record", "ok": True}]}
     rows.append({"name": "Restart the PC so the driver picks the settings up", "ok": True})
     return {"ok": all(r["ok"] for r in rows), "results": rows}

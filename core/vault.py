@@ -2,6 +2,8 @@
 import os
 import json
 import time
+import functools
+import threading
 import hashlib
 import hmac
 import base64
@@ -27,6 +29,20 @@ _vault_state = {
     "failed_attempts": 0,
     "lockout_until": 0,
 }
+
+# One PIN check or PIN setup at a time.  A check is slow on purpose, so
+# parallel attempts all passed the lockout test before the first failure was
+# counted; and two setups at once could leave this session's key out of step
+# with the salt saved on disk.
+_pin_lock = threading.Lock()
+
+
+def _one_pin_check_at_a_time(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _pin_lock:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def _derive_key(pin: str, salt: bytes) -> bytes:
@@ -72,7 +88,12 @@ def _init_db():
     conn.close()
 
 
-_init_db()
+try:
+    _init_db()
+except Exception as e:
+    # app.py imports this module at start-up: a damaged or locked vault.db
+    # would stop the whole app from opening.  The vault calls fail on their own.
+    log.error(f"Vault database could not be opened: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -86,6 +107,7 @@ def is_pin_set() -> bool:
     return row is not None
 
 
+@_one_pin_check_at_a_time
 def setup_pin(pin: str) -> dict:
     """First-time PIN setup. Creates encryption key."""
     if len(pin) < 4 or len(pin) > 8 or not pin.isdigit():
@@ -130,6 +152,7 @@ def setup_pin(pin: str) -> dict:
     return {"ok": True}
 
 
+@_one_pin_check_at_a_time
 def unlock(pin: str) -> dict:
     """Unlock the vault with PIN."""
     now = time.time()
@@ -496,5 +519,5 @@ def reset_vault() -> dict:
     conn.execute("DELETE FROM vault_meta")
     conn.commit()
     conn.close()
-    log.info("Vault reset — all data destroyed")
+    log.info("Vault reset: all data destroyed")
     return {"ok": True}

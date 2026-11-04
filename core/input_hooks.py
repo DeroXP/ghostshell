@@ -96,7 +96,10 @@ class MSLLHOOKSTRUCT(ctypes.Structure):
 _user32   = ctypes.WinDLL("user32",   use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
-LowLevelKbdProc   = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int,
+# The hook returns an LRESULT (pointer-sized).  Declared as c_long, only the
+# low 32 bits were written and Windows read the rest as stack residue; any
+# non-zero LRESULT from a low-level hook swallows the event.
+LowLevelKbdProc   = ctypes.WINFUNCTYPE(wintypes.LPARAM, ctypes.c_int,
                                        wintypes.WPARAM, wintypes.LPARAM)
 LowLevelMouseProc = LowLevelKbdProc
 
@@ -109,7 +112,7 @@ _user32.UnhookWindowsHookEx.restype = wintypes.BOOL
 _user32.CallNextHookEx.argtypes = [
     wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM,
 ]
-_user32.CallNextHookEx.restype = ctypes.c_long
+_user32.CallNextHookEx.restype = wintypes.LPARAM
 _user32.GetMessageW.argtypes = [
     ctypes.c_void_p, wintypes.HWND, ctypes.c_uint, ctypes.c_uint,
 ]

@@ -138,6 +138,7 @@ def disable_hvci() -> dict:
         r"HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
         "Locked", "0"
     )
+    ok = ok and ok2         # (clearing the lock flag is part of switching it off)
     log.info(f"  {'✓' if ok else '✗'} HVCI disabled (reboot required)")
     return {"ok": ok, "reboot_required": True}
 

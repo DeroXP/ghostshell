@@ -360,6 +360,7 @@ def handle_game_exit(exe: str, display_name: str | None,
     oc_climbed = (active_core > floor_core) or (active_mem > floor_mem)
     blacklisted = False
     step_down: dict | None = None
+    stepped_down = False
     if oc_climbed:
         add_to_blacklist(exe, active_core, active_mem, detection["kind"])
         blacklisted = True
@@ -382,10 +383,11 @@ def handle_game_exit(exe: str, display_name: str | None,
                 mem_offset_mhz=step_down["mem"],
                 power_pct=None,                 # don't touch the power limit
             )
+            stepped_down = bool(apply_r.get("ok"))
             log.info(
                 f"Crash auto-recovery: transient step-down to core+"
                 f"{step_down['core']}/mem+{step_down['mem']} "
-                f"(apply_ok={apply_r.get('ok')}) — user profile left untouched"
+                f"(apply_ok={apply_r.get('ok')}), user profile left untouched"
             )
         except Exception as e:
             log.error(f"Crash auto-recovery failed: {e}")
@@ -393,7 +395,7 @@ def handle_game_exit(exe: str, display_name: str | None,
         log.info(
             f"{name} crashed at/below the proven OC floor "
             f"(core+{active_core}/mem+{active_mem} ≤ core+{floor_core}/"
-            f"mem+{floor_mem}) — not blaming the OC, no blacklist/step-down"
+            f"mem+{floor_mem}): not blaming the OC, no blacklist/step-down"
         )
 
     # ── Toast within 5 s ───────────────────────────────────────────────
@@ -402,9 +404,13 @@ def handle_game_exit(exe: str, display_name: str | None,
         from core import notifier
         if blacklisted and step_down is not None:
             title = f"{name} crashed"
+            # The step-down is applied for now only; the saved profile is
+            # never changed here (see above).
             msg = (f"GPU TDR detected at core+{active_core} / mem+{active_mem}. "
-                   f"Stepped down to core+{step_down['core']} / "
-                   f"mem+{step_down['mem']} and saved as the new profile.")
+                   + (f"Stepped down to core+{step_down['core']} / mem+{step_down['mem']} "
+                      f"for now. " if stepped_down else
+                      "The overclock could not be stepped down. ")
+                   + "Your saved OC profile was not changed.")
         elif step_down is None and (active_core or active_mem):
             title = f"{name} crashed"
             msg = (f"Detected a {detection['kind']} during play, but no OC "

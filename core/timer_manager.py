@@ -273,7 +273,14 @@ using System.Runtime.InteropServices;
 public class MemoryAPI {
     [DllImport("ntdll.dll")]
     public static extern uint NtSetSystemInformation(int InfoClass, IntPtr Info, int Length);
+    [DllImport("ntdll.dll")]
+    public static extern uint RtlAdjustPrivilege(int Privilege, [MarshalAs(UnmanagedType.U1)] bool Enable,
+        [MarshalAs(UnmanagedType.U1)] bool CurrentThread, [MarshalAs(UnmanagedType.U1)] out bool Enabled);
     public static bool ClearStandbyList() {
+        // The purge needs SeProfileSingleProcessPrivilege (13).  An elevated
+        // token holds it switched off, and without it the call always fails.
+        bool was;
+        RtlAdjustPrivilege(13, true, false, out was);
         // SystemMemoryListInformation = 80
         // MemoryPurgeStandbyList = 4
         int command = 4;
@@ -301,7 +308,7 @@ try {
     # Fallback: try PowerShell workaround
     r2 = run_ps("Clear-Content $null -ErrorAction SilentlyContinue; [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()")
     log.info("  ⚠ Standby clear: native API may not be available, used fallback")
-    return {"ok": True, "fallback": True}
+    return {"ok": False, "fallback": True}      # (the fallback frees nothing in the standby list)
 
 
 def _islc_loop():
@@ -313,7 +320,10 @@ def _islc_loop():
     """
     consecutive_errors = 0
     MAX_ERRORS = 10
-    while _islc_state["running"]:
+    me = threading.current_thread()
+    # A loop stopped and started again while it slept must not wake up and
+    # carry on beside the new one.
+    while _islc_state["running"] and _islc_state["thread"] is me:
         try:
             mem = get_memory_status()
             free_mb = mem.get("free_mb", 99999)
@@ -328,7 +338,7 @@ def _islc_loop():
             consecutive_errors += 1
             log.warning(f"  ISLC error ({consecutive_errors}/{MAX_ERRORS}): {e}")
             if consecutive_errors >= MAX_ERRORS:
-                log.error("  ISLC: too many consecutive errors — disabling loop")
+                log.error("  ISLC: too many consecutive errors, disabling loop")
                 _islc_state["running"] = False
                 return
 
@@ -349,8 +359,8 @@ def start_islc(free_threshold_mb: int = 1024,
     _islc_state["clears"] = 0
 
     t = threading.Thread(target=_islc_loop, daemon=True)
+    _islc_state["thread"] = t       # before start(): the loop runs only while it is the current one
     t.start()
-    _islc_state["thread"] = t
 
     log.info(f"ISLC started: free<{free_threshold_mb}MB & standby>{standby_threshold_mb}MB → clear every {interval_sec}s")
     return {"ok": True}

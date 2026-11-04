@@ -1,11 +1,11 @@
 {
   "_disclaimer": "Anti-recoil scripts violate the terms of service of most competitive multiplayer games (CS2/VAC, Valorant/Vanguard, Apex/EAC) and can result in permanent bans. Use only in private servers, single-player, or community workshops with explicit permission. Not for ranked play.",
-  "_notes": "Patterns assume right-stick driving aim (Player 1 / standard controller layout). Y-axis convention: +y = stick pushed DOWN (counters upward recoil kick). Magnitudes are conservative (0.3-0.5 range) — scale up/down to match your in-game sensitivity. Each step's down_ms approximates one fire-cycle of the weapon (~100 ms for ~10 RPS automatic weapons).",
+  "_notes": "Patterns assume right-stick driving aim (Player 1 / standard controller layout). Y-axis convention: +y = stick pushed DOWN (counters upward recoil kick). Magnitudes are conservative (0.3-0.5 range), so scale up/down to match your in-game sensitivity. Each step's down_ms approximates one fire-cycle of the weapon (~100 ms for ~10 RPS automatic weapons).",
 
   "presets": [
     {
       "id": "generic_light",
-      "name": "Generic — light vertical pull",
+      "name": "Generic: light vertical pull",
       "game": "Generic",
       "weapon": "Any (light recoil)",
       "rpm": 600,
@@ -18,7 +18,7 @@
     },
     {
       "id": "generic_strong",
-      "name": "Generic — strong vertical pull",
+      "name": "Generic: strong vertical pull",
       "game": "Generic",
       "weapon": "Any (heavy recoil)",
       "rpm": 600,
@@ -32,7 +32,7 @@
 
     {
       "id": "cs2_ak47",
-      "name": "CS2 — AK-47",
+      "name": "CS2: AK-47",
       "game": "Counter-Strike 2",
       "weapon": "AK-47",
       "rpm": 600,
@@ -76,7 +76,7 @@
 
     {
       "id": "cs2_m4a4",
-      "name": "CS2 — M4A4",
+      "name": "CS2: M4A4",
       "game": "Counter-Strike 2",
       "weapon": "M4A4",
       "rpm": 666,
@@ -120,7 +120,7 @@
 
     {
       "id": "cs2_sg553",
-      "name": "CS2 — SG-553",
+      "name": "CS2: SG-553",
       "game": "Counter-Strike 2",
       "weapon": "SG-553",
       "rpm": 600,
@@ -164,12 +164,12 @@
 
     {
       "id": "valorant_vandal",
-      "name": "Valorant — Vandal",
+      "name": "Valorant: Vandal",
       "game": "Valorant",
       "weapon": "Vandal",
       "rpm": 600,
       "shots": 25,
-      "description": "Strong upward kick early, drifts left. ⚠ Vanguard heavily detects automation — practice range only.",
+      "description": "Strong upward kick early, drifts left. ⚠ Vanguard heavily detects automation: practice range only.",
       "play_mode": "once",
       "steps": [
         {"y": 0.30, "x":  0.00},
@@ -203,7 +203,7 @@
 
     {
       "id": "valorant_phantom",
-      "name": "Valorant — Phantom",
+      "name": "Valorant: Phantom",
       "game": "Valorant",
       "weapon": "Phantom",
       "rpm": 666,
@@ -247,7 +247,7 @@
 
     {
       "id": "apex_r99",
-      "name": "Apex Legends — R-99",
+      "name": "Apex Legends: R-99",
       "game": "Apex Legends",
       "weapon": "R-99 SMG",
       "rpm": 1080,
@@ -275,7 +275,7 @@
 
     {
       "id": "apex_r301",
-      "name": "Apex Legends — R-301 Carbine",
+      "name": "Apex Legends: R-301 Carbine",
       "game": "Apex Legends",
       "weapon": "R-301",
       "rpm": 810,

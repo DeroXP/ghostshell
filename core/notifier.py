@@ -109,21 +109,21 @@ try {{
 
 def notify_game_detected(game_name: str, exe: str) -> dict:
     return toast(
-        "Vispora — Game Detected",
+        "Vispora: Game Detected",
         f"Applying gaming optimizations for {game_name}",
     )
 
 
 def notify_game_exited(game_name: str) -> dict:
     return toast(
-        "Vispora — Game Closed",
+        "Vispora: Game Closed",
         f"{game_name} exited. Normal mode restored.",
     )
 
 
 def notify_boot_prep_done(duration_sec: float) -> dict:
     return toast(
-        "Vispora — Ready",
+        "Vispora: Ready",
         f"System primed for gaming in {duration_sec:.1f}s",
     )
 
@@ -140,7 +140,7 @@ def notify_update_installed(new_version: str, previous_version: str) -> dict:
 
 def notify_update_failed(reason: str) -> dict:
     return toast(
-        "Vispora — Update install failed",
+        "Vispora: Update install failed",
         f"The update did not apply: {reason}. The current version is unchanged.",
         force=True,
     )

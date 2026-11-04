@@ -69,6 +69,10 @@ _queue_lock    = threading.Lock()
 _bg_thread: threading.Thread | None = None
 _bg_stop:   threading.Event       = threading.Event()
 
+# time.monotonic() of the last heartbeat attempt: a failed one is retried
+# after RETRY_INTERVAL_SEC, not on every 60 s loop tick.
+_last_heartbeat_try: float | None = None
+
 
 # ─── Settings file ───────────────────────────────────────────────────────
 def _load_settings() -> dict[str, Any]:
@@ -126,7 +130,6 @@ def update_local_settings(**kwargs) -> dict[str, Any]:
             else:
                 log.warning(f"Ignoring invalid update_channel={v!r}")
                 continue
-            continue
         s[k] = v
     _save_settings(s)
 
@@ -285,6 +288,7 @@ def heartbeat(force: bool = False) -> dict[str, Any]:
     """Refresh `last_seen`.  Skips the call if we did one in the last
     HEARTBEAT_INTERVAL_SEC unless `force=True`.
     """
+    global _last_heartbeat_try
     if not is_enabled():
         return {"ok": False, "err": "cloud disabled"}
 
@@ -299,6 +303,12 @@ def heartbeat(force: bool = False) -> dict[str, Any]:
                     return {"ok": True, "skipped": True, "age": int(age)}
             except Exception:
                 pass
+        # Each attempt probes the hardware with several PowerShell runs, so
+        # while the server is down or the PC is offline, wait between tries.
+        if (_last_heartbeat_try is not None
+                and time.monotonic() - _last_heartbeat_try < RETRY_INTERVAL_SEC):
+            return {"ok": False, "skipped": True, "err": "retrying later"}
+    _last_heartbeat_try = time.monotonic()
 
     did = get_device_id()
     body = {"hardware": collect_hardware_fingerprint()}

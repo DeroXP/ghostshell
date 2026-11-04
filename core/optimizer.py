@@ -1,6 +1,7 @@
 """Hard performance optimizer — aggressive tweaks for gaming & latency."""
 import json
 import os
+import re
 import time
 from core.utils import run_ps, run_cmd, get_logger, backup_registry, detect_drive_type, atomic_write_json
 from config import APPDATA_DIR
@@ -20,7 +21,7 @@ def _reg(key: str, value: str, data: str, vtype: str = "REG_DWORD") -> bool:
     # for diagnostics instead of vanishing silently.
     if not r.get("ok"):
         err = (r.get("err") or r.get("out") or "").strip()[:160]
-        log.warning(f"reg write FAILED: {key}\\{value} = {data} ({vtype}) — {err}")
+        log.warning(f"reg write FAILED: {key}\\{value} = {data} ({vtype}): {err}")
     return r["ok"]
 
 
@@ -114,6 +115,9 @@ _DEFENDER_EXCLUDE_PATHS = (
 )
 _DEFENDER_EXCLUDE_PROCESSES = ("steam.exe", "epicgameslauncher.exe", "battle.net.exe",
                                "riotclientservices.exe", "ubisoftconnect.exe")
+# The row for a group whose current state could not be read.  Nothing in it is
+# changed then: without the previous state on record it could not be undone.
+_UNREADABLE = "{}: couldn't read the current state, nothing changed"
 
 sys_state.allow("service", _XBOX_SERVICES + _EDGE_SERVICES + _OTHER_SERVICES
                 + tuple(svc for _, svc in _LEGACY_SERVICES + _SMARTCARD_SERVICES))
@@ -310,7 +314,11 @@ def _read_power_baseline() -> str:
             guid = str((json.load(f) or {}).get("guid", "") or "")
     except (OSError, ValueError):
         return ""
-    return "" if guid.lower() in _own_power_plans() else guid
+    if guid.lower() in _own_power_plans():
+        return ""
+    # A plan deleted since (by the user, an update) can never be restored, and
+    # trusting it would stop the plan the user is on now from being captured.
+    return "" if guid and reg_originals.scheme_gone(guid) else guid
 
 
 def _forget_power_baseline() -> None:
@@ -385,10 +393,11 @@ def apply_ultimate_power_plan() -> dict:
         log.info(f"  ✓ Ultimate Performance plan active (GUID: {guid})")
         return {"ok": True, "guid": guid}
 
-    # Fallback: set high performance
-    run_cmd(["powercfg", "-setactive", "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"])
-    log.info("  ✓ High Performance plan set (Ultimate not available)")
-    return {"ok": True, "guid": "high-perf-fallback"}
+    # Fallback: set high performance.  (Modern Standby PCs often have neither
+    # plan; this used to report success there with the plan unchanged.)
+    ok = run_cmd(["powercfg", "-setactive", "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"])["ok"]
+    log.info(f"  {'✓' if ok else '✗'} High Performance plan set (Ultimate not available)")
+    return {"ok": ok, "guid": "high-perf-fallback"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -547,7 +556,10 @@ def apply_storage_tweaks() -> list[dict]:
     # SSD/NVMe: verify TRIM
     if drive_type in ("ssd", "nvme"):
         r = run_cmd(["fsutil", "behavior", "query", "disabledeletenotify"])
-        trim_ok = "0" in r.get("out", "")
+        # NTFS's flag is the first one printed (ReFS's follows, usually 0): a
+        # "0" anywhere in the text passed even with TRIM off.
+        trim = re.search(r"DisableDeleteNotify\s*=\s*(\d+)", r.get("out") or "")
+        trim_ok = bool(trim) and trim.group(1) == "0"
         log.info(f"  {'✓' if trim_ok else '⚠'} TRIM {'enabled' if trim_ok else 'check manually'}")
         results.append({"name": "TRIM Enabled", "ok": trim_ok})
 
@@ -715,15 +727,16 @@ def scan_startup_items() -> list[dict]:
         if r2["ok"] and r2["out"]:
             for line in r2["out"].splitlines():
                 line = line.strip()
-                if "REG_SZ" in line or "REG_EXPAND_SZ" in line:
-                    parts = line.split(maxsplit=2)
-                    if len(parts) >= 3:
-                        items.append({
-                            "name": parts[0],
-                            "command": parts[2] if len(parts) > 2 else "",
-                            "location": label,
-                            "user": "",
-                        })
+                # "<name>    REG_SZ    <command>": names can contain spaces
+                # ("Razer Synapse"), so split at the type, not at the first space.
+                parts = re.match(r"(.+?)\s+REG_(?:EXPAND_)?SZ\s+(.*)$", line)
+                if parts:
+                    items.append({
+                        "name": parts.group(1),
+                        "command": parts.group(2),
+                        "location": label,
+                        "user": "",
+                    })
     return items
 
 
@@ -930,7 +943,7 @@ def apply_latency_tweaks() -> list[dict]:
             "Get-PnpDevice | Where-Object {$_.FriendlyName -like '*High Precision*' -or "
             "$_.FriendlyName -like '*HPET*'} | Disable-PnpDevice -Confirm:$false -ErrorAction SilentlyContinue"
         )
-        results.append({"name": "[Pro] HPET disabled", "ok": True})
+        results.append({"name": "[Pro] HPET disabled", "ok": r["ok"]})
     else:
         results.append({"name": "HPET disable skipped (Pro Mode off)",
                          "ok": True, "skipped": True})
@@ -940,14 +953,16 @@ def apply_latency_tweaks() -> list[dict]:
     # removed earlier, tscsyncpolicy enhanced) are safe enough to
     # always apply.
     bcd = sys_state.bcd_values()    # one read; each element's previous value is noted before it changes
+    if bcd is None:
+        results.append({"name": _UNREADABLE.format("Boot settings (bcdedit)"), "ok": False})
     for name, element, value in [
         ("bcdedit useplatformclock no", "useplatformclock", "no"),
         ("bcdedit tscsyncpolicy enhanced", "tscsyncpolicy", "Enhanced"),
     ]:
-        results.append({"name": name, "ok": sys_state.set_bcd(element, value, current=bcd)})
+        results.append({"name": name, "ok": bcd is not None and sys_state.set_bcd(element, value, current=bcd)})
 
     if _pro_mode_enabled():
-        ok = sys_state.set_bcd("disabledynamictick", "yes", current=bcd)
+        ok = bcd is not None and sys_state.set_bcd("disabledynamictick", "yes", current=bcd)
         results.append({"name": "[Pro] bcdedit disabledynamictick yes", "ok": ok})
     else:
         results.append({"name": "disabledynamictick skipped (Pro Mode off)",
@@ -1186,7 +1201,7 @@ def reset_all_optimizations() -> dict:
             for r in services.get("results", [])]
         if services.get("unrecorded"):
             results["debloat_services"].append({
-                "name": (f"Left disabled — no previous start type on record: {', '.join(services['unrecorded'])} "
+                "name": (f"Left disabled (no previous start type on record): {', '.join(services['unrecorded'])} "
                          f"(if an early version of the debloater did that, services.msc switches them back on)"),
                 "ok": True})
         results["debloat_tasks"] = debloater.restore_scheduled_tasks().get("results", [])
@@ -1198,7 +1213,7 @@ def reset_all_optimizations() -> dict:
     run_cmd(["taskkill", "/f", "/im", "dwm.exe"])  # DWM auto-restarts
     results["dwm"] = [{"name": "DWM restarted (applies visual changes)", "ok": True}]
 
-    log.info("=== ALL OPTIMIZATIONS RESET — REBOOT RECOMMENDED ===")
+    log.info("=== ALL OPTIMIZATIONS RESET (REBOOT RECOMMENDED) ===")
     return results
 
 
@@ -1272,9 +1287,9 @@ def _reset_power_plan() -> list[dict]:
     if active_power_plan().lower() not in _own_power_plans():
         results.append({"name": "Power plan left as it is (not one Vispora switched to)", "ok": True})
         return results
-    log.info(f"  No baseline file ({restored.get('err','')}) — falling back to Balanced")
+    log.info(f"  No baseline file ({restored.get('err','')}), falling back to Balanced")
     r = run_cmd(["powercfg", "-setactive", "381b4222-f694-41f0-9685-ff5bb260df2e"])
-    results.append({"name": "Balanced Power Plan (fallback — no baseline file)", "ok": r["ok"]})
+    results.append({"name": "Balanced Power Plan (fallback, no baseline file)", "ok": r["ok"]})
     return results
 
 
@@ -1894,6 +1909,9 @@ def apply_defender_gaming_tweaks() -> list[dict]:
     # already there get recorded (and removed again by Reset All), and each
     # preference's own previous value is what a reset goes back to.
     prefs = sys_state.defender_prefs()
+    if prefs is None:           # (also: Defender is off because another antivirus runs)
+        log.info(f"  ✗ {_UNREADABLE.format('Defender')}")
+        return [{"name": _UNREADABLE.format("Defender"), "ok": False}]
 
     # Auto-detect common game-install roots and exclude them
     excluded = []
@@ -1949,15 +1967,21 @@ def apply_boot_tweaks() -> list[dict]:
     # ~40% of RAM on disk (e.g. 13 GB on a 32 GB system) which is
     # meaningful on a small SSD but unmeasurable on modern 1 TB+ NVMe.
     if _pro_mode_enabled():
-        reg_originals.note("hibernation_disabled")
+        # Noted only while it is on: hibernation that is already off is the
+        # user's own choice, and Reset All switches on what is noted.
+        hib = reg_originals.read_value(r"HKLM\SYSTEM\CurrentControlSet\Control\Power", "HibernateEnabled") or {}
+        if hib.get("data") != 0:
+            reg_originals.note("hibernation_disabled")
         run_cmd(["powercfg", "-h", "off"])
         results.append({"name": "[Pro] Hibernation disabled (frees ~RAM-size on disk)", "ok": True})
     else:
-        results.append({"name": "Hibernation off skipped (Pro Mode off — laptops keep the feature)",
+        results.append({"name": "Hibernation off skipped (Pro Mode off, so laptops keep the feature)",
                          "ok": True, "skipped": True})
 
     # bcdedit — Legacy boot menu (no fancy GUI), faster boot
     bcd = sys_state.bcd_values()
+    if bcd is None:
+        results.append({"name": _UNREADABLE.format("Boot settings (bcdedit)"), "ok": False})
     for name, cmd in [
         ("Boot menu policy: Legacy",   ["bcdedit", "/set", "{current}", "bootmenupolicy", "Legacy"]),
         # v3.3.1-beta.7: replaced `bootux disabled` with `quietboot yes`.
@@ -1975,7 +1999,7 @@ def apply_boot_tweaks() -> list[dict]:
     ]:
         # cmd is ["bcdedit", "/set", "{current}", element, value] — set
         # through sys_state, which notes what the element was before.
-        results.append({"name": name, "ok": sys_state.set_bcd(cmd[3], cmd[4], current=bcd)})
+        results.append({"name": name, "ok": bcd is not None and sys_state.set_bcd(cmd[3], cmd[4], current=bcd)})
 
     # Show verbose status messages on boot (helps diagnose hangs)
     _reg(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
@@ -2078,8 +2102,11 @@ def apply_legacy_tweaks() -> list[dict]:
     # off — and noted, so Reset All can switch exactly those back on (it used
     # to leave every one of them off for good).
     n_off = sys_state.disable_features(features_to_remove)
-    results.append({"name": f"Disabled {n_off} optional Windows feature(s) "
-                            f"(of {len(features_to_remove)} checked; the rest were already off)", "ok": True})
+    if n_off is None:
+        results.append({"name": _UNREADABLE.format("Optional Windows features"), "ok": False})
+    else:
+        results.append({"name": f"Disabled {n_off} optional Windows feature(s) "
+                                f"(of {len(features_to_remove)} checked; the rest were already off)", "ok": True})
 
     log.info("Legacy tweaks applied")
     return results
@@ -2173,9 +2200,11 @@ def _reset_boot_tweaks() -> list[dict]:
     hb_key = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power"
     if _pro_mode_enabled():
         _reg_default(hb_key, "HiberBootEnabled", "0", "1")
+    hibernation = True
     if reg_originals.noted("hibernation_disabled"):
-        run_cmd(["powercfg", "-h", "on"])
-        reg_originals.forget_notes("hibernation_disabled")
+        hibernation = run_cmd(["powercfg", "-h", "on"])["ok"]
+        if hibernation:     # (on failure the note stays, so the next Reset All tries again)
+            reg_originals.forget_notes("hibernation_disabled")
     # Fixed defaults for boot elements an older build changed without a
     # record, each only while it still reads the way that tweak left it.
     bcd = sys_state.bcd_values()
@@ -2190,7 +2219,7 @@ def _reset_boot_tweaks() -> list[dict]:
     _bcd_default(bcd, "quietboot", "yes")       # was never reset at all
     _reg_default(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
                  "VerboseStatus", "1", None)
-    return [{"name": "Boot tweaks restored", "ok": True}]
+    return [{"name": "Boot tweaks restored", "ok": hibernation}]
 
 
 def _reset_legacy_tweaks() -> list[dict]:
@@ -2250,9 +2279,11 @@ def apply_network_stack_tweaks() -> list[dict]:
 
     # netsh global — each parameter's previous value is noted before it changes
     tcp = sys_state.tcp_globals()
+    if tcp is None:
+        results.append({"name": _UNREADABLE.format("netsh TCP settings"), "ok": False})
     for param, value in _TCP_GLOBAL_TWEAKS:
         results.append({"name": f"netsh: {param} {value}",
-                        "ok": sys_state.set_tcp_global(param, value, current=tcp)})
+                        "ok": tcp is not None and sys_state.set_tcp_global(param, value, current=tcp)})
 
     log.info("Network stack tweaks applied")
     return results
@@ -2298,9 +2329,9 @@ def apply_telemetry_deep_tweaks() -> list[dict]:
 
     # Disable known telemetry scheduled tasks
     tasks = _TELEMETRY_TASKS
-    for t in tasks:
-        sys_state.disable_task(t)       # notes that it was enabled, so Reset All can re-enable it
-    results.append({"name": f"Disabled {len(tasks)} telemetry scheduled tasks", "ok": True})
+    # (Counted: one that is not on this Windows, or cannot be read, is left alone.)
+    n = sum(1 for t in tasks if sys_state.disable_task(t))  # notes that it was enabled, so Reset All can re-enable it
+    results.append({"name": f"Disabled {n} telemetry scheduled tasks", "ok": True})
 
     # Error reporting service
     sys_state.set_service_start("WerSvc", "disabled", stop=True)
@@ -2314,7 +2345,7 @@ def apply_telemetry_deep_tweaks() -> list[dict]:
     # Store/Xbox app actually needs it.  Net telemetry impact is still
     # ~zero in idle steady state.
     sys_state.set_service_start("DiagTrack", "demand", stop=True)
-    results.append({"name": "DiagTrack service → manual (was disabled — broke Store/Xbox)", "ok": True})
+    results.append({"name": "DiagTrack service → manual (was disabled, which broke Store/Xbox)", "ok": True})
 
     # dmwappushservice
     sys_state.set_service_start("dmwappushservice", "disabled", stop=True)
@@ -2488,7 +2519,11 @@ def apply_power_advanced_tweaks() -> list[dict]:
         ("Power button → Shutdown",         ["powercfg", "/setacvalueindex", "scheme_current", "4f971e89-eebd-4455-a8de-9e59040e7347", "7648efa3-dd9c-4e3e-b566-50f929386280", "3"]),
     ]
     for name, cmd in cmds:
-        reg_originals.remember_power(cmd[3], cmd[4])    # sub-group, setting — before it changes
+        if not reg_originals.remember_power(cmd[3], cmd[4]):    # sub-group, setting — before it changes
+            # Its current value could not be read, so the change could never
+            # be undone: left as it is.
+            results.append({"name": name, "ok": False})
+            continue
         r = run_cmd(cmd)
         results.append({"name": name, "ok": r["ok"]})
 
@@ -2784,7 +2819,7 @@ def _reset_power_advanced_tweaks() -> list[dict]:
     n = reg_originals.summary()["power"]
     if n:
         return [{"name": f"{n} power-plan setting(s) will be restored to their previous values", "ok": True}]
-    return [{"name": "Advanced power settings: no previous values on record — left as they are "
+    return [{"name": "Advanced power settings: no previous values on record, so left as they are "
                      "(Windows: Power Options → Restore default settings for this plan)", "ok": True}]
 
 

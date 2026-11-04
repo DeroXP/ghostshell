@@ -2,9 +2,31 @@
 import os
 import json
 import re
+from config import APPDATA_DIR
 from core.utils import run_ps, get_logger, is_reparse_point
 
 log = get_logger("cleaner")
+
+
+def _too_broad_to_clean(path: str) -> bool:
+    """True for a drive root, or a folder that holds the user profile or the
+    app's own data.  That is where a TEMP variable set to the wrong place
+    points, and the cleaner would empty all of it.  A relative path (an empty
+    variable joined to a name, or "C:") means the working folder: also True."""
+    try:
+        if not os.path.isabs(path):
+            return True
+        real = os.path.normcase(os.path.realpath(path)).rstrip("\\/")
+        if not os.path.splitdrive(real)[1].strip("\\/"):
+            return True
+        for keep in (os.environ.get("USERPROFILE"), os.environ.get("LOCALAPPDATA"), APPDATA_DIR):
+            if keep:
+                k = os.path.normcase(os.path.realpath(keep)).rstrip("\\/")
+                if k == real or k.startswith(real + os.sep):
+                    return True
+    except (OSError, ValueError, TypeError):
+        return True
+    return False
 
 
 def _is_in_pyinstaller_extract(p: str) -> bool:
@@ -32,7 +54,7 @@ def _is_in_pyinstaller_extract(p: str) -> bool:
 def _safe_rmtree(path: str) -> tuple[int, int]:
     files = 0
     size = 0
-    if not os.path.isdir(path) or is_reparse_point(path):
+    if not os.path.isdir(path) or is_reparse_point(path) or _too_broad_to_clean(path):
         return 0, 0
     subdirs = []
     for root, dirs, filenames in os.walk(path, topdown=True):
@@ -111,8 +133,12 @@ def scan_temp_sizes() -> list[dict]:
     results = []
     for loc in locations:
         total = 0; count = 0
-        if os.path.isdir(loc["path"]):
+        if os.path.isdir(loc["path"]) and not _too_broad_to_clean(loc["path"]):
             for root, dirs, files in os.walk(loc["path"]):
+                # Count only what clean_location() can remove: it does not
+                # follow junctions (os.walk does, loops included) or touch _MEI*.
+                dirs[:] = [d for d in dirs if not d.startswith("_MEI")
+                           and not is_reparse_point(os.path.join(root, d))]
                 for f in files:
                     try:
                         total += os.path.getsize(os.path.join(root, f)); count += 1
@@ -165,12 +191,15 @@ public static int Go() { int c=0; foreach(Process p in Process.GetProcesses()){t
 } catch { 0 }
 """)
     # Clear standby
+    # The purge needs SeProfileSingleProcessPrivilege (13), which an elevated
+    # token holds switched off: without switching it on this always failed.
     run_ps("""
 try {
     Add-Type -TypeDefinition @'
 using System; using System.Runtime.InteropServices;
 public class SB { [DllImport("ntdll.dll")] public static extern uint NtSetSystemInformation(int c, IntPtr i, int l);
-public static bool Go() { int v=4; IntPtr p=Marshal.AllocHGlobal(4); Marshal.WriteInt32(p,v); uint r=NtSetSystemInformation(80,p,4); Marshal.FreeHGlobal(p); return r==0; }}
+[DllImport("ntdll.dll")] public static extern uint RtlAdjustPrivilege(int p, [MarshalAs(UnmanagedType.U1)] bool on, [MarshalAs(UnmanagedType.U1)] bool thread, [MarshalAs(UnmanagedType.U1)] out bool was);
+public static bool Go() { bool w; RtlAdjustPrivilege(13,true,false,out w); int v=4; IntPtr p=Marshal.AllocHGlobal(4); Marshal.WriteInt32(p,v); uint r=NtSetSystemInformation(80,p,4); Marshal.FreeHGlobal(p); return r==0; }}
 '@ -ErrorAction SilentlyContinue; [SB]::Go()
 } catch { $false }
 """)
@@ -282,10 +311,10 @@ def scan_disk_junk(drive_letter: str) -> list[dict]:
                         _add("Root junk files", entry.stat().st_size)
                 elif entry.is_dir(follow_symlinks=False):
                     dn = entry.name.lower()
-                    if dn in _NEVER_ENTER:
+                    if dn in _NEVER_ENTER or is_reparse_point(entry.path):
                         continue
                     # Check if it's a temp/cache directory
-                    if any(k in dn for k in ("temp","tmp","cache","log","crash")):
+                    if dn in _JUNK_DIR_NAMES:       # the rule clean_disk_junk() wipes by
                         s = _measure_dir(entry.path)
                         if s > 0:
                             _add(f"Temp dir: {entry.name}", s)
@@ -309,8 +338,11 @@ def _scan_known_junk_dirs(categories):
     """Scan well-known Windows junk/cache directories on C: drive."""
     localappdata = os.environ.get("LOCALAPPDATA", "")
     temp = os.environ.get("TEMP", "")
-    appdata = os.environ.get("APPDATA", "")
 
+    # Exactly the folders _clean_known_junk_dirs() empties, so "reclaimable"
+    # is what Clean frees.  Browser, Discord, Teams, Spotify, Steam-dump,
+    # thumbnail and installer caches were counted here and never cleaned, and
+    # "Font Cache" was the folder of the user's own installed fonts.
     known = [
         ("User Temp", temp),
         ("Windows Temp", r"C:\Windows\Temp"),
@@ -318,24 +350,14 @@ def _scan_known_junk_dirs(categories):
         ("WU Downloads", r"C:\Windows\SoftwareDistribution\Download"),
         ("Crash Dumps", os.path.join(localappdata, "CrashDumps") if localappdata else ""),
         ("Internet Cache", os.path.join(localappdata, "Microsoft", "Windows", "INetCache") if localappdata else ""),
-        ("Thumbnails", os.path.join(localappdata, "Microsoft", "Windows", "Explorer") if localappdata else ""),
-        ("Installer Cache", r"C:\Windows\Installer\$PatchCache$"),
-        ("Font Cache", os.path.join(localappdata, "Microsoft", "Windows", "Fonts") if localappdata else ""),
         ("D3D Shader Cache", os.path.join(localappdata, "D3DSCache") if localappdata else ""),
         ("NVIDIA Shader Cache", os.path.join(localappdata, "NVIDIA", "DXCache") if localappdata else ""),
         ("NVIDIA GL Cache", os.path.join(localappdata, "NVIDIA", "GLCache") if localappdata else ""),
         ("AMD Shader Cache", os.path.join(localappdata, "AMD", "DxCache") if localappdata else ""),
-        ("Steam Dumps", os.path.join(os.environ.get("ProgramFiles(x86)",""), "Steam", "dumps")),
-        ("Chrome Cache", os.path.join(localappdata, "Google", "Chrome", "User Data", "Default", "Cache") if localappdata else ""),
-        ("Chrome Code Cache", os.path.join(localappdata, "Google", "Chrome", "User Data", "Default", "Code Cache") if localappdata else ""),
-        ("Edge Cache", os.path.join(localappdata, "Microsoft", "Edge", "User Data", "Default", "Cache") if localappdata else ""),
-        ("Discord Cache", os.path.join(appdata, "discord", "Cache") if appdata else ""),
-        ("Teams Cache", os.path.join(appdata, "Microsoft", "Teams", "Cache") if appdata else ""),
-        ("Spotify Cache", os.path.join(localappdata, "Spotify", "Storage") if localappdata else ""),
     ]
 
     for name, path in known:
-        if path and os.path.isdir(path):
+        if path and os.path.isdir(path) and not _too_broad_to_clean(path):
             s = _measure_dir(path)
             if s > 0:
                 if name not in categories:
@@ -368,6 +390,9 @@ def _measure_dir(path):
     total = 0
     try:
         for root, dirs, files in os.walk(path):
+            # What _safe_rmtree() would leave: junctions and _MEI* runtimes.
+            dirs[:] = [d for d in dirs if not d.startswith("_MEI")
+                       and not is_reparse_point(os.path.join(root, d))]
             for f in files:
                 try: total += os.path.getsize(os.path.join(root, f))
                 except OSError: pass
@@ -379,6 +404,8 @@ def _count_files(path):
     count = 0
     try:
         for root, dirs, files in os.walk(path):
+            dirs[:] = [d for d in dirs if not d.startswith("_MEI")
+                       and not is_reparse_point(os.path.join(root, d))]
             count += len(files)
     except (PermissionError, OSError): pass
     return count
@@ -423,7 +450,9 @@ def clean_disk_junk(drive_letters: list[str]) -> dict:
                             os.remove(entry.path); df += 1; ds += s
                     elif entry.is_dir(follow_symlinks=False):
                         dn = entry.name.lower()
-                        if dn in _NEVER_ENTER: continue
+                        # A junction here (D:\Work -> ...\Documents\Work) would
+                        # have the shallow sweep deleting inside a folder it never enters.
+                        if dn in _NEVER_ENTER or is_reparse_point(entry.path): continue
                         # 3.4.2: EXACT name match (was substring) — only
                         # wipe a folder literally named temp/cache/etc,
                         # not any folder containing the word.  Everything

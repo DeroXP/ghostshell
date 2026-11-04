@@ -7,6 +7,7 @@ import subprocess
 import sys
 import json
 import itertools
+import threading
 import stat
 from datetime import datetime
 from collections import deque
@@ -132,12 +133,18 @@ def is_admin() -> bool:
         return False
 
 
+# PowerShell writes to a pipe in the console's OEM code page, which has no
+# letters for most of the world: a "ü" in a user or adapter name came back
+# mangled and Cyrillic as "?".  Switched to UTF-8 (no BOM) first, read as UTF-8.
+_PS_UTF8_OUTPUT = "try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } catch {}\n"
+
+
 def run_ps(command: str, timeout: int = 60) -> dict:
     """Run a PowerShell command and return {'ok': bool, 'out': str, 'err': str}."""
     try:
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-            capture_output=True, text=True, timeout=timeout,
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS_UTF8_OUTPUT + command],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return {"ok": r.returncode == 0, "out": r.stdout.strip(), "err": r.stderr.strip()}
@@ -152,8 +159,11 @@ def run_ps(command: str, timeout: int = 60) -> dict:
 def run_cmd(args: list, timeout: int = 60) -> dict:
     """Run an arbitrary command list."""
     try:
+        # errors="replace": console tools print in the OEM code page, and one
+        # byte the ANSI one lacks (cp850 "ü" is 0x81) used to fail the whole
+        # call although the command had worked.
         r = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout,
+            args, capture_output=True, text=True, errors="replace", timeout=timeout,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return {"ok": r.returncode == 0, "out": r.stdout.strip(), "err": r.stderr.strip()}
@@ -208,6 +218,20 @@ def is_safe_ps_literal(value) -> bool:
     return isinstance(value, str) and bool(value) and not _PS_DQ_UNSAFE_RE.search(value)
 
 
+def _replace_retrying(src: str, dst: str, tries: int = 10) -> None:
+    """os.replace, retried for a moment: Windows refuses to replace a file
+    another handle has open (a thread reading it, another writer's replace,
+    a scanner), and that passes in milliseconds."""
+    for attempt in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(0.05)
+
+
 def atomic_write_json(path: str, data) -> bool:
     """Write JSON to `path` without ever leaving a truncated/corrupt file behind.
 
@@ -217,12 +241,18 @@ def atomic_write_json(path: str, data) -> bool:
     half-written one. Settings/state readers already fall back to defaults on
     a bad json.load, but that fallback silently loses the user's saved data —
     this prevents the corruption that fallback was papering over."""
-    tmp = f"{path}.tmp{os.getpid()}"
+    # Per thread too: two threads saving the same file shared one temp file,
+    # interleaved their writes in it and could install the mix.
+    tmp = f"{path}.tmp{os.getpid()}.{threading.get_ident()}"
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        os.replace(tmp, path)
+            # On the disk before the rename: after a crash or power cut the
+            # renamed file could otherwise be there but zero-filled.
+            f.flush()
+            os.fsync(f.fileno())
+        _replace_retrying(tmp, path)
         return True
     except Exception as e:
         get_logger("utils").warning(f"atomic_write_json failed for {path}: {e}")
@@ -236,12 +266,14 @@ def atomic_write_json(path: str, data) -> bool:
 def atomic_write_text(path: str, text: str, encoding: str = "utf-8") -> bool:
     """Same crash-safety as atomic_write_json, for plain-text files (raw
     IDs, the Windows hosts file, etc.) that aren't JSON-encoded."""
-    tmp = f"{path}.tmp{os.getpid()}"
+    tmp = f"{path}.tmp{os.getpid()}.{threading.get_ident()}"
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(tmp, "w", encoding=encoding) as f:
             f.write(text)
-        os.replace(tmp, path)
+            f.flush()
+            os.fsync(f.fileno())
+        _replace_retrying(tmp, path)
         return True
     except Exception as e:
         get_logger("utils").warning(f"atomic_write_text failed for {path}: {e}")

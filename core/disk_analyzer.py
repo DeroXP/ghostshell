@@ -312,15 +312,17 @@ def start_scan(drive: str = "C:") -> dict:
         if _active_state and _active_state.get("state") == "running":
             return {"ok": False, "err": "scan already in progress",
                     "scan_id": _active_state.get("scan_id")}
-        _active_state = _new_state(drive)
+        _active_state = state = _new_state(drive)
     _stop_event = threading.Event()
+    # The worker writes only to its own state: a cancelled scan still winding
+    # down must not mark the next one "cancelled" or mix its counts in.
     _scan_thread = threading.Thread(
         target=_run_scan_worker,
-        args=(drive, _stop_event),
-        daemon=True, name=f"disk-scan-{_active_state['scan_id']}",
+        args=(drive, _stop_event, state),
+        daemon=True, name=f"disk-scan-{state['scan_id']}",
     )
     _scan_thread.start()
-    return {"ok": True, "scan_id": _active_state["scan_id"], "drive": drive}
+    return {"ok": True, "scan_id": state["scan_id"], "drive": drive}
 
 
 def cancel_scan() -> dict:
@@ -402,7 +404,7 @@ def _drive_label(d: str) -> str:
 
 # ─── Worker thread ───────────────────────────────────────────────────
 
-def _run_scan_worker(drive: str, stop_event: threading.Event) -> None:
+def _run_scan_worker(drive: str, stop_event: threading.Event, state: dict) -> None:
     """Top-level scan driver.  Wraps engine selection + error capture
     so the public state always lands in a consistent shape."""
     started = time.time()
@@ -412,21 +414,21 @@ def _run_scan_worker(drive: str, stop_event: threading.Event) -> None:
         # which path was used.
         engine = "scandir"
         with _state_lock:
-            _active_state["engine"] = engine
-        result = _scan_via_scandir(drive, stop_event)
+            state["engine"] = engine
+        result = _scan_via_scandir(drive, stop_event, state)
         if stop_event.is_set():
             with _state_lock:
-                _active_state["state"] = "cancelled"
-                _active_state["ended_at"] = time.time()
+                state["state"] = "cancelled"
+                state["ended_at"] = time.time()
             log.info(f"disk scan cancelled after {time.time()-started:.1f}s")
             return
         result["scan_seconds"] = round(time.time() - started, 2)
         with _state_lock:
-            _active_state["state"]     = "done"
-            _active_state["ended_at"]  = time.time()
-            _active_state["result"]    = result
+            state["state"]     = "done"
+            state["ended_at"]  = time.time()
+            state["result"]    = result
         log.info(
-            f"disk scan complete: {drive} in {result['scan_seconds']:.1f}s — "
+            f"disk scan complete: {drive} in {result['scan_seconds']:.1f}s, "
             f"{result['total_files']:,} files, "
             f"{result['total_dirs']:,} dirs, "
             f"{result['total_bytes'] / (1024**3):.1f} GB"
@@ -434,12 +436,12 @@ def _run_scan_worker(drive: str, stop_event: threading.Event) -> None:
     except Exception as e:
         log.exception(f"disk scan failed: {e}")
         with _state_lock:
-            _active_state["state"]    = "error"
-            _active_state["error"]    = str(e)
-            _active_state["ended_at"] = time.time()
+            state["state"]    = "error"
+            state["error"]    = str(e)
+            state["ended_at"] = time.time()
 
 
-def _scan_via_scandir(drive: str, stop_event: threading.Event) -> dict:
+def _scan_via_scandir(drive: str, stop_event: threading.Event, state: dict) -> dict:
     """Recursive scandir-based scan.  Parallelised across top-level
     subdirs using a small thread pool — most of the wall-clock time
     is spent waiting on filesystem I/O which the OS happily services
@@ -476,6 +478,11 @@ def _scan_via_scandir(drive: str, stop_event: threading.Event) -> dict:
                     break
                 try:
                     if entry.is_dir(follow_symlinks=False):
+                        # A junction here (every C: has "Documents and
+                        # Settings" -> C:\Users) would be walked as its
+                        # target, counting that whole tree twice.
+                        if entry.stat(follow_symlinks=False).st_file_attributes & 0x400:
+                            continue
                         first_level.append(entry.path)
                     elif entry.is_file(follow_symlinks=False):
                         # Files directly under the drive root
@@ -498,7 +505,7 @@ def _scan_via_scandir(drive: str, stop_event: threading.Event) -> dict:
         futures = []
         for d in first_level:
             futures.append(pool.submit(_walk_subdir, d, stop_event,
-                                         target_volume))
+                                         target_volume, state))
         for fut in futures:
             try:
                 sub_result = fut.result()
@@ -547,10 +554,10 @@ def _scan_via_scandir(drive: str, stop_event: threading.Event) -> dict:
 
     # Update final progress with the post-scan totals
     with _state_lock:
-        _active_state["progress"]["files"]  = counters["files"]
-        _active_state["progress"]["dirs"]   = counters["dirs"]
-        _active_state["progress"]["bytes"]  = total_bytes
-        _active_state["progress"]["errors"] = counters["errors"]
+        state["progress"]["files"]  = counters["files"]
+        state["progress"]["dirs"]   = counters["dirs"]
+        state["progress"]["bytes"]  = total_bytes
+        state["progress"]["errors"] = counters["errors"]
 
     return {
         "drive":         drive,
@@ -571,7 +578,7 @@ def _scan_via_scandir(drive: str, stop_event: threading.Event) -> dict:
 
 
 def _walk_subdir(start: str, stop_event: threading.Event,
-                  target_volume: Optional[int]) -> Optional[tuple]:
+                  target_volume: Optional[int], state: dict) -> Optional[tuple]:
     """Recursively walk one subtree.  Returns (root_node, counters,
     top_files_local, top_folders_local, ext_totals_local).  Counters
     are accumulated locally to keep the threads independent — caller
@@ -579,6 +586,7 @@ def _walk_subdir(start: str, stop_event: threading.Event,
     if stop_event.is_set():
         return None
     counters = {"files": 0, "dirs": 0, "bytes": 0, "errors": 0}
+    shown = dict(counters)          # what the progress mirror has passed on so far
     top_files_local: list  = []
     top_folders_local: list = []
     ext_totals_local: dict  = {}
@@ -609,10 +617,15 @@ def _walk_subdir(start: str, stop_event: threading.Event,
                             return None
                         # Periodic progress mirror
                         with _state_lock:
-                            if _active_state is not None:
-                                p = _active_state["progress"]
+                            if state is not None:
+                                p = state["progress"]
                                 p["files"]   += 0     # incremental updates below
                                 p["current"] = cur_path[:240]
+                                # Pass the counts on as they grow; the UI
+                                # showed 0 files until the scan ended.
+                                for k in ("files", "dirs", "bytes"):
+                                    p[k] += counters[k] - shown[k]
+                                    shown[k] = counters[k]
                     try:
                         is_dir = entry.is_dir(follow_symlinks=False)
                     except OSError:
@@ -870,7 +883,7 @@ def delete_paths(paths: list, to_recycle_bin: bool = False) -> dict:
     if len(paths) > _DELETE_MAX_PATHS:
         return {"ok": False,
                 "err": f"too many paths in one call ({len(paths)} > "
-                       f"{_DELETE_MAX_PATHS}) — split into batches"}
+                       f"{_DELETE_MAX_PATHS}): split into batches"}
 
     # Phase 1: validate + size-up.  We compute the size before any
     # delete so we can enforce the total-bytes cap.
@@ -927,8 +940,8 @@ def delete_paths(paths: list, to_recycle_bin: bool = False) -> dict:
         # just the generic "no valid paths".
         if rejected:
             first = rejected[0]
-            err_msg = (f"no valid paths after safety checks — "
-                       f"first rejection: {first.get('reason', 'unknown')}")
+            err_msg = (f"no valid paths after safety checks "
+                       f"(first rejection: {first.get('reason', 'unknown')})")
         else:
             err_msg = "no valid paths after safety checks"
         return {"ok": False,

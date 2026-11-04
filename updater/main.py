@@ -144,13 +144,13 @@ def main():
             mode = "install"
             target_dir = default_install_dir()
             target_exe = pick_app_exe(target_dir)
-            log(f"auto-scan: no existing install — install mode, "
+            log(f"auto-scan: no existing install; install mode, "
                 f"default dir {target_dir}")
     else:
         log(f"using explicit target from args: {target_exe}")
 
     # Initialize the server's state with whatever we know
-    from updater.server import init_state, run_server
+    from updater.server import init_state, run_server, stop_install
     init_state(
         target_dir      = target_dir,
         target_exe      = target_exe,
@@ -211,11 +211,14 @@ def main():
             resizable=False,
         )
         webview.start(debug=False)
+        # The window is gone (Alt+F4, say), but the pipeline thread is a
+        # daemon: returning now would cut an exe swap off half-way.
+        stop_install()
     except ImportError:
         # pywebview missing — fall back to opening in default browser
         # so the user still has SOMETHING to interact with.  Highly
         # unusual but better than dying silently.
-        log("pywebview not available — opening browser fallback")
+        log("pywebview not available, opening browser fallback")
         import webbrowser
         webbrowser.open(f"http://127.0.0.1:{port}")
         # Block forever (Ctrl+C exits)

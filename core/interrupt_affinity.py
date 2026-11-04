@@ -1,6 +1,7 @@
 """Interrupt Affinity & MSI Mode Manager — redistribute interrupts off Core 0."""
 import json
 import os
+from core import reg_originals
 from core.utils import run_ps, run_cmd, get_logger, backup_registry, is_safe_ps_literal
 
 log = get_logger("irq")
@@ -308,7 +309,11 @@ def reset_device_affinity(instance_id: str) -> dict:
     affinity_key = rf"HKLM\SYSTEM\CurrentControlSet\Enum\{instance_id}\Device Parameters\Interrupt Management\Affinity Policy"
     r1 = run_cmd(["reg", "delete", affinity_key, "/v", "DevicePolicy", "/f"])
     r2 = run_cmd(["reg", "delete", affinity_key, "/v", "AssignmentSetOverride", "/f"])
-    return {"ok": True, "instance_id": instance_id}
+    # A value that was never set fails to delete as well; what counts is that
+    # neither is left (a refused delete used to be reported as done).
+    gone = [r["ok"] or (reg_originals.read_value(affinity_key, v) or {}).get("type") == reg_originals.ABSENT
+            for r, v in ((r1, "DevicePolicy"), (r2, "AssignmentSetOverride"))]
+    return {"ok": all(gone), "instance_id": instance_id}
 
 
 # (older simple reset_device_priority removed in v3 — the takeown-aware
@@ -703,6 +708,25 @@ def boost_controller_by_instance_id(instance_id: str) -> dict:
             "reboot_required": True}
 
 
+def _msi_declared(instance_id: str) -> bool:
+    """May auto_optimize_interrupts() switch MSI on for this device?  Only a
+    PCI\\ device whose driver declares MSI: its MessageSignaledInterruptProperties
+    key exists, and MSISupported is not 0 (a vendor opting the device out).
+    Forcing MSI on hardware whose driver does not handle it can keep the
+    device from starting.  USB\\ entries are devices behind a host controller,
+    with no interrupt of their own."""
+    if not instance_id.upper().startswith("PCI\\"):
+        return False
+    key = (rf"HKLM\SYSTEM\CurrentControlSet\Enum\{instance_id}\Device Parameters\Interrupt Management"
+           r"\MessageSignaledInterruptProperties")
+    if reg_originals.value_names(key) is None:
+        return False                    # no key (or unreadable): not declared
+    v = reg_originals.read_value(key, "MSISupported")
+    if v is None:
+        return False                    # unreadable: leave it
+    return not (v["type"] == "REG_DWORD" and v["data"] == 0)
+
+
 def auto_optimize_interrupts() -> list[dict]:
     """
     Automatically optimize interrupt distribution:
@@ -733,8 +757,8 @@ def auto_optimize_interrupts() -> list[dict]:
         if not iid:
             continue
 
-        # Enable MSI on everything
-        if not dev.get("msi_enabled"):
+        # Enable MSI only where the driver declares it (see _msi_declared)
+        if not dev.get("msi_enabled") and _msi_declared(iid):
             r = enable_msi_mode(iid)
             results.append({"name": f"MSI: {name}", "ok": r["ok"]})
 
@@ -761,5 +785,5 @@ def auto_optimize_interrupts() -> list[dict]:
             r2 = set_device_priority(iid, priority)
             results.append({"name": f"Priority {name} → {priority}", "ok": r2["ok"]})
 
-    log.info(f"═══ INTERRUPT OPTIMIZATION COMPLETE — {len(results)} changes ═══")
+    log.info(f"═══ INTERRUPT OPTIMIZATION COMPLETE: {len(results)} changes ═══")
     return results

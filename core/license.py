@@ -202,7 +202,13 @@ def _post(path: str, body: dict, timeout: float) -> dict:
             err_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             err_body = ""
-        return {"ok": False, "status": e.code, "data": None,
+        # The API answers with FastAPI's {"detail": ...}; an HTML page or
+        # Railway's own error JSON did not come from it.
+        try:
+            detail = json.loads(err_body).get("detail")
+        except Exception:
+            detail = None
+        return {"ok": False, "status": e.code, "data": None, "detail": detail,
                 "err": f"HTTP {e.code}: {err_body[:300]}"}
     except urllib.error.URLError as e:
         return {"ok": False, "status": 0, "data": None,
@@ -325,7 +331,11 @@ class LicenseManager:
             return LicenseState.ERROR
 
         # Cloud said no — could be wrong key, removed slot, or net error.
-        if r.get("status") in (403, 404):
+        # Only the API's own answer counts: Railway's edge returns 404 for
+        # every path while no deployment is serving, a server rolled back
+        # to a build without these routes says "Not Found", and a proxy or
+        # captive portal answers 403 with a page of its own.
+        if r.get("status") in (403, 404) and r.get("detail") not in (None, "Not Found"):
             log.warning(f"License rejected by cloud ({r['err']}); "
                         "discarding cached key")
             self._cache["license_key"] = None

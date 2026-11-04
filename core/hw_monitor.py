@@ -25,6 +25,8 @@
 """
 import ctypes
 import json
+import math
+import re
 import time
 import threading
 from collections import deque
@@ -91,7 +93,9 @@ def _sample_cpu():
         )
         if r["ok"] and r["out"]:
             try:
-                data["load"] = round(float(r["out"].strip()), 1)
+                v = float(r["out"].strip())
+                if math.isfinite(v):        # "NaN" parses, and jsonify writes it out bare
+                    data["load"] = round(v, 1)
             except ValueError:
                 pass
 
@@ -139,7 +143,7 @@ def _sample_cpu():
         # hit an error; check vispora.log for "lhm-winget" install
         # output to see why.
         log.warning(
-            "CPU temp unavailable — neither LibreHardwareMonitor (auto-installed) "
+            "CPU temp unavailable: neither LibreHardwareMonitor (auto-installed) "
             "nor any other WMI temp provider returned a sane reading.  "
             "Check %APPDATA%/Vispora/install_logs/ for 'lhm-winget' output, "
             "or open Settings > Dependencies and click 'Install' on the LHM row."
@@ -261,7 +265,8 @@ def _sample_gpu():
     ], timeout=5)
 
     if r["ok"] and r["out"]:
-        parts = r["out"].strip().split(",")
+        # One line per GPU; with two cards the fields ran into each other.
+        parts = r["out"].strip().splitlines()[0].split(",")
         if len(parts) >= 5:
             try:
                 data["temp"] = int(parts[0].strip())
@@ -311,7 +316,9 @@ def _read_gpu_via_lhm() -> dict:
     if not (r.get("ok") and r.get("out")):
         return out
     try:
-        rows = json.loads(r["out"])
+        # A sensor reading NaN arrives as a bare NaN: read it as missing, or
+        # it reaches the snapshot JSON, which the browser cannot parse.
+        rows = json.loads(r["out"], parse_constant=lambda _c: None)
         if isinstance(rows, dict):
             rows = [rows]
     except Exception:
@@ -603,7 +610,7 @@ def _sample_dpc():
     isr_pct = None
     if r.get("ok") and r.get("out"):
         try:
-            d = json.loads(r["out"])
+            d = json.loads(r["out"], parse_constant=lambda _c: None)     # (NaN: see _read_gpu_via_lhm)
             if isinstance(d, dict) and d.get("ok"):
                 dpc_pct = float(d.get("dpc_pct", 0.0))
                 isr_pct = float(d.get("isr_pct", 0.0))
@@ -637,12 +644,20 @@ def _sample_ping(target: str = "1.1.1.1"):
                     return int(val)
                 except (IndexError, ValueError):
                     pass
+            # "time" is translated (Zeit=, temps=, tiempo=); the number in
+            # front of "TTL=" is not: "Zeit=12ms TTL=57", "temps=12 ms TTL=57".
+            m = re.search(r"[=<]\s*(\d+)\s*[^\s=<]*\s+TTL=", line)
+            if m:
+                return int(m.group(1))
     return None
 
 
 def _monitor_loop():
     """Main monitoring loop — samples every 1 second."""
-    while _monitor_state["running"]:
+    me = threading.current_thread()
+    # Stop then Start within one pass used to leave this loop running beside
+    # the new one (and another per toggle); it ends once it is not the current one.
+    while _monitor_state["running"] and _monitor_state["thread"] is me:
         try:
             ts = time.time()
 
@@ -736,8 +751,8 @@ def start_monitor(ping_target: str = "1.1.1.1") -> dict:
     _monitor_state["running"] = True
     _monitor_state["ping_target"] = ping_target
     t = threading.Thread(target=_monitor_loop, daemon=True)
+    _monitor_state["thread"] = t        # before start(): the loop checks it
     t.start()
-    _monitor_state["thread"] = t
     log.info("Hardware monitor started")
     return {"ok": True}
 

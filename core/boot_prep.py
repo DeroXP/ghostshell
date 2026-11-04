@@ -73,13 +73,16 @@ public class WS {
 
 def _clear_standby_list() -> bool:
     """Drop the standby memory list so games get fresh allocations."""
+    # The purge needs SeProfileSingleProcessPrivilege (13), which an elevated
+    # token holds switched off: without switching it on this always failed.
     r = run_ps("""
 try {
     Add-Type -TypeDefinition @'
 using System; using System.Runtime.InteropServices;
 public class SB {
     [DllImport("ntdll.dll")] public static extern uint NtSetSystemInformation(int c, IntPtr i, int l);
-    public static bool Go() { int v=4; IntPtr p=Marshal.AllocHGlobal(4); Marshal.WriteInt32(p,v); uint r=NtSetSystemInformation(80,p,4); Marshal.FreeHGlobal(p); return r==0; }
+    [DllImport("ntdll.dll")] public static extern uint RtlAdjustPrivilege(int p, [MarshalAs(UnmanagedType.U1)] bool on, [MarshalAs(UnmanagedType.U1)] bool thread, [MarshalAs(UnmanagedType.U1)] out bool was);
+    public static bool Go() { bool w; RtlAdjustPrivilege(13,true,false,out w); int v=4; IntPtr p=Marshal.AllocHGlobal(4); Marshal.WriteInt32(p,v); uint r=NtSetSystemInformation(80,p,4); Marshal.FreeHGlobal(p); return r==0; }
 }
 '@ -ErrorAction SilentlyContinue
     if ([SB]::Go()) { 'OK' } else { 'FAIL' }
@@ -93,7 +96,10 @@ def _reg(key: str, val: str, data: str, vtype: str = "REG_DWORD") -> bool:
     # was there before.  These used to be written at every launch with no
     # record at all.
     reg_originals.remember(key, val, data, vtype)
-    return run_cmd(["reg", "add", key, "/v", val, "/t", vtype, "/d", data, "/f"])["ok"]
+    ok = run_cmd(["reg", "add", key, "/v", val, "/t", vtype, "/d", data, "/f"])["ok"]
+    if not ok:
+        log.warning(f"  reg write failed: {key}\\{val} = {data}")
+    return ok
 
 
 _GAMES_TASK = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games"
@@ -102,25 +108,23 @@ _SYSTEM_PROFILE = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia
 
 def _mmcss_gaming_profile() -> bool:
     """Tell MMCSS the Games task has priority."""
-    _reg(_GAMES_TASK, "GPU Priority", "8")
-    _reg(_GAMES_TASK, "Priority", "6")
-    _reg(_GAMES_TASK, "Scheduling Category", "High", "REG_SZ")
-    _reg(_GAMES_TASK, "SFIO Priority", "High", "REG_SZ")
-    return True
+    # (A list, not a generator: every write is made even after one fails.)
+    return all([_reg(_GAMES_TASK, "GPU Priority", "8"),
+                _reg(_GAMES_TASK, "Priority", "6"),
+                _reg(_GAMES_TASK, "Scheduling Category", "High", "REG_SZ"),
+                _reg(_GAMES_TASK, "SFIO Priority", "High", "REG_SZ")])
 
 
 def _foreground_boost() -> bool:
     """Boost foreground apps a little (0x26: short, variable quanta)."""
-    _reg(r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl", "Win32PrioritySeparation", "38")
-    _reg(r"HKCU\Control Panel\Desktop", "ForegroundLockTimeout", "0")
-    return True
+    return all([_reg(r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl", "Win32PrioritySeparation", "38"),
+                _reg(r"HKCU\Control Panel\Desktop", "ForegroundLockTimeout", "0")])
 
 
 def _network_throttle_off() -> bool:
     """Disable the 10-packets-per-ms multimedia network throttle."""
-    _reg(_SYSTEM_PROFILE, "NetworkThrottlingIndex", "4294967295")
-    _reg(_SYSTEM_PROFILE, "SystemResponsiveness", "10")
-    return True
+    return all([_reg(_SYSTEM_PROFILE, "NetworkThrottlingIndex", "4294967295"),
+                _reg(_SYSTEM_PROFILE, "SystemResponsiveness", "10")])
 
 
 def _flush_dns() -> bool:

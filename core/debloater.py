@@ -85,7 +85,10 @@ def scan_installed_apps() -> list[dict]:
 
 def scan_services() -> list[dict]:
     """Return SERVICES_TO_DISABLE annotated with current status."""
-    r = run_ps("Get-Service | Select-Object Name,StartType,Status | ConvertTo-Json")
+    # As text: ConvertTo-Json gives enums as their numbers, and the list
+    # showed "2" / "4" instead of Automatic / Disabled.
+    r = run_ps("Get-Service | Select-Object Name,@{n='StartType';e={[string]$_.StartType}},"
+               "@{n='Status';e={[string]$_.Status}} | ConvertTo-Json")
     svc_map: dict = {}
     if r["ok"] and r["out"]:
         try:
@@ -169,7 +172,9 @@ def disable_service(service_id: str) -> dict:
     if service_id not in backup:
         cur = _read_service_start(service_id)
         if cur is not None and cur != 4:   # don't record an already-disabled svc
-            backup[service_id] = cur
+            # Automatic (Delayed Start) is Start=2 plus a flag that `sc config
+            # start= auto` clears, so it is recorded by its own keyword.
+            backup[service_id] = "delayed-auto" if sys_state.service_start(service_id) == "delayed-auto" else cur
             _save_service_backup(backup)
     r1 = run_cmd(["sc", "stop", service_id])
     r2 = run_cmd(["sc", "config", service_id, "start=", "disabled"])
@@ -189,7 +194,7 @@ def enable_service(service_id: str, start_keyword: str = "demand") -> dict:
     restore_services().  start_keyword: boot/system/auto/demand/disabled."""
     r = run_cmd(["sc", "config", service_id, "start=", start_keyword])
     started = False
-    if r.get("ok") and start_keyword in ("auto", "boot", "system"):
+    if r.get("ok") and start_keyword in ("auto", "delayed-auto", "boot", "system"):
         s = run_cmd(["sc", "start", service_id])
         started = bool(s.get("ok"))
     if r.get("ok"):
@@ -219,13 +224,17 @@ def restore_services() -> dict:
     backup = _load_service_backup()
     results = []
     for sid, start_int in backup.items():
-        kw = _START_INT_TO_KEYWORD.get(int(start_int), "demand")
+        kw = start_int if start_int == "delayed-auto" else _START_INT_TO_KEYWORD.get(int(start_int), "demand")
         results.append(enable_service(sid, kw))
     unrecorded = [svc["id"] for svc in SERVICES_TO_DISABLE
                   if svc["id"] not in backup and _read_service_start(svc["id"]) == 4]
     # Clear the backup once restored.
     if backup:
-        _save_service_backup({})
+        # ...except what could not be: wiping that record left the service
+        # disabled for good, its original start type forgotten.  (One that is
+        # no longer installed has nothing left to restore.)
+        _save_service_backup({r["id"]: backup[r["id"]] for r in results
+                              if not r.get("ok") and _read_service_start(r["id"]) is not None})
     ok = sum(1 for r in results if r.get("ok"))
     log.info(f"restore_services: re-enabled {ok}/{len(results)} services"
              + (f"; disabled with no record, left alone: {', '.join(unrecorded)}" if unrecorded else ""))
@@ -298,7 +307,7 @@ def disable_features() -> list[dict]:
         if ok:
             log.info(f"  ✓ Disabled: {name}")
         else:
-            log.warning(f"  ✗ Failed: {name} — {r['err']}")
+            log.warning(f"  ✗ Failed: {name} ({r['err']})")
         results.append({"name": name, "ok": ok})
 
     return results
@@ -444,5 +453,5 @@ def run_full_debloat(app_ids: list[str] | None = None,
     ok_count += sum(1 for r in results["features"] if r["ok"])
     total = len(results["apps"]) + len(results["services"]) + len(results["tasks"]) + len(results["features"])
 
-    log.info(f"═══ DEBLOAT COMPLETE — {ok_count}/{total} operations succeeded ═══")
+    log.info(f"═══ DEBLOAT COMPLETE: {ok_count}/{total} operations succeeded ═══")
     return results

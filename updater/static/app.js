@@ -7,6 +7,7 @@ let _lastPhase = null;
 let _autoConfirmed = false;
 let _dirPickerForced = false;   // user clicked "Change…" — keep picker open
 let _autoCloseFired = false;    // was never declared: reading it threw, so the window never closed itself
+let _dirError = '';             // why the typed install path was refused; the status poll would wipe it otherwise
 // v1.3.0 — the install pipeline launches Vispora at step 6.  Once
 // phase=done lands, the updater has nothing left to do — close
 // immediately rather than counting down 3 seconds.  The brief "Update
@@ -76,7 +77,7 @@ function renderHeader(st) {
         appTitle.textContent = 'Vispora Updater';
     }
     document.getElementById('channel-tag').textContent =
-        'channel: ' + (st.channel || '— pick —');
+        'channel: ' + (st.channel || '(pick)');
     document.getElementById('updater-version-tag').textContent =
         'v' + (st.updater_version || '?');
 }
@@ -90,7 +91,7 @@ function renderVersions(st) {
     }
     row.style.display = '';
     document.getElementById('from-version').textContent =
-        st.current_version ? 'v' + st.current_version : '— current —';
+        st.current_version ? 'v' + st.current_version : '(current)';
     const to = document.getElementById('to-version');
     if (st.target_version) {
         to.textContent = 'v' + st.target_version;
@@ -204,7 +205,7 @@ async function pollStatus() {
     // let the 500ms poll loop blow it away with setError('').  The
     // countdown's setInterval re-paints the message every second.
     if (st.phase !== 'done') {
-        setError(st.error || '');
+        setError(st.error || _dirError);
     }
     renderHeader(st);
     renderInstallBanner(st);
@@ -249,7 +250,7 @@ function _closeUpdaterNow() {
               'stroke="currentColor" stroke-width="3" ' +
               'style="vertical-align:middle;width:14px;height:14px;margin-right:6px">' +
               '<polyline points="20 6 9 17 4 12"/></svg>' +
-            'Update complete — Vispora is launching.';
+            'Update complete. Vispora is launching.';
         box.style.display = '';
     }
     // Small delay so the banner has a frame to render before the
@@ -265,7 +266,8 @@ async function onStart() {
     // start the pipeline.  No-op if the input is empty / unchanged.
     const dirInp = document.getElementById('target-dir-input');
     if (dirInp && dirInp.value && dirInp.dataset.userEdited) {
-        await setTargetDir();
+        // Refused: starting anyway would install into the folder set before.
+        if (!(await setTargetDir())) return;
     }
     await api('POST', '/api/start', {});
 }
@@ -288,13 +290,17 @@ async function onClose() { await api('POST', '/api/quit', {}); }
 async function setTargetDir() {
     const inp = document.getElementById('target-dir-input');
     const v = (inp.value || '').trim();
-    if (!v) { setError('Please enter an install path'); return; }
+    if (!v) { setError('Please enter an install path'); return false; }
     const r = await api('POST', '/api/set-target-dir', { target_dir: v });
     if (!r || !r.ok) {
-        setError((r && r.err) || 'invalid path');
+        _dirError = (r && r.err) || 'invalid path';
+        setError(_dirError);
+        return false;
     } else {
+        _dirError = '';
         setError('');
         inp.dataset.userEdited = '';
+        return true;
     }
 }
 
@@ -304,6 +310,7 @@ async function browseFolder() {
         const inp = document.getElementById('target-dir-input');
         inp.value = r.path;
         inp.dataset.userEdited = '';
+        _dirError = '';
         // Server already updated its state in api/browse-folder
         pollStatus();
     } else if (r && !r.ok) {
@@ -314,6 +321,7 @@ async function browseFolder() {
 async function rescan() {
     await api('POST', '/api/rescan', {});
     _dirPickerForced = false;
+    _dirError = '';
     pollStatus();
 }
 
@@ -334,6 +342,7 @@ const _dirInputEl = document.getElementById('target-dir-input');
 if (_dirInputEl) {
     _dirInputEl.addEventListener('input', () => {
         _dirInputEl.dataset.userEdited = '1';
+        _dirError = '';
     });
     _dirInputEl.addEventListener('blur', () => {
         // Commit edits on blur — feels natural and avoids the user

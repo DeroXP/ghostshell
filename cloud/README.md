@@ -40,11 +40,11 @@ cloud/
 ├── schema.sql           Full v3 schema (CREATE … IF NOT EXISTS everywhere)
 ├── routers/
 │   ├── health.py        GET /healthz
-│   ├── devices.py       Phase A — register / heartbeat / settings
-│   ├── profiles.py      Phase B — stub
-│   ├── playtime.py      Phase B/D — stub
-│   ├── oc.py            Phase H — stub
-│   └── telemetry.py     Phase H — stub
+│   ├── devices.py       Phase A: register / heartbeat / settings
+│   ├── profiles.py      Phase B: stub
+│   ├── playtime.py      Phase B/D: stub
+│   ├── oc.py            Phase H: stub
+│   └── telemetry.py     Phase H: stub
 ├── requirements.txt
 ├── Procfile             web: uvicorn main:app …
 ├── railway.json         Railway build/health config
@@ -69,7 +69,7 @@ curl http://localhost:8000/healthz
 open http://localhost:8000/docs   # OpenAPI UI
 ```
 
-`run_migrations()` applies `schema.sql` on every boot and is idempotent —
+`run_migrations()` applies `schema.sql` on every boot and is idempotent:
 safe to run a hundred times on a fresh DB or an upgraded one.
 
 ---

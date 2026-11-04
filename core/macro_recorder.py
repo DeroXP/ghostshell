@@ -167,23 +167,27 @@ def start_recording(skip_move: bool = True,
         _state["_last_mouse_move_ts"] = 0.0
         _state["_last_stick_val"]   = {"left": (0, 0), "right": (0, 0)}
         _state["_last_trigger_val"] = {"lt": 0, "rt": 0}
+        ends_at = _state["countdown_ends_at"]
 
     if delay > 0:
         # Wake-up timer — flips phase to "recording" when countdown ends
         threading.Thread(target=_countdown_to_recording,
-                         args=(delay,),
+                         args=(delay, ends_at),
                          daemon=True,
                          name="macro-rec-countdown").start()
-    log.info(f"macro recording session armed — countdown {delay}s, "
+    log.info(f"macro recording session armed: countdown {delay}s, "
              f"filters {eff_filters}")
     return {"ok": True, "phase": _state["phase"], "countdown_sec": delay,
             "filters": eff_filters}
 
 
-def _countdown_to_recording(delay: float):
+def _countdown_to_recording(delay: float, ends_at: float):
     time.sleep(delay)
     with _lock:
-        if _state["phase"] != "countdown":
+        # Only the countdown this thread was started for: after a cancel and
+        # a fresh start, the old timer flipped the new session to recording
+        # early and it captured the user's alt-tab.
+        if _state["phase"] != "countdown" or _state["countdown_ends_at"] != ends_at:
             return    # cancelled or already changed
         _state["phase"]      = "recording"
         _state["started_at"] = time.perf_counter()

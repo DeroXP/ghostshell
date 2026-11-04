@@ -7,7 +7,7 @@ managed Postgres database.  Total time: ~10 minutes.
 
 ## 1.  Prereqs
 
-- A [Railway](https://railway.app) account (Hobby plan is fine — Phase A
+- A [Railway](https://railway.app) account (Hobby plan is fine: Phase A
   fits comfortably under the free tier).
 - This repo on GitHub.
 
@@ -54,7 +54,7 @@ Optional variables (sensible defaults exist):
 | `RATE_LIMIT_PER_MIN` | `120`   | Per-IP-hash request budget               |
 | `DEVICE_TTL_DAYS`    | `180`   | Devices unseen this long get pruned      |
 
-`PORT` is set automatically by Railway — don't override it.
+`PORT` is set automatically by Railway, so don't override it.
 
 ---
 
@@ -71,7 +71,7 @@ INFO     Ready to serve
 INFO     Uvicorn running on http://0.0.0.0:8080
 ```
 
-If you see `Startup failed` — check that `DATABASE_URL` is set and
+If you see `Startup failed`, check that `DATABASE_URL` is set and
 reachable.  Railway's private network usually works on the first try.
 
 ---
@@ -109,10 +109,10 @@ Once you have the public URL, in Vispora:
 > **Settings → Cloud → Cloud URL** → paste the Railway domain → **Save**.
 
 The client will register itself on the next launch (or immediately, if
-you keep the Settings panel open — `set_cloud_url` triggers an eager
+you keep the Settings panel open, since `set_cloud_url` triggers an eager
 `register()` thread).
 
-That's it — Phase A complete.  The client is now sending anonymous
+That's it: Phase A is complete.  The client is now sending anonymous
 device fingerprints, which seeds the `devices` table that Phase H's
 recommender will later read from.
 

@@ -36,7 +36,7 @@ import time
 from typing import Optional
 
 from config import APPDATA_DIR
-from core.utils import get_logger, run_cmd
+from core.utils import get_logger, run_cmd, atomic_write_json
 
 log = get_logger("snapshots")
 
@@ -188,7 +188,7 @@ def take_snapshot(name: str, description: str = "",
         shutil.rmtree(snap_dir, ignore_errors=True)
         return {"ok": False, "err": "no paths to snapshot"}
 
-    log.info(f"Taking snapshot '{name}' (id={snap_id}) — {len(targets)} paths")
+    log.info(f"Taking snapshot '{name}' (id={snap_id}): {len(targets)} paths")
     files: list[dict] = []
     started = time.time()
 
@@ -226,13 +226,12 @@ def take_snapshot(name: str, description: str = "",
         "failed_paths": [f["key"] for f in failed_paths],
         "size_bytes":   _dir_size(snap_dir),
     }
-    try:
-        with open(_meta_path(snap_dir), "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
-    except Exception as e:
-        log.error(f"Failed to write snapshot meta: {e}")
+    # Atomic: a half-written meta.json hides the snapshot from the list, from
+    # restore and from pruning, for good.
+    if not atomic_write_json(_meta_path(snap_dir), meta):
+        log.error("Failed to write snapshot meta")
         shutil.rmtree(snap_dir, ignore_errors=True)
-        return {"ok": False, "err": f"meta write failed: {e}"}
+        return {"ok": False, "err": "meta write failed"}
 
     log.info(f"Snapshot '{name}' done: {succeeded}/{len(targets)} paths "
              f"({_human_size(meta['size_bytes'])}, {elapsed}s)")
@@ -324,7 +323,7 @@ def restore_snapshot(snap_id: str) -> dict:
     for entry in meta.get("files", []):
         if not entry.get("ok"):
             results.append({"label": entry.get("label"),
-                            "ok": False, "err": "skipped — original export failed"})
+                            "ok": False, "err": "skipped: original export failed"})
             continue
         reg_file = os.path.join(full, entry["file"])
         if not os.path.exists(reg_file):
@@ -374,6 +373,9 @@ def auto_snapshot_before(operation_name: str) -> Optional[str]:
             auto=True,
         )
         if r.get("ok"):
+            # One is taken before every Apply and every Reset All (a couple of
+            # MB each); nothing else ever pruned them.
+            prune_old()
             return r.get("id")
     except Exception as e:
         log.warning(f"auto_snapshot_before failed: {e}")

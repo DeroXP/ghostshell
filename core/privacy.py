@@ -1,11 +1,12 @@
 """Privacy hardening — telemetry, hosts blocking, firewall, data collection."""
+import json
 import os
 import shutil
 from datetime import datetime
 from config import (TELEMETRY_HOSTS, FIREWALL_BLOCK_EXES, BACKUP_DIR,
-                    APP_NAME, LEGACY_APP_NAME)
+                    APP_NAME, LEGACY_APP_NAME, APPDATA_DIR)
 from core import sys_state
-from core.utils import run_ps, run_cmd, get_logger, backup_registry, atomic_write_text
+from core.utils import run_ps, run_cmd, get_logger, backup_registry, atomic_write_text, atomic_write_json
 
 log = get_logger("privacy")
 
@@ -191,7 +192,7 @@ def apply_hosts_blocking() -> dict:
         return {"ok": True, "count": len(TELEMETRY_HOSTS)}
     except PermissionError:
         log.error("  ✗ Permission denied writing hosts file (need admin)")
-        return {"ok": False, "err": "Permission denied — run as administrator"}
+        return {"ok": False, "err": "Permission denied: run as administrator"}
     except Exception as e:
         log.error(f"  ✗ Hosts file error: {e}")
         return {"ok": False, "err": str(e)}
@@ -276,13 +277,37 @@ def toggle_webcam(enable: bool) -> dict:
     return {"ok": ok, "enabled": enable}
 
 
+# The two start-up repairs below undo what old builds did, so each runs once
+# per profile.  Run at every launch, the microphone one switched device-wide
+# mic access back on for anyone who had turned it off in Windows Settings.
+_REPAIRS_PATH = os.path.join(APPDATA_DIR, "privacy_repairs.json")
+
+
+def _repairs_done() -> dict:
+    try:
+        with open(_REPAIRS_PATH, "r", encoding="utf-8") as f:
+            done = json.load(f)
+        return done if isinstance(done, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _mark_repaired(name: str) -> None:
+    done = _repairs_done()
+    done[name] = datetime.now().isoformat(timespec="seconds")
+    atomic_write_json(_REPAIRS_PATH, done)
+
+
 def restore_store_updates() -> dict:
     """Idempotent v3.1 fix.  Reverts every registry / service change
     Vispora ever made that prevents the Microsoft Store / Xbox app
     from updating.  Called from app boot so users don't have to find
     a button.  Safe to call repeatedly."""
+    if _repairs_done().get("store_updates"):
+        return {"ok": True, "skipped": "already repaired", "actions": []}
     log.info("Restoring Microsoft Store / Xbox app updates (v3.1 fix)...")
     actions = []
+    failed = []         # services it could not switch back: try again at the next launch
 
     # 1. DiagTrack — was set to disabled by apply_telemetry_tweaks; the
     #    Store and Xbox app need it to talk to Microsoft's content servers.
@@ -299,6 +324,8 @@ def restore_store_updates() -> dict:
             return
         r = run_cmd(["sc", "config", svc, "start=", mode])
         actions.append((label, r.get("ok", False)))
+        if not r.get("ok"):
+            failed.append(svc)
 
     _if_disabled("DiagTrack", "demand", "DiagTrack → manual")
     # Don't auto-START — Store will start it on demand.  But if it's
@@ -334,6 +361,8 @@ def restore_store_updates() -> dict:
     _if_disabled("InstallService", "auto", "InstallService → auto")
 
     log.info(f"  Store/Xbox update restore: {actions}")
+    if not failed:      # (a policy delete "fails" when there was nothing to delete)
+        _mark_repaired("store_updates")
     return {"ok": True, "actions": actions}
 
 
@@ -343,6 +372,8 @@ def restore_microphone_access() -> dict:
 
     Called from app boot so users don't have to find a button.
     Safe to call repeatedly — never blocks the mic, only ever permits it."""
+    if _repairs_done().get("microphone"):
+        return {"ok": True, "skipped": "already repaired", "actions": []}
     log.info("Restoring microphone access (v3.1 fix)...")
     actions = []
 
@@ -367,6 +398,8 @@ def restore_microphone_access() -> dict:
     actions.append(("Deleted HKCU LetAppsAccessMicrophone policy", r2.get("ok", False)))
 
     log.info(f"  Microphone access restore: {actions}")
+    if ok:              # the consent write took; the deletes "fail" when there was nothing to delete
+        _mark_repaired("microphone")
     return {"ok": True, "actions": actions}
 
 

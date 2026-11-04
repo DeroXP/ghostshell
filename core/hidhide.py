@@ -320,7 +320,7 @@ def recover_orphaned() -> dict:
             m = json.load(f) or {}
     except (OSError, ValueError):
         return {"ok": True, "recovered": False}
-    log.warning("HidHide was left engaged by a previous run — restoring")
+    log.warning("HidHide was left engaged by a previous run, restoring it")
     disengage(m.get("prior_state") or {}, m.get("hidden_ours") or [],
               m.get("whitelisted_app") or "")
     return {"ok": True, "recovered": True}
@@ -450,7 +450,7 @@ def download_and_install(timeout_sec: int = 180) -> dict:
         _install_status.update({
             "phase":        "installing",
             "progress_pct": 100,
-            "msg":          ("Installer window opened — click through it. "
+            "msg":          ("Installer window opened: click through it. "
                              "Vispora will detect when it's done."),
         })
         if fname.lower().endswith(".msi"):
@@ -489,7 +489,7 @@ def download_and_install(timeout_sec: int = 180) -> dict:
         # Timed out — installer may still be open or user closed without finishing
         _install_status.update({
             "phase":        "done",
-            "msg":          "Installer timed out (5 min) — try again or install manually",
+            "msg":          "Installer timed out (5 min). Try again or install manually",
             "installed":    False,
             "in_progress":  False,
         })

@@ -250,7 +250,35 @@ def _find_ffmpeg() -> Optional[str]:
     return None
 
 
-def _pick_encoder(ffmpeg_path: str, preference: str = "auto") -> str:
+# (ffmpeg path, encoder) -> did a one-frame test encode work
+_encoder_ok_cache: dict = {}
+
+
+def _encoder_works(ffmpeg_path: str, encoder: str) -> bool:
+    """`-encoders` lists what the build contains (the Gyan builds carry
+    NVENC, AMF and QSV on every PC), not what this PC's GPU can run, so a
+    hardware encoder has to open for real before "auto" picks it."""
+    key = (ffmpeg_path, encoder)
+    if key not in _encoder_ok_cache:
+        try:
+            r = subprocess.run(
+                [ffmpeg_path, "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "color=c=black:s=320x240:r=30",
+                 "-frames:v", "1", "-c:v", encoder, "-f", "null", "-"],
+                capture_output=True, timeout=8,
+                creationflags=0x08000000,
+            )
+            _encoder_ok_cache[key] = (r.returncode == 0)
+        except Exception:
+            _encoder_ok_cache[key] = False
+        log.info(f"clipper: {encoder} usable = {_encoder_ok_cache[key]}")
+    return _encoder_ok_cache[key]
+
+
+def _pick_encoder(ffmpeg_path: str, preference: str = "auto",
+                  verify: bool = False) -> str:
+    # verify: test-encode hardware candidates.  Only start_buffer asks for
+    # it; capabilities.detect() calls this before the window opens.
     if preference and preference != "auto":
         return preference
     try:
@@ -262,7 +290,8 @@ def _pick_encoder(ffmpeg_path: str, preference: str = "auto") -> str:
         out = (r.stdout or "") + (r.stderr or "")
     except Exception: return "libx264"
     for cand in ("h264_nvenc", "h264_amf", "h264_qsv", "libx264"):
-        if cand in out:
+        if cand in out and (cand == "libx264" or not verify
+                            or _encoder_works(ffmpeg_path, cand)):
             return cand
     return "libx264"
 
@@ -335,6 +364,77 @@ def _restore_self_priority(old: Optional[int]) -> None:
             log.info(f"clipper: process priority restored to {old:#x}")
     except Exception as e:
         log.debug(f"clipper: priority restore failed: {e}")
+
+
+# ─── Child processes end with the app ──────────────────────────────
+
+# A job object with KILL_ON_JOB_CLOSE: Windows ends every process in it
+# when the last handle to it closes, i.e. however this process exits
+# (crash, kill, update).  The handle is kept for the process lifetime and
+# is not inheritable.
+_job = None
+_job_lock = threading.Lock()
+_job_warned = False
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit",     ctypes.c_int64),
+                ("LimitFlags",              wintypes.DWORD),
+                ("MinimumWorkingSetSize",   ctypes.c_size_t),
+                ("MaximumWorkingSetSize",   ctypes.c_size_t),
+                ("ActiveProcessLimit",      wintypes.DWORD),
+                ("Affinity",                ctypes.c_size_t),
+                ("PriorityClass",           wintypes.DWORD),
+                ("SchedulingClass",         wintypes.DWORD)]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo",                ctypes.c_ulonglong * 6),     # IO_COUNTERS
+                ("ProcessMemoryLimit",    ctypes.c_size_t),
+                ("JobMemoryLimit",        ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed",     ctypes.c_size_t)]
+
+
+def tie_to_app_lifetime(proc) -> bool:
+    """Put a child just started with Popen (FFmpeg here, PresentMon in
+    frame_telemetry) in that job, so it cannot outlive the app.  Stopping
+    it normally is unchanged.  On any failure (no nesting under an outer
+    job, say) it logs once and the child runs as it always did."""
+    global _job, _job_warned
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        with _job_lock:
+            if _job is None:
+                job = k32.CreateJobObjectW(None, None)
+                if not job:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+                info.BasicLimitInformation.LimitFlags = 0x2000     # KILL_ON_JOB_CLOSE
+                # 9 = JobObjectExtendedLimitInformation
+                if not k32.SetInformationJobObject(job, 9, ctypes.byref(info),
+                                                   ctypes.sizeof(info)):
+                    err = ctypes.get_last_error()
+                    k32.CloseHandle(job)
+                    raise ctypes.WinError(err)
+                _job = job
+            if not k32.AssignProcessToJobObject(_job, int(proc._handle)):
+                raise ctypes.WinError(ctypes.get_last_error())
+        return True
+    except Exception as e:
+        if not _job_warned:
+            _job_warned = True
+            log.warning(f"child processes are not tied to the app's lifetime "
+                        f"({type(e).__name__}: {e}); they are only stopped the usual way")
+        return False
 
 
 # ─── DPI awareness shim ─────────────────────────────────────────────
@@ -707,7 +807,7 @@ def _resolve_capture_region(target: str) -> dict:
                     "monitor_idx": idx, "is_virtual_screen": False}
         return {"mode": "monitor", "x": full_x, "y": full_y,
                 "w": full_w, "h": full_h, "title": "",
-                "source": f"monitor:{idx} not found — falling back to desktop",
+                "source": f"monitor:{idx} not found, falling back to desktop",
                 "monitor_idx": -1, "is_virtual_screen": True}
 
     if target == TARGET_DESKTOP:
@@ -721,7 +821,7 @@ def _resolve_capture_region(target: str) -> dict:
         if not fg or not fg.get("title"):
             # Fall back to auto-follow monitor when no game in foreground
             return _resolve_capture_region(TARGET_AUTO_FOLLOW) | {
-                "source": "game-window mode but no foreground game — using monitor fallback"
+                "source": "game-window mode but no foreground game, so using monitor fallback"
             }
         return {"mode": "title", "x": 0, "y": 0, "w": 0, "h": 0,
                 "title": fg["title"],
@@ -973,6 +1073,13 @@ def start_buffer() -> dict:
     global _proc, _watcher_thread, _target_follow_thread, _stop_event
     global _sys_audio_bridge
 
+    # Checked before the OBS path too: taking it over a running FFmpeg
+    # buffer overwrote that run's state, and stop_buffer() then left the
+    # FFmpeg process running (past app exit as well).
+    with _state_lock:
+        if _state["running"]:
+            return {"ok": True, "already_running": True}
+
     # ── v3.3.0-beta.18: OBS backend path ─────────────────────────
     # When the user has the OBS toggle on AND OBS is connected, the
     # recording pipeline runs INSIDE OBS — we configure the scene +
@@ -1041,12 +1148,12 @@ def start_buffer() -> dict:
 
     ffmpeg = _find_ffmpeg()
     if not ffmpeg:
-        msg = "FFmpeg not installed — open the Dependencies panel to auto-install."
+        msg = "FFmpeg not installed: open the Dependencies panel to auto-install."
         with _state_lock: _state["last_err"] = msg
         return {"ok": False, "err": msg}
 
     settings = _load_settings()
-    encoder  = _pick_encoder(ffmpeg, settings.get("encoder", "auto"))
+    encoder  = _pick_encoder(ffmpeg, settings.get("encoder", "auto"), verify=True)
     target_cfg = settings.get("capture_target", TARGET_AUTO_FOLLOW)
     region = _resolve_capture_region(target_cfg)
 
@@ -1123,6 +1230,7 @@ def start_buffer() -> dict:
         _restore_self_priority(_prev_priority_class)
         _prev_priority_class = None
         return {"ok": False, "err": str(e)}
+    tie_to_app_lifetime(_proc)      # a crashed or killed app must not leave it capturing
 
     # ── Start the WASAPI loopback bridge AFTER FFmpeg is up, so we
     # have stdin to write into.  If bridge start fails (e.g. user
@@ -1280,6 +1388,7 @@ def _watcher_loop(proc: subprocess.Popen, stop_event: threading.Event):
     and we can't send the legacy `q` quit signal).  That produced a
     misleading red 'FFmpeg exited rc=1. Tail: Guessed Channel
     Layout: stereo' message on every Stop click."""
+    global _prev_priority_class
     tail: list = []
     try:
         while not stop_event.is_set() and proc.poll() is None:
@@ -1304,6 +1413,10 @@ def _watcher_loop(proc: subprocess.Popen, stop_event: threading.Event):
                     + (" | ".join(tail[-3:]) or "(no stderr)")
                 )
                 _state["running"] = False
+                # stop_buffer() returns early once running is False, so the
+                # priority boost would otherwise stay on until the app quits.
+                _restore_self_priority(_prev_priority_class)
+                _prev_priority_class = None
             log.warning(f"clipper FFmpeg exited rc={rc}")
         elif rc is not None and rc != 0:
             # Intentional stop — log at debug level only, don't surface
@@ -1318,7 +1431,19 @@ def _watcher_loop(proc: subprocess.Popen, stop_event: threading.Event):
 
 # ─── Save clip ──────────────────────────────────────────────────────
 
+# Each hotkey press runs on its own thread; a double press used to run two
+# saves at once over the same concat list and, within one second, the same
+# output file.
+_save_lock = threading.Lock()
+
+
 def save_clip(seconds: Optional[int] = None) -> dict:
+    """One save at a time; see _save_clip."""
+    with _save_lock:
+        return _save_clip(seconds)
+
+
+def _save_clip(seconds: Optional[int] = None) -> dict:
     """Concat the last N seconds of buffer into a single mp4.
 
     v3.3.0-beta.18: dispatches to the OBS backend's replay-buffer save
@@ -1335,7 +1460,9 @@ def save_clip(seconds: Optional[int] = None) -> dict:
     try:
         from core import obs_backend as _obs
         if _obs.is_ready_for_recording():
-            from datetime import datetime
+            # datetime is the module-level import: importing it here made it
+            # local to this whole function, and the FFmpeg path below then
+            # raised UnboundLocalError whenever this branch did not run.
             s_clipper = _load_settings()
             out_dir = s_clipper.get("output_dir") or CLIPS_DIR
             try:
@@ -1375,7 +1502,7 @@ def save_clip(seconds: Optional[int] = None) -> dict:
     with _state_lock:
         if not _state["running"]:
             return {"ok": False,
-                    "err": "Rolling buffer isn't running — turn it on first "
+                    "err": "Rolling buffer isn't running: turn it on first "
                            "in the Capture tab.  save_clip never starts a "
                            "new recording, it only saves what's already buffered."}
         seg_dir = _state["segment_dir"]
@@ -1397,7 +1524,7 @@ def save_clip(seconds: Optional[int] = None) -> dict:
         return {"ok": False, "err": f"can't list segments: {e}"}
 
     if not segs:
-        return {"ok": False, "err": "buffer hasn't captured any segments yet — wait a few seconds"}
+        return {"ok": False, "err": "buffer hasn't captured any segments yet: wait a few seconds"}
 
     # v3.3.0-beta.13: TS doesn't have the moov-atom problem the MP4
     # segments did — each TS chunk is independently parseable even
@@ -1418,7 +1545,7 @@ def save_clip(seconds: Optional[int] = None) -> dict:
     segs = [s for s in segs if s[1] >= 32 * 1024]
 
     if not segs:
-        return {"ok": False, "err": "no finalized segments yet — "
+        return {"ok": False, "err": "no finalized segments yet: "
                                      "the buffer needs at least a few seconds "
                                      "after start.  Try again in 3-5 seconds."}
 
@@ -1434,14 +1561,22 @@ def save_clip(seconds: Optional[int] = None) -> dict:
     safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in prefix)
     out_dir = s.get("output_dir") or CLIPS_DIR
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir,
-        f"{safe}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mp4")
+    base = os.path.join(out_dir,
+        f"{safe}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}")
+    out_path = base + ".mp4"
+    n = 2
+    while os.path.exists(out_path):     # a second save within the same second
+        out_path = f"{base}-{n}.mp4"
+        n += 1
 
     concat_list = os.path.join(seg_dir, "concat_list.txt")
     try:
         with open(concat_list, "w", encoding="utf-8") as f:
             for _, path in picked:
-                f.write(f"file '{path.replace(chr(92), '/')}'\n")
+                # A ' in the path (a profile like O'Brien) would end the
+                # quoted name early; the concat demuxer wants it as '\''.
+                entry = path.replace(chr(92), '/').replace("'", r"'\''")
+                f.write(f"file '{entry}'\n")
     except Exception as e:
         return {"ok": False, "err": f"can't write concat list: {e}"}
 

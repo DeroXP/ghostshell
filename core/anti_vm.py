@@ -58,7 +58,8 @@ _VM_SIGNATURES: list[tuple[str, str]] = [
     # Microsoft Hyper-V (when Windows is the GUEST, manufacturer is
     # "Microsoft Corporation" + model "Virtual Machine"; on a regular
     # Win11 host with VBS, manufacturer is the OEM e.g. "Dell Inc.")
-    ("microsoft corporation", "Hyper-V (guest)"),  # combined w/ model below
+    # No entry here: detect() needs the model too, because Microsoft's own
+    # Surface PCs report "Microsoft Corporation" as well.
     # Xen
     ("xen",             "Xen"),
     ("xenvmm",          "Xen"),
@@ -71,12 +72,12 @@ _VM_SIGNATURES: list[tuple[str, str]] = [
 ]
 
 
-def _match_vendor(value: str) -> str | None:
+def _match_vendor(value: str, prefix_only: bool = False) -> str | None:
     if not value:
         return None
     v = value.lower()
     for needle, label in _VM_SIGNATURES:
-        if needle in v:
+        if v.startswith(needle) if prefix_only else needle in v:
             return label
     return None
 
@@ -174,7 +175,10 @@ def detect() -> dict:
     for axis, value in (("bios.manufacturer", bios_mfr),
                         ("bios.version",      bios_ver),
                         ("bios.serial",       bios_sn)):
-        v = _match_vendor(value)
+        # A serial is random letters and digits, so "KVM" or "XEN" can turn
+        # up inside a real OEM service tag; a hypervisor puts its name at
+        # the front ("VMware-56 4d ...").
+        v = _match_vendor(value, prefix_only=(axis == "bios.serial"))
         if v:
             signals.append({"axis": axis, "value": value, "vendor": v})
 
