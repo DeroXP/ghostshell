@@ -4339,6 +4339,14 @@ def main():
     except Exception as e:
         log.debug(f"popup_killer start failed: {e}")
 
+    # A run that died mid-game left Adaptive Tuning's offset on the card with
+    # nothing watching it.  First, as a game's exit hands AT's offset back
+    # before game mode's own restore.
+    try:
+        adaptive_tuning.recover_interrupted_session()
+    except Exception as e:
+        log.warning(f"Adaptive Tuning recovery of an interrupted session failed: {e}")
+
     # Check if gaming tweaks are stuck from a previous session (crash/reboot mid-game)
     try:
         game_profiles.check_and_restore_on_boot()

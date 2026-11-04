@@ -311,6 +311,173 @@ def test_no_jump_to_the_learned_offset_once_at_is_switched_off():
 
 
 # ═════════════════════════════════════════════════════════════════════
+# Adaptive Tuning: what it remembers, and a run that dies mid-game
+# ═════════════════════════════════════════════════════════════════════
+def saved():
+    st = AT.get_game_state(EXE)
+    return (st["current_core"], st["current_mem"])
+
+
+def test_a_session_that_ends_in_the_start_up_guard_keeps_the_learned_offset():
+    """The game closed before the start-up guard was over: the session saved
+    the baseline it held over the offset AT had climbed to, so every short
+    session sent the next launch back to the bottom."""
+    at_fresh()
+    learned(150, 700)
+    sessions = AT.get_game_state(EXE)["stable_sessions"]
+    assert AT.on_game_start(EXE, "Test Game")["climb_target_core"] == 150
+    AT.on_game_exit(EXE, "Test Game")
+    assert saved() == (150, 700)
+    assert AT.get_game_state(EXE)["stable_sessions"] == sessions, "the session never ran it"
+    assert AT.on_game_start(EXE, "Test Game")["climb_target_core"] == 150, "the next launch goes back to it"
+
+
+def test_a_crash_in_the_start_up_guard_keeps_the_learned_offset():
+    """The card held the baseline when the game crashed, so the crash says
+    nothing against the learned offset (and the guard exists so that it
+    can't be blamed); it used to be replaced with the baseline."""
+    at_fresh()
+    learned(150, 700)
+    AT.on_game_start(EXE, "Test Game")
+    AT.on_game_exit(EXE, "Test Game", was_crash=True)
+    assert saved() == (150, 700)
+    assert AT.get_game_state(EXE)["stable_sessions"] == 0
+
+
+class HotStart(FastLoop):
+    """The real loop, with the jump to the learned offset deferred (the card
+    is too hot for it), so it climbs back toward it from the baseline."""
+
+    def __init__(self, target):
+        self.target = target
+
+    def __enter__(self):
+        super().__enter__()
+        self.real_safe = AT._is_safe_to_step_to
+        AT._is_safe_to_step_to = lambda exe, c, mm, axis="either": (
+            (False, "thermal: 86C") if (c, mm) == self.target else (True, ""))
+        score_delay[0] = 0.03
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            return super().__exit__(*exc)
+        finally:
+            AT._is_safe_to_step_to = self.real_safe
+
+
+def test_climbing_back_after_a_hot_start_keeps_the_learned_offset():
+    """A hot start defers the jump and AT climbs back from the baseline.
+    Every step up wrote the record, so leaving the game (or Vispora dying)
+    before it got there cost the learned climb, although the comment there
+    promised the next launch would go back to it."""
+    with HotStart((900, 3500)):
+        learned(900, 3500)
+        assert AT.on_game_start(EXE, "Test Game")["climb_target_core"] == 900
+        assert m.wait(lambda: len(steps_up()) >= 2), oc_calls
+        assert saved() == (900, 3500), "the record keeps it while the session is below it"
+        AT.on_game_exit(EXE, "Test Game")
+        assert saved() == (900, 3500)
+
+
+def test_a_step_down_below_the_learned_offset_drops_it():
+    """Instability on the way back up says the learned offset is too high."""
+    with HotStart((900, 3500)):
+        learned(900, 3500)
+        AT.on_game_start(EXE, "Test Game")
+        assert m.wait(lambda: len(steps_up()) >= 2), oc_calls
+        score[0] = {"score": 20, "verdict": "unstable", "last_util": 95}
+        assert m.wait(lambda: AT._runtime.get("keep_learned") is None)
+        AT.on_game_exit(EXE, "Test Game")
+        assert saved()[0] < 900 and saved() != (900, 3500), saved()
+
+
+def test_converging_below_the_learned_offset_drops_it():
+    """Blocked on both axes for good (a blacklist, a cap): nothing above is
+    reachable, so the learned offset above it is not kept either."""
+    with HotStart((900, 3500)):
+        AT._is_safe_to_step_to = lambda exe, c, mm, axis="either": (
+            (False, "thermal: 86C") if (c, mm) == (900, 3500) else (False, "blacklisted for this game"))
+        learned(900, 3500)
+        AT.on_game_start(EXE, "Test Game")
+        assert m.wait(lambda: AT.get_game_state(EXE).get("converged")), oc_calls
+        assert AT._runtime.get("keep_learned") is None and saved() == (100, 500), saved()
+
+
+def test_climbing_past_the_learned_offset_records_the_session_again():
+    with HotStart((125, 500)):                      # one core step above the 100/500 baseline
+        learned(125, 500)
+        AT.on_game_start(EXE, "Test Game")
+        assert m.wait(lambda: AT._runtime.get("keep_learned") is None), oc_calls
+        assert m.wait(lambda: saved() != (125, 500))
+        core, mem = saved()
+        assert core >= 125 and mem >= 500, saved()
+
+
+def end_without_closing():
+    """What a crash or a kill of Vispora leaves: no session end ran."""
+    AT._runtime["loop_stop"].set()
+    AT._runtime.update(active_exe=None, loop_stop=None, loop_thread=None, keep_learned=None)
+
+
+def test_a_run_that_died_mid_session_hands_the_card_back_at_the_next_start():
+    """Vispora crashed, or was killed, mid-game: no session end ran, AT's
+    climbed offset stayed on the card with nothing watching it, and nothing
+    put it back at the next start."""
+    at_fresh()
+    assert AT.on_game_start(EXE, "Test Game")["engaged"]       # the card held 100/500 before
+    assert AT._apply_offsets(EXE, 175, 800, "step-up")
+    end_without_closing()
+    real = GO._nvapi
+    GO._nvapi = FakeNvapi(175, 800)                 # what the card still holds
+    try:
+        del oc_calls[:]
+        r = AT.recover_interrupted_session()
+        assert r["recovered"] and oc_calls == [(100, 500)], (r, oc_calls)
+        assert not os.path.exists(AT.SESSION_PATH)
+        assert AT.recover_interrupted_session()["recovered"] is False, "once"
+    finally:
+        GO._nvapi = real
+
+
+def test_after_a_reboot_the_card_is_left_as_it_is():
+    """A power cut: the card came back at stock.  Putting the old offsets
+    back then would apply an overclock at boot that nobody asked for."""
+    at_fresh()
+    AT.on_game_start(EXE, "Test Game")
+    AT._apply_offsets(EXE, 175, 800, "step-up")
+    end_without_closing()
+    real = GO._nvapi
+    GO._nvapi = FakeNvapi(0, 0)
+    try:
+        del oc_calls[:]
+        r = AT.recover_interrupted_session()
+        assert not r["recovered"] and oc_calls == [], (r, oc_calls)
+        assert not os.path.exists(AT.SESSION_PATH)
+    finally:
+        GO._nvapi = real
+
+
+def test_a_session_that_ended_normally_leaves_nothing_to_recover():
+    at_fresh()
+    AT.on_game_start(EXE, "Test Game")
+    assert os.path.exists(AT.SESSION_PATH)
+    AT._apply_offsets(EXE, 175, 800, "step-up")
+    AT.on_game_exit(EXE, "Test Game")
+    assert not os.path.exists(AT.SESSION_PATH)
+    assert AT.recover_interrupted_session()["recovered"] is False
+
+
+def test_applying_the_best_offset_outside_a_session_records_nothing():
+    at_fresh()
+    st = AT.get_game_state(EXE)
+    st.update(best_stable_core=150, best_stable_mem=700)
+    AT._save_game_state(EXE, st)
+    assert AT.apply_best_stable(EXE)["ok"]
+    assert not os.path.exists(AT.SESSION_PATH)
+
+
+# ═════════════════════════════════════════════════════════════════════
 # Game mode
 # ═════════════════════════════════════════════════════════════════════
 def test_a_streaming_apps_pid_taken_by_another_process_is_left_alone():

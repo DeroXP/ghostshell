@@ -64,6 +64,11 @@ HISTORY_PATH  = os.path.join(APPDATA_DIR, "adaptive_tuning_history.json")
 # to push back to those exact offsets in ANY game.  Persists across
 # launches.
 CROSS_GAME_BLACKLIST_PATH = os.path.join(APPDATA_DIR, "adaptive_tuning_xgame_blacklist.json")
+# The session that is open right now: what it found on the card and what it
+# last wrote.  A Vispora that dies mid-game (crash, killed, power cut) never
+# closes its session, so this is what the next start uses to put the card
+# back (see recover_interrupted_session).
+SESSION_PATH = os.path.join(APPDATA_DIR, "adaptive_tuning_session.json")
 
 # v3.1 — Aggressive opening phase.  For the first OPENING_PHASE_SEC
 # after engage, the tuning loop uses reduced warmup + relaxed thresholds
@@ -331,6 +336,10 @@ _runtime: dict[str, Any] = {
     # fast-forward to the remembered climbed offset only after the game survives.
     "startup_guard_until": 0.0,
     "climb_target":        None,       # (core, mem) remembered offset above baseline
+    # The remembered offset while this session has not run it (still in the
+    # guard, holding the baseline, or climbing back toward it): it stays on
+    # record, and the next launch fast-forwards to it again.
+    "keep_learned":        None,
 }
 _lock = threading.Lock()
 # One session start or end at a time, and no offset written by a tuning loop
@@ -1015,6 +1024,7 @@ def clear_runtime_if_orphaned() -> dict:
         _runtime["started_at"]      = None
         _runtime["last_score"]      = None
         _runtime["last_verdict"]    = None
+        _runtime["keep_learned"]    = None
     return {"orphan": True, "cleared_exe": cur_exe}
 
 
@@ -1567,6 +1577,10 @@ def _apply_offsets(exe: str, core: int, mem: int, reason: str) -> bool:
                 game_profiles.note_active_oc(core, mem)
             except Exception as e:
                 log.debug(f"note_active_oc failed: {e}")
+            with _lock:
+                in_session = _runtime.get("active_exe") == _norm_exe(exe)
+            if in_session:
+                _note_applied(exe, core, mem)
         log.info(f"AT apply core+{core}/mem+{mem} → {'OK' if ok else 'FAIL'} ({reason})")
         return ok
     except Exception as e:
@@ -1653,7 +1667,8 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
             still_on = True          # can't tell, so not switched off
         if paused or not still_on:
             log.info(f"AT startup guard: no jump to core+{climb_target[0]}/mem+{climb_target[1]} "
-                     f"({'paused' if paused else 'switched off'}), holding baseline")
+                     f"({'paused' if paused else 'switched off'}), holding baseline and keeping "
+                     f"the learned offset for the next launch")
             with _lock:
                 _runtime["climb_target"] = None
             climb_target = None
@@ -1670,6 +1685,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                     _runtime["current_core"] = tc
                     _runtime["current_mem"]  = tm
                     _runtime["climb_target"] = None
+                    _runtime["keep_learned"] = None     # running it now: tracked as usual
                 log.info(f"AT survived startup guard, fast-forwarded to "
                          f"remembered core+{tc}/mem+{tm}")
         else:
@@ -1703,6 +1719,7 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                 with _lock:
                     _runtime["current_core"] = bcore
                     _runtime["current_mem"]  = bmem
+                    _runtime["keep_learned"] = None
                 log.warning(f"AT startup guard: remembered core+{tc}/mem+{tm} no "
                             f"longer safe ({why}). Reset to baseline core+{bcore}/"
                             f"mem+{bmem}, will re-explore")
@@ -1855,6 +1872,8 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                 state["last_step_offset"]  = {"core": cc, "mem": cm}
                 _update_confidence(state)
                 _save_game_state(exe, state)
+                with _lock:
+                    _runtime["keep_learned"] = None     # a crash below it: not one to come back to
                 _append_history({
                     "ts": time.time(), "exe": _norm_exe(exe),
                     "display_name": display_name,
@@ -2092,6 +2111,8 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                 state["last_step_offset"]  = {"core": cc, "mem": cm}
                 _update_confidence(state)
                 _save_game_state(exe, state)
+                with _lock:
+                    _runtime["keep_learned"] = None     # unstable below it: not one to come back to
 
                 _append_history({
                     "ts": time.time(), "exe": _norm_exe(exe),
@@ -2195,6 +2216,12 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                             state["best_stable_core"] = cc
                             state["best_stable_mem"]  = cm
                             state["converged"]       = True
+                            with _lock:
+                                learned = _runtime.get("keep_learned")
+                                _runtime["keep_learned"] = None     # as high as it goes: nothing above is reachable
+                            if learned:
+                                state["current_core"] = cc
+                                state["current_mem"]  = cm
                             _save_game_state(exe, state)
                             _append_history({
                                 "ts": time.time(), "exe": _norm_exe(exe),
@@ -2217,8 +2244,16 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
                     # decision log + ticks hot_streak.
                     if _loop_apply(stop_event, exe, proposed_core, proposed_mem, "step-up"):
                         state = get_game_state(exe)
-                        state["current_core"] = proposed_core
-                        state["current_mem"]  = proposed_mem
+                        with _lock:
+                            learned = _runtime.get("keep_learned")
+                            if learned and proposed_core >= learned[0] and proposed_mem >= learned[1]:
+                                _runtime["keep_learned"] = learned = None   # past it: this one counts now
+                        # Still below a remembered offset this session has not run
+                        # (climbing back after a hot start): the record keeps that
+                        # one, so an early exit or a dead app doesn't cost the climb.
+                        if not learned:
+                            state["current_core"] = proposed_core
+                            state["current_mem"]  = proposed_mem
                         state["best_stable_core"] = max(state["best_stable_core"], cc)
                         state["best_stable_mem"]  = max(state["best_stable_mem"],  cm)
                         state["step_count"] += 1
@@ -2392,6 +2427,10 @@ def _engage(exe: str, display_name: str | None, state: dict) -> dict:
         log.info(f"AT startup guard: holding baseline core+{bc}/mem+{bm} for "
                  f"{STARTUP_GUARD_SEC}s before fast-forwarding to remembered "
                  f"core+{cc}/mem+{cm}")
+    if not bool(state.get("dry_run")):
+        with _lock:
+            pre = _runtime.get("pre_engage_oc")
+        _note_session(exe, pre, (engage_core, engage_mem) if (apply_ok and (engage_core or engage_mem)) else None)
 
     # Stop any existing loop (shouldn't be one but be defensive)
     with _lock:
@@ -2405,6 +2444,7 @@ def _engage(exe: str, display_name: str | None, state: dict) -> dict:
         # beta.5 — startup-guard state read by the tuning loop.
         _runtime["startup_guard_until"] = startup_guard_until
         _runtime["climb_target"]        = climb_target
+        _runtime["keep_learned"]        = climb_target
         # Reflect what's ACTUALLY applied right now (baseline if guarding).
         _runtime["current_core"]     = engage_core
         _runtime["current_mem"]      = engage_mem
@@ -2514,6 +2554,73 @@ def engage_for_active_game() -> dict:
     return _engage(active["exe"], active.get("display"), state)
 
 
+def _note_session(exe: str, pre: Optional[dict], applied: Optional[tuple]) -> None:
+    """Put the open session on disk (SESSION_PATH): what was on the card
+    before it, and what it last wrote (None until it writes something)."""
+    pre = pre or {}
+    _save_json(SESSION_PATH, {
+        "exe":     _norm_exe(exe),
+        "started": time.time(),
+        "pre":     {"core": int(pre.get("core", 0) or 0), "mem": int(pre.get("mem", 0) or 0)},
+        "applied": {"core": int(applied[0]), "mem": int(applied[1])} if applied else None,
+    })
+
+
+def _note_applied(exe: str, core: int, mem: int) -> None:
+    rec = _load_json(SESSION_PATH, None)
+    if isinstance(rec, dict) and rec.get("exe") == _norm_exe(exe):
+        rec["applied"] = {"core": int(core), "mem": int(mem)}
+        _save_json(SESSION_PATH, rec)
+
+
+def _forget_session() -> None:
+    try:
+        os.remove(SESSION_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.debug(f"AT: could not remove {SESSION_PATH}: {e}")
+
+
+def recover_interrupted_session() -> dict:
+    """At start-up, before anything else touches the GPU.  A session still on
+    disk means the last run ended without closing it (Vispora crashed, was
+    killed, or the PC lost power), so nothing handed the card back.  If the
+    card still holds what that session last wrote, put back what was on it
+    before the session.  Anything else on the card (stock after a reboot, an
+    offset set since) is left as it is."""
+    rec = _load_json(SESSION_PATH, None)
+    if not isinstance(rec, dict):
+        return {"recovered": False, "reason": "no interrupted session"}
+    _forget_session()           # one attempt: this run has its own sessions to record
+    applied, pre = rec.get("applied"), rec.get("pre") or {}
+    if not isinstance(applied, dict):
+        return {"recovered": False, "reason": "the session had written nothing"}
+    try:
+        want = (int(applied.get("core", 0)), int(applied.get("mem", 0)))
+        back = (int(pre.get("core", 0)), int(pre.get("mem", 0)))
+    except (TypeError, ValueError):
+        return {"recovered": False, "reason": "unreadable session record"}
+    if want == back:
+        return {"recovered": False, "reason": "the session left the card as it found it"}
+    from core import gpu_overclock
+    now = gpu_overclock.get_current_offsets()
+    if not now.get("ok"):
+        return {"recovered": False, "reason": f"offsets unreadable: {now.get('err')}"}
+    cur = (int(now.get("core_offset_mhz") or 0), int(now.get("mem_offset_mhz") or 0))
+    if (abs(cur[0] - want[0]) > _AT_DRIFT_TOLERANCE_MHZ
+            or abs(cur[1] - want[1]) > _AT_DRIFT_TOLERANCE_MHZ):
+        return {"recovered": False, "reason": "the card no longer holds the session's offset",
+                "card": cur}
+    r = gpu_overclock.apply_oc(core_offset_mhz=back[0], mem_offset_mhz=back[1], power_pct=None)
+    ok = bool(r.get("ok"))
+    (log.warning if ok else log.error)(
+        f"AT: the last run ended mid-session ({rec.get('exe')}) with core+{want[0]}/mem+{want[1]} "
+        f"on the card; " + (f"put back core+{back[0]}/mem+{back[1]}" if ok
+                            else f"could not put back core+{back[0]}/mem+{back[1]}: {r.get('err')}"))
+    return {"recovered": ok, "exe": rec.get("exe"), "from": want, "to": back}
+
+
 def _restore_pre_engage_oc(pre: Optional[dict], cur_core: int, cur_mem: int,
                            dry_run: bool = False) -> None:
     """Re-apply the offsets that were on the card before this session began.
@@ -2568,6 +2675,7 @@ def on_game_exit(exe: str, display_name: str | None,
         cm = _runtime["current_mem"]
         active_exe = _runtime["active_exe"]
         pre_engage = _runtime.get("pre_engage_oc")
+        learned = _runtime.get("keep_learned")
 
     if active_exe != _norm_exe(exe):
         # The runtime isn't currently tracking this exe — nothing to
@@ -2593,8 +2701,20 @@ def on_game_exit(exe: str, display_name: str | None,
     state["session_count"] = int(state.get("session_count", 0)) + 1
     state["last_session_at"] = time.time()
     state["last_session_outcome"] = "crash" if was_crash else "clean"
-    state["current_core"] = cc
-    state["current_mem"]  = cm
+    if learned and was_crash and (cc, cm) != (int(state.get("baseline_core", 0)),
+                                              int(state.get("baseline_mem", 0))):
+        learned = None      # it had climbed from the baseline, and crashed below the remembered offset
+    if learned:
+        # The session never ran the remembered offset: it ended in the
+        # start-up guard, or held the baseline (paused, a hot start) or was
+        # still climbing back toward it.  Keep it; the next launch
+        # fast-forwards to it again.  (This used to save the baseline, and
+        # every short or hot session threw the learned climb away.)
+        state["current_core"] = int(learned[0])
+        state["current_mem"]  = int(learned[1])
+    else:
+        state["current_core"] = cc
+        state["current_mem"]  = cm
     if not was_crash:
         # Survived another session at this offset — bump the "best stable"
         state["best_stable_core"] = max(state.get("best_stable_core", 0), cc)
@@ -2602,8 +2722,10 @@ def on_game_exit(exe: str, display_name: str | None,
         # v3.1 — clean exit at current offset increments the stable-
         # session counter, which feeds the confidence tier.  Crash
         # exits reset stable_sessions to 0 (we no longer trust this
-        # offset until we earn confidence again).
-        state["stable_sessions"] = int(state.get("stable_sessions", 0)) + 1
+        # offset until we earn confidence again).  A session that never
+        # ran the kept offset says nothing about it either way.
+        if not learned:
+            state["stable_sessions"] = int(state.get("stable_sessions", 0)) + 1
     else:
         state["stable_sessions"] = 0
         state["stable_minutes"]  = 0.0
@@ -2615,6 +2737,7 @@ def on_game_exit(exe: str, display_name: str | None,
     # desktop and every other game ran on it — with the stock watchdog
     # (resumed further down) then enforcing it.
     _restore_pre_engage_oc(pre_engage, cc, cm, dry_run=bool(state.get("dry_run")))
+    _forget_session()           # closed: nothing for the next start to put back
 
     # Release perf_monitor consumer
     try:
@@ -2665,6 +2788,7 @@ def on_game_exit(exe: str, display_name: str | None,
         # beta.5 — clear startup-guard state so it can't leak to the next game.
         _runtime["startup_guard_until"] = 0.0
         _runtime["climb_target"]        = None
+        _runtime["keep_learned"]        = None
         _runtime["pre_engage_oc"]       = None
 
     log.info(f"AT session ended for {display_name}: "
