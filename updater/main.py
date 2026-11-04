@@ -37,7 +37,7 @@ from updater.paths import INSTALL_INFO, log
 # only two pieces of state hard-coded into the binary — everything else
 # (target dir, channel, etc) comes from args or install_info.json so the
 # updater stays usable across re-locations.
-UPDATER_VERSION  = "1.4.4"
+UPDATER_VERSION  = "1.4.5"
 SERVER_URL_DEFAULT = "https://vispora.up.railway.app"
 # The release server's previous hostname — dead since the Railway service was
 # renamed on 2026-07-01.  Kept only so a stale --server arg passed by an old
