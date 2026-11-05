@@ -39,7 +39,7 @@ a = Analysis(
     # Strip absolutely every heavyweight we don't need
     excludes=[
         'tkinter', 'matplotlib', 'pandas', 'numpy', 'mss',
-        'vgamepad', 'cryptography', 'sqlite3', 'PIL.ImageDraw',
+        'cryptography', 'sqlite3', 'PIL.ImageDraw',
         'PIL.ImageFont',
     ],
     win_no_prefer_redirects=False,

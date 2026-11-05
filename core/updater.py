@@ -1463,8 +1463,8 @@ def _is_game_foreground() -> bool:
     Returns False if we can't determine it (fail-OPEN here — if we
     can't tell, we shouldn't block the update forever)."""
     try:
-        from core.gamepad_mapper import _get_foreground_exe_name
-        exe = _get_foreground_exe_name()
+        from core import utils
+        exe = utils.foreground_exe_name()
         if not exe:
             return False
         from core.game_profiles import KNOWN_GAME_EXES
@@ -1476,8 +1476,8 @@ def _is_game_foreground() -> bool:
 def _is_own_window_foreground() -> bool:
     """True if one of our own windows is in the foreground."""
     try:
-        from core.gamepad_mapper import _get_foreground_exe_name
-        return (_get_foreground_exe_name() or "").lower() in OWN_PROCESS_NAMES
+        from core import utils
+        return (utils.foreground_exe_name() or "").lower() in OWN_PROCESS_NAMES
     except Exception:
         return False
 

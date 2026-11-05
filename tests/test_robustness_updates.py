@@ -645,7 +645,7 @@ def test_turning_autostart_off_on_a_german_windows():
 # ═════════════════════════════════════════════════════════════════════
 def test_a_refused_restart_is_not_reported_as_started():
     m.fresh()
-    D._save_state({"pending_restart": {"set_at": 1.0, "by": ["vigembus"]}})
+    D._save_state({"pending_restart": {"set_at": 1.0, "by": ["presentmon2"]}})
     answer, ran = [types.SimpleNamespace(returncode=1190, stdout="",
                                          stderr="A system shutdown has already been scheduled.(1190)")], []
     saved = D.subprocess

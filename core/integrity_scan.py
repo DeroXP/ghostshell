@@ -168,7 +168,10 @@ _NEVER_TOUCH_NAMES = {
     "community_anon_id", "community_settings.json",
     "dependencies_state.json", "driver_updater_settings.json",
     "error_reporter_settings.json", "gameplay_baselines.json",
+    "crosshair_settings.json",
+    # Left by the removed Gamepad Mapper and its HidHide cleanup.
     "gamepad_profiles.json", "user_recoil_presets.json",
+    "hidhide_engaged.json", "hidhide_cleanup_done.json",
     "gpu_oc_profile.json", "gpu_stock_baseline.json",
     "obs_settings.json", "power_baseline.json",
     "stream_helper_settings.json", "temp_ceiling_settings.json",
@@ -189,6 +192,7 @@ _NEVER_RECURSE_DIRS = {
     "backups", "snapshots", "profiles", "game_profiles", "drivers",
     "bin",            # holds downloaded binaries we still need
     "updater",        # one allow-listed file inside (updater.log)
+    "crosshairs",     # the user's own crosshair images
 }
 
 # Hard cap on file size that auto-clean is willing to touch.  Anything
@@ -353,8 +357,8 @@ def _get_user_idle_sec() -> float:
 
 def _is_own_window_foreground() -> bool:
     try:
-        from core.gamepad_mapper import _get_foreground_exe_name
-        return (_get_foreground_exe_name() or "").lower() in OWN_PROCESS_NAMES
+        from core import utils
+        return (utils.foreground_exe_name() or "").lower() in OWN_PROCESS_NAMES
     except Exception:
         return False
 

@@ -55,7 +55,7 @@ def clear_log_buffer():
 # Before: a plain FileHandler at logging.DEBUG appended forever.  The
 # log file in %APPDATA% grew unbounded — a 1 MB log after a
 # casual session, several megabytes for heavy users.  Every poll cycle
-# (perf_monitor at 5 Hz, gamepad at 30 Hz, etc) also wrote a debug
+# (perf_monitor at 5 Hz, hardware polling, etc) also wrote a debug
 # entry, contributing to UI lag during high-activity sessions because
 # we were paying the file-write cost on every tick.
 #
@@ -216,6 +216,76 @@ def is_safe_ps_literal(value) -> bool:
     is_safe_ps_exe_name: reject, don't try to escape — the caller skips
     that one operation."""
     return isinstance(value, str) and bool(value) and not _PS_DQ_UNSAFE_RE.search(value)
+
+
+# ---------------------------------------------------------------------------
+# Foreground window
+# ---------------------------------------------------------------------------
+# Private WinDLL instances, so the argtypes set here never change how other
+# modules' calls through the shared ctypes.windll behave.
+_fg_api = None
+
+
+def _foreground_api():
+    global _fg_api
+    if _fg_api is None:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        _fg_api = (ctypes, wintypes, user32, kernel32)
+    return _fg_api
+
+
+def foreground_exe_path() -> str:
+    """Full path of the program that owns the foreground window, or "" when
+    there is none or it can't be read (a protected process, say).  Never
+    raises."""
+    if sys.platform != "win32":
+        return ""
+    try:
+        ctypes, wintypes, user32, kernel32 = _foreground_api()
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        handle = kernel32.OpenProcess(0x1000, False, pid.value)    # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ""
+        try:
+            size = wintypes.DWORD(32768)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return buf.value or ""
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    return ""
+
+
+def foreground_exe_name() -> str:
+    """Lower-case file name ("game.exe") of the program that owns the
+    foreground window, or "".  Never raises."""
+    try:
+        path = foreground_exe_path()
+        return os.path.basename(path).lower() if path else ""
+    except Exception:
+        return ""
 
 
 def _replace_retrying(src: str, dst: str, tries: int = 10) -> None:

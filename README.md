@@ -25,8 +25,9 @@ borderless WebView2 window on top (pywebview), plus a tray icon.
   adaptive tuning, a hard temperature ceiling, crash recovery, driver updates.
 - **Monitoring**: live hardware sensors and frame-time telemetry (PresentMon).
 - **Capture**: instant-replay clips (FFmpeg or OBS), screenshots, stream helper.
-- **Gamepad mapper**: remapping, macros and a virtual controller (ViGEmBus /
-  HidHide). Input remapping can violate a game's anti-cheat rules; that is on you.
+- **Crosshair overlay**: a custom crosshair in its own see-through window, never
+  touching the game. Works over windowed, borderless and most fullscreen games;
+  it can't draw over true exclusive fullscreen.
 
 **Also**
 - **Password vault**: PIN-protected, PBKDF2 + Fernet, stored locally.

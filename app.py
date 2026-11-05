@@ -1,6 +1,7 @@
 """Vispora — Main Flask application with pywebview launcher."""
 import sys
 import os
+import functools
 import hmac
 import json
 import secrets
@@ -20,8 +21,8 @@ from core import (system_info, debloater, optimizer, dns_manager, network_tweaks
                   gpu_overclock, autostart, driver_updater, temp_ceiling,
                   crash_recovery, perf_monitor, adaptive_tuning, health_audit,
                   snapshots, library_scanner, background_pauser, tournament_mode,
-                  net_monitor, gamepad_mapper, competitive_latency, latency_doctor,
-                  competitive_advisor, startup_manager, idle_mode)
+                  net_monitor, competitive_latency, latency_doctor,
+                  competitive_advisor, startup_manager, idle_mode, crosshair)
 
 log = get_logger("app")
 
@@ -1311,7 +1312,7 @@ def api_dependencies_status():
 
 @app.route("/api/dependencies/install", methods=["POST"])
 def api_dependencies_install():
-    """Body: { keys: ["presentmon2", "vigembus"] } — or omit to install
+    """Body: { keys: ["presentmon2", "ffmpeg"] }, or omit it to install
     every missing auto-installable dep.  Runs in a background thread;
     poll /api/dependencies/status.progress for updates."""
     try:
@@ -2151,6 +2152,210 @@ def api_adaptive_game_knobs():
     return jsonify(adaptive_tuning.set_game_knobs(exe=exe, **knobs))
 
 
+# ─── Crosshair overlay ─────────────────────────────────────────────────
+# Thin wrappers: core/crosshair.py checks, clamps and explains every input
+# itself and never raises.  The only thing refused here is a body that
+# isn't a JSON object.
+def _crosshair_post(path: str):
+    """Register a crosshair POST route.  The handler gets the JSON object
+    body and returns a dict; any other body is answered with a 400."""
+    def register(handler):
+        @functools.wraps(handler)
+        def view():
+            d = request.get_json(force=True, silent=True)
+            if not isinstance(d, dict):
+                return jsonify({"ok": False, "err": "Expected a JSON object."}), 400
+            return jsonify(handler(d))
+        return app.route(path, methods=["POST"])(view)
+    return register
+
+
+@app.route("/api/crosshair/state")
+def api_crosshair_state():
+    return jsonify(crosshair.get_state())
+
+
+@app.route("/api/crosshair/status")
+def api_crosshair_status():
+    """Polled every second while the Crosshair page is open."""
+    return jsonify(crosshair.get_status())
+
+
+@_crosshair_post("/api/crosshair/settings")
+def api_crosshair_settings(d):
+    return crosshair.set_settings(d)
+
+
+@_crosshair_post("/api/crosshair/preview")
+def api_crosshair_preview(d):
+    return crosshair.preview(d.get("design"), d.get("background", "none"), d.get("target_height"))
+
+
+@_crosshair_post("/api/crosshair/presets")
+def api_crosshair_presets(d):
+    """Body: {action, id?, name?, design?, activate?}."""
+    return crosshair.presets(d.get("action"),
+                             **{k: d[k] for k in ("id", "name", "design", "activate") if k in d})
+
+
+@_crosshair_post("/api/crosshair/activate")
+def api_crosshair_activate(d):
+    return crosshair.activate(d.get("id"))
+
+
+@_crosshair_post("/api/crosshair/import")
+def api_crosshair_import(d):
+    return crosshair.import_code(d.get("code"))
+
+
+@_crosshair_post("/api/crosshair/export")
+def api_crosshair_export(d):
+    return crosshair.export_code(d.get("design"))
+
+
+@_crosshair_post("/api/crosshair/image/browse")
+def api_crosshair_image_browse(d):
+    """Pick a PNG in the native file dialog; it is copied into the crosshair
+    images folder.  Cancelling answers {ok: true, cancelled: true}."""
+    try:
+        import webview
+        wins = webview.windows
+    except Exception:
+        wins = None
+    if not wins:
+        return {"ok": False, "err": "The file picker needs the Vispora window. Open Vispora and try again."}
+    try:
+        # FileDialog.OPEN is the same value as the deprecated OPEN_DIALOG,
+        # which logs a warning every time it is read.
+        kind = getattr(getattr(webview, "FileDialog", None), "OPEN", None) or webview.OPEN_DIALOG
+        result = wins[0].create_file_dialog(kind, allow_multiple=False, file_types=("PNG images (*.png)",))
+    except Exception as e:
+        log.warning(f"crosshair image picker failed: {e}")
+        return {"ok": False, "err": "The file picker didn't open. Try again."}
+    if not result:
+        return {"ok": True, "cancelled": True}
+    path = result[0] if isinstance(result, (list, tuple)) else result
+    return crosshair.add_image_from_path(path)
+
+
+@_crosshair_post("/api/crosshair/games")
+def api_crosshair_games(d):
+    """Body: {exe, rule}; a null rule removes the game's rule."""
+    return crosshair.set_game_rule(d.get("exe"), d.get("rule"))
+
+
+@_crosshair_post("/api/crosshair/hidden")
+def api_crosshair_hidden(d):
+    return crosshair.set_hidden(d.get("hidden"))
+
+
+@_crosshair_post("/api/crosshair/test")
+def api_crosshair_test(d):
+    return crosshair.test_show(d.get("seconds", 5))
+
+
+def _crosshair_default_exe() -> str:
+    """The game the fullscreen check looks at when the page names none.
+
+    crosshair.default_game() decides, the same way the page picks its
+    default: the game in front, else the one Game Mode is running for, else
+    the newest game the crosshair saw in front, else none.  Never just the
+    app that was in front last: the overlay remembers browsers and chat apps
+    too, and the check would call those fine "for this game"."""
+    pick = getattr(crosshair, "default_game", None)
+    if callable(pick):
+        try:
+            exe = pick()
+            return exe if isinstance(exe, str) else ""
+        except Exception as e:
+            log.debug(f"crosshair: no default game for the fullscreen check: {e}")
+    # Without default_game: the same order, with known games only.
+    try:
+        st = crosshair.get_status().get("status") or {}
+        if st.get("game_exe"):
+            return str(st["game_exe"])
+        info = game_profiles.get_active_game_info()
+        if info and info.get("exe"):
+            return str(info["exe"])
+        known = game_profiles.KNOWN_GAME_EXES
+        return next((e for e in st.get("last_games") or [] if e in known), "")
+    except Exception as e:
+        log.debug(f"crosshair: no game for the fullscreen check: {e}")
+        return ""
+
+
+@app.route("/api/crosshair/fullscreen")
+def api_crosshair_fullscreen():
+    """?exe= picks the game; without it, see _crosshair_default_exe."""
+    exe = (request.args.get("exe") or "").strip()
+    return jsonify(crosshair.fullscreen_check(exe or _crosshair_default_exe()))
+
+
+@_crosshair_post("/api/crosshair/fullscreen/fix")
+def api_crosshair_fullscreen_fix(d):
+    """Body: {exe, paths?}; paths, the programs the page listed, limits the fix to them."""
+    paths = d.get("paths")
+    if not (isinstance(paths, list) and all(isinstance(p, str) for p in paths)):
+        paths = None
+    return crosshair.fullscreen_fix(d.get("exe"), paths)
+
+
+@_crosshair_post("/api/crosshair/fullscreen/fix-global")
+def api_crosshair_fullscreen_fix_global(d):
+    return crosshair.fullscreen_fix_global()
+
+
+@_crosshair_post("/api/crosshair/fullscreen/undo")
+def api_crosshair_fullscreen_undo(d):
+    return crosshair.fullscreen_undo()
+
+
+@_crosshair_post("/api/crosshair/legacy-notice/dismiss")
+def api_crosshair_legacy_notice_dismiss(d):
+    return crosshair.dismiss_legacy_notice()
+
+
+def _crosshair_allow_start() -> None:
+    """The process is DPI aware now, so the crosshair overlay may open its
+    window.  Runs on pywebview's GUI thread: allow_start() only sets a flag
+    and starts its own thread."""
+    try:
+        crosshair.allow_start()
+    except Exception as e:
+        log.warning(f"crosshair start gate failed: {e}")
+
+
+def _gate_crosshair_start(window) -> str:
+    """Tie the crosshair's start to the pywebview window.  Returns the event used.
+
+    pywebview (6.2.1, winforms.create_window) calls SetProcessDPIAware() on
+    the main thread, then builds the window on its GUI thread and sets
+    events.before_show there before Show(), also when the window is created
+    hidden (autostart).  Windows wants a process's DPI mode settled before
+    the process creates windows, so the overlay waits for that call.  Older
+    pywebview without before_show: events.shown, plus a late fallback in
+    case a window that starts hidden never reports shown."""
+    events = getattr(window, "events", None)
+    used = "none"
+    for name in ("before_show", "shown"):
+        ev = getattr(events, name, None)
+        if ev is None:
+            continue
+        try:
+            ev += _crosshair_allow_start          # pywebview's Event adds in place
+        except Exception as e:
+            log.warning(f"crosshair: couldn't listen for the window's {name} event: {e}")
+            continue
+        if name == "before_show":
+            return name
+        used = name
+        break
+    t = threading.Timer(30.0, _crosshair_allow_start)
+    t.daemon = True
+    t.start()
+    return used
+
+
 # ─── System Health Audit (Dashboard card) ──────────────────────────────
 @app.route("/api/health/audit")
 def api_health_audit():
@@ -2326,405 +2531,6 @@ def api_network_resume_process():
     if not pid:
         return jsonify({"ok": False, "err": "pid required"}), 400
     return jsonify(net_monitor.resume_process(pid))
-
-
-# ─── Gamepad Mapper (v3.1) ─────────────────────────────────────────────
-@app.route("/api/gamepad/status")
-def api_gamepad_status():
-    return jsonify(gamepad_mapper.get_status())
-
-
-@app.route("/api/gamepad/profiles")
-def api_gamepad_profiles():
-    return jsonify(gamepad_mapper.list_profiles())
-
-
-@app.route("/api/gamepad/profiles", methods=["POST"])
-def api_gamepad_save_profile():
-    data = request.get_json(force=True) or {}
-    name = (data.get("name") or "").strip()
-    if not name:
-        return jsonify({"ok": False, "err": "name required"}), 400
-    return jsonify(gamepad_mapper.save_profile(name, data))
-
-
-@app.route("/api/gamepad/profiles/<name>", methods=["DELETE"])
-def api_gamepad_delete_profile(name):
-    return jsonify(gamepad_mapper.delete_profile(name))
-
-
-@app.route("/api/gamepad/active", methods=["POST"])
-def api_gamepad_set_active():
-    data = request.get_json(force=True) or {}
-    return jsonify(gamepad_mapper.set_active_profile(data.get("name") or None))
-
-
-@app.route("/api/gamepad/enabled", methods=["POST"])
-def api_gamepad_set_enabled():
-    data = request.get_json(force=True) or {}
-    return jsonify(gamepad_mapper.set_enabled(bool(data.get("enabled", False))))
-
-
-@app.route("/api/gamepad/capture-button", methods=["POST"])
-def api_gamepad_capture_button():
-    """Block briefly until the user presses any button on any connected
-    XInput slot.  Used by the UI's 'press button to bind' flow."""
-    data = request.get_json(silent=True) or {}
-    timeout = float(data.get("timeout", 8.0))
-    return jsonify(gamepad_mapper.capture_next_button(timeout_sec=timeout))
-
-
-@app.route("/api/gamepad/install-status")
-def api_gamepad_install_status():
-    """Full ViGEmBus + vgamepad capability check.  Heavier than
-    /api/gamepad/status — actually tries to create a virtual pad."""
-    return jsonify(gamepad_mapper.get_install_status())
-
-
-@app.route("/api/gamepad/hidhide-status")
-def api_gamepad_hidhide_status():
-    """HidHide kernel driver + CLI presence probe.  Cheap (no IOCTL)."""
-    return jsonify(gamepad_mapper.get_hidhide_status())
-
-
-@app.route("/api/gamepad/hidhide-engage", methods=["POST"])
-def api_gamepad_hidhide_engage():
-    """User-triggered HidHide engage retry.  Returns detailed error
-    info if engagement fails so the UI can surface what went wrong."""
-    return jsonify(gamepad_mapper.force_hidhide_engage())
-
-
-@app.route("/api/gamepad/hidhide-diagnostic")
-def api_gamepad_hidhide_diagnostic():
-    """List every controller-class device on the system, tagged with
-    whether it's a ViGEmBus virtual pad (ours, kept visible) or any
-    OTHER controller / virtual-controller layer (will be hidden).
-    Used by the UI's troubleshooting panel so users can spot Razer
-    Synapse / Steam Input / DS4Windows virtual controllers competing
-    with our virtual pad."""
-    return jsonify(gamepad_mapper.get_hidhide_diagnostic())
-
-
-# ─── v3.4 macro recorder ──────────────────────────────────────────────
-@app.route("/api/gamepad/macro/record/start", methods=["POST"])
-def api_gamepad_macro_record_start():
-    """Body: { skip_move?, start_delay_sec?, filters?, sample_hz fields }.
-
-    `filters` is a partial dict — any subset of:
-        keyboard, mouse_buttons, mouse_move,
-        controller_buttons, controller_sticks, controller_triggers
-    Unspecified keys keep their defaults (digital on, analog off).
-
-    `start_delay_sec` defaults to 2.0 — countdown before recording flips
-    on, gives the user time to focus the target window."""
-    from core import macro_recorder
-    data = request.get_json(silent=True) or {}
-    return jsonify(macro_recorder.start_recording(
-        skip_move=bool(data.get("skip_move", False)),
-        start_delay_sec=float(data.get("start_delay_sec", 2.0) or 2.0),
-        filters=data.get("filters"),
-        stick_sample_hz=int(data.get("stick_sample_hz", 30) or 30),
-        trigger_sample_hz=int(data.get("trigger_sample_hz", 30) or 30),
-        mouse_move_sample_hz=int(data.get("mouse_move_sample_hz", 30) or 30),
-    ))
-
-
-@app.route("/api/gamepad/macro/record/stop", methods=["POST"])
-def api_gamepad_macro_record_stop():
-    from core import macro_recorder
-    return jsonify(macro_recorder.stop_recording())
-
-
-@app.route("/api/gamepad/macro/record/cancel", methods=["POST"])
-def api_gamepad_macro_record_cancel():
-    from core import macro_recorder
-    return jsonify(macro_recorder.cancel_recording())
-
-
-@app.route("/api/gamepad/macro/record/status")
-def api_gamepad_macro_record_status():
-    from core import macro_recorder
-    return jsonify(macro_recorder.get_status())
-
-
-@app.route("/api/gamepad/test-virtual-pad", methods=["POST"])
-def api_gamepad_test_virtual_pad():
-    """Fire a verification sequence on the virtual pad — A, stick down,
-    B — so the user can see if games are actually picking up the
-    virtual controller's state."""
-    return jsonify(gamepad_mapper.test_virtual_pad())
-
-
-@app.route("/api/gamepad/recoil-presets")
-def api_gamepad_recoil_presets():
-    """Curated anti-recoil patterns for popular shooters + generic ones,
-    MERGED with user-captured patterns saved via the capture workflow.
-    User presets carry `is_user: true` so the UI can render Edit/Delete.
-
-    Note: includes a disclaimer string the UI surfaces — these patterns
-    can violate game ToS in ranked / competitive play."""
-    return jsonify(gamepad_mapper.get_recoil_presets())
-
-
-# ─── v3.6 — recoil pattern capture from gameplay ───────────────────
-@app.route("/api/gamepad/capture/availability")
-def api_gamepad_capture_availability():
-    """Check whether the bundle includes the libs needed for capture
-    (numpy + mss).  The UI hides the capture buttons if not."""
-    from core import recoil_capture
-    return jsonify(recoil_capture.is_available())
-
-
-@app.route("/api/gamepad/capture/screen/start", methods=["POST"])
-def api_gamepad_capture_screen_start():
-    """Body: { rpm?, max_duration_sec?, capture_hz?, auto_fire? }.
-    `auto_fire` (controller users): if true, Vispora pushes RT through
-    the virtual pad while capturing so the user doesn't have to physically
-    hold their fire trigger.  Requires virtual_controller mode."""
-    from core import recoil_capture
-    data = request.get_json(silent=True) or {}
-    return jsonify(recoil_capture.start_screen_capture(
-        rpm=int(data.get("rpm", 600) or 600),
-        max_duration_sec=float(data.get("max_duration_sec", 6.0) or 6.0),
-        capture_hz=int(data.get("capture_hz", 120) or 120),
-        auto_fire=bool(data.get("auto_fire", False)),
-    ))
-
-
-@app.route("/api/gamepad/capture/counter-pull/start", methods=["POST"])
-def api_gamepad_capture_counter_pull_start():
-    """Body: { rpm?, max_duration_sec?, source?: 'mouse' | 'controller_rstick',
-              auto_fire?: bool }.
-
-    Records the user's manual counter-pull during firing — what they're
-    doing with their mouse / right-stick to compensate IS the
-    compensation pattern."""
-    from core import recoil_capture
-    data = request.get_json(silent=True) or {}
-    return jsonify(recoil_capture.start_counter_pull_capture(
-        rpm=int(data.get("rpm", 600) or 600),
-        max_duration_sec=float(data.get("max_duration_sec", 6.0) or 6.0),
-        source=str(data.get("source", "mouse")),
-        auto_fire=bool(data.get("auto_fire", False)),
-    ))
-
-
-@app.route("/api/gamepad/capture/counter-pull/stop", methods=["POST"])
-def api_gamepad_capture_counter_pull_stop():
-    from core import recoil_capture
-    return jsonify(recoil_capture.stop_counter_pull_capture())
-
-
-@app.route("/api/gamepad/capture/auto-fire-mag", methods=["POST"])
-def api_gamepad_capture_auto_fire_mag():
-    """Body: { duration_sec?: float }.  One-shot — fires RT through the
-    virtual pad for N seconds so the user can press Capture-Before, click
-    Fire, click Capture-After in sequence without alt-tabbing to manually
-    hold RT.  Requires virtual_controller mode."""
-    from core import recoil_capture
-    data = request.get_json(silent=True) or {}
-    return jsonify(recoil_capture.auto_fire_mag(
-        duration_sec=float(data.get("duration_sec", 3.0) or 3.0)
-    ))
-
-
-@app.route("/api/gamepad/capture/screen/stop", methods=["POST"])
-def api_gamepad_capture_screen_stop():
-    from core import recoil_capture
-    return jsonify(recoil_capture.stop_screen_capture())
-
-
-@app.route("/api/gamepad/capture/status")
-def api_gamepad_capture_status():
-    from core import recoil_capture
-    return jsonify(recoil_capture.get_capture_status())
-
-
-@app.route("/api/gamepad/capture/bullet-holes/snapshot", methods=["POST"])
-def api_gamepad_capture_bh_snapshot():
-    """Body: { which: 'before' | 'after' }.  Captures the foreground
-    window's current frame as either reference."""
-    from core import recoil_capture
-    data = request.get_json(silent=True) or {}
-    return jsonify(recoil_capture.bullet_hole_snapshot(
-        str(data.get("which", "")).lower()
-    ))
-
-
-@app.route("/api/gamepad/capture/bullet-holes/detect", methods=["POST"])
-def api_gamepad_capture_bh_detect():
-    """Body: { rpm?, threshold?, min_size_px?, max_size_px? }.  Diffs
-    the before/after snapshots and returns the detected hole centroids
-    in firing-order (top-down)."""
-    from core import recoil_capture
-    data = request.get_json(silent=True) or {}
-    return jsonify(recoil_capture.detect_bullet_holes(
-        rpm=int(data.get("rpm", 600) or 600),
-        threshold=int(data.get("threshold", 60) or 60),
-        min_size_px=int(data.get("min_size_px", 12) or 12),
-        max_size_px=int(data.get("max_size_px", 800) or 800),
-    ))
-
-
-@app.route("/api/gamepad/capture/bullet-holes/state")
-def api_gamepad_capture_bh_state():
-    from core import recoil_capture
-    return jsonify(recoil_capture.get_bullet_hole_state())
-
-
-@app.route("/api/gamepad/capture/bullet-holes/reset", methods=["POST"])
-def api_gamepad_capture_bh_reset():
-    from core import recoil_capture
-    return jsonify(recoil_capture.reset_bullet_hole_state())
-
-
-@app.route("/api/gamepad/capture/save", methods=["POST"])
-def api_gamepad_capture_save():
-    """Body: { name, binned: [{dx, dy}], rpm, method, sensitivity_scale?, ... }.
-    Persists a captured pattern as a user recoil preset."""
-    from core import recoil_capture
-    data = request.get_json(force=True) or {}
-    return jsonify(recoil_capture.save_capture_as_preset(
-        name=str(data.get("name", "")),
-        binned=list(data.get("binned") or []),
-        rpm=int(data.get("rpm", 600) or 600),
-        method=str(data.get("method", "screen")),
-        sensitivity_scale=float(data.get("sensitivity_scale", 0.005) or 0.005),
-        weapon=str(data.get("weapon", "")),
-        game=str(data.get("game", "")),
-        description=str(data.get("description", "")),
-        play_mode=str(data.get("play_mode", "once")),
-        auto_hold_rt=bool(data.get("auto_hold_rt", True)),
-        id_override=data.get("id_override"),
-    ))
-
-
-@app.route("/api/gamepad/capture/delete", methods=["POST"])
-def api_gamepad_capture_delete():
-    from core import recoil_capture
-    data = request.get_json(force=True) or {}
-    return jsonify(recoil_capture.delete_user_preset(str(data.get("id", ""))))
-
-
-# ─── v3.5 — profile import / export ────────────────────────────────
-@app.route("/api/gamepad/profile/export", methods=["POST"])
-def api_gamepad_profile_export():
-    """Body: { name }.  Returns a JSON blob the UI can copy to
-    clipboard or save as a .json file for sharing / backup."""
-    data = request.get_json(force=True) or {}
-    return jsonify(gamepad_mapper.export_profile(data.get("name", "")))
-
-
-@app.route("/api/gamepad/profile/import", methods=["POST"])
-def api_gamepad_profile_import():
-    """Body: { blob: <export-blob>, override_name?: str }.  Imports a
-    profile.  If a profile with the same name exists and no
-    override_name was provided, the new one gets a unique suffix."""
-    data = request.get_json(force=True) or {}
-    return jsonify(gamepad_mapper.import_profile(
-        data.get("blob") or {},
-        override_name=data.get("override_name"),
-    ))
-
-
-# ─── v3.5 — toggle hotkey ──────────────────────────────────────────
-@app.route("/api/gamepad/toggle-hotkey", methods=["POST"])
-def api_gamepad_set_toggle_hotkey():
-    """Body: { vk: int, name?: str }.  Set or clear (vk=0) the global
-    keyboard hotkey that toggles the mapper on/off."""
-    data = request.get_json(force=True) or {}
-    return jsonify(gamepad_mapper.set_toggle_hotkey(
-        int(data.get("vk", 0) or 0),
-        str(data.get("name", "") or ""),
-    ))
-
-
-# ─── v3.5 — latency probe ──────────────────────────────────────────
-@app.route("/api/gamepad/calibrate-sticks", methods=["POST"])
-def api_gamepad_calibrate_sticks():
-    """Body: { duration_sec?, margin?, save_to_profile? }.  Samples the
-    physical XInput sticks at rest for `duration_sec` and writes the
-    measured wobble + margin into the active profile's per-stick
-    `deadzone_in`.  Eliminates drift caused by tiny sub-noticeable
-    stick motion bleeding through the snapshot pipeline."""
-    data = request.get_json(silent=True) or {}
-    return jsonify(gamepad_mapper.calibrate_sticks_at_rest(
-        duration_sec=float(data.get("duration_sec", 2.0) or 2.0),
-        margin=float(data.get("margin", 0.01) or 0.01),
-        save_to_profile=bool(data.get("save_to_profile", True)),
-    ))
-
-
-@app.route("/api/gamepad/measure-latency", methods=["POST"])
-def api_gamepad_measure_latency():
-    """Body: { samples?: int }.  Run the latency probe — measures the
-    round-trip from injecting a held vbutton into our internal state
-    to seeing it reflected in the next snapshot pushed to ViGEmBus."""
-    data = request.get_json(silent=True) or {}
-    return jsonify(gamepad_mapper.measure_latency(int(data.get("samples", 50))))
-
-
-@app.route("/api/gamepad/install-hidhide", methods=["POST"])
-def api_gamepad_install_hidhide():
-    """Auto-install HidHide.  Runs in a background thread so the HTTP
-    response returns immediately; the UI polls /api/gamepad/install-progress
-    for status."""
-    import threading
-    from core import hidhide
-    threading.Thread(target=hidhide.download_and_install, daemon=True,
-                     name="hidhide-install").start()
-    return jsonify({"ok": True, "msg": "HidHide install started. Poll /install-progress"})
-
-
-@app.route("/api/gamepad/install-vigembus", methods=["POST"])
-def api_gamepad_install_vigembus():
-    import threading
-    from core import virtual_gamepad
-    threading.Thread(target=virtual_gamepad.download_and_install, daemon=True,
-                     name="vigembus-install").start()
-    return jsonify({"ok": True, "msg": "ViGEmBus install started. Poll /install-progress"})
-
-
-@app.route("/api/gamepad/install-progress")
-def api_gamepad_install_progress():
-    """Poll-able status of the most recent install — combined view of
-    both HidHide and ViGEmBus.  Returns whichever one is in progress
-    (only one runs at a time)."""
-    from core import hidhide, virtual_gamepad
-    h = hidhide.get_install_progress()
-    v = virtual_gamepad.get_install_progress()
-    if h.get("in_progress"):
-        return jsonify({"target": "hidhide",  "status": h})
-    if v.get("in_progress"):
-        return jsonify({"target": "vigembus", "status": v})
-    # Neither in progress — return the most recent (highest "phase"-rank)
-    last = h if h.get("phase") not in ("idle", "") else v
-    target = "hidhide" if h.get("phase") not in ("idle", "") else "vigembus"
-    return jsonify({"target": target, "status": last})
-
-
-@app.route("/api/gamepad/live-state")
-def api_gamepad_live_state():
-    """Backend-driven controller state — fallback for when the WebView's
-    `navigator.getGamepads()` doesn't surface the controller (Edge
-    WebView2 sometimes gates the API).  Reads XInput slots 0-3 directly
-    via ctypes — same data the mapper polling loop uses, but exposed
-    as JSON for the SVG visualizer to render against.
-
-    Also returns the latest virtual-pad snapshot (v3.5) so the UI can
-    render what the GAME sees alongside what the physical pad reports."""
-    from core import xinput_ctypes as xi
-    out = []
-    for slot in range(4):
-        s = xi.get_state(slot)
-        if s is not None:
-            out.append({"slot": slot, "state": s})
-    return jsonify({
-        "ok":          True,
-        "available":   xi.is_available(),
-        "controllers": out,
-        "vpad":        gamepad_mapper.get_last_vpad_snapshot(),
-    })
 
 
 @app.route("/api/library/enable_at_bulk", methods=["POST"])
@@ -3668,11 +3474,11 @@ def _restore_system_before_exit(reason: str) -> None:
     except Exception as e:
         log.debug(f"clip buffer stop during quit failed: {e}")
     try:
-        # Release held keys and un-hide the physical controller (HidHide's
-        # blacklist persists across reboots if we leave it engaged).
-        gamepad_mapper.shutdown()
+        # Close the crosshair window on its own thread; the setting is kept,
+        # so it comes back on the next start.
+        crosshair.stop()
     except Exception as e:
-        log.debug(f"gamepad mapper shutdown during quit failed: {e}")
+        log.debug(f"crosshair stop during quit failed: {e}")
 
 
 # The update installer exits the process too; it must go through the same restore.
@@ -3853,8 +3659,8 @@ def start_flask():
 
 def _set_efficiency_mode():
     """Set this process to efficiency mode (low priority + EcoQoS).
-    Used when Vispora is idle (no game running, no mapper firing) so
-    it stays out of the way of foreground work + saves laptop battery."""
+    Used when Vispora is idle (no game running) so it stays out of the
+    way of foreground work and saves laptop battery."""
     if sys.platform != "win32":
         return
     try:
@@ -3887,14 +3693,13 @@ def _set_efficiency_mode():
 def _set_responsive_mode():
     """Drop efficiency throttling — set Normal priority + clear EcoQoS.
     Called when Vispora needs to keep up with real work: a game is
-    running (mapper is forwarding state), tournament mode is on, the
-    network monitor is alerting on a burst, etc.
+    running, tournament mode is on, the network monitor is alerting
+    on a burst, etc.
 
     Without this, Vispora stays in Below-Normal/EcoQoS while the
-    game runs at HIGH priority — UI lags, mapper polling drops from
-    4 kHz target to 200 Hz actual, HidHide retry timer stalls.
-    Calling this restores the process to Normal priority with no
-    throttling."""
+    game runs at HIGH priority: the UI lags and Vispora's own timers
+    and watchdogs fall behind.  Calling this restores the process to
+    Normal priority with no throttling."""
     if sys.platform != "win32":
         return
     try:
@@ -4073,6 +3878,29 @@ def _create_tray_icon(show_window_func, quit_func):
         try: icon.update_menu()
         except Exception: pass
 
+    def _action_toggle_crosshair(icon, item):
+        want = not crosshair.is_enabled()
+        def _bg():
+            # Off the tray thread: turning it on waits for the overlay window.
+            try:
+                r = crosshair.set_enabled(want)
+                err = None
+                if not r.get("ok"):
+                    err = r.get("err") or "Couldn't change the crosshair setting."
+                elif want and (r.get("status") or {}).get("reason") == "error":
+                    # Saved as on, but the window didn't open: set_enabled
+                    # still answers ok, so say why nothing shows.
+                    err = r["status"].get("last_error") or "The crosshair window didn't open."
+                if err:
+                    log.warning(f"tray crosshair toggle failed: {err}")
+                    if hasattr(notifier, "toast"):
+                        notifier.toast("Crosshair didn't start" if want else "Crosshair", err)
+            except Exception as e:
+                log.warning(f"tray crosshair toggle failed: {e}")
+            try: icon.update_menu()
+            except Exception: pass
+        threading.Thread(target=_bg, daemon=True, name="tray-crosshair").start()
+
     def _action_quit(icon, item):
         try: icon.stop()
         except Exception: pass
@@ -4109,6 +3937,9 @@ def _create_tray_icon(show_window_func, quit_func):
             ),
             MenuItem("Force Normal Mode", _action_force_normal,
                      visible=lambda _: bool(active_game)),
+            # is_enabled() is a cached flag: this menu is rebuilt every 3 s.
+            MenuItem("Crosshair", _action_toggle_crosshair,
+                     checked=lambda _: crosshair.is_enabled()),
             Menu.SEPARATOR,
             MenuItem("Refresh PC now", _action_refresh_pc),
             MenuItem("Clean RAM now",  _action_clean_ram),
@@ -4371,16 +4202,6 @@ def main():
     except Exception as e:
         log.debug(f"net_monitor start failed: {e}")
 
-    # v3.1 — start the gamepad mapper.  Keys are only emitted when the
-    # master switch is on AND a profile is active AND a game is in the
-    # foreground (depending on profile setting), so this is safe to run
-    # all the time — it's also what powers the 'press a button to bind' UI.
-    try:
-        gamepad_mapper.start()
-        log.info("gamepad_mapper loop started")
-    except Exception as e:
-        log.debug(f"gamepad_mapper start failed: {e}")
-
     # v3.1 — Background Pauser orphan recovery.  If a previous run crashed
     # mid-game, any browser / AI app we suspended is still frozen.  Resume
     # them immediately so the user isn't stuck.
@@ -4511,6 +4332,17 @@ def main():
             log.warning(f"idle mode boot failed: {e}")
     _delayed(4, _arm_idle_mode)
 
+    # The controller emulator is gone, but versions up to 3.6.8 could leave
+    # HidHide hiding a controller or listing Vispora as allowed, and that
+    # outlives the app and reboots.  Undo it once, off the UI thread.
+    def _run_hidhide_cleanup():
+        try:
+            from core import hidhide_cleanup
+            hidhide_cleanup.run_once()      # logs what it did itself
+        except Exception as e:
+            log.warning(f"legacy HidHide cleanup failed: {e}")
+    _delayed(5, _run_hidhide_cleanup)
+
     # Start Flask in background thread
     flask_thread = threading.Thread(target=start_flask, daemon=True)
     flask_thread.start()
@@ -4527,12 +4359,11 @@ def main():
         except OSError:
             time.sleep(0.02)
 
-    # v3.2-beta.7 — boot-time dependency check + auto-install.  Runs in
+    # v3.2-beta.7: boot-time dependency check + auto-install.  Runs in
     # a background thread so it doesn't delay the UI window.  Honors the
     # user's `auto_install_enabled` setting (default True).  Installs
-    # ANY missing auto-installable optional deps — PresentMon 1.x,
-    # PresentMon 2.x, ViGEmBus, HidHide.  RTSS is browser-only so it's
-    # just surfaced in the UI for the user to install manually.
+    # any missing auto-installable optional deps (PresentMon 1.x and 2.x,
+    # FFmpeg, WebView2, LibreHardwareMonitor) unless the user opted out.
     def _boot_dep_check():
         try:
             time.sleep(2)   # let Flask + UI settle before we hammer disk
@@ -4694,6 +4525,10 @@ def main():
             _window_hidden = True
             log.info("Started hidden (autostart mode). Click tray icon to show")
 
+        # The crosshair overlay waits until pywebview has made the process
+        # DPI aware (see _gate_crosshair_start).
+        log.info(f"crosshair start tied to the window's {_gate_crosshair_start(_webview_window)} event")
+
         # Start tray icon in background
         tray_thread = threading.Thread(target=_create_tray_icon, args=(show_window, quit_app), daemon=True)
         tray_thread.start()
@@ -4716,6 +4551,9 @@ def main():
 
     except ImportError:
         log.warning("pywebview not installed, opening in browser mode")
+        # No pywebview, so nothing changes the process's DPI awareness: the
+        # crosshair may start now (the server is already up).
+        _crosshair_allow_start()
         import webbrowser
         webbrowser.open(_ui_url())
         # Run tray icon on main thread (blocking)

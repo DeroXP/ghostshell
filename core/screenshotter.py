@@ -13,10 +13,9 @@ Three target modes:
 Output: PNG to %USERPROFILE%/Pictures/Vispora/Screenshots/
         named `<game_or_app>_<YYYY-MM-DD>_<HH-MM-SS>.png`
 
-Why this lives in its own module rather than recoil_capture's:
-recoil_capture is a stateful capture session for the anti-recoil
-trace.  Screenshots are one-shot + opaque.  Keeping them separate
-avoids accidentally interfering with a live recoil-capture session.
+Screenshots are one-shot: grab, encode, save.  The clip recorder
+(core/clipper.py) is the stateful, long-running capture; keeping the two
+apart means a screenshot never interferes with a recording.
 """
 from __future__ import annotations
 

@@ -986,8 +986,8 @@ def _apply_network_priority(exe_name: str, streamers: list) -> None:
 
 # ── background programs on the efficiency cores ──────────────────────
 # Never put in efficiency mode: what draws the screen, makes the sound or
-# carries the input, the shell, anti-cheat, overlays and recorders — and
-# Vispora, whose gamepad mapper polls at 4 kHz.
+# carries the input, the shell, anti-cheat, overlays and recorders, and
+# Vispora itself, which keeps its own watchdogs and monitors running.
 _ECO_KEEP = frozenset({
     "system", "registry", "idle", "memory compression", "secure system",
     "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "lsass.exe", "lsaiso.exe",
@@ -1160,11 +1160,10 @@ def _eco_restore() -> None:
 
 def _apply_session_extras(exe_name: str) -> None:
     """Vispora's own responsiveness and the optional background pauser."""
-    # v3.4 — bump Vispora out of efficiency mode so the mapper /
-    # HidHide retry / network monitor / etc. stay responsive while the
-    # game runs at HIGH priority.  Without this, Vispora sits at
-    # Below-Normal + EcoQoS on E-cores and the mapper's 4 kHz polling
-    # drops to ~200 Hz.
+    # v3.4: bump Vispora out of efficiency mode so its watchdogs, the
+    # network monitor, etc. stay responsive while the game runs at HIGH
+    # priority.  Without this, Vispora sits at Below-Normal + EcoQoS on
+    # E-cores and falls behind.
     try:
         import sys
         # The function lives in app.py — we import it lazily so this
@@ -1481,23 +1480,15 @@ def _restore_normal_mode(reason: str):
     _engine["gaming_mode"] = False      # last: the session is over once all of the above is reset
     log.info("  Normal mode restored")
 
-    # v3.4 — restore Vispora efficiency mode now that the game is
-    # gone.  Saves laptop battery + lets foreground apps have CPU again.
-    # Skipped if the gamepad mapper master switch is still on (the user
-    # might still be using mappings without an active game).
+    # v3.4: restore Vispora efficiency mode now that the game is gone.
+    # Saves laptop battery and lets foreground apps have the CPU again.
     try:
-        from core import gamepad_mapper as _gm
-        mapper_busy = bool(_gm._load_state().get("enabled"))
-    except Exception:
-        mapper_busy = False
-    if not mapper_busy:
-        try:
-            import sys
-            main_app = sys.modules.get("app") or sys.modules.get("__main__")
-            if main_app and hasattr(main_app, "_set_efficiency_mode"):
-                main_app._set_efficiency_mode()
-        except Exception as e:
-            log.debug(f"could not restore efficiency mode: {e}")
+        import sys
+        main_app = sys.modules.get("app") or sys.modules.get("__main__")
+        if main_app and hasattr(main_app, "_set_efficiency_mode"):
+            main_app._set_efficiency_mode()
+    except Exception as e:
+        log.debug(f"could not restore efficiency mode: {e}")
 
     # 5b. Background pauser — resume any AI apps / browsers we suspended.
     #     Always run this regardless of `reason` so manual reset / boot

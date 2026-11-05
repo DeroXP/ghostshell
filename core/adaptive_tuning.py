@@ -107,9 +107,9 @@ CONFIDENCE_TIERS = {
 # offset blacklisted for this game.
 AUTO_REVERT_WINDOW_SEC = 24 * 3600
 
-# v3.1 — Pause API.  Other features (anti-recoil capture, latency probe)
-# call pause() to stop AT from changing OC during their measurement
-# window.  Set-backed so multiple pause sources stack without breaking.
+# v3.1: Pause API.  The user's "Pause AT" button (and any feature that
+# needs the clocks to hold still) calls pause() to stop AT from changing
+# the OC.  Set-backed so multiple pause sources stack without breaking.
 _pause_sources: "set[str]" = set()
 _pause_lock = threading.Lock()
 
@@ -431,9 +431,9 @@ def _get_gpu_health() -> dict:
 
 def pause(source: str) -> dict:
     """Pause AT step-up/down decisions.  Multiple sources can stack —
-    AT only resumes when ALL sources have called resume().  Used by
-    recoil_capture (capture sessions) and the latency probe so AT's
-    OC writes don't perturb the measurement."""
+    AT only resumes when ALL sources have called resume().  Used by the
+    manual pause (/api/adaptive/pause), and by anything that needs the
+    clocks to hold still while it measures."""
     src = str(source or "external")
     with _pause_lock:
         _pause_sources.add(src)
@@ -1045,7 +1045,7 @@ def get_status() -> dict:
 
     # Phase: 'idle' / 'warmup' / 'tuning' / 'paused' / 'opening'.  UI
     # uses this to show the right messaging — "warming up (45/60s)" vs
-    # "GPU at 8%, waiting" vs "paused for capture session".
+    # "GPU at 8%, waiting" vs "paused".
     phase = "idle"
     seconds_in_session = None
     warmup_remaining = None
@@ -1219,7 +1219,7 @@ def get_diagnostics() -> dict:
             "level": "info",
             "code":  "paused",
             "msg":   f"AT is currently paused (sources: {', '.join(get_pause_sources()) or 'unknown'})",
-            "fix":   "Click 'Resume AT' once the active capture/measurement is done.",
+            "fix":   "Click 'Resume AT' when you want it to tune again.",
         })
 
     # Engagement state breakdown
@@ -1656,9 +1656,9 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
         if stop_event.wait(remaining):
             return  # game exited during the guard — never applied the climb
     if climb_target:
-        # The main loop checks the pause requests (a capture or latency
-        # measurement under way) and the off switch before it changes
-        # anything; the jump did not.  Paused or off: no jump.
+        # The main loop checks the pause requests and the off switch
+        # before it changes anything; the jump did not.  Paused or off:
+        # no jump.
         paused = is_paused()
         try:
             still_on = bool(get_settings().get("enabled_globally")
@@ -1909,8 +1909,8 @@ def _tuning_loop(exe: str, display_name: str, stop_event: threading.Event) -> No
         except Exception as e:
             log.debug(f"AT OOB crash check failed: {e}")
 
-        # v3.1 — paused?  Skip decisions while a recoil capture / latency
-        # probe / external feature has asked AT to hold still.
+        # v3.1: paused?  Skip decisions while the user or another feature
+        # has asked AT to hold still.
         if is_paused():
             with _lock:
                 _runtime["last_reason"] = f"paused: {', '.join(sorted(_pause_sources)) or 'unknown'}"

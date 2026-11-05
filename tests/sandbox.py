@@ -1125,12 +1125,379 @@ class _FakeNtdll:
         return 0
 
 
+import collections as _collections               # noqa: E402
+import threading as _threading                   # noqa: E402
+
+
+class FakeOverlayWin:
+    """Stands in for core.crosshair_overlay._win, the overlay's only door to
+    Win32.  No window, hook, timer or GDI object is real.  It records the calls
+    that matter, answers like a quiet desktop (no window in front, one
+    1920x1080 monitor), and its wait blocks like the real one, so an overlay
+    started in a test idles instead of spinning.
+
+    Tests drive it: add_window() + foreground, keys (VKs held down), cursor,
+    swapped, monitors / modes, build, post() for window messages,
+    post_foreground_event(), and the *_ok / timers_work switches."""
+
+    WAIT_TIMEOUT, WAIT_FAILED = 0x102, 0xFFFFFFFF
+    STOCK_BITMAP = 0x0F00
+    DISPLAY1 = "\\\\.\\DISPLAY1"
+
+    def __init__(self):
+        self.cv = _threading.Condition(_threading.RLock())
+        self.calls = []                 # (name, args, thread id) for the calls worth checking
+        self.waits = _collections.deque(maxlen=20000)     # MsgWait timeouts, ms
+        self.build = 26100
+        self.high_res_ok = True
+        self.timers_work = True
+        self.timer_always_signaled = False
+        self.window_ok = True
+        self.create_delay = 0.0         # seconds CreateWindowExW takes (a busy machine)
+        self.affinity_ok = True
+        self.ulw_ok = True
+        self.wait_fails = False
+        self.above = 0x7770             # GetWindow(GW_HWNDPREV): something above us
+        self.monitors = [{"id": self.DISPLAY1, "left": 0, "top": 0, "right": 1920, "bottom": 1080,
+                          "primary": True}]
+        self.modes = {}                 # device -> (w, h) physical, else the rect's size
+        self.windows = {}               # hwnd -> {"pid", "path", "client": (left, top, w, h), "monitor", "iconic"}
+        self.foreground = 0
+        self.keys = set()
+        self.swapped = False
+        self.cursor = (True, 1, 0x10005)
+        self.wndproc = None
+        self.class_name = None
+        self.hwnd = 0
+        self.live = set()
+        self.window_thread = None
+        self.destroyed = []             # (hwnd, thread id)
+        self.gdi = set()
+        self.selected = {}
+        self.dib = {}
+        self.dib_size = {}
+        self.bits = {}
+        self.bad = []                   # GDI misuse: a bitmap deleted while still selected
+        self.ulw = []                   # (hwnd, x, y, w, h, bytes)
+        self.results = []               # (msg, wp, lp, wndproc return) for messages pumped
+        self.msgs = []
+        self.signaled = set()
+        self.timers = {}
+        self.hook_cb = None
+        self._next = 0x1000
+
+    # ---- helpers for tests ----
+    def _rec(self, name, *args):
+        with self.cv:
+            self.calls.append((name, args, _threading.get_ident()))
+
+    def _handle(self):
+        with self.cv:
+            self._next += 4
+            return self._next
+
+    def calls_to(self, name):
+        with self.cv:
+            return [c for c in self.calls if c[0] == name]
+
+    def add_window(self, exe="game.exe", pid=4242, client=(0, 0, 1920, 1080), monitor=None, iconic=False,
+                   path=None, foreground=True):
+        hwnd = self._handle()
+        self.windows[hwnd] = {"pid": pid, "path": path or rf"C:\Games\{exe}", "client": client,
+                              "monitor": monitor or self.DISPLAY1, "iconic": iconic}
+        if foreground:
+            self.foreground = hwnd
+        return hwnd
+
+    def post(self, msg, wp=0, lp=0):
+        with self.cv:
+            self.msgs.append((msg, wp, lp))
+            self.cv.notify_all()
+
+    def post_foreground_event(self):
+        self.post("winevent")
+
+    def __getattr__(self, name):        # any other Win32 call is one the overlay must never make
+        if name.startswith("__"):
+            raise AttributeError(name)
+        self.calls.append(("REFUSED " + name, (), 0))
+        raise AttributeError(f"the crosshair overlay called {name}, which it must never use")
+
+    # ---- thread, kernel objects, the wait ----
+    def GetLastError(self):
+        return 0
+
+    def windows_build(self):
+        return self.build
+
+    def SetThreadDpiAwarenessContext(self, ctx):
+        self._rec("SetThreadDpiAwarenessContext", ctx)
+        return True
+
+    def SetThreadPriority(self, priority):
+        self._rec("SetThreadPriority", priority)
+        return True
+
+    def disable_power_throttling(self):
+        self._rec("disable_power_throttling")
+        return True
+
+    def ensure_message_queue(self):
+        self._rec("ensure_message_queue")
+
+    def CreateEventW(self):
+        h = self._handle()
+        self._rec("CreateEventW", h)
+        return h
+
+    def SetEvent(self, h):
+        with self.cv:
+            self.signaled.add(h)
+            self.cv.notify_all()
+        return True
+
+    def CreateWaitableTimerExW(self, high_res):
+        self._rec("CreateWaitableTimerExW", high_res)
+        if not self.timers_work or (high_res and not self.high_res_ok):
+            return 0
+        h = self._handle()
+        with self.cv:
+            self.timers[h] = {"period": 0, "due": None, "high_res": high_res}
+        return h
+
+    def SetWaitableTimer(self, h, period_ms):
+        self._rec("SetWaitableTimer", h, period_ms)
+        with self.cv:
+            t = self.timers.get(h)
+            if t is None:
+                return False
+            t["period"], t["due"] = period_ms, time.monotonic() + period_ms / 1000.0
+            self.cv.notify_all()
+        return True
+
+    def CancelWaitableTimer(self, h):
+        self._rec("CancelWaitableTimer", h)
+        with self.cv:
+            if h in self.timers:
+                self.timers[h]["due"] = None
+        return True
+
+    def CloseHandle(self, h):
+        self._rec("CloseHandle", h)
+        with self.cv:
+            self.timers.pop(h, None)
+            self.signaled.discard(h)
+        return True
+
+    def MsgWaitForMultipleObjectsEx(self, handles, timeout_ms):
+        self.waits.append(timeout_ms)
+        if self.wait_fails:
+            time.sleep(0.001)
+            return self.WAIT_FAILED
+        end = time.monotonic() + timeout_ms / 1000.0
+        with self.cv:
+            while True:
+                if self.msgs:
+                    return len(handles)
+                now = time.monotonic()
+                wake_at = end
+                for i, h in enumerate(handles):
+                    if h in self.signaled:
+                        self.signaled.discard(h)
+                        return i
+                    t = self.timers.get(h)
+                    if t and t["due"] is not None:
+                        if self.timer_always_signaled or now >= t["due"]:
+                            t["due"] = now + t["period"] / 1000.0
+                            return i
+                        wake_at = min(wake_at, t["due"])
+                if now >= end:
+                    return self.WAIT_TIMEOUT
+                self.cv.wait(max(0.0005, wake_at - now))
+
+    def pump_messages(self):
+        with self.cv:
+            batch, self.msgs = self.msgs, []
+        for item in batch:
+            if item == "winevent":
+                if self.hook_cb:
+                    self.hook_cb(0x55, 3, self.foreground, 0, 0, 0, 0)
+                continue
+            msg, wp, lp = item
+            if msg == 0x0012:                           # WM_QUIT
+                return False
+            r = self.wndproc(self.hwnd, msg, wp, lp) if self.wndproc else 0
+            with self.cv:
+                self.results.append((msg, wp, lp, r))
+        return True
+
+    # ---- the window ----
+    def RegisterClassExW(self, class_name, wndproc):
+        self._rec("RegisterClassExW", class_name)
+        self.class_name, self.wndproc = class_name, wndproc
+        return 0xC0DE
+
+    def CreateWindowExW(self, ex_style, class_name, title, style, x, y, w, h):
+        self._rec("CreateWindowExW", ex_style, class_name, title, style, x, y, w, h)
+        if self.create_delay:
+            time.sleep(self.create_delay)
+        if not self.window_ok:
+            return 0
+        self.hwnd = self._handle()
+        self.live.add(self.hwnd)
+        self.window_thread = _threading.get_ident()
+        return self.hwnd
+
+    def DestroyWindow(self, hwnd):
+        self._rec("DestroyWindow", hwnd)
+        self.destroyed.append((hwnd, _threading.get_ident()))
+        if hwnd in self.live and self.wndproc:
+            self.wndproc(hwnd, 0x0002, 0, 0)            # WM_DESTROY, as Windows sends it
+        self.live.discard(hwnd)
+        return True
+
+    def DefWindowProcW(self, hwnd, msg, wp, lp):
+        return 0
+
+    def ShowWindow(self, hwnd, cmd):
+        self._rec("ShowWindow", hwnd, cmd)
+        return True
+
+    def SetWindowPos(self, hwnd, after, x, y, cx, cy, flags):
+        self._rec("SetWindowPos", hwnd, after, x, y, cx, cy, flags)
+        return True
+
+    def GetWindow(self, hwnd, cmd):
+        return self.above
+
+    def IsWindow(self, hwnd):
+        return hwnd in self.live
+
+    def SetWindowDisplayAffinity(self, hwnd, affinity):
+        self._rec("SetWindowDisplayAffinity", hwnd, affinity)
+        return self.affinity_ok
+
+    def WTSRegisterSessionNotification(self, hwnd):
+        self._rec("WTSRegisterSessionNotification", hwnd)
+        return True
+
+    def WTSUnRegisterSessionNotification(self, hwnd):
+        self._rec("WTSUnRegisterSessionNotification", hwnd)
+        return True
+
+    def SetWinEventHook(self, callback):
+        self._rec("SetWinEventHook")
+        self.hook_cb = callback
+        return 0x55
+
+    def UnhookWinEvent(self, hook):
+        self._rec("UnhookWinEvent", hook)
+        return True
+
+    # ---- drawing ----
+    def CreateCompatibleDC(self):
+        h = self._handle()
+        self._rec("CreateCompatibleDC", h)
+        self.gdi.add(h)
+        return h
+
+    def CreateDIBSection(self, hdc, w, h):
+        hb, bits = self._handle(), self._handle()
+        self._rec("CreateDIBSection", hdc, w, h, hb)
+        self.gdi.add(hb)
+        self.bits[bits], self.dib_size[hb] = hb, (w, h)
+        return hb, bits
+
+    def write_bits(self, bits, data):
+        self.dib[self.bits[bits]] = bytes(data)
+
+    def SelectObject(self, hdc, obj):
+        self._rec("SelectObject", hdc, obj)
+        old = self.selected.get(hdc, self.STOCK_BITMAP)
+        self.selected[hdc] = obj
+        return old
+
+    def DeleteObject(self, obj):
+        self._rec("DeleteObject", obj)
+        if obj in self.selected.values():
+            self.bad.append(("deleted while selected", obj))
+            return False
+        self.gdi.discard(obj)
+        return True
+
+    def DeleteDC(self, hdc):
+        self._rec("DeleteDC", hdc)
+        self.selected.pop(hdc, None)
+        self.gdi.discard(hdc)
+        return True
+
+    def UpdateLayeredWindow(self, hwnd, x, y, w, h, hdc):
+        hb = self.selected.get(hdc)
+        self._rec("UpdateLayeredWindow", hwnd, x, y, w, h)
+        self.ulw.append((hwnd, x, y, w, h, self.dib.get(hb), self.dib_size.get(hb)))
+        return self.ulw_ok
+
+    def gdi_objects(self):
+        return len(self.gdi)
+
+    # ---- the desktop ----
+    def GetForegroundWindow(self):
+        return self.foreground
+
+    def GetWindowThreadProcessId(self, hwnd):
+        return self.windows.get(hwnd, {}).get("pid", 0)
+
+    def process_image(self, pid):
+        for w in list(self.windows.values()):
+            if w["pid"] == pid:
+                return w["path"]
+        return ""
+
+    def IsIconic(self, hwnd):
+        return bool(self.windows.get(hwnd, {}).get("iconic"))
+
+    def client_center(self, hwnd):
+        w = self.windows.get(hwnd)
+        if not w or not w.get("client"):
+            return None
+        left, top, cw, ch = w["client"]
+        if cw <= 0 or ch <= 0:
+            return None
+        return left + cw // 2, top + ch // 2
+
+    def monitor_device(self, hwnd):
+        w = self.windows.get(hwnd)
+        return w.get("monitor") if w else self.DISPLAY1
+
+    def EnumDisplayMonitors(self):
+        return [dict(m) for m in self.monitors]
+
+    def EnumDisplaySettingsW(self, device):
+        if device in self.modes:
+            return self.modes[device]
+        for m in self.monitors:
+            if m["id"] == device:
+                return m["right"] - m["left"], m["bottom"] - m["top"]
+        return None
+
+    def GetCursorInfo(self):
+        return self.cursor
+
+    def GetAsyncKeyState(self, vk):
+        return -32768 if vk in self.keys else 0
+
+    def GetSystemMetrics(self, index):
+        return 1 if index == 23 and self.swapped else 0       # SM_SWAPBUTTON
+
+
 def wire(module):
     """Call on an app module after importing it, if it talks to Windows
     directly; modules that only use run_cmd / run_ps / winreg need nothing.
     Returns the module."""
     name = module.__name__
-    if name == "core.competitive_latency":
+    if name == "core.crosshair_overlay":
+        module._win = FakeOverlayWin()
+    elif name == "core.competitive_latency":
         module.ctypes = _CtypesShim()
     elif name == "core.timer_manager":
         module._ntdll = _FakeNtdll()
@@ -1146,6 +1513,14 @@ def app(name: str):
     """Import an app module by name ("core.optimizer") and wire() it."""
     import importlib
     return wire(importlib.import_module(name))
+
+
+# The crosshair overlay reaches Windows only through its `_win` adapter.  Wire it
+# here, whoever imports it later (app.py, core.crosshair, a route test), so no
+# test can open a real window.
+from core import crosshair_overlay as _crosshair_overlay     # noqa: E402
+
+wire(_crosshair_overlay)
 
 
 # ═════════════════════════════════════════════════════════════════════

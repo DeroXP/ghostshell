@@ -200,7 +200,7 @@ def test_a_server_that_cannot_start_says_why_in_the_log():
 def test_closing_the_window_from_outside_ends_the_process_the_way_quit_does():
     """Alt+F4, the taskbar's Close window and signing out make webview.start()
     return; main() used to just return, skipping the restore of game mode,
-    paused programs, the HidHide cloak and the clip recorder."""
+    paused programs and the clip recorder."""
     src = inspect.getsource(_app().main)
     after_start = src[src.index("webview.start(debug=False)\n"):src.index("except ImportError:")]
     assert "_restore_system_before_exit(" in after_start and "os._exit(0)" in after_start, after_start

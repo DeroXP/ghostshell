@@ -3406,6 +3406,7 @@ function openModal(html) {
 
 function closeModal() {
     document.getElementById('modal-overlay').classList.remove('open');
+    _xhBindStop();      // the crosshair hotkey dialog's key and mouse listeners go with it
     // A vault form holds a password in plain text.  Hiding the overlay left it
     // sitting in the DOM — through a vault lock, too — until the next modal.
     var mc = document.getElementById('modal-content');
@@ -4470,2442 +4471,8 @@ async function loadProfilesPage() {
     loadAdaptiveHistory();
     loadLibrary();
     loadPauser();
-    loadGamepadMapper();
+    loadCrosshairLegacyNotice();
     _startAdaptivePoll();
-}
-
-// ═══ Gamepad Mapper (Game Profiles tab) ═══
-// Common VK codes the user is likely to bind.  More can be typed in the
-// raw "VK code" input but this gives a clean dropdown for the common case.
-var GPM_KEY_OPTIONS = [
-    {label: 'A',     vk: 0x41},  {label: 'B', vk: 0x42},  {label: 'C', vk: 0x43},
-    {label: 'D',     vk: 0x44},  {label: 'E', vk: 0x45},  {label: 'F', vk: 0x46},
-    {label: 'G',     vk: 0x47},  {label: 'H', vk: 0x48},  {label: 'I', vk: 0x49},
-    {label: 'J',     vk: 0x4A},  {label: 'K', vk: 0x4B},  {label: 'L', vk: 0x4C},
-    {label: 'M',     vk: 0x4D},  {label: 'N', vk: 0x4E},  {label: 'O', vk: 0x4F},
-    {label: 'P',     vk: 0x50},  {label: 'Q', vk: 0x51},  {label: 'R', vk: 0x52},
-    {label: 'S',     vk: 0x53},  {label: 'T', vk: 0x54},  {label: 'U', vk: 0x55},
-    {label: 'V',     vk: 0x56},  {label: 'W', vk: 0x57},  {label: 'X', vk: 0x58},
-    {label: 'Y',     vk: 0x59},  {label: 'Z', vk: 0x5A},
-    {label: '0', vk: 0x30}, {label: '1', vk: 0x31}, {label: '2', vk: 0x32},
-    {label: '3', vk: 0x33}, {label: '4', vk: 0x34}, {label: '5', vk: 0x35},
-    {label: '6', vk: 0x36}, {label: '7', vk: 0x37}, {label: '8', vk: 0x38},
-    {label: '9', vk: 0x39},
-    {label: 'F1',  vk: 0x70}, {label: 'F2',  vk: 0x71}, {label: 'F3',  vk: 0x72},
-    {label: 'F4',  vk: 0x73}, {label: 'F5',  vk: 0x74}, {label: 'F6',  vk: 0x75},
-    {label: 'F7',  vk: 0x76}, {label: 'F8',  vk: 0x77}, {label: 'F9',  vk: 0x78},
-    {label: 'F10', vk: 0x79}, {label: 'F11', vk: 0x7A}, {label: 'F12', vk: 0x7B},
-    {label: 'Space',  vk: 0x20}, {label: 'Enter',  vk: 0x0D},
-    {label: 'Shift',  vk: 0x10}, {label: 'Ctrl',   vk: 0x11},
-    {label: 'Alt',    vk: 0x12}, {label: 'Tab',    vk: 0x09},
-    {label: 'Esc',    vk: 0x1B}, {label: 'Backspace', vk: 0x08},
-    {label: '↑',  vk: 0x26}, {label: '↓', vk: 0x28},
-    {label: '←', vk: 0x25}, {label: '→', vk: 0x27},
-    {label: 'Home', vk: 0x24}, {label: 'End', vk: 0x23},
-    {label: 'PgUp', vk: 0x21}, {label: 'PgDn', vk: 0x22},
-];
-
-var _gpmState = null;
-var _gpmCurrentProfile = null;
-
-// beta.12 — normalize whatever profile shape comes back from the backend
-// so the click handlers can never bail with "Cannot read properties of
-// undefined (reading 'DPAD_UP' / 'RB' / …)".  Old state.json files written
-// by pre-3.4 builds, or partial profiles created before the user touched
-// any binding, can be missing `buttons` / `alt_mappings` / `sticks` etc.
-// Call this immediately after every `_gpmCurrentProfile = …` assignment.
-function _gpmNormalizeProfile(p) {
-    if (!p || typeof p !== 'object') return p;
-    if (!p.buttons       || typeof p.buttons       !== 'object') p.buttons       = {};
-    if (!p.sticks        || typeof p.sticks        !== 'object') p.sticks        = {};
-    if (!p.triggers      || typeof p.triggers      !== 'object') p.triggers      = {};
-    if (!Array.isArray(p.alt_mappings))                          p.alt_mappings  = [];
-    if (typeof p.remap_mode !== 'string')                         p.remap_mode   = 'key_emulation';
-    return p;
-}
-var _gpmCaptureCancelled = false;
-var _gpmMacroEditorBtn = null;
-var _gpmMacroEditorSteps = [];
-
-function _vkLabel(vk) {
-    var found = GPM_KEY_OPTIONS.find(function(o){ return o.vk === vk; });
-    // An imported mapping can lack vk; throwing here stopped the mapper page render midway
-    return found ? found.label : ('VK 0x' + (vk || 0).toString(16).toUpperCase());
-}
-
-async function loadGamepadMapper() {
-    var statusLine = document.getElementById('gpm-status-line');
-    var data = await apiGet('/api/gamepad/status');
-    if (!data || data.ok === false) {
-        if (statusLine) statusLine.textContent = 'Failed to load gamepad mapper status.';
-        return;
-    }
-    _gpmState = data;
-
-    // Master toggle
-    var t = document.getElementById('toggle-gpm-master');
-    if (t) {
-        if (data.enabled) t.classList.add('on');
-        else t.classList.remove('on');
-    }
-
-    // Profile select
-    var sel = document.getElementById('gpm-profile-select');
-    if (sel) {
-        var prev = data.active_profile || '';
-        sel.innerHTML = '<option value="">(none)</option>' +
-            (data.profiles || []).map(function(name){
-                return '<option value="' + escAttr(name) + '"' + (name === prev ? ' selected' : '') + '>' + escHtml(name) + '</option>';
-            }).join('');
-    }
-
-    // Live poll-rate display
-    var hzEl  = document.getElementById('gpm-actual-hz');
-    var usefulEl = document.getElementById('gpm-useful-hz');
-    var p99El = document.getElementById('gpm-p99');
-    if (hzEl)  hzEl.textContent  = data.actual_hz ? (data.actual_hz.toFixed(0) + ' / ' + data.target_hz + ' Hz') : (data.target_hz + ' Hz target');
-    if (usefulEl) usefulEl.textContent = (data.useful_hz || 0).toFixed(0) + ' Hz';
-    if (p99El) p99El.textContent = data.frame_p99_us ? (data.frame_p99_us + ' µs (max ' + data.frame_max_us + ' µs)') : '—';
-
-    // Status line
-    if (statusLine) {
-        var slots = data.connected_slots || [];
-        var slotsTxt = slots.length
-            ? slots.length + ' controller' + (slots.length === 1 ? '' : 's') + ' connected (slot ' + slots.join(', ') + ')'
-            : 'No controllers connected via XInput';
-        var profCount = (data.profiles || []).length;
-        statusLine.innerHTML = slotsTxt + ' · <b>' + profCount + '</b> profile' + (profCount === 1 ? '' : 's') + ' saved' +
-            (data.running ? ' · <span style="color:var(--accent)">poll loop active</span>' : ' · <span style="color:var(--text-tertiary)">poll loop stopped</span>');
-    }
-
-    // Render bindings if a profile is selected
-    if (data.active_profile) {
-        await loadGpmProfileBindings(data.active_profile);
-    } else {
-        var b = document.getElementById('gpm-bindings');
-        if (b) b.style.display = 'none';
-    }
-
-    // Visual controller overlay — start the 60 Hz loop + wire clicks
-    startGpmSvgLoop();
-    _gpmInitSvgClicks();
-
-    // ViGEmBus install banner (shown only when a virtual_controller profile
-    // is active but the driver isn't installed)
-    _refreshGpmInstallBanner();
-}
-
-// install-status plugs in and removes a test virtual pad (games and Windows
-// see it), so once it has passed it is not asked again on every re-render.
-var _gpmViGEmAvailable = false;
-
-async function _refreshGpmInstallBanner() {
-    var vBanner = document.getElementById('gpm-vigembus-banner');
-    var hBanner = document.getElementById('gpm-hidhide-banner');
-    var prof = _gpmCurrentProfile;
-
-    // ── ViGEmBus banner (shown when virtual mode active + driver missing)
-    var needsViGEm = prof && prof.remap_mode === 'virtual_controller';
-    if (vBanner) {
-        if (!needsViGEm || _gpmViGEmAvailable) {
-            vBanner.style.display = 'none';
-        } else {
-            var inst = await apiGet('/api/gamepad/install-status');
-            if (inst && inst.available) {
-                _gpmViGEmAvailable = true;
-                vBanner.style.display = 'none';
-            } else {
-                vBanner.style.display = 'block';
-                var link = document.getElementById('gpm-vigembus-link');
-                if (link && inst) {
-                    link.href = inst.install_url || '#';
-                    link.target = '_blank';
-                    link.rel = 'noopener noreferrer';
-                }
-            }
-        }
-    }
-
-    // ── HidHide banner (shown when hide_physical=true + driver missing)
-    var needsHide = prof && prof.hide_physical;
-    if (hBanner) {
-        if (!needsHide) {
-            hBanner.style.display = 'none';
-        } else {
-            var hStatus = await apiGet('/api/gamepad/hidhide-status');
-            if (hStatus && hStatus.installed) {
-                hBanner.style.display = 'none';
-            } else {
-                hBanner.style.display = 'block';
-                var hLink = document.getElementById('gpm-hidhide-link');
-                if (hLink && hStatus) {
-                    hLink.href = hStatus.install_url || '#';
-                    hLink.target = '_blank';
-                    hLink.rel = 'noopener noreferrer';
-                }
-            }
-        }
-    }
-}
-
-async function loadGpmProfileBindings(name) {
-    // Fetch from backend (used on initial load + after profile-list changes
-    // like delete/create).  After local edits, use _gpmRenderBindingsLocal()
-    // instead so we don't race autosave and clobber unsaved fields.
-    var data = await apiGet('/api/gamepad/profiles');
-    var profile = (data && data.profiles && data.profiles[name]) || null;
-    _gpmCurrentProfile = _gpmNormalizeProfile(profile);
-    _gpmRenderBindingsLocal();
-}
-
-function _gpmRenderBindingsLocal() {
-    // Render the bindings UI purely from `_gpmCurrentProfile` (the
-    // in-memory copy).  Used after every on-change handler so the user
-    // sees their edit reflected without a backend round-trip.
-    var profile = _gpmCurrentProfile;
-    var b = document.getElementById('gpm-bindings');
-    if (!profile) {
-        if (b) b.style.display = 'none';
-        return;
-    }
-    if (b) b.style.display = 'block';
-
-    // Remap-mode selector
-    var ms = document.getElementById('gpm-remap-mode');
-    if (ms) ms.value = profile.remap_mode || 'key_emulation';
-
-    // Poll-rate selector
-    var phz = document.getElementById('gpm-poll-hz');
-    if (phz) phz.value = String(profile.poll_hz || 4000);
-
-    // Virtual pad type selector — only meaningful in virtual_controller mode
-    var ptWrap = document.getElementById('gpm-pad-type-wrap');
-    var pt     = document.getElementById('gpm-pad-type');
-    if (ptWrap) {
-        ptWrap.style.display = (profile.remap_mode === 'virtual_controller') ? 'flex' : 'none';
-    }
-    if (pt) pt.value = profile.virtual_pad_type || 'x360';
-
-    // HidHide status — only relevant in virtual_controller mode.
-    // Format depends on engagement state:
-    //   green ✓ engaged          → physical hidden, game sees only virtual
-    //   amber installed-not-engaged → no virtual mode active
-    //   amber install-needed     → driver missing
-    //   neutral key-emulation    → not relevant
-    _updateHidHideStatusBadge();
-
-    // v3.4 mappings table — one row per mapping.  v3.5: which layer
-    // is shown depends on whether the user clicked "Edit alt layer".
-    var rowsEl = document.getElementById('gpm-binding-rows');
-    if (rowsEl) {
-        var mappings = _gpmEditingAltLayer
-            ? (profile.alt_mappings || [])
-            : (profile.mappings || []);
-        var emptyMsg = _gpmEditingAltLayer
-            ? 'No alt-layer mappings yet. These activate while you hold the modifier input. Click <b>+ Add mapping</b>.'
-            : 'No mappings yet. Click <b>+ Add mapping</b> to create one.';
-        if (!mappings.length) {
-            rowsEl.innerHTML =
-                '<div style="color:var(--text-tertiary);padding:14px;font-style:italic;text-align:center">' +
-                emptyMsg + '</div>';
-        } else {
-            rowsEl.innerHTML = mappings.map(_renderMappingRow).join('');
-        }
-    }
-
-    _refreshGpmInstallBanner();
-    _gpmRenderSvgLabels();
-    _refreshAdvancedDisplay();
-}
-
-function onGpmRemapModeChange() {
-    if (!_gpmCurrentProfile) return;
-    var ms = document.getElementById('gpm-remap-mode');
-    if (!ms) return;
-    _gpmCurrentProfile.remap_mode = ms.value;
-    // v3.4 — virtual_controller mode now AUTO-ENGAGES HidHide.
-    _gpmCurrentProfile.hide_physical = (ms.value === 'virtual_controller');
-    // Default to Xbox 360 the first time virtual mode is picked
-    if (ms.value === 'virtual_controller' && !_gpmCurrentProfile.virtual_pad_type) {
-        _gpmCurrentProfile.virtual_pad_type = 'x360';
-    }
-    _gpmAutoSave();
-    _gpmRenderBindingsLocal();
-    _refreshGpmInstallBanner();
-    _updateHidHideStatusBadge();
-    // Show/hide the pad-type picker
-    var ptWrap = document.getElementById('gpm-pad-type-wrap');
-    if (ptWrap) ptWrap.style.display = (ms.value === 'virtual_controller') ? 'flex' : 'none';
-}
-
-function onGpmPollHzChange() {
-    if (!_gpmCurrentProfile) return;
-    var sel = document.getElementById('gpm-poll-hz');
-    if (!sel) return;
-    _gpmCurrentProfile.poll_hz = parseInt(sel.value, 10) || 4000;
-    _gpmAutoSave();
-}
-
-function onGpmPadTypeChange() {
-    if (!_gpmCurrentProfile) return;
-    var sel = document.getElementById('gpm-pad-type');
-    if (!sel) return;
-    _gpmCurrentProfile.virtual_pad_type = sel.value;
-    _gpmAutoSave();
-    // The mapper watches profile.virtual_pad_type each tick and recreates
-    // the virtual pad when it changes.  HidHide stays engaged through
-    // the swap.  Status badge reflects the new pad type within ~1 sec.
-    setTimeout(_updateHidHideStatusBadge, 200);
-}
-
-// HidHide status badge — small inline indicator on the bindings card.
-// Replaces the v3.3 "Hide physical from games" checkbox; in v3.4 we
-// auto-engage HidHide whenever a virtual_controller profile is active.
-async function _updateHidHideStatusBadge() {
-    var el = document.getElementById('gpm-hidhide-status');
-    if (!el) return;
-    var prof = _gpmCurrentProfile;
-    if (!prof || prof.remap_mode !== 'virtual_controller') {
-        el.innerHTML = '';
-        return;
-    }
-    var st = await apiGet('/api/gamepad/hidhide-status');
-    var live = await apiGet('/api/gamepad/status');
-    var engaged = live && live.hidhide_engaged;
-    var padTypeLabel = '';
-    if (live && live.current_pad_type) {
-        padTypeLabel = ' · pad: ' + (live.current_pad_type === 'ds4' ? 'DualShock 4' : 'Xbox 360');
-    }
-    var diagLink = ' · <a href="#" onclick="showHidHideDiagnostic();return false" ' +
-        'style="color:var(--text-tertiary);text-decoration:underline;cursor:pointer;font-size:11px" ' +
-        'title="See every controller-class device on the system. Useful for finding interfering virtual gamepad layers (Razer Synapse, Steam Input, DS4Windows, etc.)">' +
-        'show devices</a>';
-    if (st && st.installed) {
-        if (engaged) {
-            var hiddenN = (st.hidden_count != null ? st.hidden_count : 0);
-            var hiddenLabel = ' · ' + hiddenN + ' device' + (hiddenN === 1 ? '' : 's') + ' hidden';
-            el.innerHTML = '<span style="color:var(--accent)">● HidHide engaged' + hiddenLabel + padTypeLabel + '</span>' + diagLink;
-        } else {
-            // Click → force retry.  Surface last error if there was one.
-            var errDetail = (st.last_engage_err) ? ' (' + escHtml(st.last_engage_err.slice(0, 60)) + ')' : '';
-            el.innerHTML = '<a href="#" onclick="forceEngageHidHide();return false" ' +
-                'title="Click to retry HidHide engagement now" ' +
-                'style="color:var(--orange,#fbbf24);text-decoration:underline;cursor:pointer">' +
-                '○ HidHide installed but not engaged: click to retry' + padTypeLabel + errDetail + '</a>' + diagLink;
-        }
-    } else {
-        el.innerHTML = '<span style="color:var(--orange,#fbbf24)">⚠ HidHide not installed, so the game may see both pads</span>' + diagLink;
-    }
-}
-
-async function showHidHideDiagnostic() {
-    var d = await apiGet('/api/gamepad/hidhide-diagnostic');
-    if (!d || !d.ok) {
-        showErrorToast('Could not load device diagnostic: ' + ((d && d.err) || 'unknown'));
-        return;
-    }
-    var devs = d.devices || [];
-    var lines = devs.map(function(x){
-        var icon = x.is_vigembus ? '✓' : (x.will_hide ? '◉' : '○');
-        var note = x.is_vigembus ? 'Vispora virtual (kept visible)'
-                  : x.will_hide ? 'Will be hidden from games'
-                  : 'Not currently in hide list';
-        var vidPid = (x.vid && x.pid) ? (' [VID_' + x.vid + ' PID_' + x.pid + ']') : '';
-        return icon + '  ' + (x.name || '(unnamed)') + vidPid + '\n     ' + note;
-    });
-    var msg =
-        'Controller-class devices Windows currently sees:\n\n' +
-        (lines.length ? lines.join('\n\n') : '(none: connect a controller and try again)') +
-        '\n\n──────────────────────────────────────────\n' +
-        '✓ = our ViGEmBus virtual pad (kept visible)\n' +
-        '◉ = will be hidden when HidHide engages\n' +
-        '○ = not in hide list (rare, and usually means the device looked safe to leave visible)\n\n' +
-        'If you see your real controller plus a "Razer Virtual XInput Game Pad" or similar,\n' +
-        'they all need to be hidden so the game only sees ours.  Re-engage HidHide if not yet engaged.';
-    showInfoToast(msg);
-}
-
-async function forceEngageHidHide() {
-    var el = document.getElementById('gpm-hidhide-status');
-    if (el) el.innerHTML = '<span style="color:var(--text-tertiary)">Engaging HidHide…</span>';
-    var r = await apiPost('/api/gamepad/hidhide-engage', {});
-    if (r && r.ok && r.engaged) {
-        // Re-render to show the green engaged state
-        _updateHidHideStatusBadge();
-    } else {
-        var msg = (r && r.err) ? r.err : 'Engagement failed for an unknown reason';
-        showErrorToast('HidHide engagement failed: ' + msg +
-              '. Common causes: HidHide CLI missing (reinstall HidHide), ' +
-              'controller not detected (reconnect), or Vispora not running as admin.',
-              { timeoutMs: 12000 });
-        _updateHidHideStatusBadge();
-    }
-}
-
-async function testVirtualPad() {
-    var r = await apiPost('/api/gamepad/test-virtual-pad', {});
-    if (!r || !r.ok) {
-        showErrorToast('Could not start test: ' + (r && r.err || 'unknown'));
-        return;
-    }
-    showInfoToast(r.msg || 'Test sequence started.');
-}
-
-// ─── v3.5 advanced settings — stick tuning ──────────────────────────
-var _gpmEditingAltLayer = false;   // toggled by toggleAltLayer()
-
-function _renderStickTuningPanel() {
-    var wrap = document.getElementById('gpm-stick-tuning');
-    if (!wrap) return;
-    var prof = _gpmCurrentProfile;
-    if (!prof) { wrap.innerHTML = ''; return; }
-    var sticks = prof.sticks || {};
-    var swap = document.getElementById('gpm-stick-swap');
-    if (swap) swap.checked = !!sticks.swap;
-    var sides = ['left', 'right'];
-    var html = sides.map(function(side){
-        var c = sticks[side] || {};
-        var cur = c.curve || 'linear';
-        var curveOpts = ['linear','power','expo','s_curve'].map(function(k){
-            return '<option value="' + k + '"' + (cur === k ? ' selected' : '') + '>' + k + '</option>';
-        }).join('');
-        return '<div style="min-width:240px;border:1px solid var(--border-faint);border-radius:6px;padding:10px;background:var(--bg-elevated)">' +
-            '<div style="font-weight:600;color:var(--text-bright);margin-bottom:8px;text-transform:capitalize">' + side + ' stick</div>' +
-            _stickField(side, 'deadzone_in',    'Inner DZ',     c.deadzone_in   || 0,   '0..0.95, fraction near center treated as 0',         0,    0.95, 0.01) +
-            _stickField(side, 'deadzone_out',   'Outer DZ',     c.deadzone_out  || 1,   '0..1, where the stick is treated as fully pushed',   0.05, 1.0,  0.01) +
-            _stickField(side, 'curve_strength', 'Curve N',      c.curve_strength|| 1.5, 'Exponent / steepness for power & expo curves',       0.1,  5.0,  0.05) +
-            '<label style="display:block;margin-top:6px"><span style="display:inline-block;min-width:80px">Curve</span>' +
-                '<select onchange="onStickCfgChangeField(' + jsArg(side) + ', \'curve\', this.value)" style="padding:3px 8px;border-radius:4px;background:var(--bg-card,var(--bg-overlay));color:var(--text);border:1px solid var(--border-faint);font-size:12px">' + curveOpts + '</select>' +
-            '</label>' +
-            '<label style="display:block;margin-top:6px"><input type="checkbox" onchange="onStickCfgChangeField(' + jsArg(side) + ', \'invert_x\', this.checked)"' + (c.invert_x ? ' checked' : '') + ' /> Invert X</label>' +
-            '<label style="display:block;margin-top:2px"><input type="checkbox" onchange="onStickCfgChangeField(' + jsArg(side) + ', \'invert_y\', this.checked)"' + (c.invert_y ? ' checked' : '') + ' /> Invert Y</label>' +
-            '<label style="display:block;margin-top:2px"><input type="checkbox" onchange="onStickCfgChangeField(' + jsArg(side) + ', \'circular_gate\', this.checked)"' + (c.circular_gate ? ' checked' : '') + ' /> Circular gate</label>' +
-        '</div>';
-    }).join('');
-    wrap.innerHTML = html;
-}
-
-function _stickField(side, key, label, val, tip, min, max, step) {
-    return '<label style="display:flex;align-items:center;gap:6px;margin-bottom:4px" title="' + escAttr(tip) + '">' +
-        '<span style="display:inline-block;min-width:80px">' + label + '</span>' +
-        '<input type="number" step="' + step + '" min="' + min + '" max="' + max + '" value="' + val + '" ' +
-            'onchange="onStickCfgChangeField(' + jsArg(side) + ', ' + jsArg(key) + ', parseFloat(this.value))" ' +
-            'style="width:75px;padding:3px 6px;border-radius:4px;background:var(--bg-card,var(--bg-overlay));color:var(--text);border:1px solid var(--border-faint);font-size:12px" />' +
-    '</label>';
-}
-
-function onStickCfgChange() {
-    if (!_gpmCurrentProfile) return;
-    _gpmCurrentProfile.sticks = _gpmCurrentProfile.sticks || {};
-    var swap = document.getElementById('gpm-stick-swap');
-    if (swap) _gpmCurrentProfile.sticks.swap = !!swap.checked;
-    _gpmAutoSave();
-}
-
-function onStickCfgChangeField(side, key, val) {
-    if (!_gpmCurrentProfile) return;
-    _gpmCurrentProfile.sticks = _gpmCurrentProfile.sticks || {};
-    _gpmCurrentProfile.sticks[side] = _gpmCurrentProfile.sticks[side] || {};
-    _gpmCurrentProfile.sticks[side][key] = val;
-    _gpmAutoSave();
-}
-
-async function calibrateSticksAtRest() {
-    var status = document.getElementById('gpm-stick-calibrate-status');
-    if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">Don\'t touch the sticks for 2 sec…</span>';
-    var r = await apiPost('/api/gamepad/calibrate-sticks',
-                          {duration_sec: 2.0, margin: 0.01});
-    if (!r || !r.ok) {
-        if (status) status.innerHTML = '<span style="color:var(--danger,#f87171)">Failed: ' + escHtml((r && r.err) || 'unknown') + '</span>';
-        return;
-    }
-    if (status) {
-        status.innerHTML = '<span style="color:var(--accent)">' +
-            'L wobble ' + (r.max_left  * 100).toFixed(2) + '% → DZ ' + (r.deadzone_left  * 100).toFixed(2) + '%, ' +
-            'R wobble ' + (r.max_right * 100).toFixed(2) + '% → DZ ' + (r.deadzone_right * 100).toFixed(2) + '%' +
-            (r.written ? ' (saved)' : ' (no profile)') +
-            '</span>';
-    }
-    // Refetch profile from backend so the panel shows new deadzone values
-    if (r.written) {
-        var st = await apiGet('/api/gamepad/status');
-        if (st && st.active_profile_obj) {
-            _gpmCurrentProfile = _gpmNormalizeProfile(st.active_profile_obj);
-            _renderStickTuningPanel();
-        }
-    }
-}
-
-// ─── v3.5 advanced settings — alt layer toggle ──────────────────────
-function toggleAltLayer() {
-    _gpmEditingAltLayer = !_gpmEditingAltLayer;
-    if (_gpmEditingAltLayer && _gpmCurrentProfile && !Array.isArray(_gpmCurrentProfile.alt_mappings)) {
-        _gpmCurrentProfile.alt_mappings = [];
-    }
-    _refreshLayerButtonLabel();
-    _gpmRenderBindingsLocal();
-}
-function _refreshLayerButtonLabel() {
-    var btn = document.getElementById('gpm-alt-layer-btn');
-    if (!btn) return;
-    btn.textContent = _gpmEditingAltLayer ? 'Layer: ALT (click for Primary)' : 'Layer: Primary (click for Alt)';
-}
-
-// ─── v3.5 advanced settings — modifier capture ──────────────────────
-async function captureModifier() {
-    var capture = await apiPost('/api/gamepad/capture-button', {timeout: 8});
-    if (!capture || !capture.ok || !capture.value) {
-        showWarnToast('No input detected within timeout.');
-        return;
-    }
-    var parts = String(capture.value).split(':');
-    if (parts.length < 2) return;
-    if (!_gpmCurrentProfile) return;
-    _gpmCurrentProfile.modifier_source  = parts[0];
-    _gpmCurrentProfile.modifier_trigger = parts.slice(1).join(':');
-    _gpmAutoSave();
-    _refreshAdvancedDisplay();
-}
-function clearModifier() {
-    if (!_gpmCurrentProfile) return;
-    _gpmCurrentProfile.modifier_source  = '';
-    _gpmCurrentProfile.modifier_trigger = '';
-    _gpmAutoSave();
-    _refreshAdvancedDisplay();
-}
-
-// ─── v3.5 — auto-switch foreground exe ──────────────────────────────
-function onForegroundExeChange() {
-    if (!_gpmCurrentProfile) return;
-    var inp = document.getElementById('gpm-foreground-exe');
-    if (!inp) return;
-    _gpmCurrentProfile.foreground_exe = (inp.value || '').trim();
-    _gpmAutoSave();
-}
-
-// ─── v3.5 — global toggle hotkey ────────────────────────────────────
-async function captureToggleHotkey() {
-    var capture = await apiPost('/api/gamepad/capture-button', {timeout: 8, source: 'keyboard'});
-    if (!capture || !capture.ok || !capture.value) {
-        showWarnToast('No keyboard key detected within timeout.');
-        return;
-    }
-    var parts = String(capture.value).split(':');
-    if (parts[0] !== 'keyboard' || !capture.vk) {
-        showWarnToast('Toggle hotkey must be a keyboard key. Captured: ' + capture.value);
-        return;
-    }
-    var name = parts.slice(1).join(':');
-    var r = await apiPost('/api/gamepad/toggle-hotkey', {vk: capture.vk, name: name});
-    if (r && r.ok) _refreshAdvancedDisplay();
-}
-async function clearToggleHotkey() {
-    var r = await apiPost('/api/gamepad/toggle-hotkey', {vk: 0, name: ''});
-    if (r && r.ok) _refreshAdvancedDisplay();
-}
-
-// ─── v3.5 — latency probe ───────────────────────────────────────────
-async function runLatencyProbe() {
-    var label = document.getElementById('gpm-latency-result');
-    if (label) label.innerHTML = '<span style="color:var(--text-tertiary)">measuring (~1 sec)…</span>';
-    var r = await apiPost('/api/gamepad/measure-latency', {samples: 50});
-    if (!label) return;
-    if (!r || !r.ok) {
-        var hint = '';
-        if (r && /disabled/.test(r.err || '')) {
-            hint = '. Flip the master switch on first';
-        } else if (r && /virtual_controller/.test(r.err || '')) {
-            hint = '. Set this profile to Virtual controller mode first';
-        } else if (r && /not running/.test(r.err || '')) {
-            hint = ' (the mapper polling loop isn\'t running)';
-        }
-        label.innerHTML = '<span style="color:var(--orange,#fbbf24)">probe failed: ' +
-            escHtml((r && r.err) || 'unknown') + escHtml(hint) + '</span>';
-        return;
-    }
-    // Color the avg by quality bucket (rough, based on typical poll-rate budgets)
-    var avg = r.avg_us || 0;
-    var avgColor = avg <  300 ? 'var(--accent)' :       // <0.3 ms = great
-                   avg <  800 ? 'var(--text-bright)' :   // <0.8 ms = fine
-                   avg < 1500 ? 'var(--orange,#fbbf24)' : // <1.5 ms = meh
-                   'var(--danger,#f87171)';               // >=1.5 ms = problem
-    label.innerHTML =
-        '<span style="color:' + avgColor + ';font-weight:600">' + avg + ' µs avg</span>' +
-        '<span style="color:var(--text-tertiary)"> · p50 ' + r.p50_us + ' · p99 ' + r.p99_us + ' · max ' + r.max_us + ' µs</span>' +
-        '<br><span style="color:var(--text-tertiary);font-size:10px">' +
-        r.valid + '/' + r.samples + ' samples observed' +
-        (r.timeouts ? ' · ' + r.timeouts + ' timeouts' : '') +
-        ' · Vispora pipeline only (excludes ViGEmBus/USB/game poll)' +
-        '</span>';
-}
-
-// ─── v3.5 — profile import / export ────────────────────────────────
-async function exportProfile() {
-    if (!_gpmCurrentProfile || !_gpmCurrentProfile.name) {
-        showWarnToast('No profile selected.');
-        return;
-    }
-    var r = await apiPost('/api/gamepad/profile/export', {name: _gpmCurrentProfile.name});
-    if (!r || !r.ok) {
-        showErrorToast('Export failed: ' + ((r && r.err) || 'unknown'));
-        return;
-    }
-    var text = JSON.stringify(r.blob, null, 2);
-    try {
-        await navigator.clipboard.writeText(text);
-        showInfoToast('Profile copied to clipboard (' + text.length + ' chars). Paste into a text file or share with another Vispora user via Import.');
-    } catch (e) {
-        // Fallback — show in a prompt() so the user can manually copy
-        prompt('Copy this profile JSON:', text);
-    }
-}
-async function importProfilePrompt() {
-    var text = prompt('Paste an exported profile JSON here:');
-    if (!text) return;
-    var blob;
-    try { blob = JSON.parse(text); }
-    catch (e) { showWarnToast('Not valid JSON.'); return; }
-    var r = await apiPost('/api/gamepad/profile/import', {blob: blob});
-    if (!r || !r.ok) {
-        showErrorToast('Import failed: ' + ((r && r.err) || 'unknown'));
-        return;
-    }
-    showInfoToast('Imported as profile "' + r.name + '". Reloading…');
-    await loadGamepadMapper();
-}
-
-// ─── v3.5 — refresh the advanced-panel summary widgets ──────────────
-async function _refreshAdvancedDisplay() {
-    var prof = _gpmCurrentProfile;
-    var modDisplay = document.getElementById('gpm-modifier-display');
-    if (modDisplay) {
-        if (prof && prof.modifier_trigger) {
-            modDisplay.textContent = (prof.modifier_source || '?') + ':' + prof.modifier_trigger;
-        } else {
-            modDisplay.textContent = 'none';
-        }
-    }
-    var fgInp = document.getElementById('gpm-foreground-exe');
-    if (fgInp && prof) fgInp.value = prof.foreground_exe || '';
-    // Hotkey lives on the global state, not the profile
-    var hkDisplay = document.getElementById('gpm-hotkey-display');
-    if (hkDisplay) {
-        try {
-            var st = await apiGet('/api/gamepad/status');
-            var name = (st && st.toggle_hotkey_name) || '';
-            var vk   = (st && st.toggle_hotkey_vk)   || 0;
-            hkDisplay.textContent = vk ? (name || ('VK_0x' + vk.toString(16).toUpperCase())) : 'none';
-        } catch (e) { hkDisplay.textContent = 'none'; }
-    }
-    _renderStickTuningPanel();
-}
-
-// ─── Driver auto-install (HidHide / ViGEmBus) ───────────────────────
-async function installHidHide() {
-    var btn = document.getElementById('gpm-hidhide-install-btn');
-    var prog = document.getElementById('gpm-hidhide-progress');
-    if (btn) { btn.disabled = true; btn.textContent = 'Installing…'; }
-    if (prog) prog.style.display = 'block';
-    var r = await apiPost('/api/gamepad/install-hidhide', {});
-    if (!r || !r.ok) {
-        if (btn) { btn.disabled = false; btn.textContent = 'Install now'; }
-        if (prog) prog.textContent = 'Install kickoff failed.';
-        return;
-    }
-    _pollInstallProgress('hidhide');
-}
-
-async function installViGEmBus() {
-    var btn = document.getElementById('gpm-vigembus-install-btn');
-    var prog = document.getElementById('gpm-vigembus-progress');
-    if (btn) { btn.disabled = true; btn.textContent = 'Installing…'; }
-    if (prog) prog.style.display = 'block';
-    var r = await apiPost('/api/gamepad/install-vigembus', {});
-    if (!r || !r.ok) {
-        if (btn) { btn.disabled = false; btn.textContent = 'Install now'; }
-        if (prog) prog.textContent = 'Install kickoff failed.';
-        return;
-    }
-    _pollInstallProgress('vigembus');
-}
-
-function _pollInstallProgress(target) {
-    var progElId = target === 'hidhide' ? 'gpm-hidhide-progress' : 'gpm-vigembus-progress';
-    var btnElId  = target === 'hidhide' ? 'gpm-hidhide-install-btn' : 'gpm-vigembus-install-btn';
-    var prog = document.getElementById(progElId);
-    var btn  = document.getElementById(btnElId);
-    var timer = setInterval(async function(){
-        var r = await apiGet('/api/gamepad/install-progress');
-        if (!r || !r.status) return;
-        var s = r.status;
-        if (prog) {
-            var line = '<b>' + escHtml(s.phase || 'idle') + '</b> · ' + escHtml(s.msg || '');
-            if (s.phase === 'downloading' && s.progress_pct) {
-                line += ' (' + s.progress_pct + '%)';
-            }
-            prog.innerHTML = line;
-        }
-        if (s.in_progress) return;
-        // Done — refresh full banner state to hide if installed
-        clearInterval(timer);
-        if (btn) {
-            btn.disabled = false;
-            btn.textContent = s.installed ? 'Installed ✓' : 'Try again';
-        }
-        if (s.installed) {
-            setTimeout(function(){ _refreshGpmInstallBanner(); loadGamepadMapper(); }, 800);
-        }
-        if (s.err) {
-            if (prog) prog.innerHTML = '<span style="color:var(--red,#ef4444)">' + escHtml(s.msg || s.err) + '</span>';
-        }
-    }, 1000);
-}
-
-// ─── v3.4 mappings UI ────────────────────────────────────────────────
-// Each mapping is one row: source ▾ trigger ▾ → target ▾ details [✕]
-
-var GPM_MOUSE_TRIGGERS = ['M_LEFT','M_RIGHT','M_MIDDLE','M_X1','M_X2',
-                          'M_WHEEL_UP','M_WHEEL_DOWN'];
-var GPM_VSTICK_DIRECTIONS = ['up','down','left','right'];
-
-function _findMapping(mid) {
-    if (!_gpmCurrentProfile) return null;
-    // Search the layer the user is currently editing first, fall back
-    // to the other so click handlers from a stale render still hit
-    // the right object.
-    var primary = _gpmEditingAltLayer
-        ? (_gpmCurrentProfile.alt_mappings || [])
-        : (_gpmCurrentProfile.mappings || []);
-    var fallback = _gpmEditingAltLayer
-        ? (_gpmCurrentProfile.mappings || [])
-        : (_gpmCurrentProfile.alt_mappings || []);
-    var i;
-    for (i = 0; i < primary.length;  i++) if (primary[i].id === mid)  return primary[i];
-    for (i = 0; i < fallback.length; i++) if (fallback[i].id === mid) return fallback[i];
-    return null;
-}
-
-function _renderMappingRow(m) {
-    var mid = m.id || '';
-    var inp = m.input || {};
-    var out = m.output || {};
-    var src = inp.source || 'controller';
-
-    // ── Source dropdown
-    var srcOpts = (_gpmState && _gpmState.input_sources || ['controller','keyboard','mouse']).map(function(s){
-        return '<option value="' + s + '"' + (src === s ? ' selected' : '') + '>' +
-            (s === 'controller' ? 'Controller' : s === 'keyboard' ? 'Keyboard' : 'Mouse') +
-            '</option>';
-    }).join('');
-    var srcSel = '<select onchange="onMappingSourceChange(' + jsArg(mid) + ', this.value)" ' +
-        'style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:90px">' +
-        srcOpts + '</select>';
-
-    // ── Trigger picker (depends on source)
-    var trig = inp.trigger || '';
-    var trigPicker;
-    if (src === 'controller') {
-        var btnList = (_gpmState && _gpmState.available_buttons) || [];
-        var opts = btnList.map(function(b){
-            return '<option value="' + b + '"' + (trig === b ? ' selected' : '') + '>' + escHtml(b) + '</option>';
-        }).join('');
-        trigPicker = '<select onchange="onMappingTriggerChange(' + jsArg(mid) + ', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:110px">' +
-            '<option value="">(pick)</option>' + opts + '</select>';
-    } else if (src === 'mouse') {
-        var mopts = GPM_MOUSE_TRIGGERS.map(function(b){
-            return '<option value="' + b + '"' + (trig === b ? ' selected' : '') + '>' + b + '</option>';
-        }).join('');
-        trigPicker = '<select onchange="onMappingTriggerChange(' + jsArg(mid) + ', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:120px">' +
-            '<option value="">(pick)</option>' + mopts + '</select>';
-    } else { // keyboard
-        // Keyboard has many keys — show captured value as text + capture button
-        trigPicker = '<span style="font-family:var(--font-mono,monospace);color:var(--accent);font-size:12px;min-width:80px;display:inline-block">' +
-            (trig ? escHtml(trig) : '(press a key) →') + '</span>';
-    }
-
-    // ── Target dropdown
-    var target = out.target || 'key';
-    var targetOpts = (_gpmState && _gpmState.output_targets || ['key','mouse_button','vbutton','vstick','vtrigger','macro','disabled']).map(function(t){
-        var label = {key:'Keyboard key', mouse_button:'Mouse button',
-                     vbutton:'Virtual button', vstick:'Virtual stick',
-                     vtrigger:'Virtual trigger',
-                     macro:'Macro', disabled:'Disabled'}[t] || t;
-        return '<option value="' + t + '"' + (target === t ? ' selected' : '') + '>' + label + '</option>';
-    }).join('');
-    var targetSel = '<select onchange="onMappingTargetChange(' + jsArg(mid) + ', this.value)" ' +
-        'style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:120px">' +
-        targetOpts + '</select>';
-
-    // ── Target details (depends on target)
-    var details = '';
-    if (target === 'key') {
-        var keyOpts = GPM_KEY_OPTIONS.map(function(o){
-            return '<option value="' + o.vk + '"' + (out.vk === o.vk ? ' selected' : '') + '>' + escHtml(o.label) + '</option>';
-        }).join('');
-        details = '<select onchange="onMappingDetailChange(' + jsArg(mid) + ', \'vk\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:100px">' + keyOpts + '</select>';
-    } else if (target === 'mouse_button') {
-        var mbOpts = GPM_MOUSE_TRIGGERS.map(function(b){
-            return '<option value="' + b + '"' + (out.button === b ? ' selected' : '') + '>' + b + '</option>';
-        }).join('');
-        details = '<select onchange="onMappingDetailChange(' + jsArg(mid) + ', \'button\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:120px">' + mbOpts + '</select>';
-    } else if (target === 'vbutton') {
-        // Prefer available_vbuttons (which includes DS4-only specials
-        // like TOUCHPAD / PS); fall back to available_buttons for older
-        // backends.
-        var vbList = (_gpmState && (_gpmState.available_vbuttons || _gpmState.available_buttons)) || [];
-        var vbOpts = vbList.map(function(b){
-            var label = b;
-            if (b === 'TOUCHPAD' || b === 'PS') label = b + ' (DS4)';
-            return '<option value="' + b + '"' + (out.vbutton === b ? ' selected' : '') + '>' + escHtml(label) + '</option>';
-        }).join('');
-        details = '<select onchange="onMappingDetailChange(' + jsArg(mid) + ', \'vbutton\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:110px">' + vbOpts + '</select>';
-    } else if (target === 'vstick') {
-        var stickSide = out.stick || 'left';
-        var stickDir  = out.direction || 'up';
-        var sideOpts = ['left','right'].map(function(s){
-            return '<option value="' + s + '"' + (stickSide === s ? ' selected' : '') + '>' + s.charAt(0).toUpperCase() + s.slice(1) + ' stick</option>';
-        }).join('');
-        var dirOpts = GPM_VSTICK_DIRECTIONS.map(function(d){
-            return '<option value="' + d + '"' + (stickDir === d ? ' selected' : '') + '>' + d.charAt(0).toUpperCase() + d.slice(1) + '</option>';
-        }).join('');
-        details = '<select onchange="onMappingDetailChange(' + jsArg(mid) + ', \'stick\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">' + sideOpts + '</select>' +
-                  ' <select onchange="onMappingDetailChange(' + jsArg(mid) + ', \'direction\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">' + dirOpts + '</select>';
-    } else if (target === 'vtrigger') {
-        var trigSide = out.trigger || 'lt';
-        var trigVal  = (out.value !== undefined ? out.value : 1.0);
-        var tSideOpts = ['lt','rt'].map(function(s){
-            return '<option value="' + s + '"' + (trigSide === s ? ' selected' : '') + '>' + s.toUpperCase() + ' (' + (s === 'lt' ? 'L' : 'R') + ' trigger)</option>';
-        }).join('');
-        details = '<select onchange="onMappingDetailChange(' + jsArg(mid) + ', \'trigger\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="Which virtual trigger to drive">' + tSideOpts + '</select>' +
-            ' <label style="font-size:11px;color:var(--text-tertiary)" title="0 = released, 1 = fully pulled">value</label>' +
-            '<input type="number" step="0.05" min="0" max="1" value="' + escAttr(trigVal) + '" onchange="onMappingDetailChange(' + jsArg(mid) + ', \'value\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="0.0 = released, 1.0 = fully pulled" />';
-    } else if (target === 'macro') {
-        var stepCount = (out.steps || []).length;
-        details = '<button class="btn btn-sm" onclick="openMappingMacroEditor(' + jsArg(mid) + ')">Edit (' + stepCount + ' step' + (stepCount === 1 ? '' : 's') + ')</button>';
-    } else if (target === 'disabled') {
-        details = '<span style="color:var(--text-tertiary);font-size:11px;font-style:italic">input silenced</span>';
-    }
-
-    // ── v3.5 behavior selector (toggle / turbo / chord / normal)
-    var behavior = (inp.behavior || 'normal');
-    var behaviorOpts = ['normal','toggle','turbo','chord'].map(function(b){
-        var label = {normal:'Normal', toggle:'Toggle',
-                     turbo:'Turbo', chord:'Chord'}[b] || b;
-        return '<option value="' + b + '"' + (behavior === b ? ' selected' : '') + '>' + label + '</option>';
-    }).join('');
-    var behaviorSel = '<select onchange="onMappingBehaviorChange(' + jsArg(mid) + ', this.value)" ' +
-        'title="Normal=press/release. Toggle=press locks ON, press again releases. Turbo=auto-fire while held at the configured Hz. Chord=fires only while ALSO holding a partner input." ' +
-        'style="padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:11px">' +
-        behaviorOpts + '</select>';
-    // Conditional behavior fields
-    var behaviorExtra = '';
-    if (behavior === 'turbo') {
-        var thz = parseInt(inp.turbo_hz, 10) || 10;
-        behaviorExtra = '<label style="font-size:11px;color:var(--text-tertiary)" title="Auto-press cycles per second (1-60)">Hz</label>' +
-            '<input type="number" min="1" max="60" value="' + thz + '" onchange="onMappingBehaviorField(' + jsArg(mid) + ', \'turbo_hz\', parseInt(this.value, 10))" style="width:48px;padding:3px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:11px" />';
-    } else if (behavior === 'chord') {
-        var partner = inp.chord_with || '';
-        // Only useful for controller inputs — pick another button as partner
-        var partnerOpts = ((_gpmState && _gpmState.available_buttons) || []).map(function(b){
-            return '<option value="' + b + '"' + (partner === b ? ' selected' : '') + '>' + escHtml(b) + '</option>';
-        }).join('');
-        behaviorExtra = '<label style="font-size:11px;color:var(--text-tertiary)" title="Mapping fires only when this PARTNER input is also held simultaneously">+</label>' +
-            '<select onchange="onMappingBehaviorField(' + jsArg(mid) + ', \'chord_with\', this.value)" style="padding:3px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:11px">' +
-            '<option value="">(pick)</option>' + partnerOpts + '</select>';
-    }
-
-    return '<div style="display:flex;align-items:center;gap:8px;padding:8px 10px;background:var(--bg-elevated);border-radius:6px;font-size:12.5px;flex-wrap:wrap">' +
-              srcSel +
-              trigPicker +
-              '<span style="color:var(--text-tertiary)">→</span>' +
-              targetSel +
-              '<div style="flex:1;min-width:140px">' + details + '</div>' +
-              behaviorSel + behaviorExtra +
-              '<button class="btn btn-sm" onclick="captureMappingTrigger(' + jsArg(mid) + ')" title="Press a button on any source to assign" style="font-size:11px">capture</button>' +
-              '<button class="btn btn-sm btn-danger" onclick="deleteMapping(' + jsArg(mid) + ')" title="Delete mapping" style="font-size:11px">✕</button>' +
-           '</div>';
-}
-
-function onMappingBehaviorChange(mid, newBehavior) {
-    var m = _findMapping(mid);
-    if (!m) return;
-    m.input = m.input || {};
-    m.input.behavior = newBehavior;
-    if (newBehavior === 'turbo')   m.input.turbo_hz   = m.input.turbo_hz   || 10;
-    if (newBehavior === 'chord')   m.input.chord_with = m.input.chord_with || '';
-    _gpmAutoSave();
-    _gpmRenderBindingsLocal();
-}
-
-function onMappingBehaviorField(mid, field, val) {
-    var m = _findMapping(mid);
-    if (!m) return;
-    m.input = m.input || {};
-    m.input[field] = val;
-    _gpmAutoSave();
-}
-
-// v3.5 — which mappings array we're operating on (primary or alt).
-function _gpmActiveMappingsArray(profile) {
-    if (!profile) return null;
-    var key = _gpmEditingAltLayer ? 'alt_mappings' : 'mappings';
-    if (!Array.isArray(profile[key])) profile[key] = [];
-    return profile[key];
-}
-
-function addNewMapping() {
-    if (!_gpmCurrentProfile) {
-        showWarnToast('Pick or create a profile first.');
-        return;
-    }
-    var arr = _gpmActiveMappingsArray(_gpmCurrentProfile);
-    arr.push({
-        id: 'm' + Math.random().toString(36).slice(2, 10),
-        input:  {source: 'controller', trigger: '', behavior: 'normal'},
-        output: {target: 'key', vk: 0x20},
-    });
-    _gpmAutoSave();
-    _gpmRenderBindingsLocal();
-}
-
-function deleteMapping(mid) {
-    if (!_gpmCurrentProfile) return;
-    var arr = _gpmActiveMappingsArray(_gpmCurrentProfile);
-    var key = _gpmEditingAltLayer ? 'alt_mappings' : 'mappings';
-    _gpmCurrentProfile[key] = arr.filter(function(m){ return m.id !== mid; });
-    _gpmAutoSave();
-    _gpmRenderBindingsLocal();
-}
-
-function onMappingSourceChange(mid, newSource) {
-    var m = _findMapping(mid);
-    if (!m) return;
-    m.input = m.input || {};
-    m.input.source = newSource;
-    m.input.trigger = '';   // reset trigger — different sources use different vocabularies
-    _gpmAutoSave();
-    _gpmRenderBindingsLocal();
-}
-
-function onMappingTriggerChange(mid, newTrigger) {
-    var m = _findMapping(mid);
-    if (!m) return;
-    m.input = m.input || {};
-    m.input.trigger = newTrigger;
-    _gpmAutoSave();
-    _gpmRenderBindingsLocal();
-}
-
-function onMappingTargetChange(mid, newTarget) {
-    var m = _findMapping(mid);
-    if (!m) return;
-    // Default-fill the target's required fields
-    var defaults = {
-        key:          {target: 'key',          vk: 0x20},
-        mouse_button: {target: 'mouse_button', button: 'M_LEFT'},
-        vbutton:      {target: 'vbutton',      vbutton: 'A'},
-        vstick:       {target: 'vstick',       stick: 'left', direction: 'up', magnitude: 1.0},
-        vtrigger:     {target: 'vtrigger',     trigger: 'rt', value: 1.0},
-        macro:        {target: 'macro',        steps: []},
-        disabled:     {target: 'disabled'},
-    };
-    m.output = defaults[newTarget] || {target: newTarget};
-    _gpmAutoSave();
-    _gpmRenderBindingsLocal();
-}
-
-function onMappingDetailChange(mid, field, value) {
-    var m = _findMapping(mid);
-    if (!m) return;
-    m.output = m.output || {};
-    if (field === 'vk') {
-        m.output[field] = parseInt(value, 10);
-    } else if (field === 'value' || field === 'magnitude') {
-        // 0..1 float fields (vtrigger value, vstick magnitude)
-        var n = parseFloat(value);
-        if (isNaN(n)) n = 0;
-        m.output[field] = Math.max(0, Math.min(1, n));
-    } else {
-        m.output[field] = value;
-    }
-    _gpmAutoSave();
-    _gpmRenderSvgLabels();
-}
-
-// Capture a trigger (any source) for the given mapping.  Backend's
-// capture-button route now returns a "source:trigger" string, e.g.
-// "keyboard:F1" or "controller:A".  We split + assign.
-async function captureMappingTrigger(mid) {
-    var m = _findMapping(mid);
-    if (!m) return;
-    var modal = document.getElementById('gpm-capture-modal');
-    var msg = document.getElementById('gpm-capture-msg');
-    if (modal) modal.style.display = 'flex';
-    if (msg) msg.textContent = 'Press any controller button, keyboard key, or mouse button…';
-    _gpmCaptureCancelled = false;
-    var r = await apiPost('/api/gamepad/capture-button', {timeout: 8.0});
-    if (modal) modal.style.display = 'none';
-    if (_gpmCaptureCancelled) return;
-    if (!r || !r.ok) {
-        // No press within the window (the backend's err starts with "timeout")
-        // is not an error to report to the devs; captureModifier warns the same way.
-        if (r && /^timeout/.test(r.err || '')) showWarnToast('No input detected within timeout.');
-        else showErrorToast(r && r.err ? r.err : 'Capture failed.');
-        return;
-    }
-    // r.button is "source:trigger"
-    var captured = (r.button || '').split(':');
-    if (captured.length !== 2) {
-        showWarnToast('Unexpected capture format: ' + r.button);
-        return;
-    }
-    // Keep the rest of the input (behavior, turbo_hz, chord_with)
-    m.input = m.input || {};
-    m.input.source = captured[0];
-    m.input.trigger = captured[1];
-    _gpmAutoSave();
-    _gpmRenderBindingsLocal();
-}
-
-// Macro editor for new mappings
-// Macro-level state held while the modal is open
-var _gpmMacroPlayMode = 'once';
-var _gpmMacroRepeatCount = 2;
-
-function openMappingMacroEditor(mid) {
-    var m = _findMapping(mid);
-    if (!m) return;
-    _gpmMacroEditorBtn = mid;       // reuse existing modal state vars
-    var binding = m.output;
-    if (!binding || binding.target !== 'macro') return;
-    _gpmMacroEditorSteps = JSON.parse(JSON.stringify(binding.steps || []));
-    _gpmMacroPlayMode = binding.play_mode || 'once';
-    _gpmMacroRepeatCount = binding.repeat_count || 2;
-    document.getElementById('gpm-macro-btn-name').textContent = 'mapping ' + mid;
-
-    // Sync the play-mode UI to the loaded values
-    var pm = document.getElementById('gpm-macro-play-mode');
-    if (pm) pm.value = _gpmMacroPlayMode;
-    var rcWrap = document.getElementById('gpm-macro-repeat-wrap');
-    if (rcWrap) rcWrap.style.display = (_gpmMacroPlayMode === 'repeat_n' ? '' : 'none');
-    var rc = document.getElementById('gpm-macro-repeat-count');
-    if (rc) rc.value = String(_gpmMacroRepeatCount);
-
-    _renderMacroSteps();
-    var modal = document.getElementById('gpm-macro-modal');
-    if (modal) modal.style.display = 'flex';
-}
-
-function onMacroPlayModeChange() {
-    var sel = document.getElementById('gpm-macro-play-mode');
-    if (!sel) return;
-    _gpmMacroPlayMode = sel.value;
-    var wrap = document.getElementById('gpm-macro-repeat-wrap');
-    if (wrap) wrap.style.display = (_gpmMacroPlayMode === 'repeat_n' ? '' : 'none');
-}
-
-function onMacroRepeatCountChange() {
-    var inp = document.getElementById('gpm-macro-repeat-count');
-    if (!inp) return;
-    var n = parseInt(inp.value, 10);
-    _gpmMacroRepeatCount = (isNaN(n) || n < 1) ? 1 : n;
-}
-
-// Auto-save the current profile to the backend.  All on-change handlers
-// call this so user edits persist immediately — eliminates the "dropdown
-// reverts" bug caused by re-fetching from the backend after a local edit
-// that hasn't been saved yet.
-async function _gpmAutoSave() {
-    if (!_gpmCurrentProfile) return;
-    try {
-        var r = await apiPost('/api/gamepad/profiles', _gpmCurrentProfile);
-        // apiPost never throws; a failed save comes back as ok:false
-        if (!r || !r.ok) {
-            showWarnToast('Your last gamepad change was not saved: ' + ((r && r.err) || 'unknown error'));
-        }
-    } catch (e) {
-        console.error('gamepad profile autosave failed', e);
-    }
-}
-
-function onGpmProfileSelect() {
-    var sel = document.getElementById('gpm-profile-select');
-    if (!sel) return;
-    var name = sel.value || null;
-    apiPost('/api/gamepad/active', {name: name}).then(function(){
-        loadGamepadMapper();
-    });
-}
-
-async function newGpmProfile() {
-    var name = prompt('Profile name (e.g. "Default FPS")');
-    if (!name) return;
-    name = name.trim();
-    if (!name) return;
-    var prof = {
-        name: name,
-        // v3.4: always-on by default — no more foreground filter
-        active_only_in_game: false,
-        mappings: [],
-    };
-    var r = await apiPost('/api/gamepad/profiles', prof);
-    if (!r || !r.ok) { showErrorToast('Save failed.'); return; }
-    await apiPost('/api/gamepad/active', {name: name});
-    loadGamepadMapper();
-}
-
-async function deleteGpmProfile() {
-    if (!_gpmCurrentProfile) {
-        showWarnToast('No profile selected.');
-        return;
-    }
-    if (!confirm('Delete profile "' + _gpmCurrentProfile.name + '"?')) return;
-    var r = await apiDelete('/api/gamepad/profiles/' + encodeURIComponent(_gpmCurrentProfile.name));
-    if (!r || !r.ok) { showErrorToast((r && r.err) || 'Failed to delete profile'); return; }
-    loadGamepadMapper();
-}
-
-async function toggleGpmMaster(el) {
-    var newOn = !el.classList.contains('on');
-    el.classList.toggle('on');
-    var r = await apiPost('/api/gamepad/enabled', {enabled: newOn});
-    if (!r || !r.ok) {
-        el.classList.toggle('on');
-    }
-}
-
-// ─── Live SVG controller visualizer (60 Hz) ─────────────────────────
-// Stick well centers + radius — must match the SVG above.
-var _GPM_STICKS = {
-    L: { cx: 220, cy: 200, r: 22 },
-    R: { cx: 380, cy: 200, r: 22 },
-};
-var _gpmSvgRafId = null;
-var _gpmSvgVisible = false;
-var _gpmGamepadConnected = false;        // set by `gamepadconnected` event
-
-// Chromium (incl. Edge WebView2) requires user input on the gamepad
-// before navigator.getGamepads() returns anything — this is a privacy
-// gate identical to the one Chrome desktop uses.  We listen for the
-// `gamepadconnected` event AND watch for a populated getGamepads()
-// list so we can flip the wake-up hint off as soon as the API unlocks.
-window.addEventListener('gamepadconnected', function(e) {
-    _gpmGamepadConnected = true;
-    console.log('Gamepad connected:', e.gamepad && e.gamepad.id);
-});
-window.addEventListener('gamepaddisconnected', function() {
-    // Don't reset _gpmGamepadConnected — the controller may just be in
-    // a wake state.  Let the polling loop figure it out from getGamepads().
-});
-
-// Backend-driven state cache.  Refreshed at 60 Hz by a polling timer
-// (cheap — same XInput call our mapper loop already makes).  Used as
-// fallback when navigator.getGamepads() returns nothing.
-var _gpmBackendState = null;
-var _gpmBackendPollTimer = null;
-var _gpmActiveSource = "none";   // "browser" | "backend" | "none"
-
-function _gpmStartBackendPoll() {
-    if (_gpmBackendPollTimer) return;
-    var lastLogT = 0;
-    var inFlight = false;
-    var poll = function() {
-        if (currentPage !== 'profiles' || !_gpmSvgVisible) return;
-        // One request at a time: when the backend answers slower than the
-        // 33 ms tick, requests would otherwise pile up and starve every
-        // other API call behind the browser's per-host connection limit.
-        if (inFlight) return;
-        inFlight = true;
-        apiGet('/api/gamepad/live-state').then(function(r){
-            if (r && r.controllers && r.controllers.length) {
-                var newState = r.controllers[0].state;
-                // Tack the v3.5 virtual-pad snapshot onto our state object
-                // so the visualizer renderer can read both streams from
-                // the same place.
-                if (r.vpad) newState._vpad = r.vpad;
-                _gpmBackendState = newState;
-                // Track packet number for staleness detection
-                var pkt = newState.packet || 0;
-                if (pkt !== _gpmLastPacketSeen) {
-                    _gpmLastPacketSeen = pkt;
-                    _gpmLastPacketChangeT = Date.now();
-                }
-            } else {
-                _gpmBackendState = null;
-            }
-            // Diagnostic log — every 5 seconds with packet info
-            var now = Date.now();
-            if (now - lastLogT > 5000) {
-                lastLogT = now;
-                if (_gpmBackendState) {
-                    var sinceChange = now - _gpmLastPacketChangeT;
-                    console.log('[gpm-backend]', {
-                        packet:  _gpmBackendState.packet,
-                        last_change_ms_ago: sinceChange,
-                        pressed: _gpmBackendState.pressed,
-                        lx: _gpmBackendState.lx,
-                        ly: _gpmBackendState.ly,
-                        lt: _gpmBackendState.lt,
-                        rt: _gpmBackendState.rt,
-                    });
-                } else {
-                    console.log('[gpm-backend] no controllers in live-state');
-                }
-            }
-        }).catch(function(e){
-            console.error('[gpm-backend] live-state poll failed:', e);
-        }).finally(function(){
-            inFlight = false;
-        });
-    };
-    poll();
-    _gpmBackendPollTimer = setInterval(poll, 33);
-}
-
-function _gpmStopBackendPoll() {
-    if (_gpmBackendPollTimer) {
-        clearInterval(_gpmBackendPollTimer);
-        _gpmBackendPollTimer = null;
-    }
-}
-
-// Convert a backend XInput state row to a "synthetic gamepad" object
-// shaped like the JS Gamepad API so the rest of the loop doesn't care.
-// Backend stick range: -32768..32767 → normalize to -1..1 for SVG transform.
-function _gpmBackendStateToPad(state) {
-    if (!state) return null;
-    var pressed = new Set(state.pressed || []);
-    var BTN_ORDER = ["A","B","X","Y","LB","RB","LT","RT","BACK","START",
-                     "LSTICK","RSTICK","DPAD_UP","DPAD_DOWN","DPAD_LEFT","DPAD_RIGHT"];
-    var buttons = BTN_ORDER.map(function(name){
-        if (name === "LT") return {pressed: state.lt > 30, value: (state.lt || 0) / 255};
-        if (name === "RT") return {pressed: state.rt > 30, value: (state.rt || 0) / 255};
-        return {pressed: pressed.has(name), value: pressed.has(name) ? 1 : 0};
-    });
-    var axes = [
-        (state.lx || 0) / 32767,
-        -(state.ly || 0) / 32767,   // XInput Y is up-positive; Gamepad API is down-positive
-        (state.rx || 0) / 32767,
-        -(state.ry || 0) / 32767,
-    ];
-    return {buttons: buttons, axes: axes, _source: "backend"};
-}
-
-function startGpmSvgLoop() {
-    if (_gpmSvgRafId !== null) return;
-    var wrap = document.getElementById('gpm-visual-wrap');
-    if (wrap) wrap.style.display = 'block';
-    _gpmSvgVisible = true;
-    _gpmStartBackendPoll();    // arm the fallback
-
-    var loop = function() {
-        // ALWAYS reschedule first — if anything below throws, the loop
-        // still keeps running.  Without this, a single silent exception
-        // would freeze the visualizer until page refresh, which matches
-        // the "stops responding after first input" symptom users hit.
-        _gpmSvgRafId = requestAnimationFrame(loop);
-        if (currentPage !== 'profiles' || !_gpmSvgVisible) return;
-
-        try {
-            _gpmSvgRenderTick();
-        } catch (e) {
-            console.error('[gpm-svg] render tick failed:', e);
-        }
-    };
-    loop();
-}
-
-function _gpmSvgRenderTick() {
-    // v3.3 update — BACKEND IS PRIMARY now.  Reason: WebView2's
-    // navigator.getGamepads() in pywebview tends to "wake" on the first
-    // button press but then return STALE state forever after — a known
-    // Chromium quirk that's worse for us than a 33 ms HTTP roundtrip.
-    // The backend feed is fed by direct XInput at 30 Hz from a Python
-    // thread that has no WebView weirdness.  Reliable.
-    var pad = null;
-    var sourceUsed = "none";
-    if (_gpmBackendState) {
-        pad = _gpmBackendStateToPad(_gpmBackendState);
-        sourceUsed = "backend";
-    } else {
-        // Last resort: try the browser API (e.g. if the backend route
-        // has somehow stopped responding)
-        var pads = navigator.getGamepads ? navigator.getGamepads() : [];
-        for (var i = 0; i < pads.length; i++) {
-            if (pads[i]) { pad = pads[i]; sourceUsed = "browser"; break; }
-        }
-    }
-
-    // Update diagnostic line + the source indicator
-    if (sourceUsed !== _gpmActiveSource) {
-        _gpmActiveSource = sourceUsed;
-        _gpmUpdateDiagnostic();
-    }
-
-        var noctrl = document.getElementById('gpm-svg-noctrl');
-        if (!pad) {
-            if (noctrl) {
-                var xinputSeesIt = !!(_gpmState && _gpmState.connected_slots && _gpmState.connected_slots.length);
-                if (xinputSeesIt) {
-                    noctrl.textContent = 'XInput sees your controller. Backend feed will appear shortly';
-                    noctrl.setAttribute('fill', 'var(--orange,#fbbf24)');
-                } else {
-                    noctrl.textContent = 'No controller detected. Plug in or wake yours';
-                    noctrl.setAttribute('fill', 'var(--text-tertiary)');
-                }
-                noctrl.style.display = '';
-            }
-            _gpmSvgClearAll();
-            return;
-        }
-        if (noctrl) noctrl.style.display = 'none';
-
-        // Standard mapping (Xbox-like — what Chromium gives us by default,
-        // and exactly what _gpmBackendStateToPad emits).
-        var STD_MAP = ["A","B","X","Y","LB","RB","LT","RT","BACK","START",
-                       "LSTICK","RSTICK","DPAD_UP","DPAD_DOWN","DPAD_LEFT","DPAD_RIGHT"];
-        for (var b = 0; b < pad.buttons.length && b < STD_MAP.length; b++) {
-            var name = STD_MAP[b];
-            var pressed = pad.buttons[b].pressed;
-            var el = document.getElementById('gpm-svg-btn-' + name);
-            if (el) el.classList.toggle('is-pressed', !!pressed);
-        }
-
-        var lt = pad.buttons[6] ? pad.buttons[6].value : 0;
-        var rt = pad.buttons[7] ? pad.buttons[7].value : 0;
-        var ltFill = document.getElementById('gpm-trigger-lt-fill');
-        var rtFill = document.getElementById('gpm-trigger-rt-fill');
-        if (ltFill) ltFill.setAttribute('width', String(60 * Math.max(0, Math.min(1, lt))));
-        if (rtFill) rtFill.setAttribute('width', String(60 * Math.max(0, Math.min(1, rt))));
-
-        var lx = pad.axes[0] || 0, ly = pad.axes[1] || 0;
-        var rx = pad.axes[2] || 0, ry = pad.axes[3] || 0;
-        var lDot = document.getElementById('gpm-svg-stick-l-dot');
-        var rDot = document.getElementById('gpm-svg-stick-r-dot');
-        if (lDot) lDot.setAttribute('transform',
-            'translate(' + (lx * _GPM_STICKS.L.r) + ',' + (ly * _GPM_STICKS.L.r) + ')');
-        if (rDot) rDot.setAttribute('transform',
-            'translate(' + (rx * _GPM_STICKS.R.r) + ',' + (ry * _GPM_STICKS.R.r) + ')');
-
-        // v3.5 — overlay the VIRTUAL pad's stick position too, in a
-        // different colour, so the user can see what the game receives
-        // (e.g. anti-recoil pull, deadzone shaping, layer modifiers).
-        // The vpad snapshot is included alongside live-state when the
-        // mapper is in virtual_controller mode.
-        if (_gpmBackendState && _gpmBackendState._vpad) {
-            var v = _gpmBackendState._vpad;
-            // vpad uses XInput int16; visualizer uses W3C Gamepad API
-            // convention (+y = DOWN), so we negate Y to match.
-            var vlx = (v.lx || 0) / 32767;
-            var vly = -(v.ly || 0) / 32767;
-            var vrx = (v.rx || 0) / 32767;
-            var vry = -(v.ry || 0) / 32767;
-            _ensureVpadOverlayDots();
-            var vlDot = document.getElementById('gpm-svg-vstick-l-dot');
-            var vrDot = document.getElementById('gpm-svg-vstick-r-dot');
-            if (vlDot) vlDot.setAttribute('transform',
-                'translate(' + (vlx * _GPM_STICKS.L.r) + ',' + (vly * _GPM_STICKS.L.r) + ')');
-            if (vrDot) vrDot.setAttribute('transform',
-                'translate(' + (vrx * _GPM_STICKS.R.r) + ',' + (vry * _GPM_STICKS.R.r) + ')');
-        }
-}
-
-function _ensureVpadOverlayDots() {
-    // Lazily clone the physical-stick dots with a different fill (cyan
-    // for high contrast against the typical white/grey physical dot).
-    // Idempotent — only creates the overlays once, then we just show
-    // the legend whenever the virtual stream is active.
-    var legend = document.getElementById('gpm-visual-legend');
-    if (legend) legend.style.display = 'block';
-    if (document.getElementById('gpm-svg-vstick-l-dot')) return;
-    ['L', 'R'].forEach(function(side){
-        var src = document.getElementById('gpm-svg-stick-' + side.toLowerCase() + '-dot');
-        if (!src || !src.parentNode) return;
-        var clone = src.cloneNode(true);
-        clone.id = 'gpm-svg-vstick-' + side.toLowerCase() + '-dot';
-        clone.setAttribute('opacity', '0.85');
-        clone.setAttribute('stroke', '#0891b2');
-        clone.setAttribute('stroke-width', '1.5');
-        // Slightly smaller than the physical dot so both stay readable.
-        // Cyan (#22d3ee) is well outside the typical white/grey physical
-        // dot range so the two never visually merge even at center.
-        var children = clone.querySelectorAll('circle');
-        children.forEach(function(c){
-            var r = parseFloat(c.getAttribute('r')) || 6;
-            c.setAttribute('r', String(Math.max(2, r * 0.55)));
-            c.setAttribute('fill', '#22d3ee');
-            c.setAttribute('stroke', '#0891b2');
-        });
-        src.parentNode.appendChild(clone);
-    });
-}
-
-function _gpmUpdateDiagnostic() {
-    var el = document.getElementById('gpm-visual-source');
-    if (!el) return;
-    var apiAvail = !!(navigator.getGamepads);
-    var msg = '';
-    if (_gpmActiveSource === 'browser') {
-        msg = '<span style="color:var(--accent)">live · WebView Gamepad API (fallback)</span>';
-    } else if (_gpmActiveSource === 'backend') {
-        msg = '<span style="color:var(--accent)">live · backend XInput @ 30 Hz</span>';
-    } else if (apiAvail) {
-        msg = '<span style="color:var(--text-tertiary)">waiting for controller…</span>';
-    } else {
-        msg = '<span style="color:var(--text-tertiary)">Gamepad API unavailable in this WebView</span>';
-    }
-    el.innerHTML = msg;
-}
-
-// Track backend packet number so the visualizer knows when state is stale
-var _gpmLastPacketSeen = -1;
-var _gpmLastPacketChangeT = 0;
-
-function stopGpmSvgLoop() {
-    _gpmSvgVisible = false;
-    if (_gpmSvgRafId !== null) {
-        cancelAnimationFrame(_gpmSvgRafId);
-        _gpmSvgRafId = null;
-    }
-    _gpmStopBackendPoll();
-}
-
-function _gpmSvgClearAll() {
-    var STD = ["A","B","X","Y","LB","RB","BACK","START","LSTICK","RSTICK",
-               "DPAD_UP","DPAD_DOWN","DPAD_LEFT","DPAD_RIGHT"];
-    STD.forEach(function(n){
-        var el = document.getElementById('gpm-svg-btn-' + n);
-        if (el) el.classList.remove('is-pressed');
-    });
-    var ltFill = document.getElementById('gpm-trigger-lt-fill');
-    var rtFill = document.getElementById('gpm-trigger-rt-fill');
-    if (ltFill) ltFill.setAttribute('width', '0');
-    if (rtFill) rtFill.setAttribute('width', '0');
-    var lDot = document.getElementById('gpm-svg-stick-l-dot');
-    var rDot = document.getElementById('gpm-svg-stick-r-dot');
-    if (lDot) lDot.setAttribute('transform', 'translate(0,0)');
-    if (rDot) rDot.setAttribute('transform', 'translate(0,0)');
-}
-
-// Click any SVG button → focus the matching binding row.  If no row exists
-// yet (button is currently passthrough), default to a sensible binding so
-// the user has something to edit.
-function _gpmInitSvgClicks() {
-    var els = document.querySelectorAll('#gpm-svg .gpm-svg-btn');
-    els.forEach(function(el){
-        if (el._gpmClickWired) return;
-        el._gpmClickWired = true;
-        el.addEventListener('click', function(){
-            var btn = el.getAttribute('data-gpm-btn');
-            if (!btn || !_gpmCurrentProfile) {
-                if (!_gpmCurrentProfile) {
-                    showWarnToast('Pick or create a profile first.');
-                }
-                return;
-            }
-            // Pulse the SVG button briefly
-            el.classList.add('is-binding');
-            setTimeout(function(){ el.classList.remove('is-binding'); }, 1200);
-
-            // Default to a passthrough → key binding so the user has
-            // something to edit.  If a binding already exists, leave it.
-            // beta.12 — belt-and-suspenders: even after the normalizer
-            // runs, fail safe rather than throwing if the profile shape
-            // somehow drifted.
-            if (!_gpmCurrentProfile.buttons) _gpmCurrentProfile.buttons = {};
-            if (!_gpmCurrentProfile.buttons[btn]) {
-                if (_gpmCurrentProfile.remap_mode === 'virtual_controller') {
-                    _gpmCurrentProfile.buttons[btn] = {type: 'vbutton', vbutton: btn};
-                } else {
-                    _gpmCurrentProfile.buttons[btn] = {type: 'key', vk: 0x20};
-                }
-                loadGpmProfileBindings(_gpmCurrentProfile.name);
-            }
-            // Scroll the matching row into view + flash it
-            var rowsContainer = document.getElementById('gpm-binding-rows');
-            if (rowsContainer) {
-                // Find the row whose first <div> text matches the button
-                var rows = rowsContainer.children;
-                for (var i = 0; i < rows.length; i++) {
-                    var label = rows[i].querySelector('div');
-                    if (label && label.textContent.trim() === btn) {
-                        rows[i].scrollIntoView({behavior: 'smooth', block: 'center'});
-                        rows[i].style.transition = 'background 0.3s';
-                        rows[i].style.background = 'rgba(251,191,36,0.15)';
-                        setTimeout(function(r){
-                            return function(){ r.style.background = ''; };
-                        }(rows[i]), 1500);
-                        break;
-                    }
-                }
-            }
-        });
-    });
-}
-
-// Update the small target labels under each button on the SVG so the
-// user can see at a glance what each button is currently bound to.
-function _gpmRenderSvgLabels() {
-    var labelsG = document.getElementById('gpm-svg-labels');
-    if (!labelsG) return;
-    labelsG.innerHTML = '';
-    if (!_gpmCurrentProfile) return;
-    // SVG x/y coordinates of where to drop each button's label.  Lined
-    // up just below the corresponding visual element.
-    var POS = {
-        A:          {x: 450, y: 220},
-        B:          {x: 488, y: 185},
-        X:          {x: 412, y: 185},
-        Y:          {x: 450, y: 100},
-        LB:         {x: 130, y: 62},
-        RB:         {x: 470, y: 62},
-        BACK:       {x: 262, y: 152},
-        START:      {x: 338, y: 152},
-        LSTICK:     {x: 220, y: 250},
-        RSTICK:     {x: 380, y: 250},
-        DPAD_UP:    {x: 141, y: 119},
-        DPAD_DOWN:  {x: 141, y: 200},
-        DPAD_LEFT:  {x: 95,  y: 161},
-        DPAD_RIGHT: {x: 188, y: 161},
-    };
-    // v3.4 — read from mappings array.  Group by controller-source
-    // trigger so a button mapped to multiple outputs shows them all.
-    var byBtn = {};
-    (_gpmCurrentProfile.mappings || []).forEach(function(m){
-        var inp = m.input || {};
-        if (inp.source !== 'controller') return;
-        if (!POS[inp.trigger]) return;
-        var out = m.output || {};
-        var label = '';
-        if (out.target === 'key') {
-            label = '→ ' + (_vkLabel(out.vk) || ('VK 0x' + (out.vk||0).toString(16)));
-        } else if (out.target === 'mouse_button') {
-            label = '→ ' + (out.button || '?');
-        } else if (out.target === 'vbutton') {
-            label = '→ ' + (out.vbutton || '?');
-        } else if (out.target === 'vstick') {
-            label = '→ ' + (out.stick||'L') + ' ' + (out.direction||'?');
-        } else if (out.target === 'vtrigger') {
-            label = '→ ' + (out.trigger||'rt').toUpperCase() + ' ' + Math.round((out.value||1)*100) + '%';
-        } else if (out.target === 'macro') {
-            label = '→ macro';
-        } else if (out.target === 'disabled') {
-            label = '✕ off';
-        }
-        if (!label) return;
-        if (!byBtn[inp.trigger]) byBtn[inp.trigger] = [];
-        byBtn[inp.trigger].push(label);
-    });
-    Object.keys(byBtn).forEach(function(btn){
-        var label = byBtn[btn].join(' · ');
-        var t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        t.setAttribute('x', POS[btn].x);
-        t.setAttribute('y', POS[btn].y);
-        t.setAttribute('text-anchor', 'middle');
-        t.setAttribute('font-size', '9');
-        t.setAttribute('font-family', 'monospace');
-        t.setAttribute('fill', 'var(--accent)');
-        t.textContent = label;
-        labelsG.appendChild(t);
-    });
-}
-
-// ─── Capture-button modal ───────────────────────────────────────────
-function cancelGpmCapture() {
-    _gpmCaptureCancelled = true;
-    var modal = document.getElementById('gpm-capture-modal');
-    if (modal) modal.style.display = 'none';
-}
-
-// ─── Macro editor ───────────────────────────────────────────────────
-// v3.4 — macro steps are now polymorphic: {key:{vk,...}} | {mouse:{button,...}}
-// | {vbutton:{vbutton,...}} | {vstick:{stick, x, y, ...}}.  Legacy
-// {vk, hold_ms, delay_after_ms} is also rendered for back-compat (old
-// saved profiles).
-function _macroStepKind(step) {
-    if (!step || typeof step !== 'object') return 'key';
-    if (step.key)      return 'key';
-    if (step.mouse)    return 'mouse';
-    if (step.vbutton)  return 'vbutton';
-    if (step.vstick)   return 'vstick';
-    if (step.vtrigger) return 'vtrigger';
-    if (step.text)     return 'text';
-    if ('vk' in step)  return 'legacy';
-    return 'key';
-}
-
-function _macroStepInner(step, kind) {
-    if (kind === 'legacy') return step;     // legacy lives on the step itself
-    return step[kind] || {};
-}
-
-function _renderMacroSteps() {
-    var stepsEl = document.getElementById('gpm-macro-steps');
-    if (!stepsEl) return;
-    if (!_gpmMacroEditorSteps.length) {
-        stepsEl.innerHTML = '<div style="color:var(--text-tertiary);font-style:italic;padding:12px 0">No steps yet. Click <b>● Record</b> to capture a sequence, or <b>+ Add step manually</b>.</div>';
-        return;
-    }
-    stepsEl.innerHTML = _gpmMacroEditorSteps.map(function(step, i){
-        var kind = _macroStepKind(step);
-        var inner = _macroStepInner(step, kind);
-        var mode = inner.mode || 'tap';
-        var disabled = !!step.disabled;
-        // Step kind picker (key / mouse / vbutton / vstick / vtrigger / text)
-        var kindOpts = ['key','mouse','vbutton','vstick','vtrigger','text'].map(function(k){
-            var label = {key:'Key', mouse:'Mouse', vbutton:'V-btn',
-                         vstick:'V-stick', vtrigger:'V-trig', text:'Text'}[k];
-            return '<option value="' + k + '"' +
-                ((kind === k || (kind === 'legacy' && k === 'key')) ? ' selected' : '') +
-                '>' + label + '</option>';
-        }).join('');
-
-        // Mode picker (tap / down / up)
-        var modeOpts = [
-            ['tap',  'Tap'],
-            ['down', 'Hold ↓'],
-            ['up',   'Release ↑'],
-        ].map(function(o){
-            return '<option value="' + o[0] + '"' + (mode === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
-        }).join('');
-
-        // Target picker (depends on kind)
-        var targetSel = '';
-        if (kind === 'key' || kind === 'legacy') {
-            var keyOpts = GPM_KEY_OPTIONS.map(function(o){
-                return '<option value="' + o.vk + '"' + (inner.vk === o.vk ? ' selected' : '') + '>' + escHtml(o.label) + '</option>';
-            }).join('');
-            targetSel = '<select onchange="onMacroStepChange(' + i + ', \'vk\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;flex:1;min-width:80px">' + keyOpts + '</select>';
-        } else if (kind === 'mouse') {
-            var mb = ['M_LEFT','M_RIGHT','M_MIDDLE','M_X1','M_X2','M_WHEEL_UP','M_WHEEL_DOWN'];
-            var mbOpts = mb.map(function(b){
-                return '<option value="' + b + '"' + (inner.button === b ? ' selected' : '') + '>' + b + '</option>';
-            }).join('');
-            targetSel = '<select onchange="onMacroStepChange(' + i + ', \'button\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;flex:1;min-width:80px">' + mbOpts + '</select>';
-        } else if (kind === 'vbutton') {
-            var vbList = (_gpmState && (_gpmState.available_vbuttons || _gpmState.available_buttons)) || [];
-            var vbOpts = vbList.map(function(b){
-                var label = b;
-                if (b === 'TOUCHPAD' || b === 'PS') label = b + ' (DS4)';
-                return '<option value="' + b + '"' + (inner.vbutton === b ? ' selected' : '') + '>' + escHtml(label) + '</option>';
-            }).join('');
-            targetSel = '<select onchange="onMacroStepChange(' + i + ', \'vbutton\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;flex:1;min-width:80px">' + vbOpts + '</select>';
-        } else if (kind === 'vstick') {
-            var stickSide = inner.stick || 'left';
-            var stickX = (inner.x !== undefined ? inner.x : 0);
-            var stickY = (inner.y !== undefined ? inner.y : 0);
-            var rampMs = inner.ramp_ms || 0;
-            var sideOpts = [['left','L stick'],['right','R stick']].map(function(o){
-                return '<option value="' + o[0] + '"' + (stickSide === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
-            }).join('');
-            // Ranges:  -1 = full up/left,  0 = center,  +1 = full down/right.
-            // For a "small constant pull" (anti-recoil style) use a small
-            // POSITIVE y like y=+0.2 (gentle 20% pull DOWN).  Negative y
-            // pulls UP.  Snapping is instant unless ramp>0.
-            targetSel = '<select onchange="onMacroStepChange(' + i + ', \'stick\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="Which virtual stick to drive">' + sideOpts + '</select>' +
-                ' <label style="font-size:11px;color:var(--text-tertiary)" title="-1 = full left, 0 = center, +1 = full right">x</label>' +
-                '<input type="number" step="0.05" min="-1" max="1" value="' + escAttr(stickX) + '" onchange="onMacroStepChange(' + i + ', \'x\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="-1 = full left, 0 = center, +1 = full right" />' +
-                ' <label style="font-size:11px;color:var(--text-tertiary)" title="-1 = full up, 0 = center, +1 = full down">y</label>' +
-                '<input type="number" step="0.05" min="-1" max="1" value="' + escAttr(stickY) + '" onchange="onMacroStepChange(' + i + ', \'y\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="-1 = full up, 0 = center, +1 = full down (use small values like -0.2 for a gentle pull)" />' +
-                ' <label style="font-size:11px;color:var(--text-tertiary)" title="ms to smoothly ramp from center to target. 0 = snap instantly. Higher = smoother continuous-pull feel.">ramp</label>' +
-                '<input type="number" min="0" value="' + escAttr(rampMs) + '" onchange="onMacroStepChange(' + i + ', \'ramp_ms\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="ms to smoothly ramp from center to target. 0 = snap instantly. Higher = smoother continuous-pull feel." />';
-        } else if (kind === 'vtrigger') {
-            var trigSide = inner.trigger || 'lt';
-            var trigValue = (inner.value !== undefined ? inner.value : 1.0);
-            var sideOpts = [['lt','LT'],['rt','RT']].map(function(o){
-                return '<option value="' + o[0] + '"' + (trigSide === o[0] ? ' selected' : '') + '>' + o[1] + ' (' + (o[0] === 'lt' ? 'L' : 'R') + ' trigger)</option>';
-            }).join('');
-            targetSel = '<select onchange="onMacroStepChange(' + i + ', \'trigger\', this.value)" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">' + sideOpts + '</select>' +
-                ' <label style="font-size:11px;color:var(--text-tertiary)" title="0 = released, 1 = fully pulled">value</label>' +
-                '<input type="number" step="0.05" min="0" max="1" value="' + escAttr(trigValue) + '" onchange="onMacroStepChange(' + i + ', \'value\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" title="0.0 = trigger released, 1.0 = trigger fully pulled" />';
-        } else if (kind === 'text') {
-            var textVal = inner.text || '';
-            var perChar = inner.delay_per_char_ms || 0;
-            targetSel =
-                '<input type="text" placeholder="text to type" value="' + escAttr(textVal) + '" onchange="onMacroStepChange(' + i + ', \'text\', this.value)" style="flex:1;min-width:120px;padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" />' +
-                ' <label style="font-size:11px;color:var(--text-tertiary)">per-char</label>' +
-                '<input type="number" min="0" value="' + escAttr(perChar) + '" onchange="onMacroStepChange(' + i + ', \'delay_per_char_ms\', this.value)" style="width:50px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" />';
-        }
-
-        // Hold + delay (works for all kinds — read down_ms with hold_ms fallback for legacy)
-        var holdVal = inner.down_ms !== undefined ? inner.down_ms : (inner.hold_ms || 30);
-        var delayVal = inner.delay_after_ms || 0;
-        // Text kind ignores tap/hold/up modes — the burst types and exits.
-        // Hide the mode picker + down field for text steps to keep it clean.
-        var showMode = (kind !== 'text');
-        var showDown = showMode && (mode === 'tap');
-        var modeSel = showMode
-            ? '<select onchange="onMacroStepChange(' + i + ', \'mode\', this.value)" style="padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:11px" title="Tap = press+release, Hold ↓ = press only, Release ↑ = release prior hold">' + modeOpts + '</select>'
-            : '';
-        var rowStyle = 'display:flex;align-items:center;gap:6px;padding:6px 0;font-size:12.5px;flex-wrap:wrap'
-            + (disabled ? ';opacity:0.45;text-decoration:line-through' : '');
-        return '<div style="' + rowStyle + '">' +
-                  '<span style="color:var(--text-tertiary);min-width:20px">' + (i+1) + '.</span>' +
-                  // Step actions: move up, move down, duplicate, disable
-                  '<button class="btn btn-sm" onclick="moveMacroStep(' + i + ', -1)" title="Move up" style="font-size:11px;padding:2px 6px"' + (i === 0 ? ' disabled' : '') + '>↑</button>' +
-                  '<button class="btn btn-sm" onclick="moveMacroStep(' + i + ', 1)" title="Move down" style="font-size:11px;padding:2px 6px"' + (i === _gpmMacroEditorSteps.length - 1 ? ' disabled' : '') + '>↓</button>' +
-                  '<button class="btn btn-sm" onclick="toggleMacroStepDisabled(' + i + ')" title="' + (disabled ? 'Enable' : 'Disable') + ' this step" style="font-size:11px;padding:2px 6px">' + (disabled ? '◯' : '⊘') + '</button>' +
-                  '<button class="btn btn-sm" onclick="duplicateMacroStep(' + i + ')" title="Duplicate" style="font-size:11px;padding:2px 6px">⎘</button>' +
-                  '<select onchange="onMacroStepKindChange(' + i + ', this.value)" style="padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:11px">' + kindOpts + '</select>' +
-                  modeSel +
-                  targetSel +
-                  (showDown ?
-                    '<label style="font-size:11px;color:var(--text-tertiary)" title="How long to hold this input down before releasing">down</label>' +
-                    '<input type="number" value="' + escAttr(holdVal) + '" onchange="onMacroStepChange(' + i + ', \'down_ms\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" />'
-                    : '') +
-                  '<label style="font-size:11px;color:var(--text-tertiary)" title="ms to wait before moving to the next macro step">then wait</label>' +
-                  '<input type="number" value="' + escAttr(delayVal) + '" onchange="onMacroStepChange(' + i + ', \'delay_after_ms\', this.value)" style="width:55px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" />' +
-                  '<button class="btn btn-sm btn-danger" onclick="removeMacroStep(' + i + ')" style="font-size:11px;padding:2px 6px">×</button>' +
-               '</div>';
-    }).join('');
-}
-
-// ─── Step action helpers ─────────────────────────────────────────────
-function moveMacroStep(i, direction) {
-    var j = i + direction;
-    if (j < 0 || j >= _gpmMacroEditorSteps.length) return;
-    var tmp = _gpmMacroEditorSteps[i];
-    _gpmMacroEditorSteps[i] = _gpmMacroEditorSteps[j];
-    _gpmMacroEditorSteps[j] = tmp;
-    _renderMacroSteps();
-}
-
-function duplicateMacroStep(i) {
-    var src = _gpmMacroEditorSteps[i];
-    if (!src) return;
-    var copy = JSON.parse(JSON.stringify(src));
-    _gpmMacroEditorSteps.splice(i + 1, 0, copy);
-    _renderMacroSteps();
-}
-
-function toggleMacroStepDisabled(i) {
-    var step = _gpmMacroEditorSteps[i];
-    if (!step) return;
-    step.disabled = !step.disabled;
-    _renderMacroSteps();
-}
-
-function addGpmMacroStep() {
-    // Default delay_after_ms is 0 — new steps fire back-to-back instantly
-    // unless the user explicitly types in a delay.  Avoids the 50ms
-    // implicit pause that surprised users in early v3.4 builds.
-    _gpmMacroEditorSteps.push({key: {vk: 0x20, down_ms: 30,
-                                      delay_after_ms: 0, mode: 'tap'}});
-    _renderMacroSteps();
-}
-
-function removeMacroStep(i) {
-    _gpmMacroEditorSteps.splice(i, 1);
-    _renderMacroSteps();
-}
-
-function onMacroStepKindChange(i, newKind) {
-    if (!_gpmMacroEditorSteps[i]) return;
-    var step = _gpmMacroEditorSteps[i];
-    var oldKind = _macroStepKind(step);
-    var oldInner = _macroStepInner(step, oldKind);
-    var hold = oldInner.down_ms !== undefined ? oldInner.down_ms : (oldInner.hold_ms || 30);
-    var delay = oldInner.delay_after_ms || 0;
-    var mode = oldInner.mode || 'tap';
-    var newStep = {};
-    if (newKind === 'key')      newStep.key      = {vk: 0x20,         down_ms: hold, delay_after_ms: delay, mode: mode};
-    if (newKind === 'mouse')    newStep.mouse    = {button: 'M_LEFT', down_ms: hold, delay_after_ms: delay, mode: mode};
-    if (newKind === 'vbutton')  newStep.vbutton  = {vbutton: 'A',     down_ms: hold, delay_after_ms: delay, mode: mode};
-    if (newKind === 'vstick')   newStep.vstick   = {stick: 'left', x: 0, y: -1, down_ms: hold, delay_after_ms: delay, mode: mode};
-    if (newKind === 'vtrigger') newStep.vtrigger = {trigger: 'rt', value: 1.0, down_ms: hold, delay_after_ms: delay, mode: mode};
-    if (newKind === 'text')     newStep.text     = {text: '',           delay_per_char_ms: 0, delay_after_ms: delay};
-    // Preserve disabled flag across kind changes
-    if (step.disabled) newStep.disabled = true;
-    _gpmMacroEditorSteps[i] = newStep;
-    _renderMacroSteps();
-}
-
-function onMacroStepChange(i, field, val) {
-    var step = _gpmMacroEditorSteps[i];
-    if (!step) return;
-    var kind = _macroStepKind(step);
-    if (kind === 'legacy') {
-        // Convert legacy to v3.4 key step on first edit
-        var newStep = {key: {
-            vk: step.vk,
-            down_ms: step.hold_ms || 30,
-            delay_after_ms: step.delay_after_ms || 0,
-            mode: 'tap',
-        }};
-        _gpmMacroEditorSteps[i] = newStep;
-        step = newStep;
-        kind = 'key';
-    }
-    var inner = step[kind];
-    // Field types:
-    //   vk / down_ms / delay_after_ms  → integer
-    //   x / y                           → float (-1..1)
-    //   stick / button / vbutton / mode → string
-    if (field === 'vk' || field === 'down_ms' || field === 'delay_after_ms'
-            || field === 'ramp_ms' || field === 'delay_per_char_ms') {
-        inner[field] = Math.max(0, parseInt(val, 10) || 0);
-    } else if (field === 'x' || field === 'y') {
-        var n = parseFloat(val);
-        if (isNaN(n)) n = 0;
-        inner[field] = Math.max(-1, Math.min(1, n));
-    } else if (field === 'value') {
-        // 0..1 float — vtrigger pull amount
-        var v = parseFloat(val);
-        if (isNaN(v)) v = 0;
-        inner[field] = Math.max(0, Math.min(1, v));
-    } else {
-        inner[field] = val;
-    }
-    // If mode changed, the row's down/wait label changes — re-render
-    if (field === 'mode') _renderMacroSteps();
-}
-
-function saveGpmMacroEditor() {
-    if (!_gpmCurrentProfile || !_gpmMacroEditorBtn) return;
-    // v3.4 — _gpmMacroEditorBtn is a mapping ID (random hex string)
-    var m = _findMapping(_gpmMacroEditorBtn);
-    if (m) {
-        m.output = {
-            target:        'macro',
-            steps:         _gpmMacroEditorSteps,
-            play_mode:     _gpmMacroPlayMode || 'once',
-            repeat_count:  _gpmMacroRepeatCount || 2,
-        };
-    }
-    var modal = document.getElementById('gpm-macro-modal');
-    if (modal) modal.style.display = 'none';
-    _gpmAutoSave();
-    _gpmRenderBindingsLocal();
-}
-
-function cancelGpmMacroEditor() {
-    var modal = document.getElementById('gpm-macro-modal');
-    if (modal) modal.style.display = 'none';
-    _gpmMacroEditorBtn = null;
-    _gpmMacroEditorSteps = [];
-    // If a recording session is active, kill it
-    if (_gpmRecordingTimer) {
-        cancelMacroRecording();
-    }
-}
-
-// ─── v3.4 macro recording ────────────────────────────────────────────
-var _gpmRecordingTimer = null;
-
-// ─── Recoil preset picker ──────────────────────────────────────────
-var _gpmRecoilPresets = null;
-
-async function openRecoilPresetPicker() {
-    var modal = document.getElementById('gpm-recoil-modal');
-    var listEl = document.getElementById('gpm-recoil-list');
-    if (!modal || !listEl) return;
-    modal.style.display = 'flex';
-    listEl.innerHTML = '<div style="color:var(--text-tertiary)">Loading presets…</div>';
-    // Always re-fetch so freshly-captured user presets appear immediately
-    var r = await apiGet('/api/gamepad/recoil-presets');
-    _gpmRecoilPresets = (r && r.presets) || [];
-
-    // Capture availability — hide the buttons gracefully if libs missing
-    var avail = await apiGet('/api/gamepad/capture/availability');
-    var captureRow = '';
-    if (avail && avail.available) {
-        captureRow =
-            '<div style="display:flex;gap:8px;flex-wrap:wrap;padding:10px 12px;background:var(--bg-elevated);border-radius:6px;margin-bottom:14px;border:1px dashed var(--border-faint)">' +
-                '<div style="flex:1;min-width:200px;font-size:11px;color:var(--text-tertiary);line-height:1.4">' +
-                    '<b style="color:var(--text-bright)">Capture your own pattern</b><br/>' +
-                    'Pick a method.  Counter-pull is the simplest: fire + manually compensate, we record what you do.' +
-                '</div>' +
-                '<button class="btn btn-sm" onclick="openCaptureCounterPullModal()" title="Fire + counter-pull manually with your mouse or right stick. We record what you do as the pattern.  Works in any game; quality depends on your counter-pull technique.">✋ Counter-pull</button>' +
-                '<button class="btn btn-sm" onclick="openCaptureScreenModal()" title="Fire while we screenshot the foreground window. Phase correlation extracts the camera drift">📹 From gameplay</button>' +
-                '<button class="btn btn-sm" onclick="openCaptureBulletModal()" title="Snapshot before + after firing. We diff and detect bullet hole positions on the wall">🎯 From bullet holes</button>' +
-            '</div>';
-    } else if (avail && !avail.available) {
-        captureRow = '<div style="padding:8px 12px;background:var(--bg-elevated);border-radius:6px;margin-bottom:14px;font-size:11px;color:var(--text-tertiary)">' +
-            'Capture features unavailable in this build (' + escHtml(avail.err || 'libs missing') + ')' +
-        '</div>';
-    }
-
-    if (!_gpmRecoilPresets.length) {
-        listEl.innerHTML = captureRow + '<div style="color:var(--text-tertiary);font-style:italic">No presets yet. Capture one above, or check the bundled list.</div>';
-        return;
-    }
-    // Group by game, render cards.  User-captured presets get an extra
-    // delete button + a "captured" badge.
-    var byGame = {};
-    _gpmRecoilPresets.forEach(function(p){
-        if (!byGame[p.game]) byGame[p.game] = [];
-        byGame[p.game].push(p);
-    });
-    var sortedGames = Object.keys(byGame).sort(function(a, b){
-        // Put "(captured)" group first so user-made stuff is visible
-        if (a === '(captured)') return -1;
-        if (b === '(captured)') return 1;
-        return a.localeCompare(b);
-    });
-    listEl.innerHTML = captureRow + sortedGames.map(function(game){
-        var rows = byGame[game].map(function(p){
-            var userBadge = p.is_user
-                ? '<span style="margin-left:6px;padding:1px 6px;background:var(--accent);color:var(--bg);border-radius:3px;font-size:10px;font-weight:600">CAPTURED</span>'
-                : '';
-            var deleteBtn = p.is_user
-                ? '<button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteUserRecoilPreset(' + jsArg(p.id) + ')" style="font-size:10px;padding:2px 6px;margin-left:8px" title="Delete this captured preset">✕</button>'
-                : '';
-            return '<div onclick="applyRecoilPreset(' + jsArg(p.id) + ')" style="cursor:pointer;padding:10px 12px;background:var(--bg-overlay);border:1px solid var(--border-faint);border-radius:6px;margin-bottom:6px;transition:background 0.12s" onmouseover="this.style.background=\'var(--bg-elevated)\'" onmouseout="this.style.background=\'var(--bg-overlay)\'">' +
-                '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:4px">' +
-                    '<div><b style="color:var(--text-bright);font-size:13px">' + escHtml(p.weapon || p.name) + '</b>' + userBadge + '</div>' +
-                    '<div style="display:flex;align-items:center;gap:4px">' +
-                        '<span style="font-size:11px;color:var(--text-tertiary);font-family:var(--font-mono,monospace)">' + (p.shots || 0) + ' steps · ' + (p.duration_ms || 0) + ' ms each · ' + escHtml(p.play_mode) + '</span>' +
-                        deleteBtn +
-                    '</div>' +
-                '</div>' +
-                '<div style="font-size:12px;color:var(--text-secondary);line-height:1.5">' + escHtml(p.description || '') + '</div>' +
-            '</div>';
-        }).join('');
-        return '<div style="margin-bottom:12px">' +
-                  '<div style="font-size:11px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase;margin-bottom:6px">' + escHtml(game) + '</div>' +
-                  rows +
-               '</div>';
-    }).join('');
-}
-
-async function deleteUserRecoilPreset(presetId) {
-    if (!confirm('Delete this captured recoil preset? This cannot be undone.')) return;
-    var r = await apiPost('/api/gamepad/capture/delete', {id: presetId});
-    if (r && r.ok) {
-        _gpmRecoilPresets = null;   // force refetch
-        await openRecoilPresetPicker();
-    } else {
-        showErrorToast('Delete failed: ' + ((r && r.err) || 'unknown'));
-    }
-}
-
-function closeRecoilPresetPicker() {
-    var modal = document.getElementById('gpm-recoil-modal');
-    if (modal) modal.style.display = 'none';
-}
-
-function applyRecoilPreset(presetId) {
-    var preset = (_gpmRecoilPresets || []).find(function(p){ return p.id === presetId; });
-    if (!preset) return;
-    if (!confirm('Replace current macro steps with the "' + preset.name + '" preset?\n\n' +
-                 'This will overwrite ' + (_gpmMacroEditorSteps.length || 0) + ' existing step(s).\n\n' +
-                 'Anti-cheat warning: do not use in ranked competitive games.')) {
-        return;
-    }
-    _gpmMacroEditorSteps = JSON.parse(JSON.stringify(preset.steps || []));
-    _gpmMacroPlayMode = preset.play_mode || 'once';
-    // Sync the play-mode UI
-    var pm = document.getElementById('gpm-macro-play-mode');
-    if (pm) pm.value = _gpmMacroPlayMode;
-    var rcWrap = document.getElementById('gpm-macro-repeat-wrap');
-    if (rcWrap) rcWrap.style.display = (_gpmMacroPlayMode === 'repeat_n' ? '' : 'none');
-    closeRecoilPresetPicker();
-    _renderMacroSteps();
-}
-
-// ─── v3.6 — recoil pattern capture from gameplay ─────────────────────
-var _captureScreenState = {
-    captured: null,    // server-returned binned trace after stop
-    pollTimer: null,
-};
-
-function openCaptureScreenModal() {
-    var m = document.getElementById('gpm-capture-screen-modal');
-    if (m) m.style.display = 'flex';
-    _captureScreenState = {captured: null, pollTimer: null};
-    var status = document.getElementById('gpm-capture-screen-status');
-    if (status) status.innerHTML = '<span style="color:var(--text-tertiary)">Idle. Fill in details and click Start.</span>';
-    var saveBtn = document.getElementById('gpm-capture-screen-save');
-    if (saveBtn) saveBtn.disabled = true;
-}
-
-function closeCaptureScreenModal() {
-    var m = document.getElementById('gpm-capture-screen-modal');
-    if (m) m.style.display = 'none';
-    // Closing ends a running capture the way Stop does (it also clears the
-    // poll); left running, auto-fire held RT for the whole max_duration_sec.
-    // A start still in its countdown sees `closed` and does not begin.
-    _captureScreenState.closed = true;
-    if (_captureScreenState.pollTimer) stopCaptureScreen();
-}
-
-async function startCaptureScreen() {
-    var rpm = parseInt(document.getElementById('gpm-capture-screen-rpm').value, 10) || 600;
-    var dur = parseFloat(document.getElementById('gpm-capture-screen-dur').value) || 6.0;
-    var autoFire = !!(document.getElementById('gpm-capture-screen-autofire') &&
-                       document.getElementById('gpm-capture-screen-autofire').checked);
-    var status = document.getElementById('gpm-capture-screen-status');
-    var saveBtn = document.getElementById('gpm-capture-screen-save');
-    var startBtn = document.getElementById('gpm-capture-screen-start');
-    var stopBtn  = document.getElementById('gpm-capture-screen-stop');
-    var st = _captureScreenState;   // closeCaptureScreenModal marks it closed
-    if (saveBtn) saveBtn.disabled = true;
-
-    if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">3… 2… 1… alt-tab to your game now' +
-        (autoFire ? ' (we\'ll fire RT for you)' : ' and FIRE') + '</span>';
-    // Brief countdown so the user has time to focus the game window
-    await new Promise(function(res){ setTimeout(res, 3000); });
-    if (st.closed) return;   // dialog closed during the countdown: don't start firing
-
-    var r = await apiPost('/api/gamepad/capture/screen/start',
-                          {rpm: rpm, max_duration_sec: dur, capture_hz: 120,
-                           auto_fire: autoFire});
-    if (!r || !r.ok) {
-        if (status) status.innerHTML = '<span style="color:var(--danger,#f87171)">Failed: ' + escHtml((r && r.err) || 'unknown') + '</span>';
-        return;
-    }
-    if (st.closed) { stopCaptureScreen(); return; }   // closed while it was starting
-    if (autoFire && !r.autofire_engaged) {
-        // Asked for autofire, didn't get it — warn but continue (user
-        // can still fire manually).  Don't block the capture; the
-        // common case is "user enabled the box but mapper isn't on".
-        if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">Auto-fire couldn\'t engage (virtual pad not running). Fire RT manually instead.  Capturing…</span>';
-    }
-    if (startBtn) startBtn.disabled = true;
-    if (stopBtn)  stopBtn.disabled  = false;
-
-    if (_captureScreenState.pollTimer) clearInterval(_captureScreenState.pollTimer);
-    var pollId = _captureScreenState.pollTimer = setInterval(async function(){
-        var s = await apiGet('/api/gamepad/capture/status');
-        // Stopped (or the modal reopened) while this poll was in flight.  A
-        // second stop call answers "no capture in progress" over the result.
-        if (_captureScreenState.pollTimer !== pollId) { clearInterval(pollId); return; }
-        if (!s || !s.active) {
-            // Capture ended on its own — pull final result
-            clearInterval(_captureScreenState.pollTimer);
-            _captureScreenState.pollTimer = null;
-            await stopCaptureScreen(true);
-            return;
-        }
-        if (status) status.innerHTML = '<span style="color:var(--accent)">Capturing… ' + (s.elapsed_sec || 0).toFixed(1) + 's, ' + (s.frames || 0) + ' frames</span>';
-    }, 200);
-}
-
-async function stopCaptureScreen(autoTriggered) {
-    var startBtn = document.getElementById('gpm-capture-screen-start');
-    var stopBtn  = document.getElementById('gpm-capture-screen-stop');
-    var status   = document.getElementById('gpm-capture-screen-status');
-    var saveBtn  = document.getElementById('gpm-capture-screen-save');
-    if (_captureScreenState.pollTimer) {
-        clearInterval(_captureScreenState.pollTimer);
-        _captureScreenState.pollTimer = null;
-    }
-    if (stopBtn) stopBtn.disabled = true;   // a double click would send a second stop
-    var r = await apiPost('/api/gamepad/capture/screen/stop', {});
-    if (startBtn) startBtn.disabled = false;
-    if (stopBtn)  stopBtn.disabled  = true;
-    if (!r || !r.ok) {
-        if (status) status.innerHTML = '<span style="color:var(--danger,#f87171)">Stop failed: ' + escHtml((r && r.err) || 'unknown') + '</span>';
-        return;
-    }
-    _captureScreenState.captured = r;
-    var binned = r.binned || [];
-    if (status) {
-        status.innerHTML =
-            '<span style="color:var(--accent)">Captured ' + binned.length + ' shots from ' + (r.raw_count || 0) + ' frames.</span>' +
-            '<br/><span style="font-size:11px;color:var(--text-tertiary)">' +
-            _summarizeBinnedTrace(binned) +
-            '</span>';
-    }
-    if (saveBtn) saveBtn.disabled = false;
-}
-
-function _summarizeBinnedTrace(binned) {
-    if (!binned.length) return 'No shots binned. Try a higher RPM or longer duration';
-    var maxAbsX = 0, maxAbsY = 0, sumDx = 0, sumDy = 0;
-    binned.forEach(function(b){
-        if (Math.abs(b.dx) > maxAbsX) maxAbsX = Math.abs(b.dx);
-        if (Math.abs(b.dy) > maxAbsY) maxAbsY = Math.abs(b.dy);
-        sumDx += b.dx; sumDy += b.dy;
-    });
-    return 'Σ dx=' + sumDx + ' px · Σ dy=' + sumDy + ' px · max |dx|=' + maxAbsX + ' · max |dy|=' + maxAbsY;
-}
-
-async function saveCaptureScreen() {
-    var captured = _captureScreenState.captured;
-    if (!captured) return;
-    var name    = (document.getElementById('gpm-capture-screen-name').value || '').trim();
-    var weapon  = (document.getElementById('gpm-capture-screen-weapon').value || '').trim();
-    var game    = (document.getElementById('gpm-capture-screen-game').value || '').trim();
-    var sens    = parseFloat(document.getElementById('gpm-capture-screen-sens').value) || 0.005;
-    var playMode = document.getElementById('gpm-capture-screen-playmode').value || 'once';
-    if (!name) { showWarnToast('Give the preset a name first.'); return; }
-    var r = await apiPost('/api/gamepad/capture/save', {
-        name: name, weapon: weapon, game: game,
-        rpm: captured.rpm, binned: captured.binned,
-        method: 'screen', sensitivity_scale: sens,
-        play_mode: playMode, auto_hold_rt: true,
-    });
-    if (!r || !r.ok) { showErrorToast('Save failed: ' + ((r && r.err) || 'unknown')); return; }
-    showInfoToast('Saved as "' + (r.preset && r.preset.name) + '" (' + (r.preset && r.preset.shots) + ' steps).  Find it in the recoil presets list.');
-    closeCaptureScreenModal();
-    _gpmRecoilPresets = null;
-    await openRecoilPresetPicker();
-}
-
-// ─── Bullet-hole capture workflow ────────────────────────────────────
-function openCaptureBulletModal() {
-    var m = document.getElementById('gpm-capture-bullet-modal');
-    if (m) m.style.display = 'flex';
-    _refreshBulletState();
-}
-
-function closeCaptureBulletModal() {
-    var m = document.getElementById('gpm-capture-bullet-modal');
-    if (m) m.style.display = 'none';
-}
-
-async function _refreshBulletState() {
-    var s = await apiGet('/api/gamepad/capture/bullet-holes/state');
-    var b = document.getElementById('gpm-capture-bullet-before');
-    var a = document.getElementById('gpm-capture-bullet-after');
-    var d = document.getElementById('gpm-capture-bullet-detect');
-    if (b) b.textContent = s && s.have_before ? '✓ Before captured' : 'Capture before';
-    if (a) a.textContent = s && s.have_after  ? '✓ After captured'  : 'Capture after';
-    if (d) d.disabled = !(s && s.have_before && s.have_after);
-}
-
-async function captureBulletBefore() {
-    var r = await apiPost('/api/gamepad/capture/bullet-holes/snapshot', {which: 'before'});
-    if (!r || !r.ok) showErrorToast('Capture before failed: ' + ((r && r.err) || 'unknown'));
-    _refreshBulletState();
-}
-
-async function captureBulletAfter() {
-    var r = await apiPost('/api/gamepad/capture/bullet-holes/snapshot', {which: 'after'});
-    if (!r || !r.ok) showErrorToast('Capture after failed: ' + ((r && r.err) || 'unknown'));
-    _refreshBulletState();
-}
-
-// ─── v3.6 — counter-pull capture (option B) ──────────────────────────
-var _captureCounterPullState = {captured: null, pollTimer: null};
-
-function openCaptureCounterPullModal() {
-    var m = document.getElementById('gpm-capture-cp-modal');
-    if (m) m.style.display = 'flex';
-    _captureCounterPullState = {captured: null, pollTimer: null};
-    var status = document.getElementById('gpm-capture-cp-status');
-    if (status) status.innerHTML = '<span style="color:var(--text-tertiary)">Idle. Fill in the form and click Start.</span>';
-    var saveBtn = document.getElementById('gpm-capture-cp-save');
-    if (saveBtn) saveBtn.disabled = true;
-}
-
-function closeCaptureCounterPullModal() {
-    var m = document.getElementById('gpm-capture-cp-modal');
-    if (m) m.style.display = 'none';
-    // Same as the screen capture: closing ends a running capture like Stop,
-    // and a start still in its countdown does not begin.
-    _captureCounterPullState.closed = true;
-    if (_captureCounterPullState.pollTimer) stopCaptureCounterPull();
-}
-
-async function startCaptureCounterPull() {
-    var rpm    = parseInt(document.getElementById('gpm-capture-cp-rpm').value, 10) || 600;
-    var dur    = parseFloat(document.getElementById('gpm-capture-cp-dur').value) || 6.0;
-    var source = document.getElementById('gpm-capture-cp-source').value;
-    var autoFire = !!(document.getElementById('gpm-capture-cp-autofire') &&
-                      document.getElementById('gpm-capture-cp-autofire').checked);
-    var status = document.getElementById('gpm-capture-cp-status');
-    var saveBtn = document.getElementById('gpm-capture-cp-save');
-    var startBtn = document.getElementById('gpm-capture-cp-start');
-    var stopBtn  = document.getElementById('gpm-capture-cp-stop');
-    var st = _captureCounterPullState;   // closeCaptureCounterPullModal marks it closed
-    if (saveBtn) saveBtn.disabled = true;
-
-    if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">3… 2… 1… alt-tab to your game now and FIRE while compensating</span>';
-    await new Promise(function(res){ setTimeout(res, 3000); });
-    if (st.closed) return;   // dialog closed during the countdown: don't start firing
-
-    var r = await apiPost('/api/gamepad/capture/counter-pull/start', {
-        rpm: rpm, max_duration_sec: dur, source: source, auto_fire: autoFire
-    });
-    if (!r || !r.ok) {
-        if (status) status.innerHTML = '<span style="color:var(--danger,#f87171)">Failed: ' + escHtml((r && r.err) || 'unknown') + '</span>';
-        return;
-    }
-    if (st.closed) { stopCaptureCounterPull(); return; }   // closed while it was starting
-    if (autoFire && !r.autofire_engaged) {
-        if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">Auto-fire couldn\'t engage. Fire RT manually.  Recording…</span>';
-    }
-    if (startBtn) startBtn.disabled = true;
-    if (stopBtn)  stopBtn.disabled  = false;
-
-    if (_captureCounterPullState.pollTimer) clearInterval(_captureCounterPullState.pollTimer);
-    var pollId = _captureCounterPullState.pollTimer = setInterval(async function(){
-        var s = await apiGet('/api/gamepad/capture/status');
-        // Stopped (or the modal reopened) while this poll was in flight
-        if (_captureCounterPullState.pollTimer !== pollId) { clearInterval(pollId); return; }
-        if (!s || !s.active) {
-            clearInterval(_captureCounterPullState.pollTimer);
-            _captureCounterPullState.pollTimer = null;
-            await stopCaptureCounterPull(true);
-            return;
-        }
-        if (status) {
-            var n = s.samples || 0;
-            var color = n > 0 ? 'var(--accent)' : 'var(--orange,#fbbf24)';
-            var hint = n > 0
-                ? ''
-                : '. No input arriving yet, are you actually moving the stick / mouse?';
-            status.innerHTML = '<span style="color:' + color + '">Recording counter-pull… ' + (s.elapsed_sec || 0).toFixed(1) + 's · ' + n + ' samples' + hint + '</span>';
-        }
-    }, 200);
-}
-
-async function stopCaptureCounterPull(autoTriggered) {
-    var startBtn = document.getElementById('gpm-capture-cp-start');
-    var stopBtn  = document.getElementById('gpm-capture-cp-stop');
-    var status   = document.getElementById('gpm-capture-cp-status');
-    var saveBtn  = document.getElementById('gpm-capture-cp-save');
-    if (_captureCounterPullState.pollTimer) {
-        clearInterval(_captureCounterPullState.pollTimer);
-        _captureCounterPullState.pollTimer = null;
-    }
-    if (stopBtn) stopBtn.disabled = true;   // a double click would send a second stop
-    var r = await apiPost('/api/gamepad/capture/counter-pull/stop', {});
-    if (startBtn) startBtn.disabled = false;
-    if (stopBtn)  stopBtn.disabled  = true;
-    if (!r || !r.ok) {
-        if (status) status.innerHTML = '<span style="color:var(--danger,#f87171)">Stop failed: ' + escHtml((r && r.err) || 'unknown') + '</span>';
-        return;
-    }
-    _captureCounterPullState.captured = r;
-    var binned = r.binned || [];
-    if (status) {
-        status.innerHTML =
-            '<span style="color:var(--accent)">Captured ' + binned.length + ' shots from ' + (r.raw_count || 0) + ' samples (source: ' + escHtml(r.source) + ').</span>' +
-            '<br/><span style="font-size:11px;color:var(--text-tertiary)">' +
-            _summarizeBinnedTrace(binned) +
-            '</span>';
-    }
-    if (saveBtn) saveBtn.disabled = false;
-}
-
-async function saveCaptureCounterPull() {
-    var captured = _captureCounterPullState.captured;
-    if (!captured) return;
-    var name    = (document.getElementById('gpm-capture-cp-name').value || '').trim();
-    var weapon  = (document.getElementById('gpm-capture-cp-weapon').value || '').trim();
-    var game    = (document.getElementById('gpm-capture-cp-game').value || '').trim();
-    var sens    = parseFloat(document.getElementById('gpm-capture-cp-sens').value) || 0.005;
-    var playMode = document.getElementById('gpm-capture-cp-playmode').value || 'once';
-    if (!name) { showWarnToast('Give the preset a name first.'); return; }
-    var r = await apiPost('/api/gamepad/capture/save', {
-        name: name, weapon: weapon, game: game,
-        rpm: captured.rpm, binned: captured.binned,
-        method: 'counter_pull_' + (captured.source || 'mouse'),
-        sensitivity_scale: sens,
-        play_mode: playMode, auto_hold_rt: true,
-    });
-    if (!r || !r.ok) { showErrorToast('Save failed: ' + ((r && r.err) || 'unknown')); return; }
-    showInfoToast('Saved as "' + (r.preset && r.preset.name) + '" (' + (r.preset && r.preset.shots) + ' steps).');
-    closeCaptureCounterPullModal();
-    _gpmRecoilPresets = null;
-    await openRecoilPresetPicker();
-}
-
-async function autoFireMag() {
-    var dur = parseFloat(document.getElementById('gpm-capture-bullet-fire-dur').value) || 3.0;
-    var status = document.getElementById('gpm-capture-bullet-status');
-    if (status) status.innerHTML = '<span style="color:var(--orange,#fbbf24)">Alt-tab to your game now. Firing RT for ' + dur + 's…</span>';
-    // Give the user a brief moment to focus the game window
-    await new Promise(function(res){ setTimeout(res, 1500); });
-    var r = await apiPost('/api/gamepad/capture/auto-fire-mag', {duration_sec: dur});
-    if (!r || !r.ok) {
-        if (status) status.innerHTML = '<span style="color:var(--danger,#f87171)">Auto-fire failed: ' + escHtml((r && r.err) || 'unknown') + '</span>';
-        return;
-    }
-    // Wait for the firing to actually finish (with margin), then prompt
-    setTimeout(function(){
-        if (status) status.innerHTML = '<span style="color:var(--accent)">Done firing.  Click <b>Capture after</b> to snapshot the wall.</span>';
-    }, (dur + 0.3) * 1000);
-}
-
-async function detectBulletHoles() {
-    var rpm = parseInt(document.getElementById('gpm-capture-bullet-rpm').value, 10) || 600;
-    var thr = parseInt(document.getElementById('gpm-capture-bullet-threshold').value, 10) || 60;
-    var status = document.getElementById('gpm-capture-bullet-status');
-    if (status) status.innerHTML = '<span style="color:var(--text-tertiary)">Diffing snapshots…</span>';
-    var r = await apiPost('/api/gamepad/capture/bullet-holes/detect',
-                          {rpm: rpm, threshold: thr});
-    if (!r || !r.ok) {
-        if (status) status.innerHTML = '<span style="color:var(--danger,#f87171)">Detect failed: ' + escHtml((r && r.err) || 'unknown') + '</span>';
-        return;
-    }
-    _captureBulletState = r;     // store for save
-    if (status) {
-        status.innerHTML = '<span style="color:var(--accent)">Found ' + r.count + ' bullet holes.</span>' +
-            '<br/><span style="font-size:11px;color:var(--text-tertiary)">' +
-            _summarizeBinnedTrace(r.binned) + '</span>';
-    }
-    var saveBtn = document.getElementById('gpm-capture-bullet-save');
-    if (saveBtn) saveBtn.disabled = false;
-}
-
-var _captureBulletState = null;
-
-async function resetBulletCapture() {
-    await apiPost('/api/gamepad/capture/bullet-holes/reset', {});
-    _captureBulletState = null;
-    _refreshBulletState();
-    var status = document.getElementById('gpm-capture-bullet-status');
-    if (status) status.innerHTML = '';
-    var saveBtn = document.getElementById('gpm-capture-bullet-save');
-    if (saveBtn) saveBtn.disabled = true;
-}
-
-async function saveCaptureBullet() {
-    var captured = _captureBulletState;
-    if (!captured) return;
-    var name    = (document.getElementById('gpm-capture-bullet-name').value || '').trim();
-    var weapon  = (document.getElementById('gpm-capture-bullet-weapon').value || '').trim();
-    var game    = (document.getElementById('gpm-capture-bullet-game').value || '').trim();
-    var sens    = parseFloat(document.getElementById('gpm-capture-bullet-sens').value) || 0.005;
-    var playMode = document.getElementById('gpm-capture-bullet-playmode').value || 'once';
-    if (!name) { showWarnToast('Give the preset a name first.'); return; }
-    var r = await apiPost('/api/gamepad/capture/save', {
-        name: name, weapon: weapon, game: game,
-        rpm: captured.rpm, binned: captured.binned,
-        method: 'bullet_holes', sensitivity_scale: sens,
-        play_mode: playMode, auto_hold_rt: true,
-    });
-    if (!r || !r.ok) { showErrorToast('Save failed: ' + ((r && r.err) || 'unknown')); return; }
-    showInfoToast('Saved as "' + (r.preset && r.preset.name) + '" (' + (r.preset && r.preset.shots) + ' steps).');
-    closeCaptureBulletModal();
-    _gpmRecoilPresets = null;
-    await openRecoilPresetPicker();
-}
-
-// v3.6 — options-first record flow.  Click "Record" → modal with
-// source-filter checkboxes + countdown — Start → 2-sec countdown
-// → recording.  Backwards-compat: if the modal isn't in the DOM
-// (older builds) we fall back to the previous immediate-start flow.
-function startMacroRecording() {
-    var modal = document.getElementById('gpm-macro-record-options-modal');
-    if (!modal) return _startMacroRecordingImmediate();
-    modal.style.display = 'flex';
-}
-
-function closeMacroRecordOptions() {
-    var modal = document.getElementById('gpm-macro-record-options-modal');
-    if (modal) modal.style.display = 'none';
-}
-
-async function confirmMacroRecordOptions() {
-    var get = function(id){
-        var el = document.getElementById(id);
-        return el ? !!el.checked : false;
-    };
-    var filters = {
-        keyboard:            get('gpm-rec-opt-keyboard'),
-        mouse_buttons:       get('gpm-rec-opt-mouse-buttons'),
-        mouse_move:          get('gpm-rec-opt-mouse-move'),
-        controller_buttons:  get('gpm-rec-opt-ctrl-buttons'),
-        controller_sticks:   get('gpm-rec-opt-ctrl-sticks'),
-        controller_triggers: get('gpm-rec-opt-ctrl-triggers'),
-    };
-    if (!Object.values(filters).some(Boolean)) {
-        showWarnToast('Pick at least one source to record.');
-        return;
-    }
-    var delaySec = parseFloat(document.getElementById('gpm-rec-opt-delay').value);
-    if (!isFinite(delaySec) || delaySec < 0) delaySec = 2.0;
-    closeMacroRecordOptions();
-    await _startMacroRecordingWith(filters, delaySec);
-}
-
-async function _startMacroRecordingImmediate() {
-    // Legacy fallback — record everything digital, no countdown.
-    await _startMacroRecordingWith({
-        keyboard: true, mouse_buttons: true, mouse_move: false,
-        controller_buttons: true, controller_sticks: false,
-        controller_triggers: true,
-    }, 0.0);
-}
-
-async function _startMacroRecordingWith(filters, delaySec) {
-    var r = await apiPost('/api/gamepad/macro/record/start', {
-        skip_move: !filters.mouse_move,
-        start_delay_sec: delaySec,
-        filters: filters,
-    });
-    if (!r || !r.ok) {
-        showErrorToast('Could not start recording: ' + (r && r.err || 'unknown'));
-        return;
-    }
-    var rec = document.getElementById('gpm-macro-recording');
-    if (rec) rec.style.display = 'block';
-    var btn = document.getElementById('gpm-macro-record-btn');
-    if (btn) {
-        btn.disabled = true;
-        btn.textContent = (r.phase === 'countdown') ? 'Starting in ' + delaySec.toFixed(0) + 's…' : 'Recording…';
-    }
-    if (_gpmRecordingTimer) clearInterval(_gpmRecordingTimer);
-    _gpmRecordingTimer = setInterval(async function(){
-        var s = await apiGet('/api/gamepad/macro/record/status');
-        // A failed read has no phase and used to stop this poll for good
-        if (!s || s.ok === false) return;
-        var lbl = document.getElementById('gpm-macro-rec-timer');
-        if (lbl && s) {
-            if (s.phase === 'countdown') {
-                lbl.textContent = 'Starting in ' + (s.countdown_remaining_sec || 0).toFixed(1) + 's…';
-            } else if (s.phase === 'recording') {
-                var dig = s.events || 0;
-                var ana = (s.stick_samples || 0) + (s.trigger_samples || 0) + (s.mouse_moves || 0);
-                lbl.textContent = (s.elapsed_sec || 0).toFixed(1) + 's · ' +
-                    dig + ' digital · ' + ana + ' analog';
-            }
-        }
-        if (s && s.phase === 'countdown') {
-            if (btn) btn.textContent = 'Starting in ' + (s.countdown_remaining_sec || 0).toFixed(1) + 's…';
-        } else if (s && s.phase === 'recording') {
-            if (btn) btn.textContent = 'Recording…';
-        }
-        if (s && s.phase !== 'countdown' && s.phase !== 'recording') {
-            // Backend stopped without us — refresh UI state
-            clearInterval(_gpmRecordingTimer);
-            _gpmRecordingTimer = null;
-        }
-    }, 200);
-}
-
-async function stopMacroRecording(append) {
-    if (_gpmRecordingTimer) {
-        clearInterval(_gpmRecordingTimer);
-        _gpmRecordingTimer = null;
-    }
-    var r = await apiPost('/api/gamepad/macro/record/stop', {});
-    var rec = document.getElementById('gpm-macro-recording');
-    if (rec) rec.style.display = 'none';
-    var btn = document.getElementById('gpm-macro-record-btn');
-    if (btn) { btn.disabled = false; btn.textContent = '● Record'; }
-    if (!r || !r.ok) {
-        showErrorToast('Recording stop failed: ' + (r && r.err || 'unknown'));
-        return;
-    }
-    var newSteps = r.steps || [];
-    if (!newSteps.length) {
-        showWarnToast('No mappable events captured. Try again, and make sure to press at least one key, button, or click.');
-        return;
-    }
-    if (append) {
-        _gpmMacroEditorSteps = (_gpmMacroEditorSteps || []).concat(newSteps);
-    } else {
-        _gpmMacroEditorSteps = newSteps;
-    }
-    _renderMacroSteps();
-}
-
-async function cancelMacroRecording() {
-    if (_gpmRecordingTimer) {
-        clearInterval(_gpmRecordingTimer);
-        _gpmRecordingTimer = null;
-    }
-    await apiPost('/api/gamepad/macro/record/cancel', {});
-    var rec = document.getElementById('gpm-macro-recording');
-    if (rec) rec.style.display = 'none';
-    var btn = document.getElementById('gpm-macro-record-btn');
-    if (btn) { btn.disabled = false; btn.textContent = '● Record'; }
 }
 
 // ═══ Background Pauser ═══
@@ -8331,27 +5898,10 @@ function _startAdaptivePoll() {
         if (currentPage !== 'profiles') return;
         _refreshAdaptiveLive();
     }, 5000);
-    // Gamepad mapper live Hz/p99 readout — was 1.5 s, bumped to 3 s.
-    if (!_gpmStatsTimer) {
-        _gpmStatsTimer = setInterval(function(){
-            if (currentPage !== 'profiles') return;
-            apiGet('/api/gamepad/status').then(function(s){
-                if (!s || s.ok === false) return;   // keep the last reading, not "undefined Hz"
-                var hzEl  = document.getElementById('gpm-actual-hz');
-                var p99El = document.getElementById('gpm-p99');
-                if (hzEl)  hzEl.textContent  = s.actual_hz ? (s.actual_hz.toFixed(1) + ' Hz / ' + s.target_hz + ' target') : (s.target_hz + ' Hz target');
-                if (p99El) p99El.textContent = s.frame_p99_us ? (s.frame_p99_us + ' µs (max ' + s.frame_max_us + ' µs)') : '—';
-            });
-        }, 3000);
-    }
 }
-
-var _gpmStatsTimer = null;
 
 function _stopAdaptivePoll() {
     if (_adaptivePollTimer) { clearInterval(_adaptivePollTimer); _adaptivePollTimer = null; }
-    if (_gpmStatsTimer) { clearInterval(_gpmStatsTimer); _gpmStatsTimer = null; }
-    stopGpmSvgLoop();
 }
 
 async function loadProfileEngineStatus() {
@@ -8762,6 +6312,8 @@ switchPage = function(page) {
     if (page === 'kernel') loadKernelPage();
     if (page === 'profiles') loadProfilesPage();
     if (page === 'hwmon') loadHWMonPage();
+    if (page === 'crosshair') loadCrosshairPage();
+    else _xhStopPoll();
 
     // v3 — Hardware Monitor auto-runs.  Page entry kicks polling back on,
     // exit pauses it (keeps the backend monitor running so the snapshot is
@@ -10703,7 +8255,7 @@ async function _refreshDependencyBanner() {
               '<span style="color:var(--warning);font-weight:600">⟳ Restart needed</span>' +
               '<span style="color:var(--text-secondary);font-size:12px;flex:1">' +
                 'New drivers were installed (' + escHtml(sources.join(', ')) + '). ' +
-                'A restart finishes the install. Your virtual gamepad / frame telemetry won\'t work fully until then.' +
+                'A restart finishes the install. Frame telemetry won\'t work fully until then.' +
               '</span>' +
               '<button class="btn btn-sm btn-primary" onclick="restartNowAfterDeps()">Restart now (10 s)</button>' +
               '<button class="btn btn-sm" onclick="restartLater()">Later</button>' +
@@ -12461,4 +10013,1742 @@ function _daFormatBytes(n) {
     if (n < 1073741824) return (n/1048576).toFixed(1) + ' MB';
     if (n < 1099511627776) return (n/1073741824).toFixed(2) + ' GB';
     return (n/1099511627776).toFixed(2) + ' TB';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Crosshair overlay page
+// ═══════════════════════════════════════════════════════════════
+// The overlay always draws a saved preset: the active one, or the one a game
+// rule picks (preset_in_effect).  The designer edits a local draft that only
+// ever goes to /api/crosshair/preview; nothing reaches the overlay until the
+// draft is saved as a preset.
+
+var _xh = {
+    loaded: false,
+    settings: null,
+    presets: [],
+    status: null,
+    enabled: false,
+    enabledSeq: 0,      // bumped by every toggle, so an older toggle answer can't undo a newer one
+    enabledPending: 0,  // toggle saves still out: polls leave 'enabled' alone meanwhile
+    writeSeq: 0,        // bumped after every write a poll could cross, so an older poll can't undo it
+    activePreset: '',
+    inEffect: '',
+    monitors: [],
+    caps: {},
+    blocked: [],
+    gamesHint: [],
+    lastGame: '',
+    draft: null,
+    base: '',           // the preset the draft was seeded from
+    bg: 'dark',
+    previewSeq: 0,
+    previewTimer: null,
+    pollTimer: null,
+    pollBusy: false,
+    reloadBusy: false,
+    importNote: null,
+    fs: null,
+    pm: null,           // last present-mode reading for the game in front
+    pmBusy: false,
+    fsBusy: false,
+    offsetTimer: null,
+    nameAction: null,
+    bind: null,
+    layout: null,       // navigator.keyboard layout map, for keycap tooltips
+    keyCaps: {},        // hotkey token -> the character on the user's key, seen while binding
+};
+
+var _XH_DEFAULT_DESIGN = {
+    kind: 'shape', shape: 'cross', color: '#00FFFF', opacity: 100,
+    length: 6, thickness: 2, gap: 3,
+    arms: { top: true, bottom: true, left: true, right: true },
+    dot: { on: false, size: 2, color: '#00FFFF', opacity: 100 },
+    ring_radius: 8, ring_thickness: 2,
+    outline: { on: true, thickness: 1, color: '#000000', opacity: 100 },
+    rotation: 0, scale_with_resolution: true,
+    image: { id: '', scale: 100, opacity: 100 },
+};
+
+var _XH_SHAPES = ['cross', 'dot', 'circle', 'circle_dot', 'cross_circle', 'chevron', 'box'];
+
+var _XH_SWATCHES = [
+    ['#FFFFFF', 'White'], ['#FFFF00', 'Yellow'], ['#00FFFF', 'Cyan'], ['#FF00FF', 'Magenta'],
+    ['#00FF00', 'Green'], ['#FF0000', 'Red'], ['#E69F00', 'Orange'], ['#56B4E9', 'Sky blue'],
+];
+
+var _XH_UNITS = {
+    opacity: '%', rotation: '°', 'dot.opacity': '%', 'outline.opacity': '%',
+    'image.scale': '%', 'image.opacity': '%',
+};
+
+var _XH_REASONS = {
+    testing: 'Showing for a few seconds',
+    disabled: 'Off',
+    waiting_for_app: 'Starting',
+    not_running: 'Not running',
+    locked: 'Hidden: screen locked',
+    hidden_by_hotkey: 'Hidden with the hotkey',
+    vispora_in_front: 'Hidden while Vispora is in front',
+    blocked_game: 'Hidden: this game is reported to object to overlays',
+    rule_hidden: 'Hidden: you turned it off for this game',
+    no_game: 'Hidden: no game in front',
+    not_in_list: "Hidden: this game isn't on your list",
+    exclusive_fullscreen: "Can't draw over this game: it's in exclusive fullscreen",
+    aiming: 'Hidden while aiming',
+    cursor_visible: 'Hidden: mouse pointer is showing',
+};
+
+var _XH_HOTKEY_NAMES = { toggle: 'Show or hide', next: 'Next crosshair', prev: 'Previous crosshair' };
+
+// KeyboardEvent.keyCode -> hotkey token (spec grammar).  In WebView2 on Windows
+// keyCode is the virtual key Windows reports for the key under the active layout
+// and Num Lock: the same code the overlay polls.  KeyboardEvent.code names the
+// US-QWERTY position instead, which is another key on AZERTY, QWERTZ and the rest.
+// Letters, digits, numpad digits and F-keys are handled by range in _xhKeyToken.
+// Not here on purpose: Pause (Windows sends its press and release together, so
+// a poll never sees it) and the keys with no token (OEM_102, OEM_8, IME).
+var _XH_VK_MAP = {
+    106: 'NumMul', 107: 'NumAdd', 109: 'NumSub', 110: 'NumDot', 111: 'NumDiv',
+    33: 'PageUp', 34: 'PageDown', 35: 'End', 36: 'Home', 37: 'Left', 38: 'Up', 39: 'Right', 40: 'Down',
+    45: 'Insert', 46: 'Delete', 145: 'ScrollLock', 44: 'PrintScreen', 32: 'Space', 9: 'Tab', 13: 'Enter',
+    186: 'Semicolon', 187: 'Equals', 188: 'Comma', 189: 'Minus', 190: 'Period', 191: 'Slash',
+    192: 'Backquote', 219: 'LeftBracket', 220: 'Backslash', 221: 'RightBracket', 222: 'Quote',
+};
+var _XH_MODIFIER_CODES = ['ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'ShiftLeft', 'ShiftRight',
+                          'MetaLeft', 'MetaRight', 'OSLeft', 'OSRight'];
+var _XH_MODIFIER_VKS = [16, 17, 18, 91, 92, 160, 161, 162, 163, 164, 165];
+// Tokens whose keycap differs by layout: worth a tooltip with the user's own character.
+var _XH_CAP_TOKENS = /^([A-Z]|Semicolon|Equals|Comma|Minus|Period|Slash|Backquote|LeftBracket|Backslash|RightBracket|Quote)$/;
+
+// ─── small helpers ───
+function _xhClone(o) { return o == null ? o : JSON.parse(JSON.stringify(o)); }
+
+function _xhIsObj(o) { return !!o && typeof o === 'object' && !Array.isArray(o); }
+
+function _xhMerge(base, over) {
+    var out = _xhClone(base);
+    if (!_xhIsObj(over)) return out;
+    Object.keys(over).forEach(function(k) {
+        if (_xhIsObj(out[k]) && _xhIsObj(over[k])) out[k] = _xhMerge(out[k], over[k]);
+        else if (over[k] !== undefined) out[k] = _xhClone(over[k]);
+    });
+    return out;
+}
+
+function _xhFullDesign(d) { return _xhMerge(_XH_DEFAULT_DESIGN, d); }
+
+// Stable text for comparing designs (key order and hex case don't count).
+function _xhCanon(o) {
+    if (Array.isArray(o)) return '[' + o.map(_xhCanon).join(',') + ']';
+    if (_xhIsObj(o)) {
+        return '{' + Object.keys(o).sort().map(function(k) {
+            return JSON.stringify(k) + ':' + _xhCanon(o[k]);
+        }).join(',') + '}';
+    }
+    if (typeof o === 'string' && /^#[0-9a-f]{6}$/i.test(o)) return JSON.stringify(o.toUpperCase());
+    return JSON.stringify(o === undefined ? null : o);
+}
+
+function _xhGet(path) {
+    var cur = _xh.draft;
+    path.split('.').forEach(function(k) { cur = (cur == null) ? undefined : cur[k]; });
+    return cur;
+}
+
+function _xhSet(path, value) {
+    var parts = path.split('.');
+    var cur = _xh.draft;
+    for (var i = 0; i < parts.length - 1; i++) {
+        if (!_xhIsObj(cur[parts[i]])) cur[parts[i]] = {};
+        cur = cur[parts[i]];
+    }
+    cur[parts[parts.length - 1]] = value;
+}
+
+function _xhClampInt(v, lo, hi, dflt) {
+    var n = parseInt(v, 10);
+    if (isNaN(n)) return dflt;
+    return Math.max(lo, Math.min(hi, n));
+}
+
+function _xhPreset(id) {
+    for (var i = 0; i < _xh.presets.length; i++) if (_xh.presets[i].id === id) return _xh.presets[i];
+    return null;
+}
+
+function _xhGameName(exe) {
+    if (!exe) return '';
+    var low = String(exe).toLowerCase();
+    for (var i = 0; i < _xh.gamesHint.length; i++) {
+        var g = _xh.gamesHint[i];
+        if (g && String(g.exe || '').toLowerCase() === low && g.name) return g.name;
+    }
+    for (var j = 0; j < _xh.blocked.length; j++) {
+        var b = _xh.blocked[j];
+        if (b && String(b.exe || '').toLowerCase() === low && b.name) return b.name;
+    }
+    return exe;
+}
+
+function _xhBlockedReason(exe) {
+    var low = String(exe || '').toLowerCase();
+    for (var i = 0; i < _xh.blocked.length; i++) {
+        if (String(_xh.blocked[i].exe || '').toLowerCase() === low) return _xh.blocked[i].reason || 'Reported to object to overlays.';
+    }
+    return '';
+}
+
+// set_settings / activate answer with the overlay status; accept it bare or wrapped.
+function _xhUnwrapStatus(s) {
+    if (_xhIsObj(s) && _xhIsObj(s.status) && s.reason === undefined) return s.status;
+    return _xhIsObj(s) ? s : null;
+}
+
+function _xhSetSwitch(id, on, disabled) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.classList.remove('xh-pending');
+    el.removeAttribute('aria-disabled');    // set in the page until the first load
+    el.classList.toggle('xh-disabled', !!disabled);
+    if (el.tagName === 'BUTTON') el.disabled = !!disabled;
+    _xhSwitchOn(el, on);
+}
+
+// The look and what a screen reader hears, always together.
+function _xhSwitchOn(el, on) {
+    el.classList.toggle('on', !!on);
+    el.setAttribute('aria-checked', on ? 'true' : 'false');
+}
+
+function _xhSetSettings(s) {
+    if (!_xhIsObj(s)) return;
+    _xh.settings = s;
+    if (s.active_preset) _xh.activePreset = s.active_preset;
+}
+
+function _xhToastErr(r, fallback) {
+    showWarnToast((r && r.err) || fallback, { title: 'Crosshair' });
+}
+
+// ─── page load ───
+async function loadCrosshairPage() {
+    var data = await apiGet('/api/crosshair/state');
+    var errBox = document.getElementById('xh-load-error');
+    if (!data || data.ok === false) {
+        // Keep every switch as it is: a failed read is not "off".
+        if (errBox) {
+            errBox.style.display = 'flex';
+            errBox.innerHTML = '<div style="flex:1">Couldn\'t load the crosshair settings: ' +
+                escHtml((data && data.err) || 'unknown error') + '</div>' +
+                '<button class="btn btn-sm" onclick="loadCrosshairPage()">Try again</button>';
+        }
+        if (!_xh.loaded) {
+            var line = document.getElementById('xh-status-line');
+            if (line) line.textContent = "Couldn't load the status.";
+        }
+        return;
+    }
+    if (errBox) errBox.style.display = 'none';
+    var page = document.getElementById('page-crosshair');
+    if (page) page.classList.remove('xh-unloaded');
+    _xhApplyState(data);
+    _xhStartPoll();
+    xhFsCheck();
+    xhPollStatus();
+    _xhLoadLayout(_xhRenderHotkeys);
+}
+
+function _xhApplyState(data) {
+    var first = !_xh.loaded;
+    _xhSetSettings(data.settings || {});
+    _xh.presets = Array.isArray(data.presets) ? data.presets : [];
+    _xh.monitors = Array.isArray(data.monitors) ? data.monitors : [];
+    _xh.caps = data.capabilities || {};
+    _xh.blocked = Array.isArray(data.blocked) ? data.blocked : [];
+    _xh.gamesHint = Array.isArray(data.games_hint) ? data.games_hint : [];
+    _xh.lastGame = data.last_game || '';
+    _xh.status = _xhUnwrapStatus(data.status) || _xh.status;
+    // While a toggle save is out, the switch shows what the user picked.
+    if (!_xh.enabledPending) _xh.enabled = (data.enabled !== undefined) ? !!data.enabled : !!_xh.settings.enabled;
+    _xh.activePreset = _xh.settings.active_preset || 'builtin:classic';
+    _xh.loaded = true;
+
+    var pie = data.preset_in_effect || '';
+    if (!pie && _xh.status && _xh.status.preset && _xhPreset(_xh.status.preset)) pie = _xh.status.preset;
+    if (!pie) {
+        var st = _xh.status || {};
+        var rule = st.game_exe && _xh.settings.games && _xh.settings.games[st.game_exe];
+        pie = (rule && rule.preset && _xhPreset(rule.preset)) ? rule.preset : _xh.activePreset;
+    }
+    _xh.inEffect = pie;
+    // A draft with unsaved edits survives a page switch; otherwise start from the preset in effect.
+    if (first || !_xh.draft || !_xhPreset(_xh.base) || !_xhIsDirty()) _xhSeedDraft(pie, true);
+
+    _xhRenderMain();
+    _xhRenderNotice();
+    _xhRenderDesigner();
+    _xhRenderPresets();
+    _xhRenderPosition();
+    _xhRenderWhen();
+    _xhRenderFsSelect();
+    _xhRenderRecording();
+}
+
+// Presets changed in a way this page didn't make (a new id), or the window is
+// back in front (a hotkey may have changed a game's crosshair): fetch it all again.
+async function _xhReloadState() {
+    if (_xh.reloadBusy) return;
+    _xh.reloadBusy = true;
+    var seq = _xh.writeSeq;
+    try {
+        var data = await apiGet('/api/crosshair/state');
+        // A write answered meanwhile: this read may predate it, so read again.
+        if (data && data.ok !== false) {
+            if (seq === _xh.writeSeq) _xhApplyState(data);
+            else setTimeout(_xhReloadState, 0);
+        }
+    } finally { _xh.reloadBusy = false; }
+}
+
+_onVisible(function() {
+    if (currentPage === 'crosshair' && _xh.loaded) _xhReloadState();
+});
+
+// ─── status poll (1 s while the page is open) ───
+function _xhStartPoll() {
+    if (_xh.pollTimer) return;
+    _xh.pollTimer = setInterval(function() {
+        if (_pollSkipIfHidden()) return;
+        if (currentPage !== 'crosshair') { _xhStopPoll(); return; }
+        xhPollStatus();
+    }, 1000);
+}
+
+function _xhStopPoll() {
+    if (_xh.pollTimer) { clearInterval(_xh.pollTimer); _xh.pollTimer = null; }
+}
+
+async function xhPollStatus() {
+    if (_xh.pollBusy || !_xh.loaded) return;
+    _xh.pollBusy = true;
+    var seq = _xh.writeSeq;
+    var stale = false;
+    try {
+        var r = await apiGet('/api/crosshair/status', { timeoutMs: 5000 });
+        if (!r || r.ok === false) {
+            var line = document.getElementById('xh-status-line');
+            if (line) { line.removeAttribute('data-html'); line.textContent = "Couldn't read the status: " + ((r && r.err) || 'unknown error'); }
+            return;
+        }
+        // A write answered while this poll was out: the file it read may predate
+        // that write, so its on/off and preset fields don't count.
+        stale = seq !== _xh.writeSeq;
+        _xhApplyStatus(r, !stale, !stale && !_xh.enabledPending);
+    } finally { _xh.pollBusy = false; }
+    if (stale) xhPollStatus();      // the write's own follow-up poll was dropped while this one was out
+}
+
+function _xhApplyStatus(r, fresh, takeEnabled) {
+    var st = _xhUnwrapStatus(r.status);
+    if (st) _xh.status = st;
+    if (takeEnabled && r.enabled !== undefined) {
+        _xh.enabled = !!r.enabled;
+        if (_xh.settings) _xh.settings.enabled = _xh.enabled;
+    }
+    if (fresh && r.active_preset) {
+        _xh.activePreset = r.active_preset;
+        if (_xh.settings) _xh.settings.active_preset = r.active_preset;
+    }
+    var pie = r.preset_in_effect || _xh.activePreset;
+    if (fresh && pie && pie !== _xh.inEffect) {
+        var wasDirty = _xhIsDirty();
+        _xh.inEffect = pie;
+        if (!_xhPreset(pie)) _xhReloadState();
+        else if (!wasDirty) _xhSeedDraft(pie);
+        else _xhUpdateDirty();
+        _xhRenderPresets();
+    }
+    _xhRenderMain();
+    _xhRenderHotkeyErrors();
+    _xhRenderCaptureNote();
+    _xhMaybeCheckPresentMode();
+}
+
+// ─── card 1: master toggle and status line ───
+function _xhPresentModeOk(exe) {
+    var st = _xh.status || {};
+    var m = st.present_mode;
+    if (_xhIsObj(m) && m.mode) {
+        if (m.name && exe && String(m.name).toLowerCase() !== String(exe).toLowerCase()) return false;
+        var age = (m.age_s !== undefined) ? Number(m.age_s)
+                : (m.ts ? Date.now() / 1000 - Number(m.ts) : 999);
+        return age < 10 && !/^Hardware: Legacy/i.test(String(m.mode));
+    }
+    var pm = _xh.pm;
+    return !!(pm && pm.exe === exe && pm.ok && Date.now() - pm.at < 30000);
+}
+
+// While it shows over a game, look up that game's display mode now and then,
+// so the line can say "Showing over" only when Vispora has actually seen it.
+function _xhMaybeCheckPresentMode() {
+    var st = _xh.status || {};
+    if (st.reason !== 'shown' || !st.game_exe || _xhIsObj(st.present_mode) || _xh.pmBusy || _xh.fsBusy) return;
+    var exe = st.game_exe;
+    if (_xh.pm && _xh.pm.exe === exe && Date.now() - _xh.pm.at < 15000) return;
+    _xh.pmBusy = true;
+    apiGet('/api/crosshair/fullscreen?exe=' + encodeURIComponent(exe), { timeoutMs: 10000 }).then(function(r) {
+        var m = r && r.ok !== false && r.present_mode;
+        _xh.pm = {
+            exe: exe, at: Date.now(),
+            ok: !!(m && m.mode && Number(m.age_s) < 10 && !/^Hardware: Legacy/i.test(String(m.mode))),
+        };
+        _xhRenderMain();
+    }).finally(function() { _xh.pmBusy = false; });
+}
+
+function _xhRenderMain() {
+    if (!_xh.loaded) return;
+    _xhSetSwitch('xh-toggle-enabled', _xh.enabled);
+    var st = _xh.status || {};
+    var reason = st.reason || (_xh.enabled ? 'not_running' : 'disabled');
+    var game = st.game_exe ? _xhGameName(st.game_exe) : '';
+    var fsLink = ' <a href="#" class="xh-link" onclick="xhGoFullscreen();return false">See Fullscreen below.</a>';
+    var html, cls = 'neutral', badge = 'Hidden';
+    if (reason === 'shown') {
+        cls = 'ok'; badge = 'Showing';
+        if (!game) html = 'Showing';
+        else if (_xhPresentModeOk(st.game_exe)) html = 'Showing over ' + escHtml(game);
+        else {
+            // On, but Vispora hasn't seen the game's display mode: it may be in
+            // exclusive fullscreen, where nothing can draw over it.
+            badge = 'On';
+            html = 'On over ' + escHtml(game) + '. Not seeing it?' + fsLink;
+        }
+    } else if (reason === 'testing') {
+        cls = 'ok'; badge = 'Showing'; html = escHtml(_XH_REASONS.testing);
+    } else if (reason === 'error') {
+        cls = 'danger'; badge = 'Error';
+        html = "Couldn't start: " + escHtml(st.last_error || 'unknown error');
+    } else if (reason === 'disabled') {
+        badge = 'Off'; html = escHtml(_XH_REASONS.disabled);
+    } else if (reason === 'waiting_for_app') {
+        badge = 'Starting'; html = escHtml(_XH_REASONS.waiting_for_app);
+    } else if (reason === 'not_running') {
+        cls = 'warn'; badge = 'Stopped'; html = escHtml(_XH_REASONS.not_running);
+    } else if (reason === 'exclusive_fullscreen') {
+        cls = 'warn'; html = escHtml(_XH_REASONS.exclusive_fullscreen) + '.' + fsLink;
+    } else {
+        html = escHtml(_XH_REASONS[reason] || reason);
+    }
+    var line = document.getElementById('xh-status-line');
+    if (line && line.getAttribute('data-html') !== html) { line.setAttribute('data-html', html); line.innerHTML = html; }
+    var b = document.getElementById('xh-status-badge');
+    if (b) { b.className = 'status-badge ' + cls; b.textContent = badge; }
+
+    var extra = '';
+    if (reason === 'hidden_by_hotkey') {
+        extra += '<button class="btn btn-sm" onclick="xhShowAgain()">Show again</button>';
+    }
+    var running = ['disabled', 'waiting_for_app', 'not_running', 'error'].indexOf(reason) < 0;
+    var rule = running && st.game_exe && _xh.settings && _xh.settings.games && _xh.settings.games[st.game_exe];
+    if (rule && rule.preset && rule.preset === _xh.inEffect && _xh.inEffect !== _xh.activePreset) {
+        extra += '<div class="xh-note">' + escHtml(game) + ' uses its own crosshair (see ' +
+            '<a href="#" class="xh-link" onclick="xhScrollTo(\'xh-when-card\');return false">When to show</a>)</div>';
+    }
+    var ex = document.getElementById('xh-status-extra');
+    if (ex && ex.getAttribute('data-html') !== extra) {
+        ex.setAttribute('data-html', extra);
+        ex.innerHTML = extra;
+        ex.style.display = extra ? '' : 'none';
+    }
+}
+
+async function xhToggleEnabled(el) {
+    if (!_xh.loaded || el.classList.contains('xh-pending')) return;
+    var prev = _xh.enabled;
+    var newOn = !el.classList.contains('on');
+    // The model holds the new value while the save runs (starting can take
+    // seconds), so a repaint meanwhile shows what the user picked.
+    _xh.enabled = newOn;
+    _xhSetSwitch('xh-toggle-enabled', newOn);
+    var seq = ++_xh.enabledSeq;
+    _xh.writeSeq++;                         // polls already out read the old value
+    _xh.enabledPending++;
+    var r;
+    try { r = await apiPost('/api/crosshair/settings', { enabled: newOn }); }
+    finally { _xh.enabledPending--; }
+    if (seq !== _xh.enabledSeq) return;     // clicked again meanwhile; the later answer wins
+    if (!r || r.ok === false) {
+        _xh.enabled = prev;
+        _xh.writeSeq++;                     // polls read during the failed save don't count
+        _xhRenderMain();
+        _xhToastErr(r, "Couldn't change the crosshair.");
+        xhPollStatus();                     // after a double click, prev may not be what the server has
+        return;
+    }
+    _xhSetSettings(r.settings);
+    _xh.enabled = (r.settings && r.settings.enabled !== undefined) ? !!r.settings.enabled : newOn;
+    if (r.status) _xh.status = _xhUnwrapStatus(r.status) || _xh.status;
+    _xh.writeSeq++;                         // polls started before this answer are stale
+    _xhRenderMain();
+    xhPollStatus();
+}
+
+async function xhShowAgain() {
+    var r = await apiPost('/api/crosshair/hidden', { hidden: false });
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't show the crosshair."); return; }
+    if (r.status) { _xh.status = _xhUnwrapStatus(r.status) || _xh.status; _xhRenderMain(); }
+    xhPollStatus();
+}
+
+function xhScrollTo(id) {
+    var el = document.getElementById(id);
+    if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function xhGoFullscreen() {
+    var st = _xh.status || {};
+    xhScrollTo('xh-fs-card');
+    if (st.game_exe) xhFsCheck(st.game_exe);
+}
+
+function _xhRenderNotice() {
+    var el = document.getElementById('xh-notice');
+    if (el) el.style.display = (_xh.settings && !_xh.settings.notice_seen) ? 'flex' : 'none';
+}
+
+async function xhDismissNotice() {
+    var el = document.getElementById('xh-notice');
+    if (el) el.style.display = 'none';
+    var r = await _xhSaveSettings({ notice_seen: true });
+    if (!r) _xhRenderNotice();
+}
+
+// ─── settings saves ───
+async function _xhSaveSettings(partial) {
+    var r = await apiPost('/api/crosshair/settings', partial);
+    if (!r || r.ok === false) {
+        _xhToastErr(r, "Couldn't save the setting.");
+        return null;
+    }
+    _xhSetSettings(r.settings);
+    if (r.status) { _xh.status = _xhUnwrapStatus(r.status) || _xh.status; _xhRenderMain(); }
+    return r;
+}
+
+async function xhSetSetting(key, value) {
+    var body = {};
+    body[key] = value;
+    await _xhSaveSettings(body);
+    // Show what was saved (or put the old value back after a refusal).
+    _xhRenderPosition();
+    _xhRenderWhen();
+}
+
+async function xhToggleSetting(key, el) {
+    if (!_xh.loaded || el.classList.contains('xh-pending') || el.classList.contains('xh-disabled')) return;
+    var newOn = !el.classList.contains('on');
+    _xhSwitchOn(el, newOn);
+    var body = {};
+    body[key] = newOn;
+    var r = await _xhSaveSettings(body);
+    _xhSwitchOn(el, r ? !!(_xh.settings && _xh.settings[key]) : !newOn);
+    if (key === 'exclude_from_capture') _xhRenderCaptureNote();
+}
+
+// ─── card 2: designer ───
+function _xhSeedDraft(id, quiet) {
+    var p = _xhPreset(id) || _xhPreset('builtin:classic') || _xh.presets[0] || null;
+    _xh.base = p ? p.id : (id || '');
+    _xh.draft = _xhFullDesign(p ? p.design : null);
+    _xh.importNote = null;
+    if (!quiet) _xhRenderDesigner();
+}
+
+function _xhIsDirty() {
+    if (!_xh.draft) return false;
+    var p = _xhPreset(_xh.base);
+    if (!p) return true;
+    return _xhCanon(_xh.draft) !== _xhCanon(_xhFullDesign(p.design));
+}
+
+function _xhUpdateDirty() {
+    var dirty = _xhIsDirty();
+    var p = _xhPreset(_xh.base);
+    // An imported code is saved as a new preset, never over the one it replaced.
+    var isUser = !!(p && !p.builtin) && !_xh.importNote;
+    var d = document.getElementById('xh-dirty');
+    if (d) d.style.visibility = dirty ? 'visible' : 'hidden';
+    var save = document.getElementById('xh-btn-save');
+    if (save) { save.style.display = isUser ? '' : 'none'; save.disabled = !dirty; }
+    var undo = document.getElementById('xh-btn-undo');
+    if (undo) undo.disabled = !dirty;
+    var lab = document.getElementById('xh-editing-label');
+    if (lab) {
+        var html;
+        if (_xh.importNote) html = 'Editing an <b>imported crosshair</b>';
+        else html = p ? 'Editing <b>' + escHtml(p.name) + '</b>' : 'Editing a new crosshair';
+        if (p && p.builtin && !_xh.importNote) html += ' <span class="xh-tag">Built in</span>';
+        if (p && !_xh.importNote && _xh.base !== _xh.inEffect) html += '<div class="xh-note">Not the crosshair in use right now.</div>';
+        lab.innerHTML = html;
+    }
+}
+
+function _xhRenderDesigner() {
+    if (!_xh.draft) return;
+    var d = _xh.draft;
+    _XH_SHAPES.forEach(function(s) {
+        var b = document.getElementById('xh-shape-' + s);
+        if (b) b.classList.toggle('active', d.kind !== 'image' && d.shape === s);
+    });
+    var ib = document.getElementById('xh-shape-image');
+    if (ib) ib.classList.toggle('active', d.kind === 'image');
+    _xhRenderControls();
+    _xhRenderImportNote();
+    _xhUpdateDirty();
+    _xhSchedulePreview(0);
+}
+
+function _xhFmt(v, unit) {
+    return String(v == null ? '' : v) + (unit === '%' || unit === '°' ? unit : ' ' + unit);
+}
+
+function _xhSlider(label, path, min, max) {
+    var v = _xhGet(path);
+    var unit = _XH_UNITS[path] || 'px';
+    return '<div class="oc-slider-row xh-slider">' +
+        '<div class="oc-slider-label"><span>' + escHtml(label) + '</span>' +
+        '<span class="oc-slider-val" id="xh-val-' + path.replace(/[._]/g, '-') + '">' + escHtml(_xhFmt(v, unit)) + '</span></div>' +
+        '<input type="range" min="' + min + '" max="' + max + '" step="1" value="' + escAttr(v) + '"' +
+        ' aria-label="' + escAttr(label) + '" oninput="xhSetNum(' + jsArg(path) + ', this.value)">' +
+        '</div>';
+}
+
+function _xhSwitchRow(label, path) {
+    var on = !!_xhGet(path);
+    return '<div class="toggle-row xh-mini-row"><div class="toggle-info"><div class="toggle-name">' + escHtml(label) + '</div></div>' +
+        '<button type="button" class="toggle-switch' + (on ? ' on' : '') + '" role="switch" aria-checked="' + on + '"' +
+        ' aria-label="' + escAttr(label) + '" data-xh-bool="' + escAttr(path) + '" onclick="xhSetBool(' + jsArg(path) + ')"></button></div>';
+}
+
+function _xhColorRow(label, path) {
+    var cur = String(_xhGet(path) || '').toUpperCase();
+    var html = '<div class="xh-color-row" data-path="' + escAttr(path) + '"><span class="xh-color-label">' + escHtml(label) + '</span><div class="xh-swatches">';
+    _XH_SWATCHES.forEach(function(sw) {
+        html += '<button type="button" class="xh-swatch' + (cur === sw[0] ? ' active' : '') + '" data-hex="' + sw[0] + '" style="background:' + sw[0] + '"' +
+            ' title="' + sw[1] + '" aria-label="' + sw[1] + '" onclick="xhSetColor(' + jsArg(path) + ', ' + jsArg(sw[0]) + ')"></button>';
+    });
+    var custom = /^#[0-9A-F]{6}$/.test(cur) ? cur.toLowerCase() : '#ffffff';
+    html += '<input type="color" class="xh-color-input" value="' + custom + '" title="Any colour" aria-label="' +
+        escAttr(label) + ': any colour" oninput="xhSetColor(' + jsArg(path) + ', this.value, true)">';
+    return html + '</div></div>';
+}
+
+function _xhRenderControls() {
+    var box = document.getElementById('xh-controls');
+    if (!box || !_xh.draft) return;
+    var d = _xh.draft;
+    var html = '';
+    if (d.kind === 'image') {
+        html += '<div class="xh-image-bar">' +
+            '<div class="xh-note">' + (d.image && d.image.id ? 'Your image is in the preview.' : 'No image chosen yet.') + '</div>' +
+            '<div class="btn-group"><button class="btn btn-sm" onclick="xhUseImage()">Choose another image</button>' +
+            '<button class="btn btn-sm" onclick="xhBackToShapes()">Back to shapes</button></div></div>';
+        html += '<div class="xh-grid2">' +
+            _xhSlider('Size', 'image.scale', 10, 400) +
+            _xhSlider('Opacity', 'image.opacity', 0, 100) +
+            _xhSlider('Rotation', 'rotation', 0, 359) +
+            '</div>';
+        box.innerHTML = html;
+        return;
+    }
+    var s = d.shape;
+    var cross = (s === 'cross' || s === 'cross_circle');
+    var ring = (s === 'circle' || s === 'circle_dot' || s === 'cross_circle');
+    html += '<div class="xh-grid2">';
+    if (cross) {
+        html += _xhSlider('Length', 'length', 1, 120) + _xhSlider('Thickness', 'thickness', 1, 24) +
+                _xhSlider('Gap', 'gap', 0, 60);
+    } else if (s === 'chevron') {
+        html += _xhSlider('Arm length', 'length', 1, 120) + _xhSlider('Thickness', 'thickness', 1, 24) +
+                _xhSlider('Gap below centre', 'gap', 0, 60);
+    } else if (s === 'box') {
+        html += _xhSlider('Size', 'length', 1, 120) + _xhSlider('Border', 'thickness', 1, 24);
+    } else if (s === 'dot') {
+        html += _xhSlider('Size', 'thickness', 1, 24);
+    }
+    if (ring) html += _xhSlider('Ring size', 'ring_radius', 2, 120) + _xhSlider('Ring thickness', 'ring_thickness', 1, 24);
+    html += _xhSlider('Opacity', 'opacity', 0, 100) + _xhSlider('Rotation', 'rotation', 0, 359);
+    html += '</div>';
+    if (cross) {
+        html += '<div class="xh-sub">Arms</div><div class="xh-chips xh-arms">';
+        [['top', 'Top'], ['bottom', 'Bottom'], ['left', 'Left'], ['right', 'Right']].forEach(function(a) {
+            var on = !!(d.arms && d.arms[a[0]]);
+            html += '<button type="button" class="chip' + (on ? ' active' : '') + '" aria-pressed="' + on + '"' +
+                ' data-xh-bool="arms.' + a[0] + '" onclick="xhSetBool(' + jsArg('arms.' + a[0]) + ')">' + a[1] + '</button>';
+        });
+        html += '</div>';
+    }
+    html += _xhColorRow('Colour', 'color');
+
+    html += '<div class="xh-group">' + _xhSwitchRow('Outline', 'outline.on');
+    if (d.outline && d.outline.on) {
+        html += '<div class="xh-grid2">' + _xhSlider('Outline thickness', 'outline.thickness', 1, 6) +
+                _xhSlider('Outline opacity', 'outline.opacity', 0, 100) + '</div>' +
+                _xhColorRow('Colour', 'outline.color');
+    }
+    html += '</div>';
+
+    if (s !== 'dot') {
+        html += '<div class="xh-group">';
+        var dotOn = (s === 'circle_dot') || !!(d.dot && d.dot.on);
+        if (s === 'circle_dot') html += '<div class="xh-sub xh-sub-gap">Centre dot</div>';
+        else html += _xhSwitchRow('Centre dot', 'dot.on');
+        if (dotOn) {
+            html += '<div class="xh-grid2">' + _xhSlider('Dot size', 'dot.size', 1, 24) +
+                    _xhSlider('Dot opacity', 'dot.opacity', 0, 100) + '</div>' +
+                    _xhColorRow('Colour', 'dot.color');
+        }
+        html += '</div>';
+    }
+
+    html += '<div class="xh-group">' + _xhSwitchRow('Scale with resolution', 'scale_with_resolution') +
+        '<div class="xh-note">Sizes are for a 1080p screen' +
+        (d.scale_with_resolution ? ' and grow on bigger screens.' : '. With this off they stay the same on every screen.') +
+        '</div></div>';
+    box.innerHTML = html;
+}
+
+function _xhDraftChanged() {
+    _xhUpdateDirty();
+    _xhSchedulePreview(80);
+}
+
+function xhSetNum(path, value) {
+    if (!_xh.draft) return;
+    var v = parseInt(value, 10);
+    if (isNaN(v)) return;
+    _xhSet(path, v);
+    var lab = document.getElementById('xh-val-' + path.replace(/[._]/g, '-'));
+    if (lab) lab.textContent = _xhFmt(v, _XH_UNITS[path] || 'px');
+    _xhDraftChanged();
+}
+
+function xhSetBool(path) {
+    if (!_xh.draft) return;
+    var a = document.activeElement;
+    var refocus = !!(a && a.getAttribute && a.getAttribute('data-xh-bool') === path);
+    _xhSet(path, !_xhGet(path));
+    _xhRenderControls();
+    // The controls were drawn again: keep keyboard focus on the same switch.
+    if (refocus) {
+        var el = document.querySelector('#xh-controls [data-xh-bool="' + path + '"]');
+        if (el) el.focus();
+    }
+    _xhDraftChanged();
+}
+
+function xhSetColor(path, hex, fromPicker) {
+    if (!_xh.draft) return;
+    hex = String(hex || '').toUpperCase();
+    if (!/^#[0-9A-F]{6}$/.test(hex)) return;
+    _xhSet(path, hex);
+    // Re-rendering would close an open colour picker: update the swatch rings in place.
+    if (fromPicker) {
+        document.querySelectorAll('.xh-color-row[data-path="' + path + '"] .xh-swatch').forEach(function(b) {
+            b.classList.toggle('active', b.getAttribute('data-hex') === hex);
+        });
+    } else {
+        _xhRenderControls();
+    }
+    _xhDraftChanged();
+}
+
+function xhSetShape(shape) {
+    if (!_xh.draft) return;
+    _xh.draft.kind = 'shape';
+    _xh.draft.shape = shape;
+    _xhRenderDesigner();
+}
+
+function xhBackToShapes() {
+    if (!_xh.draft) return;
+    _xh.draft.kind = 'shape';
+    _xhRenderDesigner();
+}
+
+async function xhUseImage() {
+    if (!_xh.draft) return;
+    var btn = document.getElementById('xh-shape-image');
+    if (btn) btn.disabled = true;
+    var r;
+    try {
+        r = await apiPost('/api/crosshair/image/browse', {}, { timeoutMs: 10 * 60 * 1000 });
+    } finally { if (btn) btn.disabled = false; }
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't use that image."); return; }
+    if (r.cancelled || !r.image_id) return;
+    _xh.draft.kind = 'image';
+    _xh.draft.image = Object.assign({}, _xh.draft.image || {}, { id: r.image_id });
+    _xhRenderDesigner();
+}
+
+function xhSetBackground(bg) {
+    _xh.bg = bg;
+    ['dark', 'light', 'none'].forEach(function(k) {
+        var c = document.getElementById('xh-bg-' + k);
+        if (c) c.classList.toggle('active', k === bg);
+    });
+    _xhPaintPreviewBoxes(null);
+    _xhSchedulePreview(0);
+}
+
+function _xhSchedulePreview(ms) {
+    if (_xh.previewTimer) clearTimeout(_xh.previewTimer);
+    _xh.previewTimer = setTimeout(function() { _xh.previewTimer = null; _xhRunPreview(); }, ms);
+}
+
+async function _xhRunPreview() {
+    if (!_xh.draft) return;
+    var seq = ++_xh.previewSeq;
+    var r = await apiPost('/api/crosshair/preview', { design: _xh.draft, background: _xh.bg });
+    if (seq !== _xh.previewSeq) return;     // a newer edit already asked again
+    var warn = document.getElementById('xh-preview-warn');
+    if (!r || r.ok === false) {
+        if (warn) warn.textContent = "Couldn't draw the preview: " + ((r && r.err) || 'unknown error');
+        return;
+    }
+    var src = String(r.png || '');
+    if (src && src.indexOf('data:') !== 0) src = 'data:image/png;base64,' + src;
+    var w = Number(r.width) || 0, h = Number(r.height) || 0;
+    var dpr = window.devicePixelRatio || 1;
+    var t = document.getElementById('xh-preview-true');
+    var z = document.getElementById('xh-preview-zoom');
+    // True size: one image pixel per screen pixel.  Zoom: four per pixel.
+    if (t) {
+        t.onload = function() { _xhPaintPreviewBoxes(t); };
+        t.style.width = (w / dpr) + 'px'; t.style.height = (h / dpr) + 'px';
+        t.src = src;
+    }
+    if (z) { z.style.width = (w * 4 / dpr) + 'px'; z.style.height = (h * 4 / dpr) + 'px'; z.src = src; }
+    if (warn) {
+        warn.textContent = (r.warnings || []).map(function(m) {
+            return m === 'image missing' ? 'The image is missing, so the default crosshair is shown.' : m;
+        }).join(' ');
+    }
+}
+
+// With Dark or Light the server fills the image's own square; paint the rest of
+// the box in that same colour so no edge shows.  Checker is CSS under a clear image.
+function _xhPaintPreviewBoxes(img) {
+    var boxes = [document.getElementById('xh-preview-true-box'), document.getElementById('xh-preview-zoom-box')];
+    var color = _xh.bg === 'light' ? '#e6e6ea' : '#1c1c20';
+    if (img && _xh.bg !== 'none') {
+        try {
+            var c = document.createElement('canvas');
+            c.width = 1; c.height = 1;
+            var ctx = c.getContext('2d');
+            ctx.drawImage(img, 0, 0, 1, 1, 0, 0, 1, 1);
+            var px = ctx.getImageData(0, 0, 1, 1).data;
+            if (px[3] === 255) color = 'rgb(' + px[0] + ',' + px[1] + ',' + px[2] + ')';
+        } catch (e) { /* keep the guess */ }
+    }
+    boxes.forEach(function(b) {
+        if (!b) return;
+        b.classList.toggle('xh-checker', _xh.bg === 'none');
+        b.style.backgroundColor = _xh.bg === 'none' ? '' : color;
+    });
+}
+
+function _xhRenderImportNote() {
+    var el = document.getElementById('xh-import-note');
+    if (!el) return;
+    var n = _xh.importNote;
+    if (!n) { el.innerHTML = ''; return; }
+    var src = { vispora: 'a Vispora code', cs2: 'a CS2 code', valorant: 'a Valorant code' }[n.source] || 'a code';
+    var html = '<div class="xh-import-box"><div>Loaded from ' + src + '. Press Save as new to keep it.</div>';
+    if (n.approximate) html += '<div class="xh-warn-text">Approximate: check it in game and adjust.</div>';
+    (n.warnings || []).forEach(function(w) { html += '<div class="xh-note">' + escHtml(w) + '</div>'; });
+    el.innerHTML = html + '</div>';
+}
+
+// ─── saving the draft ───
+function _xhApplyPresetsResponse(r) {
+    if (Array.isArray(r.presets)) _xh.presets = r.presets;
+    if (r.settings) _xhSetSettings(r.settings);
+}
+
+async function xhSave() {
+    var p = _xhPreset(_xh.base);
+    if (!p || p.builtin || !_xh.draft || _xh.importNote) return;
+    var r = await apiPost('/api/crosshair/presets', { action: 'update', id: p.id, design: _xh.draft });
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't save the crosshair."); return; }
+    _xhApplyPresetsResponse(r);
+    var np = _xhPreset(p.id);
+    if (np) _xh.draft = _xhFullDesign(np.design);
+    _xh.importNote = null;
+    _xhRenderDesigner();
+    _xhRenderPresets();
+    showInfoToast('Saved ' + p.name + '.', { title: 'Crosshair' });
+}
+
+function xhSaveAsNew() {
+    if (!_xh.draft) return;
+    var userCount = _xh.presets.filter(function(p) { return !p.builtin; }).length;
+    var name = (_xh.importNote && _xh.importNote.name) || ('My crosshair ' + (userCount + 1));
+    _xhAskName('Save as new', name.slice(0, 40), async function(newName) {
+        var r = await apiPost('/api/crosshair/presets', { action: 'save', name: newName, design: _xh.draft, activate: true });
+        if (!r || r.ok === false) return (r && r.err) || "Couldn't save the crosshair.";
+        _xhApplyPresetsResponse(r);
+        _xh.writeSeq++;                     // it is the active preset now: older polls don't know
+        if (r.id && _xhPreset(r.id)) {
+            _xh.inEffect = r.id;
+            _xhSeedDraft(r.id);
+        } else {
+            _xhUpdateDirty();
+        }
+        _xhRenderPresets();
+        _xhRenderWhen();
+        xhPollStatus();
+        showInfoToast('Saved as ' + newName + '.', { title: 'Crosshair' });
+        return '';
+    });
+}
+
+function xhUndoChanges() {
+    _xhSeedDraft(_xh.base);
+}
+
+// A small name dialog (Save as new, Rename).  onOk returns '' or an error to show.
+function _xhAskName(title, initial, onOk) {
+    _xh.nameAction = onOk;
+    openModal('<div class="modal-title">' + escHtml(title) + '</div>' +
+        '<div class="form-group"><label class="form-label" for="xh-name-input">Name</label>' +
+        '<input type="text" id="xh-name-input" maxlength="40" value="' + escAttr(initial) + '"' +
+        ' onkeydown="if(event.key===\'Enter\')xhNameOk()"></div>' +
+        '<div class="xh-err" id="xh-name-err"></div>' +
+        '<div class="modal-actions"><button class="btn" onclick="closeModal()">Cancel</button>' +
+        '<button class="btn btn-primary" id="xh-name-ok" onclick="xhNameOk()">Save</button></div>');
+    setTimeout(function() {
+        var i = document.getElementById('xh-name-input');
+        if (i) { i.focus(); i.select(); }
+    }, 30);
+}
+
+async function xhNameOk() {
+    var i = document.getElementById('xh-name-input');
+    var err = document.getElementById('xh-name-err');
+    var btn = document.getElementById('xh-name-ok');
+    if (!i || !_xh.nameAction || (btn && btn.disabled)) return;
+    var name = String(i.value || '').trim();
+    if (!name || name.length > 40) {
+        if (err) err.textContent = 'Use 1 to 40 characters.';
+        return;
+    }
+    if (btn) btn.disabled = true;
+    var msg;
+    try { msg = await _xh.nameAction(name); } finally { if (btn) btn.disabled = false; }
+    if (msg) { if (err) err.textContent = msg; return; }
+    _xh.nameAction = null;
+    closeModal();
+}
+
+// ─── card 3: presets ───
+var _XH_ICON_EDIT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
+var _XH_ICON_COPY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+var _XH_ICON_DEL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>';
+
+function _xhPresetTile(p) {
+    var active = p.id === _xh.inEffect;
+    // Keys count only on the tile itself: Enter on its Rename, Duplicate or
+    // Delete button bubbles up here too, and must not switch the crosshair.
+    var html = '<div class="xh-preset' + (active ? ' active' : '') + '" role="button" tabindex="0" title="' + escAttr(p.name) + '"' +
+        ' onclick="xhActivatePreset(' + jsArg(p.id) + ')"' +
+        ' onkeydown="if(event.target===this&&(event.key===\'Enter\'||event.key===\' \')){event.preventDefault();xhActivatePreset(' + jsArg(p.id) + ')}">' +
+        '<div class="xh-preset-thumb">' +
+        (p.thumb ? '<img src="' + escAttr(p.thumb) + '" alt="" onload="xhThumbFit(this)">' : '') +
+        '</div><div class="xh-preset-name">' + escHtml(p.name) + '</div>';
+    if (active) html += '<div class="xh-preset-inuse">In use</div>';
+    html += '<div class="xh-preset-actions">';
+    if (!p.builtin) {
+        html += '<button type="button" class="xh-icon-btn" title="Rename" aria-label="Rename ' + escAttr(p.name) + '"' +
+            ' onclick="event.stopPropagation();xhRenamePreset(' + jsArg(p.id) + ')">' + _XH_ICON_EDIT + '</button>';
+    }
+    html += '<button type="button" class="xh-icon-btn" title="Duplicate" aria-label="Duplicate ' + escAttr(p.name) + '"' +
+        ' onclick="event.stopPropagation();xhDuplicatePreset(' + jsArg(p.id) + ')">' + _XH_ICON_COPY + '</button>';
+    if (!p.builtin) {
+        html += '<button type="button" class="xh-icon-btn xh-icon-danger" title="Delete" aria-label="Delete ' + escAttr(p.name) + '"' +
+            ' onclick="event.stopPropagation();xhDeletePreset(' + jsArg(p.id) + ')">' + _XH_ICON_DEL + '</button>';
+    }
+    return html + '</div></div>';
+}
+
+function _xhRenderPresets() {
+    var b = document.getElementById('xh-presets-builtin');
+    var u = document.getElementById('xh-presets-user');
+    if (!b || !u) return;
+    var built = _xh.presets.filter(function(p) { return p.builtin; });
+    var mine = _xh.presets.filter(function(p) { return !p.builtin; });
+    b.innerHTML = built.map(_xhPresetTile).join('') || '<div class="xh-empty">No built-in crosshairs.</div>';
+    u.innerHTML = mine.map(_xhPresetTile).join('') ||
+        '<div class="xh-empty">Nothing saved yet. Change a crosshair above and press Save as new.</div>';
+}
+
+// Small thumbnails are doubled (pixel-sharp), big ones shrunk to fit the tile.
+function xhThumbFit(img) {
+    var w = img.naturalWidth, h = img.naturalHeight;
+    if (!w || !h) return;
+    var s = 52 / Math.max(w, h);
+    s = s >= 2 ? 2 : (s >= 1 ? 1 : s);
+    img.style.width = Math.max(1, Math.round(w * s)) + 'px';
+    img.style.height = Math.max(1, Math.round(h * s)) + 'px';
+}
+
+async function xhActivatePreset(id) {
+    var dirty = _xhIsDirty();
+    if (id === _xh.inEffect && id === _xh.base && !dirty) return;
+    if (dirty && !confirm('Discard changes?')) return;
+    var r = await apiPost('/api/crosshair/activate', { id: id });
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't switch to that crosshair."); return; }
+    _xhSetSettings(r.settings);
+    if (r.status) _xh.status = _xhUnwrapStatus(r.status) || _xh.status;
+    _xh.inEffect = id;
+    _xh.writeSeq++;                         // a poll already out may name the old preset
+    _xhSeedDraft(id);
+    _xhRenderPresets();
+    _xhRenderMain();
+    xhPollStatus();
+}
+
+function xhRenamePreset(id) {
+    var p = _xhPreset(id);
+    if (!p || p.builtin) return;
+    _xhAskName('Rename', p.name, async function(newName) {
+        var r = await apiPost('/api/crosshair/presets', { action: 'rename', id: id, name: newName });
+        if (!r || r.ok === false) return (r && r.err) || "Couldn't rename it.";
+        _xhApplyPresetsResponse(r);
+        _xhRenderPresets();
+        _xhUpdateDirty();
+        _xhRenderWhen();
+        return '';
+    });
+}
+
+async function xhDuplicatePreset(id) {
+    var r = await apiPost('/api/crosshair/presets', { action: 'duplicate', id: id });
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't copy it."); return; }
+    _xhApplyPresetsResponse(r);
+    _xhRenderPresets();
+    _xhRenderWhen();
+    var np = r.id && _xhPreset(r.id);
+    showInfoToast(np ? 'Saved a copy as ' + np.name + '.' : 'Copy saved.', { title: 'Crosshair' });
+}
+
+async function xhDeletePreset(id) {
+    var p = _xhPreset(id);
+    if (!p || p.builtin) return;
+    if (!confirm('Delete "' + p.name + '"?')) return;
+    var r = await apiPost('/api/crosshair/presets', { action: 'delete', id: id });
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't delete it."); return; }
+    _xhApplyPresetsResponse(r);
+    _xh.writeSeq++;                         // a poll already out may still name the deleted preset
+    if (_xh.inEffect === id) _xh.inEffect = _xh.activePreset && _xh.activePreset !== id ? _xh.activePreset : 'builtin:classic';
+    if (_xh.base === id) _xhSeedDraft(_xh.inEffect);
+    _xhRenderPresets();
+    _xhRenderWhen();
+    xhPollStatus();
+}
+
+async function xhShareCode() {
+    if (!_xh.draft) return;
+    var r = await apiPost('/api/crosshair/export', { design: _xh.draft });
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't make a code."); return; }
+    var inp = document.getElementById('xh-share-code');
+    if (inp) inp.value = r.code || '';
+    var copied = false;
+    try { await navigator.clipboard.writeText(r.code || ''); copied = true; } catch (e) {
+        try { if (inp) { inp.focus(); inp.select(); copied = document.execCommand('copy'); } } catch (e2) {}
+    }
+    (r.warnings || []).forEach(function(w) { showWarnToast(w, { title: 'Share code' }); });
+    showInfoToast(copied ? 'Code copied. Paste it anywhere to share this crosshair.'
+                         : 'Select the code and copy it to share this crosshair.', { title: 'Share code' });
+}
+
+async function xhImportCode() {
+    var inp = document.getElementById('xh-import-code');
+    var code = String((inp && inp.value) || '').trim();
+    if (!code) { showWarnToast('Paste a code first.', { title: 'Import code' }); return; }
+    if (_xhIsDirty() && !confirm('Discard changes?')) return;
+    var r = await apiPost('/api/crosshair/import', { code: code });
+    if (!r || r.ok === false) { showWarnToast((r && r.err) || "Couldn't read that code.", { title: 'Import code' }); return; }
+    _xh.draft = _xhFullDesign(r.design);
+    _xh.importNote = {
+        source: r.source || '', name: r.name || '', warnings: r.warnings || [],
+        approximate: !!r.approximate || r.source === 'cs2' || r.source === 'valorant',
+    };
+    if (inp) inp.value = '';
+    _xhRenderDesigner();
+    xhScrollTo('xh-designer-card');
+}
+
+// ─── card 4: position ───
+function _xhMonitorLabel(m) {
+    if (m.label) return m.label;
+    var size = (m.width && m.height) ? m.width + 'x' + m.height : '';
+    var bits = [size, m.primary ? 'main' : ''].filter(Boolean).join(', ');
+    return (m.name || m.id || 'Display') + (bits ? ' (' + bits + ')' : '');
+}
+
+function _xhRenderPosition() {
+    var s = _xh.settings;
+    if (!s) return;
+    var a = document.getElementById('xh-anchor');
+    if (a) a.value = s.anchor === 'monitor' ? 'monitor' : 'game';
+    var sel = document.getElementById('xh-monitor');
+    if (sel) {
+        var html = '<option value="auto">Automatic</option>';
+        var found = (s.monitor || 'auto') === 'auto';
+        _xh.monitors.forEach(function(m) {
+            if (m.id === s.monitor) found = true;
+            html += '<option value="' + escAttr(m.id) + '">' + escHtml(_xhMonitorLabel(m)) + '</option>';
+        });
+        if (!found) html += '<option value="' + escAttr(s.monitor) + '">' + escHtml(s.monitor) + ' (not connected)</option>';
+        sel.innerHTML = html;
+        sel.value = s.monitor || 'auto';
+        sel.disabled = s.anchor !== 'monitor';
+    }
+    var note = document.getElementById('xh-monitor-note');
+    if (note) note.style.display = s.anchor !== 'monitor' ? '' : 'none';
+    ['x', 'y'].forEach(function(k) {
+        var el = document.getElementById('xh-offset-' + k);
+        if (el && document.activeElement !== el && !_xh.offsetTimer) el.value = s['offset_' + k] || 0;
+    });
+}
+
+function xhSetAnchor(v) { xhSetSetting('anchor', v); }
+
+function xhSetMonitor(v) { xhSetSetting('monitor', v); }
+
+function xhOffsetInput() {
+    if (_xh.offsetTimer) clearTimeout(_xh.offsetTimer);
+    _xh.offsetTimer = setTimeout(_xhSaveOffsets, 400);
+}
+
+function xhNudge(axis, delta) {
+    var el = document.getElementById('xh-offset-' + axis);
+    if (!el) return;
+    el.value = _xhClampInt(_xhClampInt(el.value, -500, 500, 0) + delta, -500, 500, 0);
+    xhOffsetInput();
+}
+
+function xhResetOffset() {
+    ['x', 'y'].forEach(function(k) {
+        var el = document.getElementById('xh-offset-' + k);
+        if (el) el.value = 0;
+    });
+    if (_xh.offsetTimer) clearTimeout(_xh.offsetTimer);
+    _xhSaveOffsets();
+}
+
+async function _xhSaveOffsets() {
+    _xh.offsetTimer = null;
+    var x = _xhClampInt((document.getElementById('xh-offset-x') || {}).value, -500, 500, 0);
+    var y = _xhClampInt((document.getElementById('xh-offset-y') || {}).value, -500, 500, 0);
+    await _xhSaveSettings({ offset_x: x, offset_y: y });
+    _xhRenderPosition();
+}
+
+async function xhTestShow() {
+    var btn = document.getElementById('xh-test-btn');
+    if (btn) btn.disabled = true;
+    var r;
+    try { r = await apiPost('/api/crosshair/test', { seconds: 5 }); } finally { if (btn) btn.disabled = false; }
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't show the crosshair."); return; }
+    if (_xhIsDirty()) {
+        showInfoToast('This shows the saved crosshair. Save your changes to see them on screen.', { title: 'Crosshair' });
+    }
+    if (r.status) { _xh.status = _xhUnwrapStatus(r.status) || _xh.status; _xhRenderMain(); }
+    xhPollStatus();
+}
+
+// ─── card 5: when to show ───
+function _xhRenderWhen() {
+    var s = _xh.settings;
+    if (!s) return;
+    var sm = document.getElementById('xh-show-mode');
+    if (sm) sm.value = s.show_mode || 'games';
+    var am = document.getElementById('xh-aim-mode');
+    if (am) am.value = s.hide_on_aim || 'off';
+    var ab = document.getElementById('xh-aim-button');
+    if (ab) { ab.value = s.aim_button || 'mouse2'; ab.disabled = (s.hide_on_aim || 'off') === 'off'; }
+    var an = document.getElementById('xh-aim-note');
+    if (an) an.style.display = s.hide_on_aim === 'toggle' ? '' : 'none';
+    _xhSetSwitch('xh-toggle-cursor', !!s.hide_with_cursor);
+    _xhRenderRules();
+    _xhRenderHotkeys();
+    var dl = document.getElementById('xh-games-datalist');
+    if (dl) {
+        dl.innerHTML = _xh.gamesHint.map(function(g) {
+            return '<option value="' + escAttr(g.exe) + '">' + escHtml(g.name || g.exe) + '</option>';
+        }).join('');
+    }
+    var bn = document.getElementById('xh-blocked-note');
+    if (bn) {
+        // Hiding is all Vispora does here: the overlay keeps running, so say so.
+        bn.innerHTML = _xh.blocked.length
+            ? "Hidden while these games are in front, unless you add a Show rule. If one of them won't start, " +
+              'turn the crosshair off first: ' + _xh.blocked.map(function(b) {
+                return '<b>' + escHtml(b.name || _xhGameName(b.exe)) + '</b>' + (b.reason ? ' (' + escHtml(b.reason) + ')' : '');
+            }).join(', ')
+            : '';
+        bn.style.display = _xh.blocked.length ? '' : 'none';
+    }
+}
+
+function _xhRenderRules() {
+    var box = document.getElementById('xh-rules');
+    if (!box) return;
+    var games = (_xh.settings && _xh.settings.games) || {};
+    var exes = Object.keys(games).sort();
+    if (!exes.length) { box.innerHTML = '<div class="xh-empty">No games added.</div>'; return; }
+    var html = '<div class="xh-rules-head"><span>Game</span><span>Show</span><span>Crosshair</span>' +
+        '<span>X</span><span>Y</span><span></span></div>';
+    exes.forEach(function(exe) {
+        var rule = games[exe] || {};
+        var name = _xhGameName(exe);
+        var a = jsArg(exe);
+        var mode = rule.mode || 'default';
+        var modeSel = '<select aria-label="Show in ' + escAttr(name) + '" onchange="xhRuleChange(' + a + ', \'mode\', this.value)">' +
+            [['default', 'Default'], ['show', 'Show'], ['hide', 'Hide']].map(function(o) {
+                return '<option value="' + o[0] + '"' + (mode === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
+            }).join('') + '</select>';
+        var known = !rule.preset || !!_xhPreset(rule.preset);
+        var presetSel = '<select aria-label="Crosshair in ' + escAttr(name) + '" onchange="xhRuleChange(' + a + ', \'preset\', this.value)">' +
+            '<option value=""' + (!rule.preset ? ' selected' : '') + '>Main crosshair</option>' +
+            _xh.presets.map(function(p) {
+                return '<option value="' + escAttr(p.id) + '"' + (rule.preset === p.id ? ' selected' : '') + '>' + escHtml(p.name) + '</option>';
+            }).join('') +
+            (known ? '' : '<option value="' + escAttr(rule.preset) + '" selected>Missing crosshair</option>') +
+            '</select>';
+        var off = function(k) {
+            var v = rule[k];
+            var empty = v === null || v === undefined;
+            return '<input type="number" min="-500" max="500" step="1" placeholder="Same" title="' +
+                (empty ? 'Uses the offset above' : 'Leave it empty to use the offset above') + '"' +
+                ' aria-label="' + k.slice(-1).toUpperCase() +
+                ' offset in ' + escAttr(name) + '" value="' + (empty ? '' : escAttr(v)) + '"' +
+                ' onchange="xhRuleChange(' + a + ', ' + jsArg(k) + ', this.value)">';
+        };
+        var why = _xhBlockedReason(exe);
+        html += '<div class="xh-rule">' +
+            '<div class="xh-rule-game"><div class="xh-rule-name">' + escHtml(name) +
+            (why ? ' <span class="xh-tag xh-tag-warn" title="' + escAttr(why) + '">May object to overlays</span>' : '') + '</div>' +
+            (name !== exe ? '<div class="xh-rule-exe">' + escHtml(exe) + '</div>' : '') + '</div>' +
+            modeSel + presetSel + off('offset_x') + off('offset_y') +
+            '<button class="btn btn-sm xh-rule-del" title="Remove" aria-label="Remove ' + escAttr(name) + '" onclick="xhRemoveRule(' + a + ')">✕</button>' +
+            '</div>';
+    });
+    box.innerHTML = html;
+}
+
+function _xhConfirmBlocked(exe) {
+    var why = _xhBlockedReason(exe);
+    if (!why) return true;
+    return confirm(_xhGameName(exe) + ': ' + why + '\n\nShow the crosshair in this game anyway?');
+}
+
+// The server merges a rule onto the saved one, so send only what changed: the
+// Next / Previous hotkeys change a game's crosshair behind this page's back, and
+// a whole rule from the page's copy would put the old one back.
+async function _xhSaveRule(exe, patch) {
+    var r = await apiPost('/api/crosshair/games', { exe: exe, rule: patch });
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't save the game rule."); return null; }
+    _xhSetSettings(r.settings);
+    _xh.writeSeq++;                         // the crosshair in effect may have changed
+    return r;
+}
+
+async function xhRuleChange(exe, field, value) {
+    var patch = {};
+    if (field === 'mode') {
+        if (value === 'show' && !_xhConfirmBlocked(exe)) { _xhRenderRules(); return; }
+        patch.mode = value;
+    } else if (field === 'preset') {
+        patch.preset = value || null;
+    } else if (field === 'offset_x' || field === 'offset_y') {
+        var t = String(value == null ? '' : value).trim();
+        patch[field] = t === '' ? null : _xhClampInt(t, -500, 500, 0);
+    } else return;
+    await _xhSaveRule(exe, patch);
+    _xhRenderRules();
+    _xhRenderMain();
+    if (field === 'preset' || field === 'mode') xhPollStatus();
+}
+
+async function xhRemoveRule(exe) {
+    var r = await apiPost('/api/crosshair/games', { exe: exe, rule: null });
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't remove the game."); return; }
+    _xhSetSettings(r.settings);
+    _xh.writeSeq++;
+    _xhRenderRules();
+    _xhRenderMain();
+    xhPollStatus();
+}
+
+async function xhAddRule() {
+    var inp = document.getElementById('xh-rule-add-exe');
+    var exe = String((inp && inp.value) || '').trim().toLowerCase();
+    if (!exe) { showWarnToast('Type the game\'s .exe name first.', { title: 'Crosshair' }); return; }
+    if (exe.indexOf('.') < 0) exe += '.exe';
+    var mode = (document.getElementById('xh-rule-add-mode') || {}).value || 'show';
+    if (mode === 'show' && !_xhConfirmBlocked(exe)) return;
+    // A new game gets the server's defaults for the rest; an existing one keeps them.
+    var r = await _xhSaveRule(exe, { mode: mode });
+    if (!r) return;
+    if (inp) inp.value = '';
+    _xhRenderRules();
+    _xhRenderMain();
+    xhPollStatus();
+}
+
+// ─── hotkeys ───
+function _xhRenderHotkeys() {
+    var hk = (_xh.settings && _xh.settings.hotkeys) || {};
+    ['toggle', 'next', 'prev'].forEach(function(n) {
+        var b = document.getElementById('xh-hk-' + n);
+        if (!b) return;
+        b.textContent = hk[n] || 'Not set';
+        b.classList.toggle('xh-hk-empty', !hk[n]);
+        // The visible name sits beside the button; a screen reader needs it on the button.
+        b.setAttribute('aria-label', (_XH_HOTKEY_NAMES[n] || n) + ' hotkey: ' + (hk[n] || 'not set'));
+        var cap = hk[n] ? _xhComboCapTitle(hk[n]) : '';
+        if (cap) b.title = cap; else b.removeAttribute('title');
+        var note = document.getElementById('xh-hk-note-' + n);
+        if (note) note.textContent = /(^|\+)Num([0-9]|Dot)$/.test(hk[n] || '') ? 'Works only while Num Lock is on.' : '';
+    });
+    _xhRenderHotkeyErrors();
+}
+
+// The character on the user's own key for a letter or punctuation token, or ''
+// when that is the token itself.  Tokens name Windows' virtual keys in US terms.
+function _xhTokenCap(tok) {
+    if (!_XH_CAP_TOKENS.test(tok || '')) return '';
+    if (_xh.keyCaps[tok] !== undefined) return _xh.keyCaps[tok];
+    var map = _xh.layout;
+    if (!map || !/^[A-Z]$/.test(tok)) return '';
+    // Latin layouts put a letter's virtual key on the key that types it; the
+    // others (Cyrillic, Greek and so on) keep the US positions for them.
+    var low = tok.toLowerCase(), latin = false;
+    try { map.forEach(function(v) { if (v === low) latin = true; }); } catch (e) { return ''; }
+    if (latin) return '';
+    var ch = String(map.get('Key' + tok) || '').toUpperCase();
+    return ch && ch !== tok ? ch : '';
+}
+
+// Tooltip for a combo whose key reads differently on the user's keyboard.
+function _xhComboCapTitle(combo) {
+    var parts = String(combo || '').split('+');
+    var cap = _xhTokenCap(parts[parts.length - 1]);
+    if (!cap) return '';
+    parts[parts.length - 1] = cap;
+    return 'On your keyboard: ' + parts.join('+');
+}
+
+function _xhLoadLayout(then) {
+    try {
+        if (!(navigator.keyboard && navigator.keyboard.getLayoutMap)) return;
+        navigator.keyboard.getLayoutMap().then(function(map) {
+            _xh.layout = map;
+            if (then) then();
+        }, function() {});
+    } catch (e) { /* no layout map: tooltips just stay off */ }
+}
+
+function _xhRenderHotkeyErrors() {
+    var hk = (_xh.settings && _xh.settings.hotkeys) || {};
+    var sh = (_xh.status && _xh.status.hotkeys) || {};
+    ['toggle', 'next', 'prev'].forEach(function(n) {
+        var e = document.getElementById('xh-hk-err-' + n);
+        if (!e) return;
+        var msg = (hk[n] && sh[n] && sh[n].ok === false && sh[n].err) ? String(sh[n].err) : '';
+        e.textContent = msg;
+        e.style.display = msg ? '' : 'none';
+    });
+}
+
+async function xhClearHotkey(name) {
+    var body = { hotkeys: {} };
+    body.hotkeys[name] = '';
+    await _xhSaveSettings(body);
+    _xhRenderHotkeys();
+}
+
+// The main token for a keydown, from the virtual key (see _XH_VK_MAP), or ''.
+function _xhKeyToken(e) {
+    var k = Number(e && e.keyCode) || 0;
+    if ((k >= 65 && k <= 90) || (k >= 48 && k <= 57)) return String.fromCharCode(k);
+    if (k >= 96 && k <= 105) return 'Num' + (k - 96);
+    if (k >= 112 && k <= 135) return 'F' + (k - 111);
+    return _XH_VK_MAP[k] || '';
+}
+
+function _xhBareAllowed(tok) {
+    return /^F(1[3-9]|2[0-4])$/.test(tok) || /^Num/.test(tok) || /^Mouse[345]$/.test(tok) ||
+        ['ScrollLock', 'Insert', 'Home', 'End', 'PageUp', 'PageDown'].indexOf(tok) >= 0;
+}
+
+function _xhIsNumDigit(tok) { return /^Num([0-9]|Dot)$/.test(tok); }
+
+function _xhMods(e) {
+    var m = [];
+    if (e.ctrlKey) m.push('Ctrl');
+    if (e.altKey) m.push('Alt');
+    if (e.shiftKey) m.push('Shift');
+    if (e.metaKey) m.push('Win');
+    return m;
+}
+
+// Click-to-bind dialog.  Its own listeners (not the Capture page's), removed
+// whenever the dialog closes, however it closes.
+function xhBindHotkey(name) {
+    if (!_xh.loaded) return;
+    _xhBindStop();
+    var cur = ((_xh.settings && _xh.settings.hotkeys) || {})[name] || '';
+    openModal('<div class="modal-title">' + escHtml(_XH_HOTKEY_NAMES[name] || name) + '</div>' +
+        '<div class="xh-bind" id="xh-bind-box">' +
+        '<div class="xh-bind-prompt">Press the keys you want</div>' +
+        '<div class="xh-bind-help">Or click the middle, back or forward mouse button. Esc cancels, Backspace clears.</div>' +
+        '<div class="xh-bind-preview" id="xh-bind-preview">' + escHtml(cur || 'Not set') + '</div>' +
+        '<div class="xh-err" id="xh-bind-err"></div>' +
+        '<div class="xh-note">Use the left Alt key: right Alt types characters on some keyboards.</div>' +
+        '</div>' +
+        '<div class="modal-actions"><button class="btn" onclick="xhBindCancel()">Cancel</button></div>');
+    var b = { name: name, busy: false, altLeft: false, altRight: false, psDown: false };
+    b.onKey = function(e) { _xhBindKey(b, e); };
+    b.onKeyUp = function(e) { _xhBindKeyUp(b, e); };
+    b.onDown = function(e) { _xhBindMouse(b, e, true); };
+    b.onUp = function(e) { _xhBindMouse(b, e, false); };
+    b.onBlock = function(e) { if (_xhBindAlive(b) && e.button !== 0) e.preventDefault(); };
+    window.addEventListener('keydown', b.onKey, true);
+    window.addEventListener('keyup', b.onKeyUp, true);
+    window.addEventListener('mousedown', b.onDown, true);
+    window.addEventListener('mouseup', b.onUp, true);
+    window.addEventListener('auxclick', b.onBlock, true);
+    window.addEventListener('contextmenu', b.onBlock, true);
+    _xh.bind = b;
+    _xhLoadLayout();            // the user may have switched keyboard layouts since
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+}
+
+function _xhBindStop() {
+    var b = _xh && _xh.bind;
+    if (!b) return;
+    _xh.bind = null;
+    window.removeEventListener('keydown', b.onKey, true);
+    window.removeEventListener('keyup', b.onKeyUp, true);
+    window.removeEventListener('mousedown', b.onDown, true);
+    window.removeEventListener('mouseup', b.onUp, true);
+    window.removeEventListener('auxclick', b.onBlock, true);
+    window.removeEventListener('contextmenu', b.onBlock, true);
+}
+
+function xhBindCancel() {
+    _xhBindStop();
+    closeModal();
+}
+
+function _xhBindAlive(b) {
+    var ov = document.getElementById('modal-overlay');
+    return _xh.bind === b && !!document.getElementById('xh-bind-box') && !!ov && ov.classList.contains('open');
+}
+
+function _xhBindShow(text, err) {
+    var p = document.getElementById('xh-bind-preview');
+    if (p && text !== null) {
+        p.textContent = text;
+        var cap = _xhComboCapTitle(text);
+        if (cap) p.title = cap; else p.removeAttribute('title');
+    }
+    var e = document.getElementById('xh-bind-err');
+    if (e) e.textContent = err || '';
+}
+
+function _xhBindKey(b, e) {
+    if (!_xhBindAlive(b)) { _xhBindStop(); return; }
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.code === 'AltLeft') b.altLeft = true;
+    if (e.code === 'AltRight') b.altRight = true;
+    if (e.code === 'PrintScreen') b.psDown = true;
+    if (e.repeat || b.busy) return;
+    if (e.code === 'Escape') { xhBindCancel(); return; }
+    if (e.code === 'Backspace') { _xhBindSave(b, ''); return; }
+    var mods = _xhMods(e);
+    if (_XH_MODIFIER_CODES.indexOf(e.code) >= 0 || _XH_MODIFIER_VKS.indexOf(e.keyCode) >= 0) {
+        _xhBindShow(mods.length ? mods.join('+') + '+…' : '…', '');
+        return;
+    }
+    var tok = _xhKeyToken(e);
+    // A number pad digit that Windows reports as End, Down and so on: Num Lock
+    // is off, or Shift turned it into the navigation key.  The overlay would
+    // then also fire on the real End, Down... keys, so don't take it.
+    if (/^Numpad([0-9]|Decimal)$/.test(e.code) && !_xhIsNumDigit(tok)) {
+        var numLock = !!(e.getModifierState && e.getModifierState('NumLock'));
+        _xhBindShow(null, numLock ? "Shift doesn't work with number pad keys. Use Ctrl, Alt or Win instead."
+                                  : 'Turn Num Lock on to use the number pad keys, or pick another key.');
+        return;
+    }
+    if (!tok) { _xhBindShow(null, "That key can't be used. Try another one."); return; }
+    // Remember the character on this key, for the "On your keyboard" tooltip.
+    if (_XH_CAP_TOKENS.test(tok) && _xh.layout && e.code) {
+        var ch = String(_xh.layout.get(e.code) || '').toUpperCase();
+        if (ch) _xh.keyCaps[tok] = ch === tok ? '' : ch;
+    }
+    _xhBindTry(b, mods, tok);
+}
+
+function _xhBindKeyUp(b, e) {
+    if (!_xhBindAlive(b)) { _xhBindStop(); return; }
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.code === 'AltLeft') b.altLeft = false;
+    if (e.code === 'AltRight') b.altRight = false;
+    // Windows often gives the page no keydown for Print Screen, only the keyup.
+    if (e.code === 'PrintScreen') {
+        if (!b.psDown && !b.busy) _xhBindTry(b, _xhMods(e), 'PrintScreen');
+        b.psDown = false;
+    }
+}
+
+function _xhBindMouse(b, e, isDown) {
+    if (!_xhBindAlive(b)) { _xhBindStop(); return; }
+    var tok = { 1: 'Mouse3', 3: 'Mouse4', 4: 'Mouse5' }[e.button];
+    if (!tok) return;           // left and right clicks keep working (the Cancel button)
+    e.preventDefault();         // no autoscroll, no Back / Forward navigation
+    e.stopPropagation();
+    if (isDown && !b.busy) _xhBindTry(b, _xhMods(e), tok);
+}
+
+function _xhBindTry(b, mods, tok) {
+    var combo = mods.concat([tok]).join('+');
+    _xhBindShow(combo, '');
+    if (b.altRight && !b.altLeft && (mods.indexOf('Alt') >= 0 || mods.indexOf('Ctrl') >= 0)) {
+        _xhBindShow(combo, "Right Alt doesn't work for hotkeys. Use the left Alt key.");
+        return;
+    }
+    if (!mods.length && !_xhBareAllowed(tok)) {
+        _xhBindShow(combo, 'Add Ctrl, Alt or Shift to this key, so it doesn\'t fire while you type or play.');
+        return;
+    }
+    // Windows turns Shift plus a number pad digit into the navigation key.
+    if (mods.indexOf('Shift') >= 0 && _xhIsNumDigit(tok)) {
+        _xhBindShow(combo, "Shift doesn't work with number pad keys. Use Ctrl, Alt or Win instead.");
+        return;
+    }
+    _xhBindSave(b, combo);
+}
+
+async function _xhBindSave(b, combo) {
+    b.busy = true;
+    var body = { hotkeys: {} };
+    body.hotkeys[b.name] = combo;
+    var r;
+    try { r = await apiPost('/api/crosshair/settings', body); } finally { b.busy = false; }
+    if (!r || r.ok === false) {
+        if (_xhBindAlive(b)) _xhBindShow(null, (r && r.err) || "Couldn't save that hotkey. Try another one.");
+        return;
+    }
+    _xhSetSettings(r.settings);
+    if (r.status) _xh.status = _xhUnwrapStatus(r.status) || _xh.status;
+    if (_xh.bind === b) xhBindCancel();
+    _xhRenderHotkeys();
+}
+
+// ─── card 6: fullscreen ───
+function _xhRenderFsSelect() {
+    var sel = document.getElementById('xh-fs-exe');
+    if (!sel) return;
+    var cur = sel.value || (_xh.fs && _xh.fs.exe) || _xh.lastGame || '';
+    var seen = {};
+    var html = '<option value="">Pick a game</option>';
+    var add = function(exe, name) {
+        var low = String(exe || '').toLowerCase();
+        if (!low || seen[low]) return;
+        seen[low] = true;
+        html += '<option value="' + escAttr(low) + '">' + escHtml(name && name !== exe ? name + ' (' + low + ')' : low) + '</option>';
+    };
+    if (_xh.lastGame) add(_xh.lastGame, _xhGameName(_xh.lastGame));
+    _xh.gamesHint.forEach(function(g) { add(g.exe, g.name); });
+    if (cur) add(cur, _xhGameName(cur));
+    sel.innerHTML = html;
+    sel.value = String(cur).toLowerCase();
+}
+
+async function xhFsCheck(exeOverride) {
+    var sel = document.getElementById('xh-fs-exe');
+    var exe = (typeof exeOverride === 'string') ? exeOverride : (sel ? sel.value : '');
+    var out = document.getElementById('xh-fs-result');
+    if (out) out.innerHTML = '<div class="xh-note">Checking…</div>';
+    _xh.fsBusy = true;
+    var r;
+    try {
+        r = await apiGet('/api/crosshair/fullscreen' + (exe ? '?exe=' + encodeURIComponent(exe) : ''), { timeoutMs: 15000 });
+    } finally { _xh.fsBusy = false; }
+    if (!r || r.ok === false) {
+        if (out) out.innerHTML = '<div class="xh-err">Couldn\'t check: ' + escHtml((r && r.err) || 'unknown error') + '</div>';
+        return;
+    }
+    _xh.fs = r;
+    if (r.exe) {
+        var m = r.present_mode;
+        _xh.pm = {
+            exe: r.exe, at: Date.now(),
+            ok: !!(_xhIsObj(m) && m.mode && Number(m.age_s) < 10 && !/^Hardware: Legacy/i.test(String(m.mode))),
+        };
+        _xhRenderMain();
+    }
+    if (sel && r.exe) {
+        var low = String(r.exe).toLowerCase();
+        if (!Array.prototype.some.call(sel.options, function(o) { return o.value === low; })) _xhRenderFsSelect();
+        sel.value = low;
+    }
+    _xhRenderFsResult();
+}
+
+function _xhRenderFsResult() {
+    var r = _xh.fs || {};
+    var out = document.getElementById('xh-fs-result');
+    var fso = Array.isArray(r.fso_flags) ? r.fso_flags : [];
+    var glob = Array.isArray(r.global_optouts) ? r.global_optouts : [];
+    var fix = document.getElementById('xh-fs-fix');
+    if (fix) fix.style.display = (r.exe && fso.length) ? '' : 'none';
+    var fg = document.getElementById('xh-fs-fix-global');
+    // Only offer the all-games fix when one of those settings is in effect.
+    if (fg) fg.style.display = glob.some(function (o) { return o && o.effective !== false; }) ? '' : 'none';
+    var undo = document.getElementById('xh-fs-undo');
+    if (undo) undo.disabled = !r.can_undo;
+    if (!out) return;
+    var V = {
+        ok: ['ok', 'Should work'],
+        exclusive: ['danger', 'Exclusive fullscreen'],
+        may_be_exclusive: ['warn', 'Might use exclusive fullscreen'],
+        unknown: ['neutral', 'Not checked'],
+    }[r.verdict] || ['neutral', r.verdict || 'Not checked'];
+    var html = '<div class="xh-fs-head"><span class="status-badge ' + V[0] + '">' + escHtml(V[1]) + '</span>';
+    if (r.exe) html += '<span class="xh-fs-game">' + escHtml(_xhGameName(r.exe)) + '</span>';
+    html += '</div>';
+    var advice = Array.isArray(r.advice) ? r.advice : [];
+    if (!r.exe) {
+        // The server's advice says the same when it has any.
+        if (!advice.length) html += '<div class="xh-note">Pick a game to check.</div>';
+    } else {
+        var pm = r.present_mode;
+        html += '<div class="xh-fs-line">' + (_xhIsObj(pm) && pm.mode
+            ? 'Display mode: <b>' + escHtml(pm.mode) + '</b>' +
+              (pm.age_s !== undefined ? ' (seen ' + Math.max(0, Math.round(Number(pm.age_s) || 0)) + ' s ago)' : '')
+            : "Vispora can't see this game's display mode right now.") + '</div>';
+    }
+    if (fso.length) {
+        // Windows keeps this per program path, and the match is by name: show
+        // every program it found, so a same-named one elsewhere is no surprise.
+        var several = _xhFsPaths(fso).length > 1;
+        html += '<div class="xh-fs-line">Fullscreen optimizations are turned off for ' +
+            (several ? 'these programs named ' + escHtml(r.exe || '') : 'this game') +
+            " in Windows' compatibility settings:</div><ul class=\"xh-list\">" +
+            fso.map(function(f) {
+                var who = { HKCU: 'your account', HKLM: 'all users' }[String(f.hive || '').toUpperCase()];
+                return '<li><span class="mono">' + escHtml(f.path || '') + '</span>' + (who ? ' (' + who + ')' : '') + '</li>';
+            }).join('') + '</ul>';
+    }
+    if (glob.length) {
+        html += '<div class="xh-fs-line">Windows settings that change fullscreen for every game:</div><ul class="xh-list">' +
+            glob.map(function(g) {
+                return '<li><span class="mono">' + escHtml(g.name) + ' = ' + escHtml(g.value) + '</span>' +
+                    (g.meaning ? ': ' + escHtml(g.meaning) : '') + '</li>';
+            }).join('') + '</ul>';
+    }
+    if (advice.length) html += '<ul class="xh-list">' + advice.map(function(a) { return '<li>' + escHtml(a) + '</li>'; }).join('') + '</ul>';
+    var fixed = Array.isArray(r.fixed_exes) ? r.fixed_exes : [];
+    if (fixed.length) {
+        html += '<div class="xh-note">Turned back on by Vispora: ' + fixed.map(function(e) { return escHtml(_xhGameName(e)); }).join(', ') + '.</div>';
+    }
+    out.innerHTML = html;
+}
+
+// The distinct program paths among the check's Layers matches (one path can be in both hives).
+function _xhFsPaths(fso) {
+    var seen = {}, out = [];
+    (fso || []).forEach(function(f) {
+        var p = String((f && f.path) || '');
+        if (p && !seen[p.toLowerCase()]) { seen[p.toLowerCase()] = true; out.push(p); }
+    });
+    return out;
+}
+
+async function xhFsFix() {
+    var exe = _xh.fs && _xh.fs.exe;
+    if (!exe) return;
+    var paths = _xhFsPaths(_xh.fs.fso_flags);
+    if (paths.length > 1 && !confirm('This turns fullscreen optimizations back on for every program named ' + exe + ':\n\n' +
+                                     paths.join('\n') + '\n\nUndo all fullscreen fixes puts them back. Continue?')) return;
+    // The paths the user was shown, so the server can leave alone any program added since the check.
+    var r = await apiPost('/api/crosshair/fullscreen/fix', { exe: exe, paths: paths });
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't change the setting."); return; }
+    showInfoToast('Fullscreen optimizations are back on for ' + _xhGameName(exe) + '. Restart the game to apply it.',
+                  { title: 'Crosshair', timeoutMs: 8000 });
+    xhFsCheck(exe);
+}
+
+async function xhFsFixGlobal() {
+    if (!confirm("Restore Windows' default fullscreen settings for all games?\n\n" +
+                 'Games without their own setting go back to using fullscreen optimizations. ' +
+                 'Undo all fullscreen fixes puts it back.')) return;
+    var r = await apiPost('/api/crosshair/fullscreen/fix-global', {});
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't change the setting."); return; }
+    showInfoToast("Windows' default is back for all games. Restart your games to apply it.", { title: 'Crosshair', timeoutMs: 8000 });
+    xhFsCheck((_xh.fs && _xh.fs.exe) || '');
+}
+
+async function xhFsUndo() {
+    if (!confirm('Undo every fullscreen fix Vispora made?')) return;
+    var r = await apiPost('/api/crosshair/fullscreen/undo', {});
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't undo the fixes."); return; }
+    showInfoToast('Fullscreen fixes undone. Restart your games to apply it.', { title: 'Crosshair' });
+    xhFsCheck((_xh.fs && _xh.fs.exe) || '');
+}
+
+// ─── card 7: recording ───
+function _xhRenderRecording() {
+    var supported = _xh.caps.capture_exclusion !== false;
+    _xhSetSwitch('xh-toggle-capture', !!(_xh.settings && _xh.settings.exclude_from_capture), !supported);
+    _xhRenderCaptureNote();
+}
+
+function _xhRenderCaptureNote() {
+    var el = document.getElementById('xh-capture-note');
+    if (!el) return;
+    var msg = '';
+    if (_xh.caps.capture_exclusion === false) msg = 'Needs Windows 10 version 2004 or later';
+    else if (_xh.settings && _xh.settings.exclude_from_capture && _xh.status && _xh.status.running &&
+             _xh.status.capture_excluded === false) {
+        msg = "Windows didn't accept this, so recordings may still show the crosshair.";
+    }
+    el.textContent = msg;
+    el.style.display = msg ? '' : 'none';
+}
+
+// ─── Profiles page: the note about the removed Gamepad Mapper ───
+async function loadCrosshairLegacyNotice() {
+    var el = document.getElementById('xh-legacy-notice');
+    if (!el) return;
+    var r = await apiGet('/api/crosshair/state');
+    // Unknown (failed read) means no note, not a guess.
+    el.style.display = (r && r.ok !== false && r.legacy_notice) ? '' : 'none';
+}
+
+async function xhDismissLegacyNotice() {
+    var r = await apiPost('/api/crosshair/legacy-notice/dismiss', {});
+    if (!r || r.ok === false) { _xhToastErr(r, "Couldn't hide the note."); return; }
+    var el = document.getElementById('xh-legacy-notice');
+    if (el) el.style.display = 'none';
 }

@@ -75,6 +75,12 @@ _GS_REGISTRY_SCOPE: list[tuple[str, str]] = [
     ("gamebar",            r"HKCU\Software\Microsoft\GameBar"),
     ("gamedvr_policy",     r"HKLM\SOFTWARE\Policies\Microsoft\Windows\GameDVR"),
 
+    # ── Per-program compatibility flags (the crosshair's fullscreen fix) ──
+    ("appcompat_layers_user",
+     r"HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"),
+    ("appcompat_layers_machine",
+     r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"),
+
     # ── Visual / desktop ──
     ("desktop",            r"HKCU\Control Panel\Desktop"),
     ("desktop_winmetrics", r"HKCU\Control Panel\Desktop\WindowMetrics"),

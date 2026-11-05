@@ -7,29 +7,6 @@ import os
 block_cipher = None
 base_path = os.path.dirname(os.path.abspath(SPEC))
 
-# v3.2 — bundle vgamepad's ViGEmClient.dll so the Gamepad Mapper's
-# virtual-controller mode works inside the PyInstaller bundle.  We pull
-# the package directory dynamically so the path is correct regardless of
-# whether vgamepad is installed system-wide or in a venv.
-_vgamepad_datas = []
-try:
-    # Located WITHOUT importing it.  vgamepad connects to the ViGEmBus driver
-    # the moment it is imported, so on a build machine without the driver the
-    # import failed, the except below swallowed it, and the build shipped
-    # with no ViGEmClient.dll — virtual-controller mode dead, no warning.
-    import importlib.util as _ilu
-    _vg_dir = os.path.dirname(_ilu.find_spec("vgamepad").origin)
-    _vg_win = os.path.join(_vg_dir, 'win')
-    if os.path.isdir(_vg_win):
-        for _root, _dirs, _files in os.walk(_vg_win):
-            for _f in _files:
-                _full = os.path.join(_root, _f)
-                _rel  = os.path.relpath(_full, _vg_dir)
-                _vgamepad_datas.append((_full, os.path.join('vgamepad', os.path.dirname(_rel))))
-except Exception:
-    pass
-
-
 # v3.3.0-beta.6 — bundle PyAudioWPatch's compiled extension + the
 # PortAudio DLL.  Without this, the system-audio WASAPI loopback path
 # falls back to "PyAudioWPatch not installed" and clips are silent for
@@ -62,11 +39,10 @@ except Exception:
 # is a top-level module in current releases, which PyInstaller finds on its
 # own — so an empty sweep above does not mean it is absent.)
 import importlib.util as _ilu
-_optional = ("vgamepad", "pyaudiowpatch", "mss", "obsws_python", "websocket", "pystray", "psutil")
+_optional = ("pyaudiowpatch", "mss", "obsws_python", "websocket", "pystray", "psutil")
 _missing = [m for m in _optional if _ilu.find_spec(m) is None]
-print(f"build.spec: {len(_vgamepad_datas)} vgamepad data file(s) bundled; "
-      f"optional packages missing on this machine: {', '.join(_missing) or 'none'}")
-if _missing or not _vgamepad_datas:
+print(f"build.spec: optional packages missing on this machine: {', '.join(_missing) or 'none'}")
+if _missing:
     print("build.spec: WARNING - the features that need them will not work in this build")
 
 
@@ -86,9 +62,7 @@ a = Analysis(
         ('templates', 'templates'),
         ('static', 'static'),
         ('assets', 'assets'),
-        # v3.4 — bundle curated recoil presets file alongside its module
-        ('core/recoil_presets.json', 'core'),
-    ] + _vgamepad_datas,
+    ],
     hiddenimports=[
         'flask',
         'cryptography',
@@ -104,13 +78,8 @@ a = Analysis(
         'PIL',
         'PIL.Image',
         'PIL.ImageDraw',
-        # v3.2 — virtual gamepad / ViGEmBus integration
-        'vgamepad',
-        # v3.6 — recoil pattern capture from gameplay
-        # numpy: FFT-based phase correlation for camera-motion tracking
-        # mss: fast multi-monitor screen capture (~5 ms/frame vs PIL ImageGrab's ~30-50 ms)
-        'numpy',
-        'numpy.fft',
+        # mss: fast multi-monitor screen capture for screenshots
+        # (~5 ms/frame vs PIL ImageGrab's ~30-50 ms)
         'mss',
         'mss.windows',
         # v3.3.0-beta.6 — WASAPI loopback bridge for native system-audio
@@ -125,10 +94,10 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    # v3.6 — numpy is needed for the recoil-capture feature.  pandas /
-    # matplotlib stay excluded since we don't use them and they'd add
-    # another ~150 MB.
-    excludes=['tkinter', 'matplotlib', 'pandas'],
+    # pandas / matplotlib stay excluded: nothing uses them and they'd add
+    # another ~150 MB.  numpy too: nothing in Vispora uses it, but Pillow's
+    # type hints (PIL._typing) name it, which would pull the whole package in.
+    excludes=['tkinter', 'matplotlib', 'pandas', 'numpy'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

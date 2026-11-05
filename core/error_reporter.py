@@ -19,7 +19,7 @@ Payload contains:
 NOT sent:
   • Username, full disk paths beyond what's already in error messages
   • install_info.json contents
-  • Vault data, recoil presets, gamepad config
+  • Vault data, crosshair designs, game profiles
   • Anything else not explicitly listed
 
 Reports live at:

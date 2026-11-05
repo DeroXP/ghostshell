@@ -223,13 +223,20 @@ class FastLoop:
             preset.update(FAST)
         AT.STARTUP_GUARD_SEC = AT.OPENING_PHASE_SEC = 0
         at_fresh(loop=REAL_LOOP)
+        self.before = {x.ident for x in threading.enumerate()}
         return self
 
     def __exit__(self, *exc):
         t = AT._runtime.get("loop_thread")
         AT.end_active_session("test over")
-        if t:
-            t.join(5)
+        # A test that called on_game_exit itself left no loop_thread to join, but
+        # that loop can still be finishing its last poll: it would then decide
+        # (and save the game's record) under the next test's fakes.
+        loops = [x for x in threading.enumerate()
+                 if x.name.startswith("adaptive-tuning-") and x.ident not in self.before]
+        for t in [t] + loops:
+            if t:
+                t.join(5)
         presets, AT.STARTUP_GUARD_SEC, AT.OPENING_PHASE_SEC = self.saved
         for k, v in presets.items():
             AT.MODE_PRESETS[k].clear()
@@ -285,8 +292,8 @@ def learned(core, mem):
 
 
 def test_no_jump_to_the_learned_offset_while_at_is_paused():
-    """A recoil capture or latency measurement pauses AT so the clocks hold
-    still; the jump after the start-up guard changed them anyway."""
+    """A manual pause holds AT so the clocks stay still; the jump after the
+    start-up guard changed them anyway."""
     with FastLoop():
         AT.STARTUP_GUARD_SEC = 0.3
         score[0] = {"score": None, "verdict": "idle", "last_util": 0}

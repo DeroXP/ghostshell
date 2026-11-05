@@ -10,7 +10,6 @@ Run:
 Re-run any time the brand colours / geometry change.
 """
 import os
-import numpy as np
 from PIL import Image, ImageDraw
 
 # ─── Tokens (Vispora Nacre) ───────────────────────────────────────────────
@@ -34,20 +33,19 @@ SIZES = [256, 128, 64, 48, 32, 24, 16]
 
 def _gradient_rgba(n: int) -> Image.Image:
     """An n x n RGBA image holding the diagonal Nacre gradient."""
-    yy, xx = np.mgrid[0:n, 0:n].astype(np.float32)
-    t = (xx + yy) / (2 * (n - 1)) if n > 1 else np.zeros((n, n), np.float32)
-    r = np.zeros((n, n), np.float32)
-    g = np.zeros_like(r)
-    b = np.zeros_like(r)
-    for (t0, c0), (t1, c1) in zip(GRAD_STOPS, GRAD_STOPS[1:]):
-        m = (t >= t0) & (t <= t1)
-        f = (t[m] - t0) / (t1 - t0)
-        r[m] = c0[0] + (c1[0] - c0[0]) * f
-        g[m] = c0[1] + (c1[1] - c0[1]) * f
-        b[m] = c0[2] + (c1[2] - c0[2]) * f
-    a = np.full((n, n), 255, np.uint8)
-    arr = np.dstack([r.astype(np.uint8), g.astype(np.uint8), b.astype(np.uint8), a])
-    return Image.fromarray(arr)   # HxWx4 uint8 -> RGBA inferred
+    # The colour depends only on x + y, so compute one pixel per diagonal and
+    # give each row an n-pixel window of that strip (Pillow only, no numpy).
+    diag = bytearray()
+    for s in range(2 * n - 1):
+        t = s / (2 * (n - 1)) if n > 1 else 0.0
+        rgb = GRAD_STOPS[0][1]
+        for (t0, c0), (t1, c1) in zip(GRAD_STOPS, GRAD_STOPS[1:]):
+            if t0 <= t <= t1:            # a later stop wins on a shared edge
+                f = (t - t0) / (t1 - t0)
+                rgb = tuple(int(a + (b - a) * f) for a, b in zip(c0, c1))
+        diag += bytes(rgb) + b"\xff"
+    rows = b"".join(bytes(diag[4 * y:4 * (y + n)]) for y in range(n))
+    return Image.frombytes("RGBA", (n, n), rows)
 
 
 def _render(size: int) -> Image.Image:

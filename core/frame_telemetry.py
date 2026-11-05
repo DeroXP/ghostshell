@@ -43,6 +43,7 @@ Public API (unchanged from v3.2.0-beta.1)
     get_recent_stats(sec) → {avg_fps, min_fps_1pct, frametime_*, source}
     get_live_snapshot()   → instantaneous {fps, frametime_ms, source}
     get_status()          → full status dump for diagnostics panel
+    get_present_mode()    → last PresentMode seen {pid, name, mode, ts}, or None
 
 All errors are caught — telemetry is advisory.  If no source is
 available, AT degrades to GPU-only scoring (the historic v3.1
@@ -282,6 +283,9 @@ _state = {
     "pm_csv_path":   None,
     "pm_csv_pos":    0,
     "pm_csv_header": None,
+    # Last PresentMode PresentMon reported: {"pid", "name", "mode", "ts"} or None.
+    # Replaced whole, never changed in place, so readers need no lock.
+    "present_mode":  None,
     # Download progress
     "install_state": "idle",  # idle | downloading | installed | error
     "install_dl":    0,
@@ -615,6 +619,40 @@ def _start_presentmon2(pid: int, cli_path: str) -> Optional[dict]:
         return None
 
 
+_PRESENT_MODE_EVERY_S = 1.0     # an unchanged mode is re-stamped at most this often
+
+
+def _note_present_mode(row: list, idx_pid, idx_name, idx_mode) -> None:
+    """Keep the PresentMode of a CSV row in _state["present_mode"]: at once when
+    the mode or the process changes, else at most once a second (just to keep
+    the timestamp fresh).  A lock-free single-key write of a new dict, like the
+    reader's other _state writes (see the note in _pm_stdout_reader)."""
+    try:
+        if len(row) <= max(idx_pid, idx_name, idx_mode):
+            return
+        mode = row[idx_mode].strip().strip('"')
+        if not mode:
+            return
+        pid = int(row[idx_pid])
+        name = row[idx_name].strip().strip('"').lower()
+    except (ValueError, IndexError, TypeError):
+        return
+    now = time.time()
+    cur = _state.get("present_mode")
+    if (isinstance(cur, dict) and cur.get("pid") == pid and cur.get("mode") == mode
+            and now - cur.get("ts", 0.0) < _PRESENT_MODE_EVERY_S):
+        return
+    _state["present_mode"] = {"pid": pid, "name": name, "mode": mode, "ts": now}
+
+
+def get_present_mode() -> Optional[dict]:
+    """The last PresentMode PresentMon reported, {"pid", "name", "mode", "ts"}
+    (ts = time.time() of the row), or None.  Callers judge freshness from ts:
+    the value stays after PresentMon stops."""
+    pm = _state.get("present_mode")
+    return dict(pm) if isinstance(pm, dict) else None
+
+
 def _pm_stdout_reader(proc, stop_event: threading.Event) -> None:
     """Read PresentMon 2.x CSV rows off its stdout pipe and append per-frame
     frametime samples to the shared ring buffer, in real time.
@@ -624,7 +662,7 @@ def _pm_stdout_reader(proc, stop_event: threading.Event) -> None:
     line reads on the pipe end when PM2 exits (game closed / --timed hit) or
     when stop_event is set (retarget / stop_tracking); the sampler loop then
     restarts a fresh PM2 + reader as needed."""
-    idx_pid = idx_ft = idx_name = None
+    idx_pid = idx_ft = idx_name = idx_mode = None
     header_done = False
     added = 0
     try:
@@ -653,6 +691,7 @@ def _pm_stdout_reader(proc, stop_event: threading.Event) -> None:
                 idx_name = _col("application", default=0)
                 # PM 2.3.0 = FrameTime; older = msBetweenPresents.
                 idx_ft   = _col("frametime", "msbetweenpresents", default=None)
+                idx_mode = _col("presentmode", default=None)
                 header_done = True
                 # Lock-free single-key writes (atomic under the GIL).  We must
                 # NOT take _state_lock here: start_tracking()/retarget calls
@@ -663,9 +702,13 @@ def _pm_stdout_reader(proc, stop_event: threading.Event) -> None:
                 if idx_ft is None:
                     log.warning(f"PM2 stdout: no frametime column in header: {line[:140]}")
                 continue
+            row = line.split(",")
+            if idx_mode is not None:
+                # Before the frame-time filter: a dropped frame still says how
+                # the game presents.
+                _note_present_mode(row, idx_pid, idx_name, idx_mode)
             if idx_ft is None:
                 continue
-            row = line.split(",")
             if len(row) <= max(idx_pid, idx_ft, idx_name):
                 continue
             try:
@@ -793,6 +836,7 @@ def _parse_presentmon_csv(handle: dict) -> int:
             idx_pid  = _col("ProcessID", default=1)
             idx_name = _col("Application", default=0)
             idx_ft   = _col("FrameTime", "msBetweenPresents", default=None)
+            idx_mode = _col("PresentMode", default=None)
             # (we use wall-clock time.time() per sample, so the CSV timestamp
             #  column — TimeInSeconds in 1.x / CPUStartTime in 2.x — isn't read)
             if idx_ft is None:
@@ -804,6 +848,8 @@ def _parse_presentmon_csv(handle: dict) -> int:
 
             for row_str in f:
                 row = row_str.strip().split(",")
+                if idx_mode is not None:
+                    _note_present_mode(row, idx_pid, idx_name, idx_mode)
                 if len(row) <= max(idx_pid, idx_ft, idx_name):
                     continue
                 try:

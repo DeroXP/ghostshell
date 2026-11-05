@@ -17,13 +17,6 @@ Dependencies tracked
                         Guru3D doesn't expose stable download URLs, so
                         we open the browser to their page and detect
                         the install via the existing shared-memory probe.
-  ViGEmBus           — virtual gamepad driver.  Required for the
-                        anti-recoil / mapper to emit synthetic input.
-                        Auto-installed from GitHub.  Driver install,
-                        usually needs restart.
-  HidHide            — hides physical controllers so games see only
-                        the virtual one.  Auto-installed from GitHub.
-                        Driver install, may need restart.
 
 Boot-time behaviour
 ───────────────────
@@ -71,16 +64,6 @@ INSTALLER_DIR   = os.path.join(APPDATA_DIR, "installers")
 PM2_VERSION     = "2.4.1"
 PM2_MSI_URL     = f"https://github.com/GameTechDev/PresentMon/releases/download/v{PM2_VERSION}/PresentMon-v{PM2_VERSION}.msi"
 PM2_SVC_NAMES   = ("Intel PresentMon Service", "PresentMonService")
-
-# ViGEmBus — virtual gamepad driver
-VIGEMBUS_VERSION = "1.22.0"
-VIGEMBUS_URL     = f"https://github.com/ViGEm/ViGEmBus/releases/download/v{VIGEMBUS_VERSION}/ViGEmBus_{VIGEMBUS_VERSION}_x64_x86_arm64.exe"
-VIGEMBUS_SVC     = "ViGEmBus"
-
-# HidHide — hides physical controllers
-HIDHIDE_VERSION  = "1.5.230"
-HIDHIDE_URL      = f"https://github.com/ViGEm/HidHide/releases/download/v{HIDHIDE_VERSION}.0/HidHide_{HIDHIDE_VERSION}_x64.exe"
-HIDHIDE_SVC      = "HidHide"
 
 # RTSS — Guru3D's URLs aren't stable so we just direct users to the page
 RTSS_PAGE_URL    = "https://www.guru3d.com/files-details/rtss-rivatuner-statistics-server-download.html"
@@ -132,14 +115,39 @@ _progress: dict = {
 }
 
 
+# Dependencies Vispora used to manage (the controller emulator's drivers).
+# A state file from an older version can still name them; they are dropped
+# on load so the settings and the restart banner never show them.
+_RETIRED_KEYS = frozenset({"vigembus", "hidhide"})
+
+
+def _prune_retired(state: dict) -> dict:
+    opt_outs = state.get("opt_outs")
+    if isinstance(opt_outs, list):
+        state["opt_outs"] = [k for k in opt_outs if k not in _RETIRED_KEYS]
+    pending = state.get("pending_restart")
+    if isinstance(pending, dict) and isinstance(pending.get("by"), list):
+        by = [k for k in pending["by"] if k not in _RETIRED_KEYS]
+        if pending["by"] and not by:
+            # Only a retired driver asked for this restart: Vispora no
+            # longer needs it.
+            state.pop("pending_restart", None)
+        else:
+            pending["by"] = by
+    return state
+
+
 def _load_state() -> dict:
     if not os.path.exists(STATE_PATH):
         return {}
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
+            data = json.load(f) or {}
     except Exception:
         return {}
+    if not isinstance(data, dict):
+        return {}
+    return _prune_retired(data)
 
 
 def _save_state(data: dict) -> None:
@@ -192,14 +200,6 @@ def _detect_pm2() -> dict:
         if svc.get("installed"):
             return svc
     return {"installed": False, "running": False}
-
-
-def _detect_vigembus() -> dict:
-    return _service_query(VIGEMBUS_SVC)
-
-
-def _detect_hidhide() -> dict:
-    return _service_query(HIDHIDE_SVC)
 
 
 def _find_lhm_exe() -> Optional[str]:
@@ -675,42 +675,6 @@ def install_presentmon2() -> dict:
                 "message": f"install error: {e}"}
 
 
-def install_vigembus() -> dict:
-    """Auto-install ViGEmBus virtual gamepad driver."""
-    svc = _detect_vigembus()
-    if svc.get("installed"):
-        return {"ok": True, "already_installed": True,
-                "needs_restart": False,
-                "message": "ViGEmBus already installed"}
-
-    _set_progress(current_step=f"Downloading ViGEmBus ({VIGEMBUS_VERSION})…")
-    exe_path = os.path.join(INSTALLER_DIR, f"ViGEmBus_{VIGEMBUS_VERSION}.exe")
-    if not _download(VIGEMBUS_URL, exe_path):
-        return {"ok": False, "needs_restart": False,
-                "message": "Download failed"}
-
-    _set_progress(current_step="Installing ViGEmBus driver (signed) …")
-    try:
-        # ViGEmBus installer is a Wix bundle wrapping an MSI; silent
-        # install flags from Burn are /quiet /norestart
-        r = subprocess.run(
-            [exe_path, "/quiet", "/norestart"],
-            capture_output=True, text=True,
-            creationflags=_CREATE_NO_WINDOW,
-            timeout=300,
-        )
-        needs_restart = (r.returncode == 3010) or _windows_pending_reboot()
-        try: os.remove(exe_path)
-        except Exception: pass
-        if r.returncode in (0, 3010):
-            return {"ok": True, "needs_restart": needs_restart,
-                    "message": f"ViGEmBus installed (rc={r.returncode})"}
-        return {"ok": False, "needs_restart": False,
-                "message": f"installer failed (rc={r.returncode})"}
-    except Exception as e:
-        return {"ok": False, "needs_restart": False, "message": str(e)}
-
-
 INSTALL_LOG_DIR = os.path.join(APPDATA_DIR, "install_logs")
 
 
@@ -878,40 +842,6 @@ def install_ffmpeg() -> dict:
                 "message": str(e)}
 
 
-def install_hidhide() -> dict:
-    """Auto-install HidHide controller-hiding driver."""
-    svc = _detect_hidhide()
-    if svc.get("installed"):
-        return {"ok": True, "already_installed": True,
-                "needs_restart": False,
-                "message": "HidHide already installed"}
-
-    _set_progress(current_step=f"Downloading HidHide ({HIDHIDE_VERSION})…")
-    exe_path = os.path.join(INSTALLER_DIR, f"HidHide_{HIDHIDE_VERSION}.exe")
-    if not _download(HIDHIDE_URL, exe_path):
-        return {"ok": False, "needs_restart": False,
-                "message": "Download failed"}
-
-    _set_progress(current_step="Installing HidHide driver…")
-    try:
-        r = subprocess.run(
-            [exe_path, "/quiet", "/norestart"],
-            capture_output=True, text=True,
-            creationflags=_CREATE_NO_WINDOW,
-            timeout=300,
-        )
-        needs_restart = (r.returncode == 3010) or _windows_pending_reboot()
-        try: os.remove(exe_path)
-        except Exception: pass
-        if r.returncode in (0, 3010):
-            return {"ok": True, "needs_restart": needs_restart,
-                    "message": f"HidHide installed (rc={r.returncode})"}
-        return {"ok": False, "needs_restart": False,
-                "message": f"installer failed (rc={r.returncode})"}
-    except Exception as e:
-        return {"ok": False, "needs_restart": False, "message": str(e)}
-
-
 # ─── Dependency manifest ─────────────────────────────────────────────
 # Each entry: {key, label, description, detect, install, opt_outable, browser_only}
 # - opt_outable: shown in settings; user can disable for that dep
@@ -935,24 +865,6 @@ DEPENDENCIES = [
         "detect":       lambda: _detect_pm2().get("installed"),
         "install":      install_presentmon2,
         "size":         "122 MB MSI",
-    },
-    {
-        "key":          "vigembus",
-        "label":        "ViGEmBus (virtual gamepad driver)",
-        "description":  "Required for the anti-recoil / gamepad mapper to emit synthetic Xbox controller input. Signed driver from the ViGEm project.",
-        "auto_install": True,
-        "detect":       lambda: _detect_vigembus().get("installed"),
-        "install":      install_vigembus,
-        "size":         "6 MB",
-    },
-    {
-        "key":          "hidhide",
-        "label":        "HidHide (hide physical controllers from games)",
-        "description":  "Optional helper for the gamepad mapper: hides your physical controller so the game only sees Vispora's virtual one, avoiding double-input. Signed driver.",
-        "auto_install": True,
-        "detect":       lambda: _detect_hidhide().get("installed"),
-        "install":      install_hidhide,
-        "size":         "8 MB",
     },
     {
         "key":          "ffmpeg",

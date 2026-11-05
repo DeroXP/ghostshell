@@ -100,6 +100,10 @@
                 <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
                 Capture
             </div>
+            <div class="nav-item" data-page="crosshair" onclick="switchPage('crosshair')">
+                <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="7"/><line x1="12" y1="2" x2="12" y2="8"/><line x1="12" y1="16" x2="12" y2="22"/><line x1="2" y1="12" x2="8" y2="12"/><line x1="16" y1="12" x2="22" y2="12"/></svg>
+                Crosshair
+            </div>
         </div>
         <div class="nav-section">
             <div class="nav-section-label">Security</div>
@@ -489,8 +493,8 @@
                     <div class="opt-cat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg></div>
                     <div class="opt-cat-info">
                         <div class="opt-cat-title">Gaming</div>
-                        <div class="opt-cat-desc">Game DVR/Bar off, fullscreen optimizations off, HW GPU scheduling on, timer resolution, MSI mode.</div>
-                        <div class="opt-cat-count">~10 tweaks</div>
+                        <div class="opt-cat-desc">Game DVR and Game Bar overlay off, Game Mode on, HW GPU scheduling on, optimizations for windowed games on. Fullscreen optimizations stay at the Windows default.</div>
+                        <div class="opt-cat-count">~6 tweaks</div>
                     </div>
                 </div>
                 <div class="opt-cat" data-cat="visual" data-group="standard">
@@ -1610,7 +1614,7 @@
                 </details>
                 <div class="filter-row" style="margin-top:18px;margin-bottom:8px">
                     <span class="filter-row-label">Manual control</span>
-                    <button class="btn btn-sm" onclick="pauseAtManually()" title="Stop AT from tuning until you resume. Useful before running benchmarks, capturing recoil patterns, or temporarily testing manual offsets.">Pause AT</button>
+                    <button class="btn btn-sm" onclick="pauseAtManually()" title="Stop AT from tuning until you resume. Useful before running benchmarks or while you try manual offsets.">Pause AT</button>
                     <button class="btn btn-sm" onclick="resumeAtManually()" title="Release a manual pause.">Resume AT</button>
                 </div>
                 <div class="filter-row" style="margin-top:18px;margin-bottom:8px">
@@ -1690,540 +1694,11 @@
                 <button class="btn btn-primary" onclick="addCustomGame()">Add Game</button>
                 <div id="custom-games-list" style="margin-top:14px"></div>
             </div>
-
-            <div class="section-divider">Gamepad Mapper</div>
-            <div class="card" id="gpm-card">
-                <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="6" y1="11" x2="10" y2="11"/><line x1="8" y1="9" x2="8" y2="13"/><circle cx="15" cy="12" r="1"/><circle cx="18" cy="10" r="1"/><path d="M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258A4 4 0 0 0 17.32 5z"/></svg></div>
-                <div class="card-title">Gamepad → Keyboard Remap + Macros</div>
-                <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:680px">
-                    Bind any controller button to a keyboard key or run a macro sequence. Useful for games that don't natively support remap, or for binding combos onto a single button. By default, mappings only fire while a known game is in the foreground, so your controller won't type in Discord when you alt-tab.
-                </p>
-                <div style="font-size:12.5px;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.35);color:var(--text);padding:11px 14px;border-radius:8px;margin-bottom:12px;line-height:1.55;max-width:680px">
-                    <b style="color:#ef4444">⚠ Anti-cheat / ban warning.</b> Emulating a controller (virtual-controller mode) and running input macros are treated as cheating by many competitive games and their kernel anti-cheats. Call of Duty's RICOCHET flags controller-emulation + scripted input the same as a Cronus/XIM, and Riot (Valorant), EA (Apex), Epic (Fortnite) and Activision prohibit input automation in their Terms <b>regardless of whether it's detected</b>. Using button→macro or virtual-controller mode in ranked/competitive titles can get your account <b>permanently banned</b>. Use these only in single-player, private servers, or games without kernel anti-cheat. Never in ranked.
-                </div>
-                <div id="gpm-vigembus-banner" style="display:none;font-size:12.5px;background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);color:var(--text);padding:10px 14px;border-radius:6px;margin-bottom:10px;line-height:1.55">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap">
-                        <div>
-                            <b style="color:var(--orange,#fbbf24)">Virtual-controller mode requires ViGEmBus.</b>
-                            <div style="margin-top:2px;color:var(--text-secondary);font-size:12px">Open-source signed kernel driver by Nefarius. ~3 MB. No reboot required.</div>
-                        </div>
-                        <div style="display:flex;gap:8px">
-                            <button class="btn btn-sm btn-primary" onclick="installViGEmBus()" id="gpm-vigembus-install-btn">Install now</button>
-                            <a href="#" id="gpm-vigembus-link" target="_blank" rel="noopener noreferrer" class="btn btn-sm" style="text-decoration:none">Manual</a>
-                        </div>
-                    </div>
-                    <div id="gpm-vigembus-progress" style="display:none;margin-top:10px;font-size:11.5px;color:var(--text-secondary)"></div>
-                </div>
-                <div id="gpm-hidhide-banner" style="display:none;font-size:12.5px;background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);color:var(--text);padding:10px 14px;border-radius:6px;margin-bottom:14px;line-height:1.55">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap">
-                        <div>
-                            <b style="color:var(--orange,#fbbf24)">"Hide physical from games" requires HidHide.</b>
-                            <div style="margin-top:2px;color:var(--text-secondary);font-size:12px">Companion driver to ViGEmBus (same author, also signed). Without it, games see both physical and virtual pads.</div>
-                        </div>
-                        <div style="display:flex;gap:8px">
-                            <button class="btn btn-sm btn-primary" onclick="installHidHide()" id="gpm-hidhide-install-btn">Install now</button>
-                            <a href="#" id="gpm-hidhide-link" target="_blank" rel="noopener noreferrer" class="btn btn-sm" style="text-decoration:none">Manual</a>
-                        </div>
-                    </div>
-                    <div id="gpm-hidhide-progress" style="display:none;margin-top:10px;font-size:11.5px;color:var(--text-secondary)"></div>
-                </div>
-                <div style="font-size:12px;color:var(--text-tertiary);background:var(--bg-overlay);padding:8px 12px;border-radius:6px;margin-bottom:14px;line-height:1.55">
-                    Two remap modes: <b>Key emulation</b> (no driver needed) and <b>Virtual controller</b> (true button-to-button remap via ViGEmBus). Live poll: <span id="gpm-actual-hz" style="font-family:var(--font-mono,monospace);color:var(--accent)">—</span> · useful: <span id="gpm-useful-hz" style="font-family:var(--font-mono,monospace);color:var(--accent)">—</span> · p99 frame: <span id="gpm-p99" style="font-family:var(--font-mono,monospace);color:var(--accent)">—</span>
-                </div>
-                <div class="toggle-row">
-                    <div class="toggle-info">
-                        <div class="toggle-name">Gamepad Mapper</div>
-                        <div class="toggle-desc">Master switch (opt-in). The polling loop runs always for the bind UI; this controls whether mapped keys actually fire.</div>
-                    </div>
-                    <div class="toggle-switch" id="toggle-gpm-master" onclick="toggleGpmMaster(this)"></div>
-                </div>
-
-                <div class="filter-row" style="margin-top:18px;margin-bottom:8px">
-                    <span class="filter-row-label">Active profile</span>
-                    <select id="gpm-profile-select" onchange="onGpmProfileSelect()" style="padding:6px 10px;border-radius:6px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);min-width:180px">
-                        <option value="">(none)</option>
-                    </select>
-                    <button class="btn btn-sm" onclick="newGpmProfile()">New profile</button>
-                    <button class="btn btn-sm btn-danger" onclick="deleteGpmProfile()">Delete profile</button>
-                </div>
-
-                <div id="gpm-status-line" style="font-size:12.5px;color:var(--text-tertiary);margin-bottom:12px">Loading…</div>
-
-                <!-- v3.3 — visual controller diagram with live press/stick overlay -->
-                <div id="gpm-visual-wrap" style="display:none;background:var(--bg-overlay);border-radius:8px;padding:16px;margin-bottom:14px">
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;gap:14px;flex-wrap:wrap">
-                        <span style="font-size:11px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase">Live controller view</span>
-                        <div style="display:flex;gap:14px;font-size:11px;color:var(--text-tertiary);align-items:center">
-                            <span id="gpm-visual-source" style="font-family:var(--font-mono,monospace)">—</span>
-                            <span>·</span>
-                            <span id="gpm-visual-hint">Click any button below to bind it</span>
-                        </div>
-                    </div>
-                    <!-- v3.5 — legend explaining the dual-dot visualizer -->
-                    <div id="gpm-visual-legend" style="display:none;font-size:11px;color:var(--text-tertiary);margin-bottom:8px;line-height:1.4;padding:6px 10px;background:var(--bg-elevated);border-radius:4px">
-                        <span style="display:inline-block;width:8px;height:8px;background:#fff;border-radius:50%;margin-right:4px;vertical-align:middle"></span>physical (your real controller)
-                        &nbsp;·&nbsp;
-                        <span style="display:inline-block;width:8px;height:8px;background:#22d3ee;border-radius:50%;margin-right:4px;vertical-align:middle"></span>virtual (what the game sees, after deadzone/curve/recoil/swap)
-                    </div>
-                    <svg id="gpm-svg" viewBox="0 0 600 360" style="width:100%;max-width:640px;height:auto;display:block;margin:0 auto" xmlns="http://www.w3.org/2000/svg">
-                        <defs>
-                            <radialGradient id="gpm-press-glow" cx="50%" cy="50%" r="50%">
-                                <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.9"/>
-                                <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"/>
-                            </radialGradient>
-                        </defs>
-
-                        <!-- Body — soft contoured Xbox-style outline -->
-                        <path d="M 100 90
-                                 Q 60 90 50 130
-                                 Q 30 200 80 240
-                                 Q 110 260 170 250
-                                 Q 220 240 280 240
-                                 L 320 240
-                                 Q 380 240 430 250
-                                 Q 490 260 520 240
-                                 Q 570 200 550 130
-                                 Q 540 90 500 90
-                                 Z"
-                              fill="var(--bg-elevated)" stroke="var(--border-faint)" stroke-width="1.5"/>
-
-                        <!-- Triggers (top-most): LT and RT — vertical fill bars -->
-                        <g id="gpm-trigger-lt-group">
-                            <rect x="100" y="40" width="60" height="22" rx="5" fill="var(--bg-overlay)" stroke="var(--border-faint)"/>
-                            <rect id="gpm-trigger-lt-fill" x="100" y="40" width="0" height="22" rx="5" fill="var(--accent)" opacity="0.7"/>
-                            <text x="130" y="56" text-anchor="middle" fill="var(--text-secondary)" font-size="11" font-family="monospace">LT</text>
-                        </g>
-                        <g id="gpm-trigger-rt-group">
-                            <rect x="440" y="40" width="60" height="22" rx="5" fill="var(--bg-overlay)" stroke="var(--border-faint)"/>
-                            <rect id="gpm-trigger-rt-fill" x="440" y="40" width="0" height="22" rx="5" fill="var(--accent)" opacity="0.7"/>
-                            <text x="470" y="56" text-anchor="middle" fill="var(--text-secondary)" font-size="11" font-family="monospace">RT</text>
-                        </g>
-
-                        <!-- Bumpers: LB / RB -->
-                        <rect class="gpm-svg-btn" data-gpm-btn="LB"
-                              id="gpm-svg-btn-LB" x="95" y="68" width="70" height="16" rx="6"
-                              fill="var(--bg-overlay)" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                        <text x="130" y="80" text-anchor="middle" fill="var(--text-secondary)" font-size="10" font-family="monospace" pointer-events="none">LB</text>
-                        <rect class="gpm-svg-btn" data-gpm-btn="RB"
-                              id="gpm-svg-btn-RB" x="435" y="68" width="70" height="16" rx="6"
-                              fill="var(--bg-overlay)" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                        <text x="470" y="80" text-anchor="middle" fill="var(--text-secondary)" font-size="10" font-family="monospace" pointer-events="none">RB</text>
-
-                        <!-- Face buttons: Y(top) / X(left) / B(right) / A(bottom), Xbox color order -->
-                        <circle class="gpm-svg-btn" data-gpm-btn="Y" id="gpm-svg-btn-Y" cx="450" cy="120" r="18"
-                                fill="#fbbf24" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                        <text x="450" y="125" text-anchor="middle" fill="#000" font-size="13" font-weight="700" font-family="monospace" pointer-events="none">Y</text>
-                        <circle class="gpm-svg-btn" data-gpm-btn="X" id="gpm-svg-btn-X" cx="412" cy="155" r="18"
-                                fill="#3b82f6" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                        <text x="412" y="160" text-anchor="middle" fill="#fff" font-size="13" font-weight="700" font-family="monospace" pointer-events="none">X</text>
-                        <circle class="gpm-svg-btn" data-gpm-btn="B" id="gpm-svg-btn-B" cx="488" cy="155" r="18"
-                                fill="#ef4444" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                        <text x="488" y="160" text-anchor="middle" fill="#fff" font-size="13" font-weight="700" font-family="monospace" pointer-events="none">B</text>
-                        <circle class="gpm-svg-btn" data-gpm-btn="A" id="gpm-svg-btn-A" cx="450" cy="190" r="18"
-                                fill="#c4c1ff" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                        <text x="450" y="195" text-anchor="middle" fill="#000" font-size="13" font-weight="700" font-family="monospace" pointer-events="none">A</text>
-
-                        <!-- D-pad -->
-                        <rect class="gpm-svg-btn" data-gpm-btn="DPAD_UP" id="gpm-svg-btn-DPAD_UP"
-                              x="130" y="125" width="22" height="22" rx="3"
-                              fill="var(--bg-overlay)" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                        <rect class="gpm-svg-btn" data-gpm-btn="DPAD_DOWN" id="gpm-svg-btn-DPAD_DOWN"
-                              x="130" y="167" width="22" height="22" rx="3"
-                              fill="var(--bg-overlay)" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                        <rect class="gpm-svg-btn" data-gpm-btn="DPAD_LEFT" id="gpm-svg-btn-DPAD_LEFT"
-                              x="109" y="146" width="22" height="22" rx="3"
-                              fill="var(--bg-overlay)" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                        <rect class="gpm-svg-btn" data-gpm-btn="DPAD_RIGHT" id="gpm-svg-btn-DPAD_RIGHT"
-                              x="151" y="146" width="22" height="22" rx="3"
-                              fill="var(--bg-overlay)" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-
-                        <!-- Center: BACK + START -->
-                        <rect class="gpm-svg-btn" data-gpm-btn="BACK" id="gpm-svg-btn-BACK"
-                              x="245" y="125" width="35" height="14" rx="7"
-                              fill="var(--bg-overlay)" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                        <text x="262" y="135" text-anchor="middle" fill="var(--text-secondary)" font-size="9" font-family="monospace" pointer-events="none">BACK</text>
-                        <rect class="gpm-svg-btn" data-gpm-btn="START" id="gpm-svg-btn-START"
-                              x="320" y="125" width="35" height="14" rx="7"
-                              fill="var(--bg-overlay)" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                        <text x="338" y="135" text-anchor="middle" fill="var(--text-secondary)" font-size="9" font-family="monospace" pointer-events="none">START</text>
-
-                        <!-- Left stick well + dot -->
-                        <g>
-                            <circle cx="220" cy="200" r="34"
-                                    fill="var(--bg-overlay)" stroke="var(--border-faint)" stroke-width="1.5"/>
-                            <circle class="gpm-svg-btn" data-gpm-btn="LSTICK" id="gpm-svg-btn-LSTICK"
-                                    cx="220" cy="200" r="22"
-                                    fill="var(--bg-elevated)" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                            <circle id="gpm-svg-stick-l-dot" cx="220" cy="200" r="6"
-                                    fill="var(--accent)" pointer-events="none"/>
-                        </g>
-
-                        <!-- Right stick well + dot -->
-                        <g>
-                            <circle cx="380" cy="200" r="34"
-                                    fill="var(--bg-overlay)" stroke="var(--border-faint)" stroke-width="1.5"/>
-                            <circle class="gpm-svg-btn" data-gpm-btn="RSTICK" id="gpm-svg-btn-RSTICK"
-                                    cx="380" cy="200" r="22"
-                                    fill="var(--bg-elevated)" stroke="var(--border-faint)" stroke-width="1.5" cursor="pointer"/>
-                            <circle id="gpm-svg-stick-r-dot" cx="380" cy="200" r="6"
-                                    fill="var(--accent)" pointer-events="none"/>
-                        </g>
-
-                        <!-- Binding labels — populated by JS, one <text> per button -->
-                        <g id="gpm-svg-labels" pointer-events="none"></g>
-
-                        <!-- "No controller" overlay (toggle visibility from JS) -->
-                        <text id="gpm-svg-noctrl" x="300" y="320" text-anchor="middle"
-                              fill="var(--text-tertiary)" font-size="12" font-family="monospace" style="display:none">
-                            No controller detected. Plug in or wake yours
-                        </text>
-                    </svg>
-                </div>
-
-                <div id="gpm-bindings" style="display:none;padding:12px;background:var(--bg-overlay);border-radius:8px">
-                    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;gap:14px;flex-wrap:wrap">
-                        <span style="font-size:11px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase">Button bindings</span>
-                        <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
-                            <label style="font-size:12px;color:var(--text-secondary);display:flex;gap:6px;align-items:center">
-                                Mode:
-                                <select id="gpm-remap-mode" onchange="onGpmRemapModeChange()" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">
-                                    <option value="key_emulation">Key emulation</option>
-                                    <option value="virtual_controller">Virtual controller (ViGEmBus)</option>
-                                </select>
-                            </label>
-                            <label id="gpm-pad-type-wrap" style="font-size:12px;color:var(--text-secondary);display:none;gap:6px;align-items:center" title="Choose which kind of virtual controller the game sees. Xbox 360 = standard XInput. DualShock 4 = some games (Persona, Elden Ring, Final Fantasy) display PlayStation prompts when they detect a DS4.">
-                                Type:
-                                <select id="gpm-pad-type" onchange="onGpmPadTypeChange()" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">
-                                    <option value="x360">Xbox 360</option>
-                                    <option value="ds4">DualShock 4</option>
-                                </select>
-                            </label>
-                            <label style="font-size:12px;color:var(--text-secondary);display:flex;gap:6px;align-items:center" title="Internal sample rate: how fast Vispora reads your physical controller and pushes updates to the virtual pad. Higher = lower latency between input and the virtual pad's state being current. Note: ViGEmBus's USB-side rate to the GAME is hardcoded by the kernel driver (~1 kHz for DS4, ~250 Hz for X360); higher internal rates make the data the game sees fresher, but don't increase how often the game polls.">
-                                Sample:
-                                <select id="gpm-poll-hz" onchange="onGpmPollHzChange()" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">
-                                    <option value="1000">1 kHz</option>
-                                    <option value="2000">2 kHz</option>
-                                    <option value="4000" selected>4 kHz</option>
-                                    <option value="8000">8 kHz (internal)</option>
-                                </select>
-                            </label>
-                            <span id="gpm-hidhide-status" style="font-size:11px;color:var(--text-tertiary);display:flex;gap:6px;align-items:center" title="When virtual_controller mode is active, Vispora auto-cloaks the physical controller from games so they see only the virtual pad."></span>
-                            <button class="btn btn-sm" onclick="testVirtualPad()" style="font-size:11px" title="Fires a brief test sequence (A press, R-stick down, B press) on the virtual controller so you can verify games are seeing it">Test virtual pad</button>
-                        </div>
-                    </div>
-                    <div id="gpm-binding-rows" style="display:flex;flex-direction:column;gap:8px"></div>
-                    <div class="btn-group" style="margin-top:14px">
-                        <button class="btn btn-primary btn-sm" onclick="addNewMapping()">+ Add mapping</button>
-                        <button class="btn btn-sm" onclick="loadGamepadMapper()">Reload</button>
-                        <button class="btn btn-sm" onclick="toggleAltLayer()" id="gpm-alt-layer-btn" title="Switch between editing the PRIMARY layer (always active) and the ALT layer (active only while you hold the configured modifier input).  Click to flip.">Layer: Primary (click for Alt)</button>
-                        <button class="btn btn-sm" onclick="exportProfile()" title="Copy this profile's full config to your clipboard as JSON for sharing or backup">Export</button>
-                        <button class="btn btn-sm" onclick="importProfilePrompt()" title="Paste an exported profile JSON to import it">Import</button>
-                    </div>
-
-                    <!-- v3.5 — Advanced settings collapsible -->
-                    <details id="gpm-advanced" style="margin-top:16px;border:1px solid var(--border-faint);border-radius:8px;padding:8px 12px;background:var(--bg-overlay)">
-                        <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--text-secondary);padding:4px 0">Advanced: sticks, modifier layer, auto-switch, latency</summary>
-                        <div style="padding-top:12px;display:flex;flex-direction:column;gap:18px;font-size:12px">
-                            <!-- Stick tuning -->
-                            <div>
-                                <div style="font-weight:600;color:var(--text-bright);margin-bottom:6px">Stick tuning</div>
-                                <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:8px">
-                                    <label style="display:inline-flex;gap:6px;align-items:center">
-                                        <input type="checkbox" id="gpm-stick-swap" onchange="onStickCfgChange()" />
-                                        <span title="Swap the LEFT and RIGHT sticks at the virtual pad. Useful for left-handed players or unusual game bindings.">Swap left ↔ right sticks</span>
-                                    </label>
-                                    <button class="btn btn-sm" onclick="calibrateSticksAtRest()" title="Sample at-rest stick wobble for 2 seconds and write the measured value as the inner deadzone.  Eliminates drift on the virtual pad caused by sub-noticeable physical stick noise.  Don't touch the sticks while it runs.">📐 Calibrate at-rest deadzone</button>
-                                    <span id="gpm-stick-calibrate-status" style="font-size:11px;color:var(--text-tertiary);font-family:var(--font-mono,monospace)"></span>
-                                </div>
-                                <div id="gpm-stick-tuning" style="display:flex;flex-wrap:wrap;gap:24px"></div>
-                            </div>
-                            <!-- Modifier / shift layer -->
-                            <div>
-                                <div style="font-weight:600;color:var(--text-bright);margin-bottom:6px">Modifier / shift layer</div>
-                                <div style="color:var(--text-tertiary);margin-bottom:6px;line-height:1.4">Hold the chosen input to activate a SECOND layer of bindings (Edit primary/alt layer button above switches which layer you're editing).  Empty = no layer.</div>
-                                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-                                    <span id="gpm-modifier-display" style="font-family:var(--font-mono,monospace);color:var(--accent);min-width:120px">none</span>
-                                    <button class="btn btn-sm" onclick="captureModifier()">Capture modifier</button>
-                                    <button class="btn btn-sm" onclick="clearModifier()">Clear</button>
-                                </div>
-                            </div>
-                            <!-- Auto-switch -->
-                            <div>
-                                <div style="font-weight:600;color:var(--text-bright);margin-bottom:6px">Auto-switch</div>
-                                <div style="color:var(--text-tertiary);margin-bottom:6px;line-height:1.4">When this exe owns the foreground window, this profile auto-activates.  Use the bare filename (e.g. <code>cs2.exe</code>, <code>VALORANT-Win64-Shipping.exe</code>).  Empty = manual select only.</div>
-                                <input type="text" id="gpm-foreground-exe" placeholder="cs2.exe" onchange="onForegroundExeChange()" style="padding:6px 10px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;min-width:260px;font-family:var(--font-mono,monospace)" />
-                            </div>
-                            <!-- Toggle hotkey -->
-                            <div>
-                                <div style="font-weight:600;color:var(--text-bright);margin-bottom:6px">Global toggle hotkey</div>
-                                <div style="color:var(--text-tertiary);margin-bottom:6px;line-height:1.4">A keyboard key (any app, anywhere on Windows) that turns the mapper master switch on/off.  Use a function key like F8 or F11 to avoid clashing with game inputs.</div>
-                                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-                                    <span id="gpm-hotkey-display" style="font-family:var(--font-mono,monospace);color:var(--accent);min-width:100px">none</span>
-                                    <button class="btn btn-sm" onclick="captureToggleHotkey()">Capture key</button>
-                                    <button class="btn btn-sm" onclick="clearToggleHotkey()">Clear</button>
-                                </div>
-                            </div>
-                            <!-- Latency probe -->
-                            <div>
-                                <div style="font-weight:600;color:var(--text-bright);margin-bottom:6px">Latency probe</div>
-                                <div style="color:var(--text-tertiary);margin-bottom:6px;line-height:1.4">Measures the round-trip from injecting a synthetic input into Vispora to the next snapshot reflecting it.  Doesn't include ViGEmBus/USB/game-poll delay (those are kernel-side).</div>
-                                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-                                    <button class="btn btn-sm" onclick="runLatencyProbe()">Run probe (50 samples)</button>
-                                    <span id="gpm-latency-result" style="font-family:var(--font-mono,monospace);color:var(--text-secondary);font-size:11px"></span>
-                                </div>
-                            </div>
-                        </div>
-                    </details>
-                </div>
-            </div>
-
-            <!-- Bind-button modal (shown over the page when capturing) -->
-            <div id="gpm-capture-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center">
-                <div style="background:var(--bg-card,var(--bg-elevated));padding:32px;border-radius:12px;max-width:380px;text-align:center;border:1px solid var(--border-faint)">
-                    <div style="font-size:14px;font-weight:600;color:var(--text-bright);margin-bottom:12px">Press a controller button</div>
-                    <div id="gpm-capture-msg" style="font-size:13px;color:var(--text-secondary);line-height:1.55">Waiting for input… (8s timeout)</div>
-                    <button class="btn btn-sm" style="margin-top:18px" onclick="cancelGpmCapture()">Cancel</button>
-                </div>
-            </div>
-
-            <!-- Macro editor modal -->
-            <div id="gpm-macro-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center">
-                <div style="background:var(--bg-card,var(--bg-elevated));padding:24px;border-radius:12px;max-width:560px;width:90%;border:1px solid var(--border-faint)">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px">
-                        <div style="font-size:14px;font-weight:600;color:var(--text-bright)">Macro for <span id="gpm-macro-btn-name">—</span></div>
-                        <button class="btn btn-sm btn-primary" id="gpm-macro-record-btn" onclick="startMacroRecording()">● Record</button>
-                    </div>
-                    <div style="font-size:12.5px;color:var(--text-secondary);margin-bottom:10px;line-height:1.55">
-                        A macro plays its sequence on press, then <b>holds any pressed-down inputs until you release the trigger</b> that fired it.
-                        Step modes: <b>Tap</b> press+release within <code>down</code> ms · <b>Hold ↓</b> press and stay pressed · <b>Release ↑</b> manually release a prior Hold ↓.
-                    </div>
-                    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;font-size:12.5px;flex-wrap:wrap">
-                        <label style="color:var(--text-secondary)">Play mode:</label>
-                        <select id="gpm-macro-play-mode" onchange="onMacroPlayModeChange()" style="padding:4px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">
-                            <option value="once">Once</option>
-                            <option value="loop_while_held">Loop while held</option>
-                            <option value="repeat_n">Repeat N times</option>
-                        </select>
-                        <span id="gpm-macro-repeat-wrap" style="display:none">
-                            <input type="number" id="gpm-macro-repeat-count" min="1" value="2" onchange="onMacroRepeatCountChange()" style="width:60px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px" />
-                            <span style="color:var(--text-tertiary);font-size:11px">times</span>
-                        </span>
-                        <span style="margin-left:auto;color:var(--text-tertiary);font-size:11px">Tip: hit <b>Record</b> to auto-fill timings</span>
-                    </div>
-
-                    <!-- Recording overlay (shown during active record session) -->
-                    <div id="gpm-macro-recording" style="display:none;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:14px;margin-bottom:14px">
-                        <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
-                            <span style="display:inline-block;width:10px;height:10px;background:#ef4444;border-radius:50%;animation:gpmPulse 1s infinite"></span>
-                            <b style="color:#ef4444">Recording…</b>
-                            <span id="gpm-macro-rec-timer" style="margin-left:auto;font-family:var(--font-mono,monospace);color:var(--text-bright)">0.0s · 0 events</span>
-                        </div>
-                        <div style="font-size:12px;color:var(--text-secondary);line-height:1.5">Press your sequence (keyboard, mouse, controller) anywhere on screen. Vispora timestamps each press/release. Mouse movement is filtered out. Hit Stop when done.</div>
-                        <div class="btn-group" style="margin-top:10px">
-                            <button class="btn btn-sm btn-primary" onclick="stopMacroRecording(false)">Stop &amp; replace</button>
-                            <button class="btn btn-sm" onclick="stopMacroRecording(true)">Stop &amp; append</button>
-                            <button class="btn btn-sm btn-danger" onclick="cancelMacroRecording()">Cancel</button>
-                        </div>
-                    </div>
-
-                    <div id="gpm-macro-steps" style="margin-bottom:14px;max-height:280px;overflow-y:auto"></div>
-                    <div class="btn-group" style="margin-bottom:6px">
-                        <button class="btn btn-sm" onclick="addGpmMacroStep()">+ Add step manually</button>
-                        <button class="btn btn-sm" onclick="openRecoilPresetPicker()" title="Insert a pre-built anti-recoil pattern from a curated list (CS2, Apex, Valorant, generic)">Insert recoil preset…</button>
-                    </div>
-                    <div class="btn-group" style="margin-top:14px">
-                        <button class="btn btn-primary btn-sm" onclick="saveGpmMacroEditor()">Save</button>
-                        <button class="btn btn-sm" onclick="cancelGpmMacroEditor()">Cancel</button>
-                    </div>
-                </div>
-            </div>
-            <style>@keyframes gpmPulse { 0%,100%{opacity:1} 50%{opacity:0.4} }</style>
-
-            <!-- v3.6 — Macro recording options modal (sources + countdown) -->
-            <div id="gpm-macro-record-options-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1001;align-items:center;justify-content:center">
-                <div style="background:var(--bg-card,var(--bg-elevated));padding:24px;border-radius:12px;max-width:480px;width:90%;border:1px solid var(--border-faint)">
-                    <div style="font-size:14px;font-weight:600;color:var(--text-bright);margin-bottom:8px">● Record macro: pick sources</div>
-                    <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55">
-                        Recording starts after a configurable delay so you have time to alt-tab into your target window.  Tick anything you want recorded. Analog inputs (stick / trigger / mouse-move) sample at 30 Hz and produce more steps than digital presses, so leave them off if you only need keyboard / button taps.
-                    </div>
-                    <div style="display:flex;flex-direction:column;gap:8px;font-size:12.5px;margin-bottom:14px">
-                        <div style="font-size:11px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase;margin-top:4px">Digital (press / release)</div>
-                        <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="gpm-rec-opt-keyboard" checked /> Keyboard keys</label>
-                        <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="gpm-rec-opt-mouse-buttons" checked /> Mouse buttons + wheel</label>
-                        <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="gpm-rec-opt-ctrl-buttons" checked /> Controller buttons (A/B/X/Y/LB/RB/etc.)</label>
-                        <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="gpm-rec-opt-ctrl-triggers" checked /> Controller triggers (LT/RT, both digital threshold + analog sampling)</label>
-
-                        <div style="font-size:11px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase;margin-top:8px">Analog (continuous, sampled at 30 Hz)</div>
-                        <label style="display:flex;gap:8px;align-items:center" title="Records left/right stick positions over time as a series of vstick steps.  Useful for capturing aim sweeps, but generates ~30 steps per second of stick motion."><input type="checkbox" id="gpm-rec-opt-ctrl-sticks" /> Controller sticks (L/R)</label>
-                        <label style="display:flex;gap:8px;align-items:center" title="Records relative mouse cursor motion.  Generates a mouse_move step kind that plays back via SendInput."><input type="checkbox" id="gpm-rec-opt-mouse-move" /> Mouse movement</label>
-
-                        <div style="font-size:11px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase;margin-top:8px">Timing</div>
-                        <label style="display:flex;gap:8px;align-items:center">Countdown <input type="number" id="gpm-rec-opt-delay" value="2.0" min="0" max="10" step="0.5" style="width:70px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/> sec</label>
-                    </div>
-                    <div class="btn-group">
-                        <button class="btn btn-primary btn-sm" onclick="confirmMacroRecordOptions()">Start recording</button>
-                        <button class="btn btn-sm" onclick="closeMacroRecordOptions()">Cancel</button>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Recoil-preset picker modal -->
-            <div id="gpm-recoil-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1001;align-items:center;justify-content:center">
-                <div style="background:var(--bg-card,var(--bg-elevated));padding:24px;border-radius:12px;max-width:680px;width:90%;border:1px solid var(--border-faint);max-height:85vh;overflow-y:auto">
-                    <div style="font-size:14px;font-weight:600;color:var(--text-bright);margin-bottom:8px">Insert recoil preset</div>
-                    <div style="font-size:12.5px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55">
-                        Pick a curated anti-recoil pattern. The selected pattern will <b>replace</b> the current macro steps. Default magnitudes are conservative. Tweak per-step after insertion to match your in-game sensitivity.
-                    </div>
-
-                    <!-- Anti-cheat disclaimer -->
-                    <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.3);color:var(--text);padding:10px 14px;border-radius:6px;margin-bottom:14px;font-size:12px;line-height:1.55">
-                        <b style="color:#ef4444">⚠ Anti-cheat warning.</b> Most competitive shooters' anti-cheat (VAC, Vanguard, Easy Anti-Cheat) detect or prohibit input automation. <b>Using these patterns in ranked play can result in a permanent ban.</b> Use only in private servers, single-player, or community workshops.
-                    </div>
-
-                    <div id="gpm-recoil-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px">
-                        Loading…
-                    </div>
-                    <div class="btn-group">
-                        <button class="btn btn-sm" onclick="closeRecoilPresetPicker()">Cancel</button>
-                    </div>
-                </div>
-            </div>
-
-            <!-- v3.6 — Counter-pull capture modal (option B) -->
-            <div id="gpm-capture-cp-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:1002;align-items:center;justify-content:center">
-                <div style="background:var(--bg-card,var(--bg-elevated));padding:24px;border-radius:12px;max-width:560px;width:90%;border:1px solid var(--border-faint);max-height:90vh;overflow-y:auto">
-                    <div style="font-size:14px;font-weight:600;color:var(--text-bright);margin-bottom:8px">✋ Counter-pull recording</div>
-                    <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55">
-                        Aim at any target in your game (no screen capture, so windowed mode <i>not</i> required).  Click <b>Start</b>, then fire your full magazine while <b>manually compensating</b>: drag your mouse down or push your right stick down to keep the crosshair on target.  We record what you do.  Whatever inputs you make IS the compensation pattern.
-                        <br/><br/>
-                        Quality depends on your counter-pull technique.  Practice the spray a few times first; your last attempt is usually the cleanest.
-                    </div>
-                    <div style="display:grid;grid-template-columns:max-content 1fr;gap:8px 12px;font-size:12px;margin-bottom:14px;align-items:center">
-                        <label>Preset name</label>
-                        <input type="text" id="gpm-capture-cp-name" placeholder="e.g. CS2 - AK47 (mine)" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
-                        <label>Game</label>
-                        <input type="text" id="gpm-capture-cp-game" placeholder="Counter-Strike 2" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
-                        <label>Weapon</label>
-                        <input type="text" id="gpm-capture-cp-weapon" placeholder="AK-47" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
-                        <label title="Which input device are you compensating with">Source</label>
-                        <select id="gpm-capture-cp-source" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">
-                            <option value="mouse">Mouse (record cursor deltas)</option>
-                            <option value="controller_rstick">Controller right stick</option>
-                        </select>
-                        <label>RPM</label>
-                        <input type="number" id="gpm-capture-cp-rpm" value="600" min="60" max="1500" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:90px"/>
-                        <label>Max duration</label>
-                        <input type="number" id="gpm-capture-cp-dur" value="6.0" min="1" max="20" step="0.5" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:90px"/>
-                        <label title="Pixel-to-stick scale on playback.  0.005 = 200 px per full stick.  Tune if the played-back compensation feels too weak/strong.">Sensitivity</label>
-                        <input type="number" id="gpm-capture-cp-sens" value="0.005" min="0.0001" max="0.05" step="0.0005" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:110px"/>
-                        <label>Play mode</label>
-                        <select id="gpm-capture-cp-playmode" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">
-                            <option value="once">Once (full mag spray)</option>
-                            <option value="loop_while_held">Loop while held (rapid SMG)</option>
-                        </select>
-                        <label title="Have Vispora hold RT through the virtual pad while you focus on the counter-pull motion.  Requires Virtual controller mode + master switch on.">Auto-fire</label>
-                        <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="gpm-capture-cp-autofire" /> <span style="font-size:11px;color:var(--text-tertiary)">Push RT via virtual pad for me (controller users)</span></label>
-                    </div>
-
-                    <div id="gpm-capture-cp-status" style="padding:10px 12px;background:var(--bg-overlay);border-radius:6px;margin-bottom:14px;font-size:12px;line-height:1.55;min-height:40px"></div>
-
-                    <div class="btn-group">
-                        <button class="btn btn-primary btn-sm" id="gpm-capture-cp-start" onclick="startCaptureCounterPull()">Start (3 sec countdown)</button>
-                        <button class="btn btn-sm" id="gpm-capture-cp-stop" onclick="stopCaptureCounterPull(false)" disabled>Stop</button>
-                        <button class="btn btn-primary btn-sm" id="gpm-capture-cp-save" onclick="saveCaptureCounterPull()" disabled>Save preset</button>
-                        <button class="btn btn-sm" onclick="closeCaptureCounterPullModal()">Close</button>
-                    </div>
-                </div>
-            </div>
-
-            <!-- v3.6 — Capture from gameplay (screen tracking) modal -->
-            <div id="gpm-capture-screen-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:1002;align-items:center;justify-content:center">
-                <div style="background:var(--bg-card,var(--bg-elevated));padding:24px;border-radius:12px;max-width:560px;width:90%;border:1px solid var(--border-faint);max-height:90vh;overflow-y:auto">
-                    <div style="font-size:14px;font-weight:600;color:var(--text-bright);margin-bottom:8px">📹 Capture from gameplay (screen tracking)</div>
-                    <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55">
-                        Aim at a flat wall in your game (<b>windowed or borderless</b>), click <b>Start</b>, fire your full magazine <b>without moving your aim</b> (don't touch the right stick / mouse).  We screenshot the foreground window at 120 Hz and use FFT-based phase correlation to extract the camera-drift pattern.  After firing, click Stop (or wait for the duration to elapse) and save as a preset.
-                        <br/><br/>
-                        <b>Controller user?</b>  Enable <b>Auto-fire</b> below and Vispora will push RT through your virtual pad so you don't have to hold the trigger yourself.  Requires virtual_controller mode + master switch on.
-                    </div>
-                    <div style="display:grid;grid-template-columns:max-content 1fr;gap:8px 12px;font-size:12px;margin-bottom:14px;align-items:center">
-                        <label>Preset name</label>
-                        <input type="text" id="gpm-capture-screen-name" placeholder="e.g. CS2 - AK47 (mine)" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
-                        <label>Game</label>
-                        <input type="text" id="gpm-capture-screen-game" placeholder="Counter-Strike 2" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
-                        <label>Weapon</label>
-                        <input type="text" id="gpm-capture-screen-weapon" placeholder="AK-47" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
-                        <label title="Rounds per minute. Controls how the captured frames are binned into per-shot deltas">RPM</label>
-                        <input type="number" id="gpm-capture-screen-rpm" value="600" min="60" max="1500" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:90px"/>
-                        <label title="How long to capture for (seconds).  Auto-stops when the magazine ends.">Max duration</label>
-                        <input type="number" id="gpm-capture-screen-dur" value="6.0" min="1" max="20" step="0.5" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:90px"/>
-                        <label title="Pixel-to-stick scale.  0.005 = 200 px ≈ full stick.  Lower = weaker compensation, higher = stronger.">Sensitivity</label>
-                        <input type="number" id="gpm-capture-screen-sens" value="0.005" min="0.0001" max="0.05" step="0.0005" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:110px"/>
-                        <label>Play mode</label>
-                        <select id="gpm-capture-screen-playmode" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">
-                            <option value="once">Once (full mag spray)</option>
-                            <option value="loop_while_held">Loop while held (rapid SMG)</option>
-                        </select>
-                        <label title="Have Vispora hold RT through your virtual pad during the capture window, so you don't have to physically touch the trigger.  Requires the active profile in Virtual controller mode + master switch on.">Auto-fire</label>
-                        <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="gpm-capture-screen-autofire" /> <span style="font-size:11px;color:var(--text-tertiary)">Push RT via virtual pad for me (controller users)</span></label>
-                    </div>
-
-                    <div id="gpm-capture-screen-status" style="padding:10px 12px;background:var(--bg-overlay);border-radius:6px;margin-bottom:14px;font-size:12px;line-height:1.55;min-height:40px"></div>
-
-                    <div class="btn-group">
-                        <button class="btn btn-primary btn-sm" id="gpm-capture-screen-start" onclick="startCaptureScreen()">Start (3 sec countdown)</button>
-                        <button class="btn btn-sm" id="gpm-capture-screen-stop" onclick="stopCaptureScreen(false)" disabled>Stop</button>
-                        <button class="btn btn-primary btn-sm" id="gpm-capture-screen-save" onclick="saveCaptureScreen()" disabled>Save preset</button>
-                        <button class="btn btn-sm" onclick="closeCaptureScreenModal()">Close</button>
-                    </div>
-                </div>
-            </div>
-
-            <!-- v3.6 — Capture from bullet holes modal -->
-            <div id="gpm-capture-bullet-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:1002;align-items:center;justify-content:center">
-                <div style="background:var(--bg-card,var(--bg-elevated));padding:24px;border-radius:12px;max-width:560px;width:90%;border:1px solid var(--border-faint);max-height:90vh;overflow-y:auto">
-                    <div style="font-size:14px;font-weight:600;color:var(--text-bright);margin-bottom:8px">🎯 Capture from bullet holes</div>
-                    <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55">
-                        Aim at a clean flat wall in a training map (e.g. CS2's <code>aim_botz</code>, Apex firing range, R6's terrorist hunt).  Click <b>Capture before</b>, fire your full magazine <b>without moving your aim</b> (don't touch the right stick / mouse), then click <b>Capture after</b>.  We diff the two screenshots, detect bullet holes via connected components, and sort top-down (first-shot-highest convention).
-                        <br/><br/>
-                        <b>Controller user?</b>  Click <b>Auto-fire mag</b> between Before and After and Vispora will hold RT through your virtual pad for the right duration so you don't need to alt-tab.  Requires virtual_controller mode.
-                    </div>
-                    <div style="display:grid;grid-template-columns:max-content 1fr;gap:8px 12px;font-size:12px;margin-bottom:14px;align-items:center">
-                        <label>Preset name</label>
-                        <input type="text" id="gpm-capture-bullet-name" placeholder="e.g. CS2 - AK47 (mine)" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
-                        <label>Game</label>
-                        <input type="text" id="gpm-capture-bullet-game" placeholder="Counter-Strike 2" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
-                        <label>Weapon</label>
-                        <input type="text" id="gpm-capture-bullet-weapon" placeholder="AK-47" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px"/>
-                        <label title="Rounds per minute (affects timing, not detection)">RPM</label>
-                        <input type="number" id="gpm-capture-bullet-rpm" value="600" min="60" max="1500" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:90px"/>
-                        <label title="Per-pixel BGR-sum delta below which we ignore changes.  60 works for most games.  Bump up if you get too many false positives, down if you miss faint holes.">Threshold</label>
-                        <input type="number" id="gpm-capture-bullet-threshold" value="60" min="10" max="200" step="5" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:90px"/>
-                        <label title="Pixel-to-stick scale.  0.005 = 200 px ≈ full stick.  Adjust if compensation feels too weak/strong in-game.">Sensitivity</label>
-                        <input type="number" id="gpm-capture-bullet-sens" value="0.005" min="0.0001" max="0.05" step="0.0005" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px;width:110px"/>
-                        <label>Play mode</label>
-                        <select id="gpm-capture-bullet-playmode" style="padding:5px 8px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:12px">
-                            <option value="once">Once (full mag spray)</option>
-                            <option value="loop_while_held">Loop while held (rapid SMG)</option>
-                        </select>
-                    </div>
-
-                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center">
-                        <button class="btn btn-sm" id="gpm-capture-bullet-before" onclick="captureBulletBefore()">Capture before</button>
-                        <button class="btn btn-sm" id="gpm-capture-bullet-after"  onclick="captureBulletAfter()">Capture after</button>
-                        <button class="btn btn-sm" onclick="autoFireMag()" title="Push RT through your virtual pad for the configured duration so you don't have to manually fire.  Requires Virtual controller mode + master switch on.">Auto-fire mag</button>
-                        <input type="number" id="gpm-capture-bullet-fire-dur" value="3.0" min="0.5" max="10" step="0.5" title="Auto-fire duration in seconds" style="width:60px;padding:4px 6px;border-radius:4px;background:var(--bg-elevated);color:var(--text);border:1px solid var(--border-faint);font-size:11px"/>
-                        <span style="font-size:11px;color:var(--text-tertiary)">sec</span>
-                        <span style="flex:1"></span>
-                        <button class="btn btn-sm" id="gpm-capture-bullet-detect" onclick="detectBulletHoles()" disabled>Detect holes</button>
-                        <button class="btn btn-sm" onclick="resetBulletCapture()" title="Drop both snapshots and start over">Reset</button>
-                    </div>
-
-                    <div id="gpm-capture-bullet-status" style="padding:10px 12px;background:var(--bg-overlay);border-radius:6px;margin-bottom:14px;font-size:12px;line-height:1.55;min-height:40px"></div>
-
-                    <div class="btn-group">
-                        <button class="btn btn-primary btn-sm" id="gpm-capture-bullet-save" onclick="saveCaptureBullet()" disabled>Save preset</button>
-                        <button class="btn btn-sm" onclick="closeCaptureBulletModal()">Close</button>
-                    </div>
+            <div class="card xh-legacy" id="xh-legacy-notice" style="display:none">
+                <div class="xh-legacy-row">
+                    <div class="card-icon xh-legacy-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></div>
+                    <div class="xh-legacy-text">The Gamepad Mapper was removed in this version. Your old profiles are still saved in %APPDATA%\Vispora. If nothing else uses them, the ViGEm Bus Driver and HidHide can be uninstalled from Windows Settings &gt; Apps.</div>
+                    <button class="btn btn-sm" onclick="xhDismissLegacyNotice()">Dismiss</button>
                 </div>
             </div>
         </div>
@@ -2493,6 +1968,258 @@
 
             <div class="section-divider">Recent screenshots</div>
             <div id="recent-screenshots-list" style="font-size:13px;display:grid;grid-template-columns:repeat(auto-fill, minmax(220px, 1fr));gap:10px"></div>
+        </div>
+
+        <!-- ═══ CROSSHAIR: an overlay window above the game, never inside it ═══ -->
+        <div class="page xh-unloaded" id="page-crosshair">
+            <div class="page-header">
+                <div class="page-header-row">
+                    <div>
+                        <div class="section-title">Crosshair</div>
+                        <div class="section-subtitle">A custom crosshair drawn on top of your games, in its own window that never touches the game. Works over windowed, borderless and most fullscreen games.</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="warn-box" id="xh-load-error" style="display:none"></div>
+
+            <div class="xh-notice" id="xh-notice" style="display:none">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                <div class="xh-notice-text">Some games and tournaments don't allow crosshair overlays. Check the rules where you play.</div>
+                <button class="btn btn-sm" onclick="xhDismissNotice()">Got it</button>
+            </div>
+
+            <div class="card" id="xh-main-card">
+                <div class="toggle-row xh-main-row">
+                    <div class="toggle-info">
+                        <div class="toggle-name">Show crosshair</div>
+                        <div class="toggle-desc" id="xh-status-line">Loading…</div>
+                    </div>
+                    <span class="status-badge neutral" id="xh-status-badge">…</span>
+                    <button type="button" class="toggle-switch xh-pending" id="xh-toggle-enabled" role="switch" aria-checked="false" aria-disabled="true" aria-label="Show crosshair" onclick="xhToggleEnabled(this)"></button>
+                </div>
+                <div class="xh-status-extra" id="xh-status-extra"></div>
+            </div>
+
+            <div class="section-divider">Designer</div>
+            <div class="card" id="xh-designer-card">
+                <div class="xh-designer">
+                    <div class="xh-preview-col">
+                        <div class="xh-editing" id="xh-editing-label"></div>
+                        <div class="xh-preview-box" id="xh-preview-true-box"><img id="xh-preview-true" alt="Crosshair at true size"></div>
+                        <div class="xh-cap">True size</div>
+                        <div class="xh-preview-box xh-zoom" id="xh-preview-zoom-box"><img id="xh-preview-zoom" alt="Crosshair at 4x zoom"></div>
+                        <div class="xh-cap">4x zoom</div>
+                        <div class="xh-chips" role="group" aria-label="Preview background">
+                            <button type="button" class="chip active" id="xh-bg-dark" onclick="xhSetBackground('dark')">Dark</button>
+                            <button type="button" class="chip" id="xh-bg-light" onclick="xhSetBackground('light')">Light</button>
+                            <button type="button" class="chip" id="xh-bg-none" onclick="xhSetBackground('none')">Checker</button>
+                        </div>
+                        <div class="xh-note xh-warn-text" id="xh-preview-warn"></div>
+                        <div class="xh-save-bar">
+                            <div class="xh-dirty" id="xh-dirty">Unsaved changes</div>
+                            <div class="btn-group">
+                                <button class="btn btn-sm btn-primary" id="xh-btn-save" onclick="xhSave()">Save</button>
+                                <button class="btn btn-sm" id="xh-btn-saveas" onclick="xhSaveAsNew()">Save as new</button>
+                                <button class="btn btn-sm" id="xh-btn-undo" onclick="xhUndoChanges()">Undo changes</button>
+                            </div>
+                            <div id="xh-import-note"></div>
+                        </div>
+                    </div>
+                    <div class="xh-controls-col">
+                        <div class="xh-sub">Shape</div>
+                        <div class="xh-shapes">
+                            <button type="button" class="xh-shape" id="xh-shape-cross" onclick="xhSetShape('cross')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v6M12 15v6M3 12h6M15 12h6"/></svg>Cross</button>
+                            <button type="button" class="xh-shape" id="xh-shape-dot" onclick="xhSetShape('dot')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>Dot</button>
+                            <button type="button" class="xh-shape" id="xh-shape-circle" onclick="xhSetShape('circle')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="7"/></svg>Circle</button>
+                            <button type="button" class="xh-shape" id="xh-shape-circle_dot" onclick="xhSetShape('circle_dot')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="1.6" fill="currentColor"/></svg>Circle and dot</button>
+                            <button type="button" class="xh-shape" id="xh-shape-cross_circle" onclick="xhSetShape('cross_circle')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="7"/><path d="M12 2v6M12 16v6M2 12h6M16 12h6"/></svg>Crossed circle</button>
+                            <button type="button" class="xh-shape" id="xh-shape-chevron" onclick="xhSetShape('chevron')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 19 12 13 18 19"/></svg>Chevron</button>
+                            <button type="button" class="xh-shape" id="xh-shape-box" onclick="xhSetShape('box')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12"/></svg>Box</button>
+                            <button type="button" class="xh-shape" id="xh-shape-image" onclick="xhUseImage()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>Use an image</button>
+                        </div>
+                        <div id="xh-controls"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section-divider">Presets</div>
+            <div class="card" id="xh-presets-card">
+                <div class="xh-sub">Built in</div>
+                <div class="xh-preset-grid" id="xh-presets-builtin"></div>
+                <div class="xh-sub xh-sub-gap">My crosshairs</div>
+                <div class="xh-preset-grid" id="xh-presets-user"></div>
+                <div class="xh-codes">
+                    <div>
+                        <div class="xh-sub">Share code</div>
+                        <div class="xh-inline">
+                            <input type="text" id="xh-share-code" readonly placeholder="A code for the crosshair you're editing" aria-label="Share code">
+                            <button class="btn btn-sm" onclick="xhShareCode()">Share code</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="xh-sub">Import code</div>
+                        <div class="xh-inline">
+                            <input type="text" id="xh-import-code" placeholder="Vispora, CS2 or Valorant code" aria-label="Code to import" onkeydown="if(event.key==='Enter')xhImportCode()">
+                            <button class="btn btn-sm" onclick="xhImportCode()">Import code</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section-divider">Position</div>
+            <div class="card" id="xh-position-card">
+                <div class="xh-fields">
+                    <div class="form-group">
+                        <label class="form-label" for="xh-anchor">Centre on</label>
+                        <select id="xh-anchor" onchange="xhSetAnchor(this.value)">
+                            <option value="game">Game window</option>
+                            <option value="monitor">Screen</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="xh-monitor">Monitor</label>
+                        <select id="xh-monitor" onchange="xhSetMonitor(this.value)">
+                            <option value="auto">Automatic</option>
+                        </select>
+                        <div class="xh-note" id="xh-monitor-note">Uses the game's monitor</div>
+                    </div>
+                </div>
+                <div class="xh-offsets">
+                    <div>
+                        <label class="form-label" for="xh-offset-x">X offset</label>
+                        <div class="xh-stepper">
+                            <button class="btn btn-sm" onclick="xhNudge('x', -1)" aria-label="Move left">-1</button>
+                            <input type="number" id="xh-offset-x" min="-500" max="500" step="1" value="0" oninput="xhOffsetInput()">
+                            <button class="btn btn-sm" onclick="xhNudge('x', 1)" aria-label="Move right">+1</button>
+                        </div>
+                    </div>
+                    <div>
+                        <label class="form-label" for="xh-offset-y">Y offset</label>
+                        <div class="xh-stepper">
+                            <button class="btn btn-sm" onclick="xhNudge('y', -1)" aria-label="Move up">-1</button>
+                            <input type="number" id="xh-offset-y" min="-500" max="500" step="1" value="0" oninput="xhOffsetInput()">
+                            <button class="btn btn-sm" onclick="xhNudge('y', 1)" aria-label="Move down">+1</button>
+                        </div>
+                    </div>
+                    <button class="btn btn-sm" onclick="xhResetOffset()">Reset to centre</button>
+                </div>
+                <div class="xh-note">In screen pixels. Positive X moves right, positive Y moves down.</div>
+                <div class="btn-group xh-gap-top">
+                    <button class="btn btn-sm btn-primary" id="xh-test-btn" onclick="xhTestShow()">Show on screen for 5 s</button>
+                </div>
+            </div>
+
+            <div class="section-divider">When to show</div>
+            <div class="card" id="xh-when-card">
+                <div class="form-group">
+                    <label class="form-label" for="xh-show-mode">Show the crosshair</label>
+                    <select id="xh-show-mode" onchange="xhSetSetting('show_mode', this.value)">
+                        <option value="games">Only when a game is in front</option>
+                        <option value="always">Always</option>
+                        <option value="list">Only for games I pick</option>
+                    </select>
+                </div>
+
+                <div class="xh-sub xh-sub-gap">Games</div>
+                <div class="xh-note">Show or hide it per game, give a game its own crosshair, or move it in that game. Empty X and Y use the offset above.</div>
+                <div id="xh-rules"></div>
+                <div class="xh-rule-add">
+                    <input type="text" id="xh-rule-add-exe" list="xh-games-datalist" placeholder="game.exe" aria-label="Game to add" onkeydown="if(event.key==='Enter')xhAddRule()">
+                    <select id="xh-rule-add-mode" aria-label="Rule for the new game">
+                        <option value="show">Show</option>
+                        <option value="hide">Hide</option>
+                        <option value="default">Default</option>
+                    </select>
+                    <button class="btn btn-sm" onclick="xhAddRule()">Add game</button>
+                </div>
+                <datalist id="xh-games-datalist"></datalist>
+                <div class="xh-note" id="xh-blocked-note"></div>
+
+                <div class="xh-sub xh-sub-gap">Aiming and menus</div>
+                <div class="xh-fields">
+                    <div class="form-group">
+                        <label class="form-label" for="xh-aim-mode">Hide while aiming</label>
+                        <select id="xh-aim-mode" onchange="xhSetSetting('hide_on_aim', this.value)">
+                            <option value="off">Off</option>
+                            <option value="hold">While held</option>
+                            <option value="toggle">Toggle</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="xh-aim-button">Button</label>
+                        <select id="xh-aim-button" onchange="xhSetSetting('aim_button', this.value)">
+                            <option value="mouse2">Right mouse</option>
+                            <option value="mouse3">Middle mouse</option>
+                            <option value="mouse4">Back button</option>
+                            <option value="mouse5">Forward button</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="xh-note" id="xh-aim-note" style="display:none">Toggle can get out of step with the game. Press the button twice to fix it.</div>
+                <div class="toggle-row">
+                    <div class="toggle-info">
+                        <div class="toggle-name">Hide in menus (when the mouse pointer is showing)</div>
+                        <div class="toggle-desc">Most games hide the pointer while you play and show it in menus.</div>
+                    </div>
+                    <button type="button" class="toggle-switch xh-pending" id="xh-toggle-cursor" role="switch" aria-checked="false" aria-disabled="true" aria-label="Hide in menus" onclick="xhToggleSetting('hide_with_cursor', this)"></button>
+                </div>
+
+                <div class="xh-sub xh-sub-gap">Hotkeys</div>
+                <div class="xh-hk-row">
+                    <div class="xh-hk-label">Show or hide</div>
+                    <button class="btn btn-sm xh-hk-btn" id="xh-hk-toggle" onclick="xhBindHotkey('toggle')">…</button>
+                    <button class="btn btn-sm" onclick="xhClearHotkey('toggle')" title="Clear" aria-label="Clear the show or hide hotkey">✕</button>
+                    <div class="xh-err xh-hk-err" id="xh-hk-err-toggle"></div>
+                    <div class="xh-note xh-hk-note" id="xh-hk-note-toggle"></div>
+                </div>
+                <div class="xh-hk-row">
+                    <div class="xh-hk-label">Next crosshair</div>
+                    <button class="btn btn-sm xh-hk-btn" id="xh-hk-next" onclick="xhBindHotkey('next')">…</button>
+                    <button class="btn btn-sm" onclick="xhClearHotkey('next')" title="Clear" aria-label="Clear the next crosshair hotkey">✕</button>
+                    <div class="xh-err xh-hk-err" id="xh-hk-err-next"></div>
+                    <div class="xh-note xh-hk-note" id="xh-hk-note-next"></div>
+                </div>
+                <div class="xh-hk-row">
+                    <div class="xh-hk-label">Previous crosshair</div>
+                    <button class="btn btn-sm xh-hk-btn" id="xh-hk-prev" onclick="xhBindHotkey('prev')">…</button>
+                    <button class="btn btn-sm" onclick="xhClearHotkey('prev')" title="Clear" aria-label="Clear the previous crosshair hotkey">✕</button>
+                    <div class="xh-err xh-hk-err" id="xh-hk-err-prev"></div>
+                    <div class="xh-note xh-hk-note" id="xh-hk-note-prev"></div>
+                </div>
+                <div class="xh-note">Use the left Alt key: right Alt types characters on some keyboards.</div>
+            </div>
+
+            <div class="section-divider">Fullscreen</div>
+            <div class="card" id="xh-fs-card">
+                <p class="xh-p">Works over windowed, borderless and most fullscreen games. It can't draw over a game in true exclusive fullscreen. If the crosshair doesn't show in a game, set the game to borderless, or turn fullscreen optimizations back on for it below.</p>
+                <div class="xh-inline xh-fs-pick">
+                    <label class="form-label" for="xh-fs-exe">Check a game</label>
+                    <select id="xh-fs-exe" onchange="xhFsCheck()">
+                        <option value="">Pick a game</option>
+                    </select>
+                    <button class="btn btn-sm" onclick="xhFsCheck()">Check</button>
+                </div>
+                <div id="xh-fs-result"></div>
+                <div class="btn-group xh-gap-top">
+                    <button class="btn btn-sm btn-primary" id="xh-fs-fix" style="display:none" onclick="xhFsFix()">Turn fullscreen optimizations back on</button>
+                    <button class="btn btn-sm" id="xh-fs-fix-global" style="display:none" onclick="xhFsFixGlobal()">Restore Windows' default for all games</button>
+                    <button class="btn btn-sm" id="xh-fs-undo" disabled onclick="xhFsUndo()">Undo all fullscreen fixes</button>
+                </div>
+            </div>
+
+            <div class="section-divider">Recording</div>
+            <div class="card" id="xh-rec-card">
+                <div class="toggle-row">
+                    <div class="toggle-info">
+                        <div class="toggle-name">Hide from recordings and screenshots</div>
+                        <div class="toggle-desc">Off by default, so screen recordings and Vispora's clips show your crosshair. OBS Game Capture never shows it either way.</div>
+                        <div class="xh-note xh-warn-text" id="xh-capture-note"></div>
+                    </div>
+                    <button type="button" class="toggle-switch xh-pending" id="xh-toggle-capture" role="switch" aria-checked="false" aria-disabled="true" aria-label="Hide from recordings and screenshots" onclick="xhToggleSetting('exclude_from_capture', this)"></button>
+                </div>
+                <div class="xh-note">Some anti-cheat tools take screenshots; leave this off in those games.</div>
+            </div>
         </div>
 
         <!-- ═══ HARDWARE MONITOR ═══ -->
