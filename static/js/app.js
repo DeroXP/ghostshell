@@ -1472,13 +1472,21 @@ function formatSize(bytes) {
 // ═══ System Health Audit (Dashboard card) ═══
 var _SEV_GLYPH = { ok: '✓', warn: '!', crit: '✕' };
 
+// A page's name as the sidebar shows it ("Profiles" for 'profiles').
+function _pageLabel(page) {
+    var nav = document.querySelector('.nav-item[data-page="' + String(page).replace(/[^\w-]/g, '') + '"]');
+    var text = '';
+    if (nav) nav.childNodes.forEach(function(n) { if (n.nodeType === 3) text += n.textContent; });
+    return text.trim() || String(page);
+}
+
 function _renderHealthRow(c) {
     var sev = c.severity || 'ok';
     var fix = '';
     if (c.fix) {
         if (c.fix.kind === 'navigate') {
             fix = '<button class="btn btn-sm" onclick="switchPage(' + jsArg(c.fix.page) + ')" '
-                + 'style="margin-left:8px;flex-shrink:0">Open ' + escHtml(c.fix.page) + '</button>';
+                + 'style="margin-left:8px;flex-shrink:0">Open ' + escHtml(_pageLabel(c.fix.page)) + '</button>';
         } else if (c.fix.kind === 'route' && c.fix.method === 'POST') {
             fix = '<button class="btn btn-sm btn-primary" '
                 + 'onclick="_healthFix(' + jsArg(c.fix.url) + ', ' + jsArg(JSON.stringify(c.fix.body || {})) + ', this)" '
@@ -3875,8 +3883,8 @@ async function _checkRecentCrash() {
             'GPU recovered from a ' + (c.kind || 'crash') +
             ' at core+' + (off.core || 0) + ' / mem+' + (off.mem || 0) +
             ' (' + Math.round(ageS) + 's ago). ' +
-            'NVAPI offsets were automatically reset to stock. ' +
-            'Try a smaller offset next time.');
+            'Vispora took the overclock off the card by itself. ' +
+            'Try a smaller overclock next time.');
         // Acknowledge so we don't show it again on next reload
         apiPost('/api/gpu/oc/crash-state', {});
     } catch (e) { /* silent */ }
@@ -4466,13 +4474,10 @@ var _profilePollTimer = null;
 async function loadProfilesPage() {
     loadProfileEngineStatus();
     loadCustomGames();
-    loadAdaptiveSettings();
-    loadAdaptiveGames();
-    loadAdaptiveHistory();
     loadLibrary();
     loadPauser();
     loadCrosshairLegacyNotice();
-    _startAdaptivePoll();
+    _at2StartPoll();
 }
 
 // ═══ Background Pauser ═══
@@ -4637,7 +4642,7 @@ function _renderTournament(s) {
         idle.style.display = 'flex';
         active.style.display = 'none';
         if (summary) {
-            summary.textContent = 'One-button "before a match" macro: pauses browsers, kills OneDrive, mutes notifications, switches to High Performance, applies competitive AT.';
+            summary.textContent = 'One-button "before a match" macro: pauses browsers, kills OneDrive, mutes notifications, switches to High Performance.';
         }
     }
 }
@@ -4714,115 +4719,105 @@ async function extendTournament(extraMin) {
     loadTournament();
 }
 
-// ═══ Game Library Scanner (Detected Library card) ═══
-var _libraryFilter = 'known';   // 'known' | 'all'
-var _libraryCache = null;       // last response from /api/library
+// ═══ Installed Games (Profiles page) ═══
+var _libraryFilter = 'all';     // 'all' | 'known'
+var _libraryCache = null;       // last answer of /api/library
+var _libraryMine = {};          // exes in "my games", lower case: a game added here shows as added without a new scan
 
 async function loadLibrary(forceScan) {
     var summary = document.getElementById('library-summary');
     var list = document.getElementById('library-list');
     if (!summary || !list) return;
-    summary.textContent = forceScan ? 'Scanning library… this can take 5-15 seconds.' : 'Loading library…';
+    summary.textContent = forceScan ? 'Scanning. This can take 5 to 15 seconds.' : 'Loading…';
     list.innerHTML = '';
-    var url = '/api/library';
-    var data;
-    if (forceScan) {
-        data = await apiPost('/api/library/scan', { force: true });
-    } else {
-        data = await apiGet(url);
-    }
+    var got = await Promise.all([
+        forceScan ? apiPost('/api/library/scan', { force: true }) : apiGet('/api/library'),
+        apiGet('/api/profiles'),
+    ]);
+    var data = got[0];
     // A failed request (ok:false) would otherwise replace the cache and read as "No scan yet"
     if (!data || data.ok === false) {
-        summary.textContent = 'Library scan unavailable.';
+        summary.textContent = "Couldn't load the list of installed games.";
         return;
     }
     _libraryCache = data;
+    _librarySetMine(got[1]);
     _renderLibrary();
 }
 
+// The games the user added by hand.  A failed read keeps what is known.
+function _librarySetMine(data) {
+    if (!data || data.ok === false || !data.profiles) return;
+    var exes = (data.profiles.custom || {}).exes;
+    _libraryMine = {};
+    (Array.isArray(exes) ? exes : []).forEach(function(g) {
+        if (g && g.exe) _libraryMine[String(g.exe).toLowerCase()] = true;
+    });
+}
+
+function _libraryExe(g) { return String((g && g.exe) || '').toLowerCase(); }
+
+// The game's name as the rest of the app shows it (the scan title cleaned the
+// way game mode cleans it), else the title the launcher gave.
+function _libraryTitle(g) { return String((g && (g.display_name || g.title)) || ''); }
+
+function _libraryAdded(g) { var exe = _libraryExe(g); return !!exe && _libraryMine[exe] === true; }
+
+// Vispora watches for it: on its own list, or added by the user.
+function _libraryRecognised(g) { return !!(g && g.known) || _libraryAdded(g); }
+
 function _renderLibrary() {
-    var data = _libraryCache || { games: [], total: 0, known: 0, scanned_at: 0 };
+    var data = _libraryCache || { games: [], scanned_at: 0 };
     var summary = document.getElementById('library-summary');
     var list = document.getElementById('library-list');
     if (!summary || !list) return;
+    _updateLibraryFilterLinks();
 
     if (!data.scanned_at) {
-        summary.innerHTML = 'No scan yet. Click <b>Scan now</b> to discover installed games.';
+        summary.innerHTML = 'No scan yet. Press <b>Scan now</b> to list the games installed on this PC.';
         list.innerHTML = '';
         return;
     }
-    var when = new Date(data.scanned_at * 1000);
-    summary.innerHTML = '<b>' + data.total + '</b> installed games detected · ' +
-        '<b>' + data.known + '</b> recognized by Vispora · ' +
-        'last scan ' + when.toLocaleString();
+    var all = (data.games || []).slice();
+    var recognised = all.filter(_libraryRecognised).length;
+    summary.innerHTML = '<b>' + all.length + '</b> ' + (all.length === 1 ? 'game' : 'games') + ' installed · ' +
+        '<b>' + recognised + '</b> recognised · last scan ' + escHtml(new Date(data.scanned_at * 1000).toLocaleString());
 
-    var games = (data.games || []).slice();
-    if (_libraryFilter === 'known') {
-        games = games.filter(function(g){ return g.known; });
-    }
+    var games = _libraryFilter === 'known' ? all.filter(_libraryRecognised) : all;
     if (!games.length) {
-        list.innerHTML = '<div style="color:var(--text-tertiary);padding:8px 0">' +
-            (_libraryFilter === 'known'
-                ? 'No recognized games found. Switch to <b>all</b> to see what was scanned, or use Custom Games to add an unknown title.'
-                : 'No games found by any launcher scanner.') +
+        list.innerHTML = '<div class="at2-empty">' +
+            (!all.length ? 'No installed games were found.'
+                         : 'None of the installed games is recognised yet. Switch to <b>all</b> to add them.') +
             '</div>';
-        _updateLibraryFilterLinks();
         return;
     }
-
-    // Build per-game adaptive-tuning state lookup so we can show toggle position.
-    // /api/adaptive/games returns { games: { "exe": state, ... } } — a dict
-    // keyed by exe, NOT an array.  Don't call forEach on it.
-    apiGet('/api/adaptive/games').then(function(at){
-        var atMap = {};
-        if (at && at.games && typeof at.games === 'object') {
-            Object.keys(at.games).forEach(function(k){
-                atMap[k.toLowerCase()] = at.games[k];
-            });
-        }
-        var html = games.map(function(g){
-            var exe = (g.exe || '').toLowerCase();
-            var atState = atMap[exe];
-            var isOn = atState && atState.enabled;
-            var hint = g.mode_hint ? '<span style="color:var(--accent);font-size:11px;text-transform:uppercase;letter-spacing:0.04em;margin-left:8px">' + g.mode_hint + '</span>' : '';
-            var knownBadge = g.known ? '' : '<span style="color:var(--text-tertiary);font-size:11px;margin-left:8px">unrecognized</span>';
-            var btnLabel = isOn ? 'AT enabled (click to disable)' : (g.known ? 'Enable AT' : 'Add as custom + enable AT');
-            var btnClass = isOn ? 'btn btn-sm' : 'btn btn-sm btn-primary';
-            return '<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border-faint);gap:10px">' +
-                '<div style="min-width:0;flex:1">' +
-                    '<div style="color:var(--text-bright);font-weight:600;font-size:13.5px">' +
-                        escHtml(g.title) + hint + knownBadge +
-                    '</div>' +
-                    '<div style="color:var(--text-tertiary);font-size:12px;margin-top:2px">' +
-                        escHtml(g.launcher) + ' · ' + escHtml(exe || '(no exe found)') +
-                    '</div>' +
-                '</div>' +
-                (exe ?
-                    '<button class="' + btnClass + '" onclick="toggleATForLibraryGame(' + jsArg(exe) + ',' + (isOn ? 'false' : 'true') + ')">' + btnLabel + '</button>'
-                    : '<span style="color:var(--text-tertiary);font-size:12px">no exe</span>'
-                ) +
-            '</div>';
-        }).join('');
-        list.innerHTML = html;
-        _updateLibraryFilterLinks();
-    });
+    list.innerHTML = games.map(function(g) {
+        var exe = _libraryExe(g);
+        var title = _libraryTitle(g);
+        var right;
+        if (g.known) right = '<span class="at2-lib-state">Recognised</span>';
+        else if (_libraryAdded(g)) right = '<span class="at2-lib-state">In my games</span>';
+        else if (exe) right = '<button class="btn btn-sm" onclick="addLibraryGame(' + jsArg(exe) + ', ' + jsArg(title) + ', this)">Add to my games</button>';
+        else right = '<span class="at2-lib-state">No program found</span>';
+        return '<div class="at2-lib-row">' +
+            '<div class="at2-lib-info">' +
+                '<div class="at2-lib-title">' + escHtml(title || exe || 'Unknown game') + '</div>' +
+                '<div class="at2-lib-sub">' + escHtml(g.launcher || '') + (g.launcher && exe ? ' · ' : '') + escHtml(exe) + '</div>' +
+            '</div>' + right +
+        '</div>';
+    }).join('');
 }
 
 function _updateLibraryFilterLinks() {
     var k = document.getElementById('lib-filter-known');
     var a = document.getElementById('lib-filter-all');
     if (!k || !a) return;
-    if (_libraryFilter === 'known') {
-        k.style.color = 'var(--accent)'; k.style.fontWeight = '600';
-        a.style.color = 'var(--text-secondary)'; a.style.fontWeight = '400';
-    } else {
-        a.style.color = 'var(--accent)'; a.style.fontWeight = '600';
-        k.style.color = 'var(--text-secondary)'; k.style.fontWeight = '400';
-    }
+    k.classList.toggle('active', _libraryFilter === 'known');
+    a.classList.toggle('active', _libraryFilter !== 'known');
 }
 
 function setLibraryFilter(mode) {
-    _libraryFilter = (mode === 'all') ? 'all' : 'known';
+    _libraryFilter = (mode === 'known') ? 'known' : 'all';
     _renderLibrary();
 }
 
@@ -4830,1078 +4825,867 @@ async function scanLibrary() {
     await loadLibrary(true);
 }
 
-async function toggleATForLibraryGame(exe, enable) {
+// An installed game Vispora does not recognise: add it to "my games", so game
+// mode and Adaptive Tuning can see it when it runs.
+async function addLibraryGame(exe, title, btn) {
     if (!exe) return;
-    var r = await apiPost('/api/library/enable_at', { exe: exe, enabled: !!enable });
+    if (btn) btn.disabled = true;
+    var r = await apiPost('/api/profiles/add-game', { exe: exe, name: title || '' });
     if (!r || !r.ok) {
-        showErrorToast('Failed to update Adaptive Tuning state.');
+        if (btn) btn.disabled = false;
+        showWarnToast((r && r.err) || "Couldn't add the game.", { title: 'Installed Games' });
         return;
     }
-    _renderLibrary();        // refresh the row's button label
-    loadAdaptiveGames();     // refresh AT card so the user sees the new entry
+    _libraryMine[String(exe).toLowerCase()] = true;
+    _renderLibrary();
+    loadCustomGames();
 }
 
-async function enableATForLibrary(enable) {
-    if (!_libraryCache || !_libraryCache.games) {
-        showWarnToast('Run a scan first.');
-        return;
-    }
-    var verb = enable ? 'Enable' : 'Disable';
-    var known = _libraryCache.games.filter(function(g){ return g.known && g.exe; });
-    if (!known.length) {
-        showWarnToast('No recognized games to flip.');
-        return;
-    }
-    if (!confirm(verb + ' Adaptive Tuning for ' + known.length + ' recognized games?')) return;
-    var exes = known.map(function(g){ return g.exe; });
-    var r = await apiPost('/api/library/enable_at_bulk', {
-        exes: exes, enabled: !!enable, only_known: true
-    });
-    if (r && r.ok) {
-        showInfoToast(verb + 'd AT for ' + r.flipped + ' games.');
-        _renderLibrary();
-        loadAdaptiveGames();
-    } else {
-        showErrorToast('Bulk update failed.');
-    }
+// ═══════════════════════════════════════════════════════════════
+// ADAPTIVE TUNING (card on the Profiles page; ids and classes start with at2-)
+//
+// The card shows the answer of GET /api/adaptive/state and nothing else.
+// Every sentence is built by the pure functions in the first half of this
+// section (they read only their arguments), so tests can run them against
+// tests/fixtures/at2_states.json.
+// ═══════════════════════════════════════════════════════════════
+var AT2_TEST_REFUSED = "Close the game first. A test can't run while a game is using the graphics card.";
+var AT2_NO_GAMES = 'Play a game with Adaptive Tuning on and it will show up here.';
+var AT2_NO_HISTORY = 'Nothing has happened yet.';
+var AT2_GAME_SWITCH_TIP = 'Off: Adaptive Tuning leaves this game alone. To run it with less overclock, use Ease one step.';
+var AT2_RESET_QUESTION = 'Forget everything Adaptive Tuning learned about your games?\n\n' +
+    'Every game goes back to full overclock, games you switched off are looked after again, ' +
+    'and the list under What happened is cleared.';
+var AT2_CONFIRM_FALLBACK = 'This game had a graphics driver error at that level not long ago. Try it again?';
+var AT2_LEVELS = 'Each repeat problem takes that game one step down: full, 75%, 50%, then no overclock. You can undo any step.';
+var AT2_LEVELS_WATCH = 'It is set to only tell you, so nothing is eased by itself. You can ease a game one step yourself.';
+var AT2_LOG_UNREADABLE = "Vispora can't read the Windows event log on this PC, so it can't tell when the graphics driver " +
+    'has problems. Games still get your saved overclock.';
+var AT2_PROMISE = 'One more within 10 hours of play and it will be eased.';
+var AT2_PROMISE_WATCH = 'One more within 10 hours of play and you will be told.';
+var AT2_MAIN_OFF = 'Adaptive Tuning is off, so these games run on whatever overclock is on the graphics card';
+var AT2_MAIN_OFF_KEPT = 'Their levels are kept for when you turn it on again.';
+var AT2_LEFT_AS_IS = 'the overclock is left as it is until the game closes.';
+var _AT2_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+var _AT2_LEVEL_NAMES = ['Full', '75%', '50%', 'No overclock'];
+var _AT2_PERCENT = [100, 75, 50, 0];
+
+function _at2Num(v) {
+    v = Number(v);
+    return isFinite(v) ? v : 0;
 }
 
-// ═══ Adaptive Tuning (Game Profiles tab) ═══
-var _adaptivePollTimer = null;
-
-async function loadAdaptiveSettings() {
-    var s = await apiGet('/api/adaptive/settings');
-    // A failed read must not render the master switch OFF
-    if (!s || s.ok === false) {
-        addLog('Could not load Adaptive Tuning settings: ' + ((s && s.err) || 'unknown error'));
-        return;
-    }
-    var t = document.getElementById('toggle-adaptive-global');
-    if (t) {
-        if (s.enabled_globally) t.classList.add('on');
-        else t.classList.remove('on');
-    }
+// +450, -50, +0
+function _at2Signed(v) {
+    var n = Math.round(_at2Num(v));
+    return (n < 0 ? '-' : '+') + Math.abs(n);
 }
 
-async function toggleAdaptiveGlobal(el) {
-    var newOn = !el.classList.contains('on');
-    el.classList.toggle('on');
-    var r = await apiPost('/api/adaptive/settings', { enabled_globally: newOn });
-    // Success returns the settings (no `ok`).  Not saved: undo the flip, since
-    // a failed reload below now leaves the switch as it is.
-    if (r && r.ok === false) el.classList.toggle('on', !newOn);
-    loadAdaptiveSettings();
+// "+450 MHz core, +2225 MHz memory"
+function _at2LimitText(limit) {
+    limit = limit || {};
+    return _at2Signed(limit.core) + ' MHz core, ' + _at2Signed(limit.mem) + ' MHz memory';
 }
 
-async function _refreshAdaptiveLive() {
-    // Pull AT status AND game-mode active-game state in parallel.  We
-    // need both to render the "tracked but not tuning" state — that's
-    // when game_profiles knows about a game but AT hasn't engaged yet
-    // (either because global is off, or per-game toggle is off).
-    var [s, ge] = await Promise.all([
-        apiGet('/api/adaptive/status'),
-        apiGet('/api/profiles/status'),
-    ]);
-    // beta.14 — surface the "install PresentMon 2 for better AT accuracy"
-    // nudge as a toast once per session.  The toast helper itself dedupes
-    // identical messages so even if this poll fires hourly, the user
-    // sees it once.
-    try {
-        if (s && s.pm2_install_hint && s.pm2_install_hint.needs_pm2
-              && !window._pm2NudgeShown) {
-            window._pm2NudgeShown = true;
-            showInfoToast(s.pm2_install_hint.msg,
-                { title: 'Adaptive Tuning: recommendation',
-                  timeoutMs: 14000 });
+function _at2GameName(o) {
+    return String((o && (o.name || o.exe)) || 'your game');
+}
+
+// now in milliseconds; left out, the current time
+function _at2NowMs(now) {
+    return now == null ? Date.now() : now;
+}
+
+// A day as "1 Nov"; the year is added only when it is not this year.
+// ts in seconds, now in milliseconds (left out: the current time).
+function at2DateText(ts, now) {
+    var t = _at2Num(ts);
+    if (t <= 0) return '';
+    var d = new Date(t * 1000);
+    var today = new Date(_at2NowMs(now));
+    var text = d.getDate() + ' ' + _AT2_MONTHS[d.getMonth()];
+    return d.getFullYear() === today.getFullYear() ? text : text + ' ' + d.getFullYear();
+}
+
+// Which of the card's states this is.  First match wins, in this order.
+function at2StatusKind(state) {
+    if (!state || state.ok !== true) return 'load_failed';
+    if (!(state.supported && state.supported.ok)) return 'unsupported';
+    var limit = state.limit || {};
+    if (!limit.has_profile || (!_at2Num(limit.core) && !_at2Num(limit.mem))) return 'no_overclock';
+    if (!state.enabled) return 'off';
+    if (!state.watching) return 'not_watching';
+    if (state.tuner_running) return 'test_running';
+    if (state.session) return 'session';
+    if (state.game && !state.game.looked_after) return 'game_not_looked_after';
+    return 'on_idle';
+}
+
+// The row of "Your games" for this exe, or null.
+function _at2Row(state, exe) {
+    var games = (state && Array.isArray(state.games)) ? state.games : [];
+    for (var i = 0; i < games.length; i++) if (games[i] && games[i].exe === exe) return games[i];
+    return null;
+}
+
+// "+338 MHz core, +1669 MHz memory" from a session or a row
+function _at2ClocksText(o) {
+    return _at2Signed(o.core) + ' MHz core, ' + _at2Signed(o.mem) + ' MHz memory';
+}
+
+// "at full overclock (+450 MHz core, ...)", "at 75% of your overclock (...)", "with no overclock".
+// When the saved overclock changed since the game was eased, the clocks are not
+// that percentage of what is saved now, so only the percentage is named.
+// The same when the session's clocks are not what its level is of the overclock
+// saved now: a session keeps to the lowest saved overclock it has seen, so one
+// that was saved higher (or lowered and put back) mid-game is used from the
+// game's next start.  At full only the clocks are named then.
+function _at2LevelPhrase(s, row) {
+    var level = Math.round(_at2Num(s.level));
+    var percent = (typeof s.percent === 'number' && isFinite(s.percent)) ? Math.round(s.percent)
+                : (_AT2_PERCENT[level] != null ? _AT2_PERCENT[level] : 100);
+    if (level >= 3 || percent <= 0) return 'with no overclock';
+    var clocks = ' (' + _at2ClocksText(s) + ')';
+    var other = !!row && Math.round(_at2Num(row.level)) === level &&
+        (Math.round(_at2Num(row.core)) !== Math.round(_at2Num(s.core)) ||
+         Math.round(_at2Num(row.mem)) !== Math.round(_at2Num(s.mem)));
+    if (level <= 0 && percent >= 100) return other ? 'at ' + _at2ClocksText(s) : 'at full overclock' + clocks;
+    if (row && (row.limit_changed === true || other)) return 'at ' + percent + '%' + clocks;
+    return 'at ' + percent + '% of your overclock' + clocks;
+}
+
+// An open session that game mode or the user let go of while the game still
+// runs (held "released"): nothing more is changed until the game closes.
+function _at2Released(state) {
+    var s = state && state.session;
+    return !!(s && s.held === 'released');
+}
+
+// " Call of Duty is still running, so the overclock is left as it is until the game closes."
+function _at2ReleasedTail(state) {
+    return _at2Released(state) ? ' ' + _at2GameName(state.session) + ' is still running, so ' + AT2_LEFT_AS_IS : '';
+}
+
+function _at2ForgottenText(name) {
+    return 'Now: ' + name + ". It isn't looked after this time, because you asked Adaptive Tuning to forget it.";
+}
+
+// The one status line under the switch.
+function at2StatusText(state) {
+    var kind = at2StatusKind(state);
+    if (kind === 'load_failed') return "Couldn't load Adaptive Tuning. Try again.";
+    if (kind === 'unsupported') {
+        return String((state.supported && state.supported.reason) || '') || "Adaptive Tuning isn't available on this PC.";
+    }
+    if (kind === 'no_overclock') {
+        return "There's no overclock to look after yet. Quick Tune (GPU page, under Auto Overclock) finds one in about " +
+            '5 to 8 minutes, or set your own there and press Save Profile.';
+    }
+    var limit = state.limit || {};
+    if (kind === 'off') {
+        return 'Off. Your saved overclock: ' + _at2LimitText(limit) + '.' +
+            (limit.apply_on_startup === false ? " It isn't applied when Windows starts." : '') + _at2ReleasedTail(state);
+    }
+    if (kind === 'not_watching') {
+        if (state.monitor_starting === true) return 'On. Vispora starts watching for games in a moment.' + _at2ReleasedTail(state);
+        return "On, but Vispora isn't watching for games. Press Start Monitoring above." + _at2ReleasedTail(state);
+    }
+    if (kind === 'test_running') return 'Paused while a test runs on the GPU page.';
+    if (kind === 'session') {
+        var s = state.session;
+        var now = 'Now: ' + _at2GameName(s);
+        if (s.held === 'released') {
+            var g0 = state.game;
+            if (g0 && g0.reason === 'forgotten' && (!g0.exe || g0.exe === s.exe)) {
+                return _at2ForgottenText(_at2GameName(s)) + ' The overclock is left as it is until the game closes.';
+            }
+            return now + ". It isn't looked after any more this time, so " + AT2_LEFT_AS_IS;
         }
-    } catch (_e) { /* nudge is cosmetic */ }
-    var box  = document.getElementById('adaptive-live');
-    var cont = document.getElementById('adaptive-live-content');
-    if (!box || !cont) return;
-
-    var atActive = s && s.active_exe;
-    var gmActive = ge && ge.active_exe;
-    if (!atActive && !gmActive) {
-        box.style.display = 'none';
-        return;
-    }
-    box.style.display = 'block';
-
-    if (atActive) {
-        // AT is actively tuning this game — full status row
-        var verdict = s.last_verdict || 'no-data';
-        var verdictColor =
-            verdict === 'healthy'  ? 'var(--accent)' :
-            verdict === 'warn'     ? 'var(--warning)' :
-            verdict === 'unstable' ? 'var(--danger)' :
-            'var(--text-tertiary)';
-        // v3.1 — confidence + paused + opening-phase + hot-streak
-        var conf = s.confidence || 'low';
-        var confColor = conf === 'high' ? 'var(--accent)' :
-                        conf === 'medium' ? 'var(--warning)' :
-                        'var(--text-tertiary)';
-        var confBadge = '<span class="status-badge" style="background:' + confColor + '22;color:' + confColor + '" title="' +
-                        'AT confidence in this game\'s learned profile. Low = exploring, Medium = settling, High = converged.">' +
-                        conf + '</span>';
-        var pausedBadge = s.paused
-            ? '<span class="status-badge danger" title="AT paused (sources: ' +
-              ((s.pause_sources||[]).join(', ') || 'unknown') + ')">paused</span>'
-            : '';
-        var openingBadge = s.in_opening_phase
-            ? '<span class="status-badge" style="background:var(--accent-soft);color:var(--accent)" title="First 5 min of a fresh session: AT explores faster with halved thresholds.">opening</span>'
-            : '';
-        var hotBadge = (s.hot_streak || 0) >= 3
-            ? '<span class="status-badge" style="background:var(--warning-soft,#ffaa0022);color:var(--warning)" title="Hot streak: ' + s.hot_streak + ' consecutive step-ups without instability. Step size is doubled.">🔥' + s.hot_streak + '</span>'
-            : '';
-        var dryBadge = s.dry_run
-            ? '<span class="status-badge neutral" title="Dry-run mode: AT logs steps but does not apply them to the GPU.">dry-run</span>'
-            : '';
-        // v3.2-beta.3 — gameplay-vs-menu pill.  Reading the pill tells
-        // the user at a glance why AT may not be making decisions
-        // (e.g. "menu detected").
-        var gp = s.gameplay_phase || 'unknown';
-        var gpLabel = gp === 'gameplay'           ? '▶ in game' :
-                      gp === 'menu'               ? '⏸ menu' :
-                      gp === 'transitional'      ? '… transitioning' :
-                      gp === 'baseline-building' ? '… baselining' :
-                                                    '… ' + gp;
-        var gpColor = gp === 'gameplay'           ? 'var(--accent)' :
-                      gp === 'menu'               ? 'var(--warning)' :
-                                                    'var(--text-tertiary)';
-        var gpReasons = (s.gameplay_reasons || []).join(' · ') || 'gathering data';
-        var gpBadge = '<span class="status-badge" style="background:' + gpColor +
-                      '22;color:' + gpColor + '" title="' + escHtml(gpReasons) + '">' +
-                      gpLabel + (s.gameplay_conf ? ' ' + Math.round((s.gameplay_conf || 0) * 100) + '%' : '') +
-                      '</span>';
-        var healthLine = '';
-        if (s.gpu_health && (s.gpu_health.temp_c != null || s.gpu_health.power_pct != null)) {
-            var t = s.gpu_health.temp_c;
-            var p = s.gpu_health.power_pct;
-            healthLine =
-                '<span style="margin-left:14px;color:var(--text-tertiary);font-size:11.5px;font-family:var(--font-mono)">' +
-                (t != null ? 'temp ' + Math.round(t) + '°' : '') +
-                (t != null && p != null ? ' · ' : '') +
-                (p != null ? 'pwr ' + Math.round(p) + '%' : '') +
-                '</span>';
+        if (s.applied_ok === false) {
+            return now + '. The graphics card did not accept the overclock. Close other overclocking tools and start the game again.';
         }
-        // v3.2 — frame telemetry line (FPS / 1%-low / frametime σ).  Only
-        // shown when PresentMon is feeding us data.  Without this, the
-        // user can't tell whether AT is actually receiving frame info
-        // or running blind on GPU metrics alone.
-        // v3.3.1-beta.5: source label updated (was 'RTSS frame data')
-        // since RTSS path was removed.
-        var frameLine = '';
-        if (s.frame_stats && s.frame_stats.available) {
-            var f = s.frame_stats;
-            var sigColor = f.frametime_var_pct >= 40 ? 'var(--danger)' :
-                           f.frametime_var_pct >= 25 ? 'var(--warning)' :
-                           'var(--accent)';
-            frameLine =
-                '<div style="margin-top:6px;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);' +
-                'padding:6px 8px;background:rgba(0,0,0,0.18);border-radius:4px;border-left:3px solid var(--accent)">' +
-                '<span style="color:var(--text-tertiary);font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase;margin-right:8px">PresentMon frame data</span>' +
-                'fps <span style="color:var(--accent-bright)">' + (f.avg_fps != null ? f.avg_fps : '–') + '</span>' +
-                '  ·  1%-low <span style="color:var(--accent-bright)">' + (f.min_fps_1pct != null ? f.min_fps_1pct : '–') + '</span>' +
-                '  ·  σ <span style="color:' + sigColor + '">' + (f.frametime_std_ms != null ? f.frametime_std_ms : '–') + ' ms</span>' +
-                '  ·  p99 <span style="color:' + sigColor + '">' + (f.frametime_p99_ms != null ? f.frametime_p99_ms : '–') + ' ms</span>' +
-                '  ·  var ' + (f.frametime_var_pct != null ? f.frametime_var_pct : '–') + '%' +
-                '</div>';
+        if (s.held === 'hot') return now + ' with no overclock. The graphics card got too hot, so it stays off until the game closes.';
+        if (s.held === 'manual') return now + ". You changed the overclock yourself, so it's left alone until the game closes.";
+        if (s.held === 'other_program') return now + ". Another program keeps changing the overclock, so it's left alone until the game closes.";
+        if (s.held) return now + '. The overclock is left alone until the game closes.';
+        return now + ' ' + _at2LevelPhrase(s, _at2Row(state, s.exe)) + '.';
+    }
+    if (kind === 'game_not_looked_after') {
+        var g = state.game;
+        var head = 'Now: ' + _at2GameName(g) + '. ';
+        if (g.reason === 'switched_off') return head + 'Adaptive Tuning is switched off for this game.';
+        if (g.reason === 'test_running') return head + "It started while a test was running, so it isn't looked after this time.";
+        if (g.reason === 'card_unreadable') return head + "Vispora couldn't read the graphics card, so it isn't looked after this time.";
+        if (g.reason === 'forgotten') return _at2ForgottenText(_at2GameName(g));
+        return head + "It isn't looked after this time.";
+    }
+    return 'On. Games run at ' + _at2LimitText(limit) + ' unless one needs less.' +
+        (limit.apply_on_startup === false ? ' Your overclock is only put on while a game runs. It comes off when the game closes.' : '');
+}
+
+// How the status line is drawn: 'warn' needs the user, 'live' is a game being looked after.
+function at2StatusTone(state) {
+    var kind = at2StatusKind(state);
+    if (kind === 'load_failed') return 'warn';
+    if (kind === 'not_watching') return state.monitor_starting === true && !_at2Released(state) ? '' : 'warn';
+    if (kind === 'session') return (state.session.applied_ok === false || state.session.held) ? 'warn' : 'live';
+    return '';
+}
+
+// The small line under the lead: what happens at a repeat problem.
+function at2LevelsText(state) {
+    return (state && state.ok === true && state.sensitivity === 'watch') ? AT2_LEVELS_WATCH : AT2_LEVELS;
+}
+
+// The one-time note after the upgrade ('' when there is none to show).
+function at2NoteText(state) {
+    if (!state || state.ok !== true || !state.upgrade_note) return '';
+    return 'Adaptive Tuning is new in this version. It no longer raises your overclock while you play. ' +
+        'It keeps the overclock you saved and eases it off in a game where the graphics driver keeps having problems.' +
+        (state.old_switch_was_on ? ' It is off until you turn it on again, because it now covers every game.' : '');
+}
+
+// The health line is the event log's own trouble, not a count (drawn as a warning).
+function at2HealthUnreadable(state) {
+    var kind = at2StatusKind(state);
+    if (kind === 'load_failed' || kind === 'unsupported' || kind === 'no_overclock') return false;
+    return state.enabled === true && !!state.health && state.health.log_readable === false;
+}
+
+// What the Windows log says about the graphics driver ('' when there is nothing to say).
+function at2HealthText(state, now) {
+    var kind = at2StatusKind(state);
+    if (kind === 'load_failed' || kind === 'unsupported' || kind === 'no_overclock') return '';
+    if (at2HealthUnreadable(state)) return AT2_LOG_UNREADABLE;
+    var h = state.health || {};
+    if (!h.available) return '';
+    var days = Math.max(1, Math.round(_at2Num(h.covered_days)));
+    var span = days === 1 ? 'in the last day' : 'in the last ' + days + ' days';
+    var n = Math.round(_at2Num(h.errors_30d));
+    if (n <= 0) return 'No graphics driver errors ' + span + '.';
+    var last = at2DateText(h.last_error_ts, now);
+    var text = 'The graphics driver logged errors ' + n + (n === 1 ? ' time ' : ' times ') + span +
+        (last ? ' (last on ' + last + ')' : '') + '.';
+    if (_at2Num(h.at_stock_90d) > 0) {
+        return text + ' It also did that with no overclock on the card, so the overclock may not be the cause.';
+    }
+    if (!state.enabled) return text + ' Adaptive Tuning can ease your overclock in the game where it keeps happening.';
+    if (state.sensitivity === 'watch') return text + ' If it keeps happening in a game, Adaptive Tuning tells you and changes nothing.';
+    return text + ' If it keeps happening in a game, that game is eased.';
+}
+
+// The chip next to a game's name.  mainOn false: Adaptive Tuning itself is off,
+// so the level is not in force now ("75% when on").
+function at2ChipText(game, mainOn) {
+    game = game || {};
+    if (game.enabled === false) return 'Not looked after';
+    var name = String(game.level_name || _AT2_LEVEL_NAMES[Math.round(_at2Num(game.level))] || 'Full');
+    return mainOn === false ? name + ' when on' : name;
+}
+
+// The line above "Your games" while Adaptive Tuning is off ('' when it is on or there are no games).
+function at2MainOffText(state) {
+    if (!state || state.ok !== true || state.enabled !== false) return '';
+    if (!Array.isArray(state.games) || !state.games.length) return '';
+    var limit = state.limit || {};
+    return AT2_MAIN_OFF + (limit.apply_on_startup === false ? '' : ' (your full saved overclock, when it is applied at start-up)') +
+        '. ' + AT2_MAIN_OFF_KEPT;
+}
+
+function at2PlayedText(game) {
+    var h = _at2Num(game && game.hours);
+    if (h < 1) return 'Less than 1 hour played';
+    var n = Math.round(h);
+    return n + (n === 1 ? ' hour played' : ' hours played');
+}
+
+// The forward-looking sentence after a game's warning ('' when it would not be true).
+// Only while the backend says the warning still counts and the next qualifying
+// error would ease the game (warning_open), Adaptive Tuning is on and watching,
+// the game's own switch is on, and the last problem is that warning.  Not while
+// the game's own session that had the warning is still open: within one session a
+// second error is not eased (once eased, a session is not eased again, and errors
+// close together are one spell), so the sentence waits until the game has closed.
+function at2PromiseText(game, state) {
+    if (!game || !state || state.ok !== true || state.enabled !== true || game.enabled === false) return '';
+    var kind = at2StatusKind(state);
+    if (kind !== 'on_idle' && kind !== 'session' && kind !== 'game_not_looked_after' && kind !== 'test_running') return '';
+    if (game.warning_open !== true) return '';
+    var p = game.last_problem;
+    if (!p || p.kind !== 'warning') return '';
+    var level = Math.round(_at2Num(game.level));
+    if (level >= 3) return '';
+    if (level === 2 && _at2Num((state.health || {}).at_stock_90d) > 0) return '';
+    var s = state.session;
+    if (s && s.exe === game.exe && _at2Num(p.ts) >= _at2Num(s.since)) return '';
+    return state.sensitivity === 'watch' ? AT2_PROMISE_WATCH : AT2_PROMISE;
+}
+
+// "Try full overclock", "Try 75%", "Try one step up": what the step up is called.
+function _at2UpName(game) {
+    var up = String((game && game.next_up_name) || '');
+    if (!up) return 'one step up';
+    return /^full$/i.test(up) ? 'full overclock' : up;
+}
+
+// The text of one row of "Your games": { played, problem, hints: [] }.
+// state (optional) is the whole answer: the row's promise depends on it.
+function at2RowText(game, now, state) {
+    game = game || {};
+    var problem = '';
+    var p = game.last_problem;
+    if (p && p.text) {
+        var day = at2DateText(p.ts, now);
+        problem = (day ? day + ': ' : '') + String(p.text);
+        var promise = at2PromiseText(game, state);
+        if (promise) problem += ' ' + promise;
+    }
+    var off = game.enabled === false;           // no step buttons: no advice that needs one
+    var level = Math.round(_at2Num(game.level));
+    var hints = [];
+    if (game.suggest_step_up && !off) {
+        hints.push('Steady for 20 hours at this level. You could try ' + _at2UpName(game) + ' again.');
+    }
+    if (game.best_left_here) hints.push('It had problems at the level above twice, so it is best left here.');
+    if (game.limit_changed) {
+        var pct = _AT2_PERCENT[level];
+        hints.push('Your saved overclock changed since this was eased.' +
+            (level === 1 || level === 2 ? ' It runs at ' + pct + '% of the old or the new one, whichever is less.' : ''));
+    }
+    if (game.plain_crash_hint && !off) {
+        hints.push('Closed unexpectedly 3 times with no graphics driver error. If you think the overclock is the cause, ease it one step.');
+    }
+    return { played: at2PlayedText(game), problem: problem, hints: hints };
+}
+
+// The buttons of one row, in order: [{ to, label }].  to is what the step route
+// takes ('faster' | 'full' | 'slower'), or 'forget'.  A game whose own switch is
+// off gets only Forget: a level set for it would not be used (the switch is the way back).
+function at2RowActions(game) {
+    game = game || {};
+    var out = [];
+    if (game.enabled !== false) {
+        if (game.can_step_up) {
+            out.push({ to: 'faster', label: 'Try ' + _at2UpName(game) });
+            // Only when full is more than one step away; one step away, the button above already says it.
+            if (Math.round(_at2Num(game.level)) >= 2) out.push({ to: 'full', label: 'Back to full' });
         }
-        // Phase-specific status string — distinguishes "still in warmup
-        // window" from "post-warmup but GPU is too idle to score".
-        var statusStr;
-        if (s.last_score != null) {
-            statusStr = 'score ' + s.last_score + ' (' + verdict + ')';
-        } else if (s.phase === 'warmup') {
-            statusStr = 'warmup ' + Math.round(s.warmup_remaining) + 's remaining';
-        } else if (verdict === 'idle') {
-            statusStr = 'GPU at ' + (s.last_util != null ? s.last_util + '%' : '?') +
-                        ', waiting for ≥15% sustained load';
-        } else if (verdict === 'no-data') {
-            statusStr = 'collecting samples…';
-        } else {
-            statusStr = verdict;
+        if (game.can_step_down) out.push({ to: 'slower', label: 'Ease one step' });
+    }
+    out.push({ to: 'forget', label: 'Forget this game' });
+    return out;
+}
+
+// What a forget does to a game that is being looked after right now (D1: never more overclock).
+function _at2RunningSentence(name) {
+    return name + " is running now. Adaptive Tuning stops looking after it, and it won't get more overclock before it closes.";
+}
+
+// state (optional) is the whole answer: a game being looked after right now is named.
+function at2ForgetQuestion(game, state) {
+    game = game || {};
+    var name = _at2GameName(game);
+    var q = 'Forget ' + name + '?\n\n' + (game.enabled === false
+        ? 'What Adaptive Tuning learned about it is removed, its switch here included. Next time it runs, it is looked after ' +
+          'again, at full overclock.'
+        : 'What Adaptive Tuning learned about it is removed. It starts again at full overclock.');
+    var s = state && state.ok === true ? state.session : null;
+    if (s && game.exe && s.exe === game.exe) q += '\n\n' + _at2RunningSentence(name);
+    return q;
+}
+
+function at2ResetQuestion(state) {
+    var s = state && state.ok === true ? state.session : null;
+    return AT2_RESET_QUESTION + (s ? '\n\n' + _at2RunningSentence(_at2GameName(s)) : '');
+}
+
+// A line of "What happened": the day, and the time of day for the last 7 days.
+function at2HistDateText(ts, now) {
+    var day = at2DateText(ts, now);
+    var t = _at2Num(ts);
+    var age = _at2NowMs(now) - t * 1000;
+    if (!day || age < 0 || age >= 7 * 86400 * 1000) return day;
+    return day + ', ' + new Date(t * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+// ─── the card ───
+var _at2 = {
+    state: null,        // the last good answer of /api/adaptive/state
+    loaded: false,
+    failed: false,      // the last read failed: a failed read is not "off"
+    busy: false,        // a read is out
+    again: false,       // read once more when the one that is out comes back
+    saving: false,      // a change is being saved: one at a time
+    inflight: 0,        // saves whose answer is still out (the note's "Got it" included)
+    dropped: false,     // a read came back while a save was out and was not drawn
+    writeSeq: 0,        // bumped by every save; a read that started before one is dropped
+    timer: null,
+    pollGen: 0,
+    html: {},           // what each list was last drawn with, so a poll that changed nothing redraws nothing
+    engineKey: null,
+    gpuTimer: null,
+    gpuBusy: false,
+    gpuSession: null,   // GPU page: the game session that is open, when one is known
+    gpuEnabled: null,   // GPU page: whether Adaptive Tuning is on (null: not known)
+};
+
+// Quick Tune's finished line: where the new overclock is used in games.
+function _at2AfterTuneText() {
+    return _at2.gpuEnabled === true
+        ? 'Adaptive Tuning uses it from the next game you start.'
+        : 'Turn on Adaptive Tuning under Profiles to have it looked after in your games.';
+}
+
+function _at2El(id) { return document.getElementById(id); }
+
+function _at2Show(id, on, display) {
+    var el = _at2El(id);
+    if (el) el.style.display = on ? (display || '') : 'none';
+}
+
+// Redraw a list only when it changed.  A control that had the keyboard focus
+// gets it back after the redraw (found again by its data-at2-key, "action|exe");
+// when that button is gone (a step reached the end), the game's own switch gets it.
+function _at2SetHtml(id, html) {
+    var el = _at2El(id);
+    if (!el || _at2.html[id] === html) return;
+    var active = document.activeElement;
+    var key = (active && el.contains(active)) ? active.getAttribute('data-at2-key') : null;
+    _at2.html[id] = html;
+    el.innerHTML = html;
+    if (!key) return;
+    var wanted = [key, 'switch|' + key.slice(key.indexOf('|') + 1)];
+    var again = el.querySelectorAll('[data-at2-key]');
+    for (var w = 0; w < wanted.length; w++) {
+        for (var i = 0; i < again.length; i++) {
+            if (again[i].getAttribute('data-at2-key') !== wanted[w]) continue;
+            try { again[i].focus({ preventScroll: true }); } catch (e) { again[i].focus(); }
+            return;
         }
-        var mode = s.active_mode || 'balanced';
-        var modeColor =
-            mode === 'competitive' ? 'var(--warning)' :
-            mode === 'visual'      ? 'var(--accent)'  :
-            'var(--text-secondary)';
-        cont.innerHTML =
-            '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">' +
-              (s.paused ? pausedBadge : '<span class="status-badge ok">tuning</span>') +
-              '<span class="status-badge" style="background:' + modeColor + '22;color:' + modeColor + '">' + escHtml(mode) + '</span>' +
-              confBadge + openingBadge + hotBadge + dryBadge + gpBadge +
-              '<span style="font-weight:600;color:var(--text-bright)">▶ ' +
-              escHtml(s.active_display || s.active_exe) + '</span>' +
-              healthLine +
-              '<span style="margin-left:auto;font-size:11px;color:var(--text-tertiary);font-family:var(--font-mono)">' +
-              (s.seconds_in_session != null ? Math.round(s.seconds_in_session) + 's in session' : '') +
-              '</span>' +
-            '</div>' +
-            '<div style="font-family:var(--font-mono);font-size:13px">' +
-              'core+' + s.current_core + ' / mem+' + s.current_mem +
-              ' &nbsp;·&nbsp; steps: ' + s.step_count +
-              ' &nbsp;·&nbsp; good: ' + s.consecutive_good + '/' + (s.settings && s.settings.consecutive_good_required || 5) +
-              ' &nbsp;·&nbsp; <span style="color:' + verdictColor + '">' + statusStr + '</span>' +
-            '</div>' +
-            (s.last_score == null && s.phase === 'tuning' && verdict === 'idle'
-              ? '<div style="margin-top:6px;font-size:11.5px;color:var(--text-tertiary);line-height:1.5">' +
-                  'This game isn\'t loading the GPU enough for AT to assess stability. ' +
-                  'A score will appear once GPU util sustains above 15%.' +
-                '</div>'
-              : '') +
-            (s.active_preset
-              ? '<div style="margin-top:6px;font-size:11px;color:var(--text-tertiary);font-family:var(--font-mono)">' +
-                  'preset: step ±' + s.active_preset.core_step_mhz + '/±' + s.active_preset.mem_step_mhz +
-                  ' · threshold ' + s.active_preset.max_score_to_step_down + '/' + s.active_preset.min_score_to_step_up +
-                  ' · cap ' + s.active_preset.max_core_offset + '/' + s.active_preset.max_mem_offset +
-                '</div>'
-              : '') +
-            frameLine;
-    } else {
-        // game-mode tracks the game but AT didn't engage
-        var settings = await apiGet('/api/adaptive/settings');
-        var gameState = (await apiGet('/api/adaptive/games')).games || {};
-        var key = (ge.active_exe || '').toLowerCase();
-        // Strip any path prefix to match _norm_exe
-        var keyShort = key.split(/[\\/]/).pop();
-        var gs = gameState[keyShort] || gameState[key];
-
-        var why = '';
-        var fixBtn = '';
-        if (settings && !settings.enabled_globally) {
-            why = 'AT master switch is off.';
-            fixBtn =
-                '<button class="btn btn-sm btn-primary" onclick="_quickEnableAtGlobal()">' +
-                'Enable Adaptive Tuning</button>';
-        } else if (gs && !gs.enabled) {
-            why = 'AT is off for this specific game.';
-            fixBtn =
-                '<button class="btn btn-sm btn-primary" onclick="_quickEnableAtForGame(' + jsArg(keyShort) + ')">Enable for this game</button>';
-        } else {
-            why = 'Tracked. AT will engage on next game launch.';
-        }
-
-        cont.innerHTML =
-            '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">' +
-              '<span class="status-badge neutral">tracked</span>' +
-              '<span style="font-weight:600;color:var(--text-bright)">▶ ' +
-              escHtml(ge.active_game || ge.active_exe) + '</span>' +
-              '<span style="margin-left:auto">' + fixBtn + '</span>' +
-            '</div>' +
-            '<div style="font-size:12.5px;color:var(--text-secondary)">' +
-              escHtml(why) +
-            '</div>';
     }
 }
 
-async function _quickEnableAtGlobal() {
-    await apiPost('/api/adaptive/settings', { enabled_globally: true });
-    loadAdaptiveSettings();
-    setTimeout(function() { _refreshAdaptiveLive(); loadAdaptiveGames(); }, 400);
-}
-async function _quickEnableAtForGame(exe) {
-    await apiPost('/api/adaptive/game-toggle', { exe: exe, enabled: true });
-    setTimeout(function() { _refreshAdaptiveLive(); loadAdaptiveGames(); }, 400);
-}
-
-async function loadAdaptiveGames() {
-    // Pull games + active-game state in parallel so we can mark the
-    // currently-running one with a live indicator
-    var [data, ge] = await Promise.all([
-        apiGet('/api/adaptive/games'),
-        apiGet('/api/profiles/status'),
-    ]);
-    var games = (data && data.games) || {};
-    var activeKey = ge && ge.active_exe
-        ? (ge.active_exe.split(/[\\/]/).pop() || '').toLowerCase()
-        : null;
-    var c = document.getElementById('adaptive-games-list');
-    if (!c) return;
-    var keys = Object.keys(games);
-    if (keys.length === 0) {
-        c.innerHTML = '<div class="empty-state">No games tracked yet. AT will start learning the first time a known game launches with the master switch on.</div>';
-        return;
+// While a save is out the card says so (aria-busy, dimmed controls) and takes no
+// other change: the handlers check _at2CanAct(), and the select can't be moved.
+function _at2SetBusy() {
+    var busy = _at2.inflight > 0;
+    var card = _at2El('at2-card');
+    if (card) {
+        card.classList.toggle('at2-saving', busy);
+        if (busy) card.setAttribute('aria-busy', 'true');
+        else card.removeAttribute('aria-busy');
     }
-    var html = '';
-    keys.sort();
-    keys.forEach(function(exe) {
-        var g = games[exe];
-        var isActive = (exe.toLowerCase() === activeKey);
-        var verdictPill = g.last_session_outcome === 'crash'
-            ? '<span class="status-badge danger" style="margin-left:6px">last: crash</span>'
-            : g.last_session_outcome === 'clean'
-            ? '<span class="status-badge ok" style="margin-left:6px">last: clean</span>'
-            : '';
-        var convergedPill = g.converged
-            ? '<span class="status-badge ok" style="margin-left:6px">converged</span>'
-            : '';
-        var livePill = isActive
-            ? '<span class="status-badge ok" style="margin-left:6px;display:inline-flex;align-items:center;gap:6px">'
-              + '<span class="live-dot" style="width:6px;height:6px"></span>playing now</span>'
-            : '';
-        var enabledTog = '<div class="toggle-switch ' + (g.enabled ? 'on' : '') + '" ' +
-                          'onclick="toggleAdaptiveGame(' + jsArg(exe) + ', this)" ' +
-                          'style="margin-left:auto"></div>';
-        var mode = g.mode || 'balanced';
-        var modeColor =
-            mode === 'competitive' ? 'var(--warning)' :
-            mode === 'visual'      ? 'var(--accent)'  :
-            'var(--text-secondary)';
-        var target = g.target || 'auto';
-        var targetLabel =
-            target === 'max_fps'     ? 'Max FPS' :
-            target === 'low_latency' ? 'Low Latency' :
-            target === 'balanced'    ? 'Balanced' : 'Auto';
-        var hasBest = (g.best_stable_core || 0) > 0 || (g.best_stable_mem || 0) > 0;
-        // v3.1 — confidence badge + dry-run + baseline display
-        var conf = g.confidence || 'low';
-        var confColor = conf === 'high' ? 'var(--accent)' :
-                        conf === 'medium' ? 'var(--warning)' :
-                        'var(--text-tertiary)';
-        var confTitle = 'AT confidence in this game\'s profile · ' +
-                        'sessions:' + (g.stable_sessions||0) + ' / minutes:' + Math.round(g.stable_minutes||0);
-        var confPill = '<span class="status-badge" style="margin-left:6px;background:' + confColor +
-                       '22;color:' + confColor + '" title="' + escHtml(confTitle) + '">conf: ' + conf + '</span>';
-        var dryPill = g.dry_run
-            ? '<span class="status-badge neutral" style="margin-left:6px" title="Dry-run mode: AT logs steps but does not push to GPU">dry-run</span>'
-            : '';
-        var baselineCore = g.baseline_core || 0;
-        var baselineMem  = g.baseline_mem  || 0;
-        var hotPill = (g.hot_streak || 0) >= 3
-            ? '<span class="status-badge" style="margin-left:6px;background:var(--warning-soft,#ffaa0022);color:var(--warning)" title="' +
-              g.hot_streak + ' consecutive step-ups without trouble, so step size is temporarily doubled">🔥' + g.hot_streak + '</span>'
-            : '';
-        // Default knob values (matching adaptive_tuning._empty_state)
-        var thermal = (g.thermal_limit_c != null) ? g.thermal_limit_c : 82;
-        var powerB  = (g.power_bound_pct != null) ? g.power_bound_pct : 95;
-        var stepMul = (g.step_multiplier != null) ? g.step_multiplier : 1.0;
-        var knobsId = 'at-knobs-' + exe.replace(/[^a-z0-9]/gi,'_');
-        html +=
-          '<div style="padding:12px 14px;border:1px solid ' +
-            (isActive ? 'var(--accent)' : 'var(--border)') +
-            ';border-radius:var(--radius-sm);background:' +
-            (isActive ? 'var(--accent-soft)' : 'var(--bg-elevated)') +
-            ';margin-bottom:6px">' +
-            '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
-              '<span style="font-weight:600;color:var(--text-bright);font-family:var(--font-mono);font-size:13px">' + escHtml(exe) + '</span>' +
-              '<span class="status-badge neutral" style="background:' + modeColor + '22;color:' + modeColor + ';margin-left:6px">' + escHtml(mode) + '</span>' +
-              confPill + hotPill + dryPill +
-              livePill + verdictPill + convergedPill +
-              enabledTog +
-            '</div>' +
-            '<div style="margin-top:6px;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);line-height:1.6">' +
-              'current: <span style="color:var(--accent)">core+' + (g.current_core||0) + ' / mem+' + (g.current_mem||0) + '</span>' +
-              ' &nbsp;·&nbsp; baseline floor: <span style="color:var(--text-tertiary)">core+' + baselineCore + ' / mem+' + baselineMem + '</span>' +
-              ' &nbsp;·&nbsp; best stable: <span style="color:var(--accent-bright)">core+' + (g.best_stable_core||0) + ' / mem+' + (g.best_stable_mem||0) + '</span>' +
-              '<br>' +
-              'sessions: ' + (g.session_count||0) +
-              ' &nbsp;·&nbsp; total play: ' + Math.round(g.session_minutes||0) + ' min' +
-              ' &nbsp;·&nbsp; steps taken: ' + (g.step_count||0) +
-              ' &nbsp;·&nbsp; warned: ' + (g.warned_offsets||[]).length +
-              ' &nbsp;·&nbsp; stable: ' + (g.stable_sessions||0) + ' sess / ' + Math.round(g.stable_minutes||0) + ' min' +
-            '</div>' +
-            '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
-              '<label style="font-size:11.5px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase">Mode</label>' +
-              '<select onchange="setAdaptiveGameMode(' + jsArg(exe) + ', this.value)" style="width:auto;min-width:130px;padding:5px 28px 5px 10px;font-size:12.5px">' +
-                '<option value="balanced"' + (mode === 'balanced' ? ' selected' : '') + '>Balanced</option>' +
-                '<option value="competitive"' + (mode === 'competitive' ? ' selected' : '') + '>Competitive</option>' +
-                '<option value="visual"' + (mode === 'visual' ? ' selected' : '') + '>Visual</option>' +
-              '</select>' +
-              '<label style="font-size:11.5px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase" title="What this game is FOR. Max FPS = full GPU power + Ultimate power plan, and Adaptive Tuning climbs your OC above baseline for more frames (stability-gated). Low Latency = competitive-latency tweaks for the session (GPU OC left alone, these titles are CPU-bound). Auto = normal adaptive behaviour.">Target</label>' +
-              '<select onchange="setAdaptiveGameTarget(' + jsArg(exe) + ', this.value)" style="width:auto;min-width:130px;padding:5px 28px 5px 10px;font-size:12.5px">' +
-                '<option value="auto"' + (target === 'auto' ? ' selected' : '') + '>Auto</option>' +
-                '<option value="max_fps"' + (target === 'max_fps' ? ' selected' : '') + '>Max FPS</option>' +
-                '<option value="low_latency"' + (target === 'low_latency' ? ' selected' : '') + '>Low Latency</option>' +
-                '<option value="balanced"' + (target === 'balanced' ? ' selected' : '') + '>Balanced</option>' +
-              '</select>' +
-              (hasBest
-                ? '<button class="btn btn-sm" onclick="applyAdaptiveBest(' + jsArg(exe) + ')">Apply best now</button>'
-                : '') +
-              '<button class="btn btn-sm" onclick="reseedAdaptiveGame(' + jsArg(exe) + ')" title="Restart this game\'s exploration from your CURRENT manual OC profile.  Keeps session count + warned offsets. It just bumps the floor so AT doesn\'t crawl up from 0.">Reseed from current OC</button>' +
-              '<button class="btn btn-sm" onclick="toggleAtKnobs(' + jsArg(knobsId) + ')">Advanced…</button>' +
-              '<button class="btn btn-sm" onclick="clearAdaptiveBlacklist(' + jsArg(exe) + ')" style="margin-left:auto">Clear blacklist</button>' +
-              '<button class="btn btn-sm btn-danger" onclick="resetAdaptiveGame(' + jsArg(exe) + ')">Reset</button>' +
-            '</div>' +
-            // Advanced knobs panel — collapsed by default
-            '<div id="' + knobsId + '" style="display:none;margin-top:12px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-overlay)">' +
-              '<div style="font-size:11px;color:var(--text-tertiary);letter-spacing:0.04em;text-transform:uppercase;font-weight:600;margin-bottom:8px">Advanced knobs</div>' +
-              '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;font-size:12px">' +
-                '<div>' +
-                  '<label style="display:block;margin-bottom:4px;color:var(--text-secondary)" title="AT skips step-ups when GPU temp is at or above this">Thermal limit °C: <span id="' + knobsId + '-thermal-val">' + thermal + '</span></label>' +
-                  '<input type="range" min="60" max="95" step="1" value="' + thermal + '" ' +
-                    'oninput="document.getElementById(\'' + knobsId + '-thermal-val\').textContent = this.value" ' +
-                    'onchange="setAtKnob(' + jsArg(exe) + ', \'thermal_limit_c\', this.value)" ' +
-                    'style="width:100%">' +
-                '</div>' +
-                '<div>' +
-                  '<label style="display:block;margin-bottom:4px;color:var(--text-secondary)" title="AT skips CORE step-ups when GPU power draw is at or above this % of TDP">Power bound %: <span id="' + knobsId + '-power-val">' + powerB + '</span></label>' +
-                  '<input type="range" min="50" max="100" step="1" value="' + powerB + '" ' +
-                    'oninput="document.getElementById(\'' + knobsId + '-power-val\').textContent = this.value" ' +
-                    'onchange="setAtKnob(' + jsArg(exe) + ', \'power_bound_pct\', this.value)" ' +
-                    'style="width:100%">' +
-                '</div>' +
-                '<div>' +
-                  '<label style="display:block;margin-bottom:4px;color:var(--text-secondary)" title="Global scaler on step size (hot-streak still compounds on top)">Step multiplier: <span id="' + knobsId + '-mul-val">' + stepMul.toFixed(2) + '</span>×</label>' +
-                  '<input type="range" min="0.5" max="2.0" step="0.05" value="' + stepMul + '" ' +
-                    'oninput="document.getElementById(\'' + knobsId + '-mul-val\').textContent = parseFloat(this.value).toFixed(2)" ' +
-                    'onchange="setAtKnob(' + jsArg(exe) + ', \'step_multiplier\', this.value)" ' +
-                    'style="width:100%">' +
-                '</div>' +
-              '</div>' +
-              '<div style="margin-top:10px;display:flex;align-items:center;gap:8px">' +
-                '<div class="toggle-switch ' + (g.dry_run ? 'on' : '') + '" ' +
-                  'onclick="toggleAtDryRun(' + jsArg(exe) + ', this)" style="transform:scale(0.85);transform-origin:left"></div>' +
-                '<span style="font-size:12.5px;color:var(--text-secondary)" title="When on, AT runs all logic but does NOT push OC changes to the GPU. History still records what AT would have done.">Dry-run (log only, do not apply OC)</span>' +
-              '</div>' +
-            '</div>' +
-          '</div>';
-    });
-    c.innerHTML = html;
+    var sel = _at2El('at2-sensitivity');
+    if (sel) sel.disabled = busy;
 }
 
-async function reseedAdaptiveGame(exe) {
-    if (!confirm('Reseed ' + exe + ' from your current manual OC?\n\n' +
-                 'AT will read your saved OC profile (from the GPU Overclock page) and use those offsets as the new baseline floor.  Session history + warned offsets are kept; only the search starting point moves.\n\n' +
-                 'Use this after you\'ve manually tuned your card higher.')) return;
-    var r = await apiPost('/api/adaptive/reseed', { exe: exe });
-    if (r && r.ok) {
-        addLog('Reseeded ' + exe + ' to core+' + r.baseline_core + ' / mem+' + r.baseline_mem);
-    } else {
-        addLog('Reseed failed: ' + ((r && r.err) || 'unknown'));
-    }
-    loadAdaptiveGames();
+// The look and what a screen reader hears, always together.
+function _at2SwitchOn(el, on) {
+    el.classList.toggle('on', !!on);
+    el.setAttribute('aria-checked', on ? 'true' : 'false');
 }
 
-async function toggleAdaptiveGame(exe, el) {
-    var newOn = !el.classList.contains('on');
-    el.classList.toggle('on');
-    await apiPost('/api/adaptive/game-toggle', { exe: exe, enabled: newOn });
-    loadAdaptiveGames();
-}
-
-async function resetAdaptiveGame(exe) {
-    if (!confirm('Wipe ALL learned offsets + history for ' + exe + '?\n\n' +
-                 'Next launch will start from your current manual OC profile as the new baseline (was hardcoded 0 in older versions).\n\n' +
-                 'If you only want to bump the search starting point WITHOUT losing session history, use "Reseed from current OC" instead.')) return;
-    await apiPost('/api/adaptive/reset', { exe: exe });
-    loadAdaptiveGames();
-}
-
-async function setAdaptiveGameMode(exe, mode) {
-    var r = await apiPost('/api/adaptive/game-mode', { exe: exe, mode: mode });
-    if (r && r.ok) {
-        addLog('AT mode for ' + exe + ' → ' + mode);
-    }
-    loadAdaptiveGames();
-    _refreshAdaptiveLive();
-}
-
-async function setAdaptiveGameTarget(exe, target) {
-    var r = await apiPost('/api/adaptive/game-target', { exe: exe, target: target });
-    if (r && r.ok) {
-        addLog('Optimization target for ' + exe + ' → ' + target
-            + (r.at_enabled === false ? ' (adaptive tuning off, so the target owns the posture)' : ''));
-        if (target === 'max_fps') showInfoToast('Max FPS: full GPU power + Ultimate power plan, and Adaptive Tuning climbs your OC above baseline for more frames (stability-gated).', { title: exe });
-        else if (target === 'low_latency') showInfoToast('Low Latency: engages the competitive-latency tweaks while this game runs (GPU OC left alone, since these titles are CPU-bound).', { title: exe });
-    } else {
-        showErrorToast((r && r.err) || 'Could not set target');
-    }
-    loadAdaptiveGames();
-    _refreshAdaptiveLive();
-}
-
-async function applyAdaptiveBest(exe) {
-    if (!confirm('Apply ' + exe + '\'s best-known-stable offsets to your GPU now?\n\nThis is the same OC AT would apply at the next game launch. No risk beyond what you\'ve already played at.')) return;
-    var r = await apiPost('/api/adaptive/apply-best', { exe: exe });
-    if (r && r.ok) {
-        addLog('Applied best OC for ' + exe + ': core+' + r.core + ' / mem+' + r.mem);
-    } else {
-        addLog('Apply-best failed: ' + (r && r.err));
-    }
-    loadAdaptiveGames();
-}
-
-async function clearAdaptiveBlacklist(exe) {
-    if (!confirm('Clear the crash blacklist for ' + exe + '?\n\nKeeps best-stable + session counts.  Useful after a driver update: old crashed offsets may now be stable.')) return;
-    var r = await apiPost('/api/adaptive/clear-blacklist', { exe: exe });
-    if (r && r.ok) addLog('Blacklist cleared for ' + exe);
-    else addLog('Clear blacklist failed: ' + ((r && r.err) || 'unknown'));
-    loadAdaptiveGames();
-}
-
-async function resetAdaptiveAll() {
-    if (!confirm('Wipe ALL learned per-game profiles?\n\nThis is permanent. Every game will start from scratch.')) return;
-    await apiPost('/api/adaptive/reset', {});
-    loadAdaptiveGames();
-}
-
-// ── v3.1 — pause/resume, per-game knobs, cross-game blacklist ───────────
-function toggleAtKnobs(panelId) {
-    var el = document.getElementById(panelId);
+function _at2SetSwitch(id, on, disabled, pending) {
+    var el = _at2El(id);
     if (!el) return;
-    el.style.display = (el.style.display === 'none' || !el.style.display) ? 'block' : 'none';
+    el.classList.toggle('at2-pending', !!pending);
+    el.classList.toggle('at2-disabled', !!disabled);
+    if (disabled || pending) el.setAttribute('aria-disabled', 'true');
+    else el.removeAttribute('aria-disabled');
+    if (el.tagName === 'BUTTON') el.disabled = !!(disabled || pending);
+    _at2SwitchOn(el, on);
 }
 
-async function setAtKnob(exe, knob, value) {
-    var body = { exe: exe };
-    body[knob] = value;
-    var r = await apiPost('/api/adaptive/game-knobs', body);
-    if (r && r.ok) {
-        addLog('AT ' + knob + ' for ' + exe + ' → ' + value);
-    } else {
-        addLog('AT knob update failed: ' + ((r && r.err) || 'unknown'));
+function _at2FindGame(exe) {
+    var games = (_at2.state && _at2.state.games) || [];
+    for (var i = 0; i < games.length; i++) if (games[i].exe === exe) return games[i];
+    return null;
+}
+
+function _at2GameHtml(g, nowExe, st) {
+    var off = g.enabled === false;
+    var mainOn = !!(st && st.enabled);
+    var level = Math.max(0, Math.min(3, Math.round(_at2Num(g.level))));
+    var text = at2RowText(g, null, st);
+    var name = _at2GameName(g);
+    var key = String(g.exe || '');
+    var html = '<div class="at2-game' + (off ? ' at2-game-off' : '') + (g.exe === nowExe ? ' at2-game-now' : '') + '">' +
+        '<div class="at2-game-head">' +
+            '<div class="at2-game-name">' + escHtml(name) + '</div>' +
+            '<span class="at2-chip ' + (off || !mainOn ? 'at2-chip-off' : 'at2-chip-l' + level) + '">' +
+                escHtml(at2ChipText(g, mainOn)) + '</span>' +
+            '<span class="at2-game-played">' + escHtml(text.played) + '</span>' +
+            '<button type="button" class="toggle-switch at2-game-switch' + (off ? '' : ' on') + '" role="switch"' +
+                ' aria-checked="' + (off ? 'false' : 'true') + '" aria-label="' + escAttr('Look after ' + name) + '"' +
+                ' data-at2-key="' + escAttr('switch|' + key) + '"' +
+                ' title="' + escAttr(AT2_GAME_SWITCH_TIP) + '" onclick="at2ToggleGame(' + jsArg(g.exe) + ', this)"></button>' +
+        '</div>';
+    if (text.problem) html += '<div class="at2-game-problem">' + escHtml(text.problem) + '</div>';
+    text.hints.forEach(function(h) { html += '<div class="at2-game-hint">' + escHtml(h) + '</div>'; });
+    html += '<div class="at2-game-actions">';
+    at2RowActions(g).forEach(function(a) {
+        var k = ' data-at2-key="' + escAttr(a.to + '|' + key) + '"';
+        html += a.to === 'forget'
+            ? '<button type="button" class="btn btn-sm at2-quiet"' + k + ' onclick="at2Forget(' + jsArg(g.exe) + ')">' + escHtml(a.label) + '</button>'
+            : '<button type="button" class="btn btn-sm"' + k + ' onclick="at2Step(' + jsArg(g.exe) + ', ' + jsArg(a.to) + ')">' + escHtml(a.label) + '</button>';
+    });
+    return html + '</div></div>';
+}
+
+// "Open the GPU page" when there is no overclock yet: straight to Quick Tune.
+function at2OpenQuickTune() {
+    switchPage('gpu');
+    var card = _at2El('oc-auto-card');
+    if (!card) return;
+    var scroller = _at2El('main-content');
+    card.scrollIntoView({ block: 'center' });
+    card.classList.remove('at2-flash');
+    void card.offsetWidth;                          // start the highlight again
+    card.classList.add('at2-flash');
+    setTimeout(function() { card.classList.remove('at2-flash'); }, 2600);
+    // The page above it is still filling in: put it in view once more, unless the user scrolled.
+    var top = scroller ? scroller.scrollTop : null;
+    setTimeout(function() {
+        if (currentPage !== 'gpu' || (scroller && scroller.scrollTop !== top)) return;
+        card.scrollIntoView({ block: 'center' });
+    }, 700);
+}
+
+function _at2Render(force) {
+    if (force) _at2.html = {};
+    var st = _at2.failed ? { ok: false } : _at2.state;
+    var kind = at2StatusKind(st);
+    var usable = kind !== 'load_failed' && kind !== 'unsupported';
+
+    var line = _at2El('at2-status');
+    if (line) {
+        var tone = at2StatusTone(st);
+        line.textContent = at2StatusText(st);
+        line.classList.toggle('at2-warn', tone === 'warn');
+        line.classList.toggle('at2-live', tone === 'live');
     }
+    _at2SetHtml('at2-status-extra',
+        kind === 'load_failed' ? '<button class="btn btn-sm" onclick="at2Load()">Retry</button>'
+        : kind === 'no_overclock' ? '<button class="btn btn-sm btn-primary" onclick="at2OpenQuickTune()">Open the GPU page</button>'
+        : '');
+
+    // The switch: off and unusable without a supported card; after a failed
+    // read it keeps what it last showed (or shows neither, before the first read).
+    var last = _at2.state;
+    if (kind === 'load_failed') _at2SetSwitch('at2-toggle-enabled', !!(last && last.enabled), _at2.loaded, !_at2.loaded);
+    else if (kind === 'unsupported') _at2SetSwitch('at2-toggle-enabled', false, true, false);
+    else _at2SetSwitch('at2-toggle-enabled', !!st.enabled, false, false);
+
+    var note = at2NoteText(st);
+    var noteEl = _at2El('at2-note-text');
+    if (noteEl) noteEl.textContent = note;
+    _at2Show('at2-note', !!note, 'flex');
+
+    _at2Show('at2-levels', kind !== 'unsupported');
+    var levelsEl = _at2El('at2-levels');
+    if (levelsEl) levelsEl.textContent = at2LevelsText(st);
+    var health = at2HealthText(st);
+    var healthEl = _at2El('at2-health');
+    if (healthEl) {
+        healthEl.textContent = health;
+        healthEl.classList.toggle('at2-warn', at2HealthUnreadable(st));
+    }
+    _at2Show('at2-health', !!health);
+    _at2SetBusy();
+
+    _at2Show('at2-body', usable);
+    if (!usable) return;
+
+    var games = Array.isArray(st.games) ? st.games : [];
+    var nowExe = st.session ? st.session.exe : '';
+    var list = _at2El('at2-games');
+    if (list) list.classList.toggle('at2-main-off', !st.enabled);
+    var offLine = at2MainOffText(st);
+    var offEl = _at2El('at2-main-off-line');
+    if (offEl) offEl.textContent = offLine;
+    _at2Show('at2-main-off-line', !!offLine);
+    _at2SetHtml('at2-games', games.length
+        ? games.map(function(g) { return _at2GameHtml(g, nowExe, st); }).join('')
+        : '<div class="at2-empty">' + escHtml(AT2_NO_GAMES) + '</div>');
+
+    var history = Array.isArray(st.history) ? st.history : [];
+    _at2SetHtml('at2-history', history.length
+        ? history.map(function(h) {
+            return '<div class="at2-hist-row"><span class="at2-hist-date">' + escHtml(at2HistDateText(h.ts)) + '</span>' +
+                '<span class="at2-hist-text">' + escHtml(h.text || '') + '</span></div>';
+        }).join('')
+        : '<div class="at2-empty">' + escHtml(AT2_NO_HISTORY) + '</div>');
+
+    _at2SetSwitch('at2-toggle-notify', !!st.notify, false, false);
+    var sel = _at2El('at2-sensitivity');
+    if (sel && st.sensitivity && sel.value !== st.sensitivity) sel.value = st.sensitivity;
 }
 
-async function toggleAtDryRun(exe, el) {
+function _at2Apply(state) {
+    _at2.state = state;
+    _at2.loaded = true;
+    _at2.failed = false;
+    _at2Render();
+}
+
+// Read the state and draw it.  Also the Retry button.
+async function at2Load() {
+    if (_at2.busy) { _at2.again = true; return; }
+    _at2.busy = true;
+    try {
+        for (var i = 0; i < 3; i++) {
+            _at2.again = false;
+            var seq = _at2.writeSeq;
+            var st = await apiGet('/api/adaptive/state', { timeoutMs: 10000 });
+            // A change saved while this read was out carries the newer state: drop the read.
+            // So is one that is still being saved (the backend may not have taken it yet):
+            // drop it too, and read again once that save is done, unless its answer carries the state.
+            if (_at2.inflight > 0) _at2.dropped = true;
+            else if (seq === _at2.writeSeq) {
+                if (st && st.ok === true) _at2Apply(st);
+                else { _at2.failed = true; _at2Render(); }
+            }
+            if (!_at2.again) break;
+        }
+    } finally { _at2.busy = false; }
+}
+
+// Every 5 s while a game or a session is on the card, every 30 s otherwise.
+function _at2PollDelay() {
+    var st = _at2.failed ? null : _at2.state;
+    return (st && (st.session || st.game)) ? 5000 : 30000;
+}
+
+function _at2StartPoll() {
+    var gen = ++_at2.pollGen;
+    if (_at2.timer) { clearTimeout(_at2.timer); _at2.timer = null; }
+    _at2Tick(gen, true);
+}
+
+function _at2StopPoll() {
+    _at2.pollGen++;
+    if (_at2.timer) { clearTimeout(_at2.timer); _at2.timer = null; }
+}
+
+async function _at2Tick(gen, first) {
+    if (gen !== _at2.pollGen || currentPage !== 'profiles') return;
+    if (first || !_pollSkipIfHidden()) await at2Load();
+    if (gen !== _at2.pollGen || currentPage !== 'profiles') return;
+    _at2.timer = setTimeout(function() { _at2.timer = null; _at2Tick(gen); }, _at2PollDelay());
+}
+
+// The game monitor's own status read sees a game start or stop first, and the
+// Start / Stop Monitoring button: read the card again when either changed.
+function _at2OnEngineStatus(data) {
+    var key = (data.monitoring ? 'on' : 'off') + '|' + ((data.gaming_mode && data.active_exe) || '');
+    var changed = _at2.engineKey !== null && key !== _at2.engineKey;
+    _at2.engineKey = key;
+    if (changed) setTimeout(function() { if (currentPage === 'profiles') _at2StartPoll(); }, 1200);
+}
+
+_onVisible(function() {
+    if (currentPage === 'profiles') _at2StartPoll();
+    else if (currentPage === 'gpu') _at2GpuRefresh();
+});
+
+function _at2Fail(r, fallback) {
+    showWarnToast((r && r.err) || fallback, { title: 'Adaptive Tuning' });
+}
+
+// Save one change.  The answer carries the new state; without one, read it again.
+async function _at2Post(url, body) {
+    _at2.writeSeq++;                    // a read that is out predates this change
+    _at2.inflight++;
+    _at2SetBusy();
+    var r;
+    try { r = await apiPost(url, body); }
+    finally {
+        _at2.writeSeq++;                // and so does one that started while it was being saved
+        _at2.inflight = Math.max(0, _at2.inflight - 1);
+        _at2SetBusy();
+    }
+    var reread = false;
+    if (_at2.inflight === 0) { reread = _at2.dropped; _at2.dropped = false; }
+    if (r && r.ok === true && r.state && r.state.ok === true) _at2Apply(r.state);
+    else if ((r && r.ok === true) || reread) at2Load();
+    return r || { ok: false };
+}
+
+function _at2CanAct() {
+    return _at2.loaded && !_at2.failed && !_at2.saving && _at2.inflight === 0;
+}
+
+// The main switch: it moves at once and goes back if the save fails.
+async function at2ToggleEnabled(el) {
+    if (!_at2CanAct() || el.classList.contains('at2-pending') || el.classList.contains('at2-disabled')) return;
     var newOn = !el.classList.contains('on');
-    el.classList.toggle('on');
-    var r = await apiPost('/api/adaptive/game-knobs', { exe: exe, dry_run: newOn });
-    if (r && r.ok) {
-        addLog('AT dry-run for ' + exe + ' → ' + (newOn ? 'ON (no OC applied)' : 'OFF (live)'));
-    }
-    loadAdaptiveGames();
-}
-
-async function pauseAtManually() {
-    var r = await apiPost('/api/adaptive/pause', { source: 'user' });
-    if (r && r.ok) {
-        addLog('Adaptive Tuning paused (manual)');
-        _refreshAdaptiveLive();
+    _at2SwitchOn(el, newOn);
+    _at2.saving = true;
+    var r;
+    try { r = await _at2Post('/api/adaptive/settings', { enabled: newOn }); }
+    finally { _at2.saving = false; }
+    if (r.ok !== true) {
+        _at2Render(true);
+        _at2Fail(r, "Couldn't change Adaptive Tuning.");
     }
 }
 
-async function resumeAtManually() {
-    var r = await apiPost('/api/adaptive/resume', { source: 'user' });
-    if (r && r.ok) {
-        addLog('Adaptive Tuning resumed (manual)');
-        _refreshAdaptiveLive();
+async function at2ToggleNotify(el) {
+    if (!_at2CanAct()) return;
+    var newOn = !el.classList.contains('on');
+    _at2SwitchOn(el, newOn);
+    _at2.saving = true;
+    var r;
+    try { r = await _at2Post('/api/adaptive/settings', { notify: newOn }); }
+    finally { _at2.saving = false; }
+    if (r.ok !== true) {
+        _at2Render(true);
+        _at2Fail(r, "Couldn't save the setting.");
     }
 }
 
-async function loadCrossGameBlacklist() {
-    var r = await apiGet('/api/adaptive/cross-blacklist');
-    var c = document.getElementById('adaptive-cross-blacklist');
-    if (!c) return;
-    var entries = (r && r.entries) || [];
-    if (entries.length === 0) {
-        c.innerHTML = '<div class="empty-state" style="padding:8px;font-size:12px">No cross-game blacklist entries. Driver-level crashes (TDR / BSOD / WER) at specific offsets land here automatically.</div>';
+async function at2SetSensitivity(value) {
+    if (!_at2CanAct()) { _at2Render(true); return; }
+    _at2.saving = true;
+    var r;
+    try { r = await _at2Post('/api/adaptive/settings', { sensitivity: value }); }
+    finally { _at2.saving = false; }
+    if (r.ok !== true) {
+        _at2Render(true);               // the select goes back to what is saved
+        _at2Fail(r, "Couldn't save the setting.");
+    }
+}
+
+async function at2ToggleGame(exe, el) {
+    if (!_at2CanAct() || !exe) return;
+    var newOn = !el.classList.contains('on');
+    _at2SwitchOn(el, newOn);
+    _at2.saving = true;
+    var r;
+    try { r = await _at2Post('/api/adaptive/game', { exe: exe, enabled: newOn }); }
+    finally { _at2.saving = false; }
+    // The row was changed by hand above, so it is drawn again from what is
+    // saved (when the answer carried no state, by the read that follows it).
+    if (r.ok === true && !(r.state && r.state.ok === true)) _at2.html = {};
+    else _at2Render(true);
+    if (r.ok !== true) _at2Fail(r, "Couldn't change that game.");
+}
+
+// to: 'faster' | 'full' | 'slower'.  A step up to a level that failed not long
+// ago comes back as a question; yes sends it again with confirm.
+async function at2Step(exe, to, confirmed) {
+    if (!_at2CanAct() || !exe) return;
+    _at2.saving = true;
+    var r;
+    try {
+        var body = { exe: exe, to: to };
+        if (confirmed) body.confirm = true;
+        r = await _at2Post('/api/adaptive/game/step', body);
+    } finally { _at2.saving = false; }
+    if (r.ok === true) return;
+    if (r.need_confirm && !confirmed) {
+        if (confirm(r.text || AT2_CONFIRM_FALLBACK)) await at2Step(exe, to, true);
         return;
     }
-    var html = '<div style="font-size:12px;font-family:var(--font-mono);line-height:1.7">';
-    entries.forEach(function(e) {
-        var when = e.ts ? new Date(e.ts * 1000).toLocaleString() : '?';
-        html += '<div style="padding:4px 0;border-bottom:1px solid var(--border)">' +
-                  '<span style="color:var(--danger)">core+' + e.core + ' / mem+' + e.mem + '</span>' +
-                  ' &nbsp;·&nbsp; <span style="color:var(--text-tertiary)">' + escHtml(e.reason || '') + '</span>' +
-                  (e.source_exe ? ' &nbsp;·&nbsp; <span style="color:var(--text-secondary)">from ' + escHtml(e.source_exe) + '</span>' : '') +
-                  ' &nbsp;·&nbsp; <span style="color:var(--text-tertiary);font-size:11px">' + when + '</span>' +
-                '</div>';
+    _at2Fail(r, "Couldn't change that game.");
+}
+
+async function at2Forget(exe) {
+    if (!_at2CanAct() || !exe) return;
+    if (!confirm(at2ForgetQuestion(_at2FindGame(exe) || { exe: exe }, _at2.state))) return;
+    _at2.saving = true;
+    var r;
+    try { r = await _at2Post('/api/adaptive/game/forget', { exe: exe }); }
+    finally { _at2.saving = false; }
+    if (r.ok !== true) _at2Fail(r, "Couldn't forget that game.");
+}
+
+async function at2ResetAll() {
+    if (!_at2CanAct()) return;
+    if (!confirm(at2ResetQuestion(_at2.state))) return;
+    _at2.saving = true;
+    var r;
+    try { r = await _at2Post('/api/adaptive/reset', {}); }
+    finally { _at2.saving = false; }
+    if (r.ok !== true) _at2Fail(r, "Couldn't forget it.");
+}
+
+async function at2DismissNote() {
+    _at2Show('at2-note', false);
+    var r = await _at2Post('/api/adaptive/note/dismiss', {});
+    if (r.ok !== true) {
+        _at2Render(true);               // the note comes back: it was not saved as read
+        _at2Fail(r, "Couldn't save that.");
+    }
+}
+
+// ─── GPU page: no test while a game is using the graphics card ───
+// Only undoes what it did: a button it turned off is marked, and only a marked
+// button is turned on again (Quick Tune stays off on a card Vispora can't overclock).
+function _at2GpuTake(state) {
+    _at2.gpuSession = (state && state.ok === true && state.session) ? state.session : null;
+    _at2.gpuEnabled = (state && state.ok === true) ? !!state.enabled : null;
+    var blocked = !!_at2.gpuSession;
+    var cap = (typeof _ocState !== 'undefined' && _ocState) ? _ocState.capability : null;
+    var capOff = !!(cap && (!cap.ok || cap.vendor !== 'nvidia'));
+    ['at2-gpu-test-stability', 'at2-gpu-test-benchmark', 'auto-oc-start-btn', 'bench-tune-start-btn'].forEach(function(id) {
+        var b = _at2El(id);
+        if (!b) return;
+        var mine = b.getAttribute('data-at2-blocked') === '1';
+        if (blocked) {
+            if (!mine && b.disabled) return;           // off for another reason: not ours
+            b.setAttribute('data-at2-blocked', '1');
+            b.disabled = true;
+            b.title = AT2_TEST_REFUSED;
+        } else if (mine) {
+            b.removeAttribute('data-at2-blocked');
+            b.removeAttribute('title');
+            b.disabled = id === 'auto-oc-start-btn' && capOff;
+        }
     });
-    html += '</div>';
-    c.innerHTML = html;
+    _at2Show('at2-gpu-note', blocked, 'flex');
 }
 
-// ── v3.2 — Diagnostic panel (the "what is AT doing?" surface) ───────
-var _adaptiveDiagPoll = null;
+async function _at2GpuRefresh() {
+    if (_at2.gpuBusy) return;
+    _at2.gpuBusy = true;
+    try {
+        var st = await apiGet('/api/adaptive/state', { timeoutMs: 5000 });
+        // Not known (the read failed): the buttons stay usable.  The start
+        // calls are refused by the backend itself while a game holds the card.
+        _at2GpuTake(st && st.ok === true ? st : null);
+    } finally { _at2.gpuBusy = false; }
+}
 
-function startAdaptiveDiagnosticsPoll() {
-    if (_adaptiveDiagPoll) clearInterval(_adaptiveDiagPoll);
-    _refreshAdaptiveDiagnostics();
-    // v3.3.0-beta.5: was 4 s.  Diagnostics panel = explainer for AT's
-    // decisions; it changes maybe once every 10-30 s in real workloads.
-    // 6 s is responsive enough and matches the capture poll cadence.
-    _adaptiveDiagPoll = setInterval(function() {
+function _at2GpuStart() {
+    _at2GpuRefresh();
+    if (_at2.gpuTimer) return;
+    _at2.gpuTimer = setInterval(function() {
         if (_pollSkipIfHidden()) return;
-        if (currentPage !== 'profiles') return;
-        _refreshAdaptiveDiagnostics();
-    }, 6000);
-}
-
-function stopAdaptiveDiagnosticsPoll() {
-    if (_adaptiveDiagPoll) { clearInterval(_adaptiveDiagPoll); _adaptiveDiagPoll = null; }
-}
-
-async function _refreshAdaptiveDiagnostics() {
-    var d = await apiGet('/api/adaptive/diagnostics');
-    var c = document.getElementById('adaptive-diagnostics');
-    if (!c || !d) return;
-
-    var html = '';
-
-    // ── Blockers section (the answer to "why isn't AT acting?") ────
-    if (d.blockers && d.blockers.length) {
-        html += '<div style="margin-bottom:12px">';
-        d.blockers.forEach(function(b) {
-            var color =
-                b.level === 'error' ? 'var(--danger)' :
-                b.level === 'warn'  ? 'var(--warning)' :
-                'var(--text-tertiary)';
-            var bg =
-                b.level === 'error' ? 'rgba(255,80,80,0.10)' :
-                b.level === 'warn'  ? 'rgba(255,180,80,0.10)' :
-                'var(--bg-overlay)';
-            html +=
-                '<div style="padding:8px 10px;margin-bottom:6px;border-left:3px solid ' + color +
-                ';background:' + bg + ';border-radius:4px">' +
-                  '<div style="color:' + color + ';font-weight:600;font-size:12px">' + escHtml(b.msg) + '</div>' +
-                  '<div style="color:var(--text-secondary);font-size:11.5px;margin-top:2px">' + escHtml(b.fix) + '</div>' +
-                '</div>';
-        });
-        html += '</div>';
-    }
-
-    // ── Foreground game ────────────────────────────────────────────
-    html += '<div style="margin-bottom:10px;font-family:var(--font-mono);font-size:12px;line-height:1.7">' +
-              '<span style="color:var(--text-tertiary);font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase;display:block;margin-bottom:4px">Foreground game</span>';
-    if (d.foreground) {
-        html += '<span style="color:var(--text-bright);font-weight:600">' + escHtml(d.foreground.exe || '?') + '</span>' +
-                ' · pid ' + (d.foreground.pid || '?') +
-                ' · ' + (d.foreground_known
-                    ? '<span style="color:var(--accent)">known game</span>'
-                    : '<span style="color:var(--warning)">not in known list</span>' +
-                      ' · <button class="btn btn-sm" style="margin-left:8px;padding:2px 8px;font-size:11px" ' +
-                      'onclick="addThisGameToAt(' + jsArg(d.foreground.exe) + ')">Track this game</button>');
-    } else {
-        html += '<span style="color:var(--text-tertiary)">none (game_profiles polls every 3 s)</span>';
-    }
-    html += '</div>';
-
-    // ── perf_monitor (GPU clock/util sampler) ──────────────────────
-    var pm = d.perf_monitor || {};
-    var pmColor = pm.running ? 'var(--accent)' : 'var(--danger)';
-    html += '<div style="margin-bottom:10px;font-family:var(--font-mono);font-size:12px;line-height:1.7">' +
-              '<span style="color:var(--text-tertiary);font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase;display:block;margin-bottom:4px">GPU sampler (nvidia-smi)</span>' +
-              '<span style="color:' + pmColor + ';font-weight:600">' + (pm.running ? 'running' : 'stopped') + '</span>' +
-              ' · samples ' + (pm.samples || 0) +
-              (pm.last_util != null ? ' · util ' + pm.last_util + '%' : '') +
-              (pm.last_core_mhz != null ? ' · core ' + pm.last_core_mhz + ' MHz' : '') +
-              (pm.last_temp != null ? ' · ' + pm.last_temp + '°C' : '') +
-            '</div>';
-
-    // ── frame_telemetry (PresentMon 1.x + 2.x; RTSS removed in v3.3.1-beta.5) ──
-    var ft = d.frame_telemetry || {};
-    var ftAvail = ft.available && ft.available.available;
-    var sourceLabel = ftAvail ? (ft.available.label || ft.available.source || '') :
-                                 'none';
-    html += '<div style="margin-bottom:10px;font-family:var(--font-mono);font-size:12px;line-height:1.7">' +
-              '<span style="color:var(--text-tertiary);font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase;display:block;margin-bottom:4px">Frame telemetry' +
-              ': <span style="color:' + (ftAvail ? 'var(--accent-bright)' : 'var(--warning)') + '">' +
-              escHtml(sourceLabel) + '</span></span>';
-    if (ftAvail) {
-        var live = ft.live || {};
-        var recent = ft.recent || {};
-        var pmh    = ft.pm_health || null;
-        var srcLbl = (ft.available.source === 'presentmon')  ? 'PresentMon 1.x (Microsoft)' :
-                     (ft.available.source === 'presentmon2') ? 'PresentMon 2.x (Microsoft)' :
-                     ft.available.source;
-        // Lead with the truth — installed AND producing frames is what
-        // "connected" should mean.  PresentMon being installed but not
-        // capturing this game (OpenGL etc) is the case that confused
-        // people in beta.4.
-        var pmProducing = pmh ? pmh.producing_frames : true;
-        var headlineColor = pmProducing ? 'var(--accent)' : 'var(--warning)';
-        var headlineText  = pmProducing ? 'connected & capturing frames' :
-                            (pmh && !pmh.alive)                ? 'subprocess exited' :
-                                                                  'attached, but no frames yet';
-        html += '<span style="color:' + headlineColor + ';font-weight:600">' + headlineText + '</span>' +
-                ' · source <span style="color:var(--accent-bright)">' + escHtml(srcLbl || '?') + '</span>' +
-                (ft.available.version ? ' v' + escHtml(ft.available.version) : '') +
-                (ft.tracked_name ? ' · target <span style="color:var(--text-bright)">' + escHtml(ft.tracked_name) + '</span>' : '');
-
-        // PresentMon health row — only when PresentMon is the source
-        if (pmh) {
-            html += '<br>presentmon: ' +
-                    (pmh.alive ? '<span style="color:var(--accent)">running</span>'
-                              : '<span style="color:var(--danger)">exited (rc=' + (pmh.rc != null ? pmh.rc : '?') + ')</span>') +
-                    ' · csv ' + (pmh.csv_size != null ? Math.round(pmh.csv_size / 1024) + ' KB' : '?') +
-                    ' · buffered ' + (pmh.buffer_samples || 0) + ' samples';
-            if (!pmh.producing_frames) {
-                html += '<br><span style="color:var(--warning);font-size:11px">' +
-                        '⚠ PresentMon is running but no frame events are coming through. ' +
-                        'This usually means the game uses OpenGL or an older Vulkan path that ' +
-                        'PresentMon 1.x can\'t capture (e.g. Minecraft Java). AT will fall back to ' +
-                        'GPU-metrics-only scoring (still works, just without frametime variance signals).' +
-                        '</span>';
-            }
-        }
-
-        if (live.available) {
-            html += '<br>live: fps ' + (live.fps_avg || '?') +
-                    ' · frametime ' + (live.frametime_ms || '?') + ' ms' +
-                    ' · age ' + (live.age_sec || '?') + ' s' +
-                    ' · exe ' + escHtml(live.exe || '?');
-        }
-        if (recent.available && recent.sample_count) {
-            var sigColor = recent.frametime_var_pct >= 40 ? 'var(--danger)' :
-                           recent.frametime_var_pct >= 25 ? 'var(--warning)' :
-                           'var(--accent)';
-            html += '<br>30 s window: avg ' + (recent.avg_fps || '–') + ' fps' +
-                    ' · 1%-low ' + (recent.min_fps_1pct || '–') +
-                    ' · frametime ' + (recent.frametime_avg_ms || '–') + ' ms ' +
-                    '(<span style="color:' + sigColor + '">σ ' + (recent.frametime_std_ms || '–') + ' ms, ' +
-                    'var ' + (recent.frametime_var_pct || 0) + '%</span>)' +
-                    ' · samples ' + recent.sample_count;
-        }
-    } else {
-        // Not available — show download button for PresentMon
-        var ftReason = (ft.available && ft.available.reason) || 'No frame-timing source.';
-        var ftInstall = ft.install || {};
-        html += '<span style="color:var(--warning);font-weight:600">no source active</span>' +
-                '<br><span style="color:var(--text-secondary);font-size:11.5px">' +
-                escHtml(ftReason) +
-                '</span>';
-        // Install button — visible when PresentMon not yet installed
-        if (ftInstall.state === 'downloading') {
-            var pct = ftInstall.total > 0
-                ? Math.min(100, Math.round((ftInstall.downloaded / ftInstall.total) * 100))
-                : 0;
-            html += '<br><div style="margin-top:6px;font-size:11.5px;color:var(--text-secondary)">' +
-                    'Downloading PresentMon... ' + pct + '% (' +
-                    Math.round(ftInstall.downloaded / 1024) + ' KB' +
-                    (ftInstall.total ? ' / ' + Math.round(ftInstall.total / 1024) + ' KB' : '') + ')' +
-                    '<div style="margin-top:4px;height:4px;background:var(--bg-elevated);border-radius:2px;overflow:hidden">' +
-                      '<div style="width:' + pct + '%;height:100%;background:var(--accent);transition:width 0.3s"></div>' +
-                    '</div></div>';
-        } else if (ftInstall.state === 'installed' || ftInstall.path) {
-            html += '<br><span style="color:var(--accent);font-size:11.5px">' +
-                    'PresentMon installed. It will activate next time AT engages on a game.' +
-                    '</span>';
-        } else if (ftInstall.state === 'error') {
-            html += '<br><span style="color:var(--danger);font-size:11.5px">' +
-                    'Install failed: ' + escHtml(ftInstall.err || 'unknown') +
-                    '</span>' +
-                    '<br><button class="btn btn-sm btn-primary" style="margin-top:6px" ' +
-                    'onclick="installPresentMon()">Retry download</button>';
-        } else {
-            html += '<br><button class="btn btn-sm btn-primary" style="margin-top:6px" ' +
-                    'onclick="installPresentMon()">Enable PresentMon 1.x (~380 KB, one-time)</button>' +
-                    '<div style="margin-top:4px;font-size:10.5px;color:var(--text-tertiary)">' +
-                    'Downloads Microsoft PresentMon from its official GitHub. Runs only when AT engages on a game; no background process. <b>Does not capture OpenGL or Vulkan</b>.' +
-                    '</div>';
-        }
-    }
-
-    // v3.2-beta.6 — sources matrix.  Shows EVERY known source with its
-    // coverage + install link.  Lets the user pick the right tool for
-    // their games without us prescribing one.
-    var allSources = (ft.available && ft.available.sources_tried) || [];
-    if (allSources.length) {
-        html += '<div style="margin-top:10px;padding:8px 10px;border:1px solid var(--border);' +
-                'border-radius:4px;background:var(--bg-overlay)">' +
-                '<div style="color:var(--text-tertiary);font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase;margin-bottom:6px">' +
-                'Available sources (pick what fits your games)</div>';
-        allSources.forEach(function(s) {
-            // v3.2-beta.9 — 3-state status:
-            //   green dot = ok (installed AND running)
-            //   yellow dot = installed but not running (RTSS specifically)
-            //   grey dot = not installed
-            // s.ok comes from is_available's "ok" flag (running check).
-            // For RTSS we may have installed=true but ok=false.
-            var partial = !s.ok && s.installed_only;
-            var dotColor = s.ok      ? 'var(--accent)' :
-                            partial   ? 'var(--warning)' :
-                                        'var(--text-tertiary)';
-            var dot = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' +
-                      dotColor + ';margin-right:6px"></span>';
-            var rowColor = s.ok ? 'var(--text-bright)' : 'var(--text-secondary)';
-            html += '<div style="margin-bottom:6px;font-size:11.5px;line-height:1.4">' +
-                    dot + '<span style="color:' + rowColor + ';font-weight:600">' +
-                    escHtml(s.label || s.name) + '</span>' +
-                    (s.size ? ' <span style="color:var(--text-tertiary)">(' + escHtml(s.size) + ')</span>' : '') +
-                    '<br><span style="color:var(--text-tertiary);font-size:10.5px;margin-left:14px">' +
-                    'covers: ' + escHtml(s.coverage || '?') +
-                    (s.reason ? ' · <span style="color:' + (partial ? 'var(--warning)' : 'var(--warning)') + '">' + escHtml(s.reason) + '</span>' : '') +
-                    '</span>';
-            if (!s.ok) {
-                // v3.3.1-beta.5: RTSS removed as a frame source.
-                if (s.name === 'presentmon') {
-                    html += '<br><button class="btn btn-sm" style="margin:4px 0 0 14px;padding:2px 8px;font-size:10.5px" onclick="installPresentMon()">Install PresentMon 1.x</button>';
-                } else if (s.install_url) {
-                    html += '<br><a href="' + escHtml(s.install_url) +
-                            '" target="_blank" class="btn btn-sm" ' +
-                            'style="margin:4px 0 0 14px;padding:2px 8px;font-size:10.5px;display:inline-block">' +
-                            'Open download page ↗</a>';
-                }
-            }
-            html += '</div>';
-        });
-        html += '<div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border);font-size:10.5px;color:var(--text-tertiary);line-height:1.5">' +
-                '<b>Quick guide:</b> For most modern D3D9-12 / DXGI games (almost every AAA), <b>PresentMon 1.x</b> is zero-config and tiny.  For OpenGL / Vulkan titles (Minecraft Java, Quake, DOOM Eternal Vulkan, etc), install <b>PresentMon 2.x</b> (Microsoft first-party, ~122 MB but covers everything PresentMon 1.x can\'t).' +
-                '</div>' +
-                '</div>';
-    }
-
-    html += '</div>';
-
-    // ── Score sub-breakdown ────────────────────────────────────────
-    var subs = (d.runtime || {}).last_score_subs || {};
-    if (subs && Object.keys(subs).length) {
-        html += '<div style="margin-bottom:10px;font-family:var(--font-mono);font-size:12px;line-height:1.7">' +
-                  '<span style="color:var(--text-tertiary);font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase;display:block;margin-bottom:4px">GPU stability score breakdown</span>' +
-                  'clock <span style="color:var(--accent-bright)">' + (subs.clock_score != null ? subs.clock_score : '?') + '/40</span>' +
-                  ' · temp <span style="color:var(--accent-bright)">' + (subs.temp_score != null ? subs.temp_score : '?') + '/30</span>' +
-                  ' · util <span style="color:var(--accent-bright)">' + (subs.util_score != null ? subs.util_score : '?') + '/30</span>' +
-                  '<br>clock σ ' + (subs.clock_std != null ? subs.clock_std + ' MHz' : '?') +
-                  ' · temp range ' + (subs.temp_range != null ? subs.temp_range + '°' : '?') +
-                  ' · util σ ' + (subs.util_std != null ? subs.util_std + '%' : '?') +
-                  ' · active ' + (subs.active_pct != null ? subs.active_pct + '%' : '?') +
-                '</div>';
-    }
-
-    // ── Gameplay-vs-menu classifier ────────────────────────────────
-    var rt = d.runtime || {};
-    var gp = rt.gameplay_phase || 'unknown';
-    var gpConf = Math.round((rt.gameplay_conf || 0) * 100);
-    var gpBase = rt.gameplay_baseline || {};
-    var gpColor = gp === 'gameplay' ? 'var(--accent)' :
-                  gp === 'menu'     ? 'var(--warning)' :
-                                       'var(--text-tertiary)';
-    var gpDesc =
-        gp === 'gameplay'           ? 'AT is making decisions normally.' :
-        gp === 'menu'               ? 'AT is HOLDING: menu / lobby / loading screen detected. Decisions resume when gameplay returns.' :
-        gp === 'transitional'       ? 'Recently switched states. Waiting for ' + (3 - (rt.consecutive_alt || 0)) + ' more consistent ticks before changing.' :
-        gp === 'baseline-building'  ? 'Gathering reference samples (need ~60 s of any activity).' :
-                                       'Unknown: no telemetry yet.';
-    html += '<div style="margin-bottom:10px;font-family:var(--font-mono);font-size:12px;line-height:1.7">' +
-              '<span style="color:var(--text-tertiary);font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase;display:block;margin-bottom:4px">Gameplay vs menu classifier</span>' +
-              '<span style="color:' + gpColor + ';font-weight:600">' + escHtml(gp) + '</span>' +
-              ' · confidence <span style="color:var(--accent-bright)">' + gpConf + '%</span>' +
-              '<br><span style="color:var(--text-secondary);font-size:11.5px">' + escHtml(gpDesc) + '</span>';
-
-    // Baseline reference (what's considered "normal" for this game)
-    if (gpBase && gpBase.fps_p50 != null) {
-        var manualTag = gpBase.manual
-            ? '<span style="color:var(--accent);font-size:10.5px"> (manual)</span>'
-            : '';
-        html += '<br><span style="color:var(--text-tertiary);font-size:11px">' +
-                'baseline' + manualTag + ': fps <span style="color:var(--text-bright)">' +
-                Math.round(gpBase.fps_p50 || 0) + '</span>' +
-                ' · util <span style="color:var(--text-bright)">' +
-                Math.round(gpBase.util_p50 || 0) + '%</span>' +
-                ' · ftvar <span style="color:var(--text-bright)">' +
-                (gpBase.ftvar_p50 != null ? gpBase.ftvar_p50.toFixed(1) + '%' : '?') + '</span>' +
-                ' · ' + (gpBase.sample_count || 0) + ' samples' +
-                '</span>';
-    }
-
-    // Reasons (the signals driving the current classification)
-    var gpReasons = rt.gameplay_reasons || [];
-    if (gpReasons.length) {
-        html += '<div style="margin-top:6px;padding-left:10px;border-left:2px solid ' +
-                gpColor + ';color:var(--text-secondary);font-size:11.5px">';
-        gpReasons.forEach(function(r) {
-            html += '• ' + escHtml(r) + '<br>';
-        });
-        html += '</div>';
-    }
-
-    // Manual recalibrate button (anchor "this is gameplay" for poor auto-detection)
-    if (rt.active_exe) {
-        html += '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">' +
-                '<button class="btn btn-sm" onclick="recalibrateGameplay(' + jsArg(rt.active_exe) + ')" ' +
-                'title="If the classifier got it wrong, anchor the baseline to RIGHT NOW. ' +
-                'Use this when you\'re sure you\'re in actual gameplay so AT learns what your real-play numbers look like.">' +
-                '▶ Anchor as gameplay</button>' +
-                '<button class="btn btn-sm" onclick="markCurrentAsMenu(' + jsArg(rt.active_exe) + ')" ' +
-                'title="Teach the classifier that the CURRENT readings are a menu. ' +
-                'AT will recognize this menu instantly the next time you enter it (no waiting on hysteresis).">' +
-                '⏸ Mark as menu</button>' +
-                '<button class="btn btn-sm" onclick="resetGameplayBaseline(' + jsArg(rt.active_exe) + ')">' +
-                'Reset baseline</button>' +
-                '</div>';
-    }
-
-    // ── Learned menu signatures (v3.2-beta.4) ──────────────────────
-    var sigs = (gpBase && gpBase.menu_signatures) || [];
-    if (sigs.length) {
-        html += '<div style="margin-top:8px;padding:6px 10px;background:rgba(255,180,80,0.05);border-radius:4px;border-left:2px solid var(--warning)">' +
-                '<span style="color:var(--text-tertiary);font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase">Learned menu signatures (' + sigs.length + ')</span>';
-        sigs.forEach(function(sig, i) {
-            var srcTag = sig.source === 'manual' ? ' ✋' : ' 🤖';
-            html += '<div style="margin-top:4px;font-size:11.5px;display:flex;align-items:center;gap:6px">' +
-                    '<span style="color:var(--text-secondary);flex:1">' +
-                    srcTag + ' fps ' + sig.fps_lo + '–' + sig.fps_hi +
-                    ' · util ' + sig.util_lo + '–' + sig.util_hi +
-                    '</span>' +
-                    '<button class="btn btn-sm" style="padding:1px 6px;font-size:10.5px" ' +
-                    'onclick="removeMenuSignature(' + jsArg(rt.active_exe) + ', ' + i + ')">×</button>' +
-                    '</div>';
-        });
-        html += '</div>';
-    }
-    html += '</div>';
-
-    // ── Next action (the "what's AT waiting on?" line) ─────────────
-    if (d.next_action) {
-        var na = d.next_action;
-        html += '<div style="padding:8px 10px;margin-top:8px;border-radius:4px;background:var(--accent-soft);font-size:12px;line-height:1.5">' +
-                  '<span style="color:var(--text-tertiary);font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase">Next action</span><br>' +
-                  '<span style="color:var(--text-bright)">' + escHtml(na.msg) + '</span>' +
-                '</div>';
-    }
-    c.innerHTML = html;
-}
-
-async function recalibrateGameplay(exe) {
-    var r = await apiPost('/api/adaptive/gameplay-recalibrate', { exe: exe });
-    if (r && r.ok) {
-        addLog('Gameplay baseline anchored for ' + exe);
-        _refreshAdaptiveDiagnostics();
-    } else {
-        addLog('Recalibrate failed: ' + ((r && r.err) || 'unknown'));
-    }
-}
-
-async function resetGameplayBaseline(exe) {
-    if (!confirm('Wipe gameplay/menu samples + baseline for ' + exe + '?\n\n' +
-                 'AT will rebuild from scratch (~60 s of any activity before it can classify again).')) return;
-    var r = await apiPost('/api/adaptive/gameplay-reset', { exe: exe });
-    if (r && r.ok) {
-        addLog('Gameplay baseline reset for ' + exe);
-        _refreshAdaptiveDiagnostics();
-    }
-}
-
-async function markCurrentAsMenu(exe) {
-    var r = await apiPost('/api/adaptive/menu-signature/add', { exe: exe });
-    if (r && r.ok) {
-        if (r.added) {
-            addLog('Menu signature learned for ' + exe + ': fps≈' +
-                   r.signature.fps + ', util≈' + r.signature.util);
-        } else if (r.duplicate_of) {
-            addLog('Already matched an existing signature. Nothing new to learn');
-        }
-        _refreshAdaptiveDiagnostics();
-    } else {
-        addLog('Mark-as-menu failed: ' + ((r && r.err) || 'unknown'));
-    }
-}
-
-async function removeMenuSignature(exe, index) {
-    var r = await apiPost('/api/adaptive/menu-signature/remove',
-                          { exe: exe, index: index });
-    if (r && r.ok) {
-        addLog('Removed menu signature for ' + exe);
-        _refreshAdaptiveDiagnostics();
-    }
-}
-
-
-async function installPresentMon() {
-    addLog('Downloading PresentMon from Microsoft GitHub...');
-    var r = await apiPost('/api/frame-telemetry/install', {});
-    if (!r || !r.ok) {
-        addLog('PresentMon install failed: ' + ((r && r.err) || 'unknown'));
-        return;
-    }
-    if (r.already_installed) {
-        addLog('PresentMon already installed at ' + r.path);
-        _refreshAdaptiveDiagnostics();
-        return;
-    }
-    // Refresh diagnostics aggressively while download is in flight so
-    // the progress bar updates smoothly.
-    var pollCount = 0;
-    var pollInterval = setInterval(async function() {
-        pollCount++;
-        var prog = await apiGet('/api/frame-telemetry/install/progress');
-        if (!prog) return;
-        _refreshAdaptiveDiagnostics();
-        if (prog.state === 'installed') {
-            clearInterval(pollInterval);
-            addLog('PresentMon installed successfully. Frame telemetry will activate on next game launch');
-        } else if (prog.state === 'error') {
-            clearInterval(pollInterval);
-            addLog('PresentMon install error: ' + (prog.err || 'unknown'));
-        } else if (pollCount > 60) {
-            // 60 ticks * 1.5s = 90s timeout
-            clearInterval(pollInterval);
-            addLog('PresentMon install timed out');
-        }
-    }, 1500);
-}
-
-async function addThisGameToAt(exe) {
-    if (!exe) return;
-    var r = await apiPost('/api/profiles/add-game', { exe: exe });
-    if (r && r.ok) {
-        addLog('Added ' + exe + ' to known games, enabling AT for it');
-        // Tracking just got added; flip per-game AT switch on AND try to
-        // retroactively engage so the user doesn't have to relaunch the game.
-        await apiPost('/api/adaptive/game-toggle', { exe: exe, enabled: true });
-        setTimeout(function() {
-            _refreshAdaptiveLive();
-            loadAdaptiveGames();
-            _refreshAdaptiveDiagnostics();
-        }, 800);
-    } else {
-        addLog('Could not add ' + exe + ': ' + ((r && r.err) || 'unknown'));
-    }
-}
-
-async function clearCrossGameBlacklist() {
-    if (!confirm('Wipe the cross-game offset blacklist?\n\nThese are driver-level crashes (TDR/BSOD/WER) where AT decided NO game should try this offset.  Clear after a driver update that may have fixed the underlying instability.')) return;
-    var r = await apiPost('/api/adaptive/clear-cross-blacklist', {});
-    if (r && r.ok) {
-        addLog('Cross-game blacklist cleared');
-    }
-    loadCrossGameBlacklist();
-}
-
-async function loadAdaptiveHistory() {
-    var data = await apiGet('/api/adaptive/history');
-    var history = (data && data.history) || [];
-    var c = document.getElementById('adaptive-history');
-    if (!c) return;
-    if (history.length === 0) {
-        c.innerHTML = '<div class="empty-state">No tuning steps yet.</div>';
-        return;
-    }
-    var html = '';
-    history.slice().reverse().forEach(function(h) {
-        var d = new Date(h.ts * 1000);
-        var arrow = h.action === 'step_up'    ? '↑' :
-                    h.action === 'step_down'  ? '↓' :
-                    h.action === 'converged'  ? '✓' : '·';
-        var color = h.action === 'step_up'    ? 'var(--accent)' :
-                    h.action === 'step_down'  ? 'var(--danger)' :
-                    h.action === 'converged'  ? 'var(--accent)' : 'var(--text-secondary)';
-        html +=
-          '<div style="padding:6px 10px;border-left:2px solid ' + color + ';margin-bottom:4px;background:var(--bg-elevated);font-family:var(--font-mono)">' +
-            '<span style="color:var(--text-tertiary);font-size:11px">' + d.toLocaleString() + '</span> · ' +
-            '<span style="color:' + color + ';font-weight:600">' + arrow + ' ' + h.action + '</span> · ' +
-            escHtml(h.display_name || h.exe) + ' · ' +
-            'core+' + h.from_core + '→' + h.to_core + ' / ' +
-            'mem+' + h.from_mem + '→' + h.to_mem +
-            (h.score != null ? ' · score ' + h.score : '') +
-            (h.reason ? ' <span style="color:var(--text-tertiary)">(' + escHtml(h.reason) + ')</span>' : '') +
-          '</div>';
-    });
-    c.innerHTML = html;
-}
-
-function _startAdaptivePoll() {
-    if (_adaptivePollTimer) return;
-    _refreshAdaptiveLive();
-    // v3.3.0-beta.5: was 3 s.  AT decisions land every few seconds at
-    // most; the live readout is a status indicator, not a chart.  5 s
-    // is plenty live and cuts Flask hits by 40%.  Also added a
-    // currentPage gate so the poll stops doing fetches when the user
-    // navigates away (the interval gets cleared by _stopAdaptivePoll
-    // when leaving profiles, but the in-flight refresh that started
-    // just before navigation can still race).
-    _adaptivePollTimer = setInterval(function() {
-        if (_pollSkipIfHidden()) return;
-        if (currentPage !== 'profiles') return;
-        _refreshAdaptiveLive();
+        if (currentPage !== 'gpu') { _at2GpuStop(); return; }
+        _at2GpuRefresh();
     }, 5000);
 }
 
-function _stopAdaptivePoll() {
-    if (_adaptivePollTimer) { clearInterval(_adaptivePollTimer); _adaptivePollTimer = null; }
+function _at2GpuStop() {
+    if (_at2.gpuTimer) { clearInterval(_at2.gpuTimer); _at2.gpuTimer = null; }
+}
+
+// True when a test must not start because a game session is known to be open.
+function _at2TestRefused(title) {
+    if (!_at2.gpuSession) return false;
+    termWrite('gpu-terminal', '✗ ' + title + ': ' + AT2_TEST_REFUSED, 'error');
+    showWarnToast(AT2_TEST_REFUSED, { title: title });
+    return true;
+}
+
+// A start call answered ok:false: say why where the user is looking.  Returns the text.
+function _at2StartFailed(title, r, fallback) {
+    var err = (r && r.err) || fallback;
+    termWrite('gpu-terminal', '✗ ' + title + ': ' + err, 'error');
+    showWarnToast(err, { title: title });
+    if (r && r.refused) _at2GpuRefresh();       // the buttons did not know yet
+    return err;
 }
 
 async function loadProfileEngineStatus() {
@@ -5909,6 +5693,7 @@ async function loadProfileEngineStatus() {
     // A failed read would show "Stopped" and flip the Start/Stop button
     if (!data || data.ok === false) return;
     _profileEngineRunning = data.monitoring;
+    _at2OnEngineStatus(data);
     var el = document.getElementById('profile-engine-status');
     var btn = document.getElementById('btn-profile-engine');
 
@@ -6343,7 +6128,7 @@ switchPage = function(page) {
     if (page === 'profiles' && _profileEngineRunning) {
         setTimeout(function() { if (currentPage === 'profiles') loadProfileEngineStatus(); }, 3000);
     }
-    if (page !== 'profiles') _stopAdaptivePoll();
+    if (page !== 'profiles') _at2StopPoll();
 
     // v3 — GPU live state auto-runs.  Same pattern as hwmon: keep polling
     // while on the GPU page, pause when off.
@@ -6355,7 +6140,10 @@ switchPage = function(page) {
         // v3 — load crash-recovery history once on page entry (no need to poll;
         // updates only happen on game exit which is a rare event)
         try { loadCrashRecoveryHistory(); } catch (e) {}
+        // The four test buttons are off while a game is using the card.
+        _at2GpuStart();
     } else {
+        _at2GpuStop();
         // Pause the live poll when leaving GPU, but only if no in-flight
         // stress test / auto-OC is depending on it.
         if (_ocState.liveActive && !_ocState.stressActive && !_ocState.autoActive) {
@@ -6543,7 +6331,7 @@ async function applyOcSliders() {
 }
 
 async function resetOc() {
-    termWrite('gpu-terminal', 'Resetting GPU to stock...');
+    termWrite('gpu-terminal', 'Taking the overclock off the graphics card...');
     var r = await apiPost('/api/gpu/oc/reset');
     (r.steps || []).forEach(function(s) {
         termWrite('gpu-terminal', '  ' + _rowMark(s.ok) + ' ' + s.name);
@@ -6552,7 +6340,7 @@ async function resetOc() {
         termWrite('gpu-terminal', '✗ ' + (r.err || 'Reset failed'), 'error');
         return;
     }
-    termWrite('gpu-terminal', '=== Reset to stock complete ===');
+    termWrite('gpu-terminal', '=== Done: the card runs at its default clocks ===');
     // Reset sliders
     var cs = document.getElementById('oc-core-slider'); if (cs) cs.value = 0;
     var ms = document.getElementById('oc-mem-slider'); if (ms) ms.value = 0;
@@ -6739,8 +6527,8 @@ async function loadCrashRecoveryHistory() {
     var lastEl = document.getElementById('crash-recovery-last');
     if (countEl) countEl.textContent = history.length;
     if (history.length === 0) {
-        if (lastEl) lastEl.textContent = 'No crashes recorded. Nice.';
-        if (c) c.innerHTML = '<div class="empty-state">No crashes recorded yet. The blacklist is empty too.</div>';
+        if (lastEl) lastEl.textContent = 'No crashes recorded.';
+        if (c) c.innerHTML = '<div class="empty-state">No crashes recorded yet.</div>';
         return;
     }
     var last = history[history.length - 1];
@@ -6752,13 +6540,13 @@ async function loadCrashRecoveryHistory() {
             ? ' → core+' + h.step_down.core + ' / mem+' + h.step_down.mem
             : '';
         var bl = h.blacklisted
-            ? '<span class="status-badge danger" style="margin-left:6px">blacklisted</span>'
+            ? '<span class="status-badge danger" style="margin-left:6px">clocks remembered</span>'
             : '<span class="status-badge neutral" style="margin-left:6px">no OC</span>';
         html +=
           '<div style="padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elevated);margin-bottom:6px">' +
             '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
               '<span style="font-weight:600;color:var(--text-bright)">' + escHtml(h.display_name || h.exe || 'unknown game') + '</span>' +
-              '<span class="status-badge warn">' + escHtml(h.kind) + '</span>' +
+              '<span class="status-badge warn">' + escHtml(_crashKindText(h.kind)) + '</span>' +
               bl +
               '<span style="margin-left:auto;color:var(--text-tertiary);font-family:var(--font-mono);font-size:11px">' + d.toLocaleString() + '</span>' +
             '</div>' +
@@ -6768,38 +6556,49 @@ async function loadCrashRecoveryHistory() {
             '</div>' +
             (h.tdr_count > 0 || h.crash_count > 0
               ? '<div style="margin-top:4px;font-size:11px;color:var(--text-tertiary)">' +
-                'tdr=' + (h.tdr_count || 0) + ' · driver_crash=' + (h.crash_count || 0) + '</div>'
+                'Graphics driver errors: ' + (h.tdr_count || 0) + ' · driver crashes: ' + (h.crash_count || 0) + '</div>'
               : '') +
           '</div>';
     });
     if (c) c.innerHTML = html;
 }
 
+// What crash_recovery calls a crash, in words.
+function _crashKindText(kind) {
+    var words = { tdr: 'graphics driver error', driver_crash: 'driver crash', inapp_signal: 'seen by a Vispora test', normal: 'normal exit' };
+    return words[kind] || String(kind || 'crash').replace(/_/g, ' ');
+}
+
 async function clearCrashRecoveryHistory() {
-    if (!confirm('Clear the crash history? This does NOT clear the blacklist, so failed offsets stay banned.')) return;
+    if (!confirm('Clear the crash history?\n\nThe clocks remembered for each game are kept. Clear remembered clocks removes those.')) return;
     await apiDelete('/api/gpu/crash-recovery/history');
     loadCrashRecoveryHistory();
 }
 
 async function clearCrashRecoveryBlacklist() {
-    if (!confirm('Clear the per-game crash blacklist for ALL games?\n\nVispora will stop avoiding offsets that previously crashed.')) return;
+    if (!confirm('Forget the clocks Crash Recovery remembered for every game?\n\nIt stops avoiding clocks that crashed a game before.')) return;
     await apiDelete('/api/gpu/crash-recovery/blacklist');
-    termWrite('gpu-terminal', '✓ Crash blacklist cleared.');
+    termWrite('gpu-terminal', '✓ Remembered crash clocks cleared.');
     loadCrashRecoveryHistory();
 }
 
+// A dry run: crash_recovery looks at the Windows event log as it does when a
+// game closes, and changes no clock and remembers nothing.
 async function testCrashRecovery() {
-    if (!confirm('Fire a TEST crash-recovery event?\n\nThis writes a fake entry to the blacklist + history and fires the toast notification, but does NOT actually step down your saved profile.')) return;
-    // Use core+1/mem+1 sentinel values so the test doesn't touch real blacklist entries.
+    if (!confirm('Test Crash Recovery?\n\nVispora looks in the Windows event log for a graphics driver error in the last two minutes, ' +
+                 'as it does when a game closes. This is only a check: no clock is changed and nothing is remembered for any game.')) return;
     var r = await apiPost('/api/gpu/crash-recovery/test',
         { exe: '__test__.exe', display_name: 'Vispora Test', core: 1, mem: 1 });
-    if (r && r.crashed) {
+    if (!r || r.ok === false) {
+        termWrite('gpu-terminal', '✗ Crash Recovery test: ' + ((r && r.err) || "the check didn't run."), 'error');
+    } else if (r.crashed) {
         termWrite('gpu-terminal',
-            '✓ Test crash-recovery event fired (kind=' + r.kind + '). Toast should appear within 1-2s.');
+            '✓ Crash Recovery test: the event log has a ' + _crashKindText(r.kind) + ' from the last two minutes, ' +
+            'so a game closing now would count as a crash.');
     } else {
         termWrite('gpu-terminal',
-            '⚠ Test ran but no crash signal was found in the event log. ' +
-            'On a real crash you would see TDR events here. That means the toast / blacklist / step-down logic is working but there was nothing to react to.');
+            '✓ Crash Recovery test: no graphics driver error in the last two minutes, ' +
+            'so a game closing now would count as a normal exit.');
     }
     loadCrashRecoveryHistory();
 }
@@ -6895,6 +6694,7 @@ async function runBenchmarkComparison() {
         showErrorToast('Another GPU test is running. Wait for it to finish.');
         return;
     }
+    if (_at2TestRefused('Benchmark')) return;
     if (!_ocState.capability || _ocState.capability.vendor !== 'nvidia') {
         showErrorToast('Benchmark requires an NVIDIA GPU.');
         return;
@@ -6913,14 +6713,14 @@ async function runBenchmarkComparison() {
         return;
     }
 
-    if (!confirm('Benchmark will:\n• Reset GPU to stock and measure 30s baseline\n• Apply OC and measure 30s comparison\n• Show FPS / temp / clock deltas\n\nTakes ~70 seconds. Continue?')) return;
+    if (!confirm('Benchmark will:\n• Take the overclock off and measure 30s at default clocks\n• Apply OC and measure 30s comparison\n• Show FPS / temp / clock deltas\n\nTakes ~70 seconds. Continue?')) return;
 
     var benchEl = document.getElementById('oc-benchmark-card');
     var contentEl = document.getElementById('oc-benchmark-content');
     benchEl.style.display = 'block';
     contentEl.innerHTML = '<div class="pulse" style="color:var(--text-dim)">▶ Resetting to stock for baseline measurement...</div>';
 
-    termWrite('gpu-terminal', '📊 Benchmark started, stock baseline first');
+    termWrite('gpu-terminal', '📊 Benchmark started, default clocks first');
 
     // v2.9.5 — gate the stability-step loop with our new benchmark flag so
     // _runAutoStabilityStep() actually iterates instead of bailing on tick 1.
@@ -6929,12 +6729,19 @@ async function runBenchmarkComparison() {
         var startResp = await apiPost('/api/gpu/oc/benchmark/start', { oc: oc });
         if (!startResp.ok) {
             contentEl.innerHTML = '<div style="color:var(--red)">✗ ' + escHtml(startResp.err || 'Benchmark failed to start') + '</div>';
+            if (startResp.refused) _at2GpuRefresh();        // the buttons did not know yet
             return;
         }
 
         // Phase 1: Stock measurement
         contentEl.innerHTML = '<div class="pulse" style="color:var(--accent)">▶ Measuring STOCK performance for ' + startResp.duration_s + 's...</div>';
         var stockVerdict = await _runAutoStabilityStep(startResp.duration_s);
+        if (stockVerdict.start_failed) {
+            // The measurement never ran: close the benchmark instead of scoring nothing.
+            await apiPost('/api/gpu/oc/benchmark/cancel');
+            contentEl.innerHTML = '<div style="color:var(--red)">✗ ' + escHtml(_at2StartFailed('Benchmark', stockVerdict, "The measurement couldn't start.")) + '</div>';
+            return;
+        }
         // Cleared when the user leaves the GPU page, which also cuts the step
         // short: cancel instead of scoring a half-measured run.
         if (!_ocState.benchmarkActive) {
@@ -6943,7 +6750,7 @@ async function runBenchmarkComparison() {
             termWrite('gpu-terminal', '⏹ Benchmark cancelled');
             return;
         }
-        termWrite('gpu-terminal', '  Stock: ' + (stockVerdict.avg_fps || 0) + ' FPS, max temp ' + (stockVerdict.max_temp_c || 0) + '°C');
+        termWrite('gpu-terminal', '  Default clocks: ' + (stockVerdict.avg_fps || 0) + ' FPS, max temp ' + (stockVerdict.max_temp_c || 0) + '°C');
 
         // Submit verdict; backend applies OC and tells us to do phase 2
         var phase2 = await apiPost('/api/gpu/oc/benchmark/record', stockVerdict);
@@ -6955,6 +6762,11 @@ async function runBenchmarkComparison() {
         // Phase 2: OC measurement
         contentEl.innerHTML = '<div class="pulse" style="color:var(--accent)">▶ Stock: ' + (stockVerdict.avg_fps || 0) + ' FPS. Applying OC, measuring ' + phase2.duration_s + 's...</div>';
         var ocVerdict = await _runAutoStabilityStep(phase2.duration_s);
+        if (ocVerdict.start_failed) {
+            await apiPost('/api/gpu/oc/benchmark/cancel');
+            contentEl.innerHTML = '<div style="color:var(--red)">✗ ' + escHtml(_at2StartFailed('Benchmark', ocVerdict, "The measurement couldn't start.")) + '</div>';
+            return;
+        }
         if (!_ocState.benchmarkActive) {
             await apiPost('/api/gpu/oc/benchmark/cancel');
             benchEl.style.display = 'none';
@@ -7043,10 +6855,10 @@ function _renderBenchmarkComparison(el, result) {
 }
 
 async function deleteOcProfile() {
-    if (!confirm('Delete saved OC profile and reset GPU to stock?')) return;
+    if (!confirm('Delete the saved OC profile and take the overclock off the card?')) return;
     var r = await apiDelete('/api/gpu/oc/profile');
     if (r && r.ok) {
-        termWrite('gpu-terminal', '✓ Profile deleted, GPU reset to stock');
+        termWrite('gpu-terminal', '✓ Profile deleted, the card runs at its default clocks');
         loadOcProfile();
         var cs = document.getElementById('oc-core-slider'); if (cs) cs.value = 0;
         var ms = document.getElementById('oc-mem-slider'); if (ms) ms.value = 0;
@@ -7468,6 +7280,7 @@ async function runStabilityTest(durationSec) {
         termWrite('gpu-terminal', '⚠ Stability test already running');
         return;
     }
+    if (_at2TestRefused('Stability test')) return;
     durationSec = durationSec || 60;
     _ocState.stressActive = true;
     _ocState.stressDuration = durationSec;
@@ -7489,7 +7302,16 @@ async function runStabilityTest(durationSec) {
     var liveBefore = await apiGet('/api/gpu/oc/live');
     var expectedCoreMax = liveBefore.ok ? (liveBefore.core_max_mhz || 0) : 0;
 
-    await apiPost('/api/gpu/oc/probe/start', { expected_core_max: expectedCoreMax });
+    var started = await apiPost('/api/gpu/oc/probe/start', { expected_core_max: expectedCoreMax });
+    if (!started || started.ok === false) {
+        // Refused or failed: no test is running, so nothing is stressed or scored.
+        _ocState.stressActive = false;
+        document.getElementById('oc-stress-card').style.display = 'none';
+        _at2StartFailed('Stability test', started, "The test couldn't start.");
+        // Not a refusal (a timeout, say): the probe may have opened after all, so close it.
+        if (!(started && started.refused)) apiPost('/api/gpu/oc/probe/end');
+        return;
+    }
     // Aborted (or the page left) while those requests ran: finishStabilityTest
     // is done already, so a workload started now would never be stopped.
     // Close the probe again in case it opened after that finish closed it.
@@ -7602,7 +7424,7 @@ async function finishStabilityTest() {
             termWrite('gpu-terminal', '  ⚠ Thermal throttle / clock dips detected: GPU is power/temp limited');
         }
         if (verdict.tdr_count > 0) {
-            termWrite('gpu-terminal', '  ✗ ' + verdict.tdr_count + ' driver TDR event(s) logged during test', 'error');
+            termWrite('gpu-terminal', '  ✗ ' + verdict.tdr_count + ' graphics driver error(s) logged during the test', 'error');
         }
         if (verdict.context_lost) {
             termWrite('gpu-terminal', '  ✗ WebGL context lost = GPU driver crash', 'error');
@@ -7626,11 +7448,12 @@ function abortStabilityTest() {
 // ─── Auto-OC loop (binary-search + jump-step v2) ───
 async function startAutoOc() {
     if (_ocState.autoActive) return;
+    if (_at2TestRefused('Quick Tune')) return;
     if (!_ocState.capability || _ocState.capability.vendor !== 'nvidia') {
         showErrorToast('Auto-OC requires an NVIDIA GPU.');
         return;
     }
-    if (!confirm('Auto-OC v3: Robust Binary Search\n\n• Maxes power limit FIRST (more clock headroom)\n• Jumps +75 MHz core / +250 MHz memory until first crash\n• Binary searches to within 5 MHz core / 15 MHz mem of true ceiling\n• Stability checked via: driver TDR events, WebGL context loss, pixel artifacts, frame variance, clock dips, thermal throttle\n• Final 60s validation pass\n• ~5-8 minutes total\n\nContinue?')) return;
+    if (!confirm('Auto-OC v3: Robust Binary Search\n\n• Maxes power limit FIRST (more clock headroom)\n• Jumps +75 MHz core / +250 MHz memory until first crash\n• Binary searches to within 5 MHz core / 15 MHz mem of true ceiling\n• Stability checked via: graphics driver errors, WebGL context loss, pixel artifacts, frame variance, clock dips, thermal throttle\n• Final 60s validation pass\n• About 5 to 8 minutes in total\n\nContinue?')) return;
 
     var coreStep = parseInt(document.getElementById('auto-core-step').value) || 75;
     var memStep = parseInt(document.getElementById('auto-mem-step').value) || 250;
@@ -7647,11 +7470,28 @@ async function startAutoOc() {
     updateAutoOcStatus('Starting binary-search auto-tune...');
 
     termWrite('gpu-terminal', '🤖 Auto-OC v2 started: core_jump=' + coreStep + 'MHz, mem_jump=' + memStep + 'MHz, max_iters=' + maxSteps);
-    await apiPost('/api/gpu/oc/auto/start', {
+    var startResp = await apiPost('/api/gpu/oc/auto/start', {
         core_step_mhz: coreStep,
         mem_step_mhz: memStep,
         max_steps: maxSteps,
     });
+    if (!startResp || startResp.ok === false) {
+        // Stop here.  Going on to the first step would fail there and then
+        // cancel, and a cancel takes the overclock off the card: a refused
+        // start changed nothing, so nothing is cancelled.
+        var refused = !!(startResp && startResp.refused);
+        if (refused && owns()) _ocState.autoActive = false;
+        var why = _at2StartFailed('Quick Tune', startResp, "Quick Tune couldn't start.");
+        // Not a refusal (a timeout, say): the run may have opened after all, so close it.
+        if (!refused && owns()) await apiPost('/api/gpu/oc/auto/cancel');
+        if (_ocState.autoRun !== run) return;
+        _ocState.autoActive = false;
+        updateAutoOcStatus('✗ ' + why);
+        document.getElementById('auto-oc-start-btn').style.display = '';
+        document.getElementById('auto-oc-cancel-btn').style.display = 'none';
+        document.getElementById('oc-auto-progress-bar').style.display = 'none';
+        return;
+    }
 
     var prev = null;
     // Must not be smaller than the backend's own cap (max_iters + 10, where
@@ -7679,14 +7519,15 @@ async function startAutoOc() {
                     '🛑 Auto-OC aborted: ' + (nxt.abort_reason || 'GPU could not be recovered'),
                     'error');
                 await _showCrashBanner('Auto-tune aborted',
-                    nxt.abort_reason || 'GPU crashed and could not be recovered. Offsets reset to stock.');
+                    nxt.abort_reason || 'GPU crashed and could not be recovered. The overclock was taken off the card.');
                 updateAutoOcStatus('🛑 Aborted (see crash banner)');
                 break;
             }
             var b = nxt.best || {};
             var validatedTag = nxt.validated ? ' ✓ validated' : ' (validation failed; backed off)';
             termWrite('gpu-terminal', '🏆 Auto-OC complete: core+' + b.core_offset_mhz + ' MHz, mem+' + b.mem_offset_mhz + ' MHz' + validatedTag + ', saved as profile');
-            updateAutoOcStatus('✓ Auto-tune complete! Saved: core+' + b.core_offset_mhz + ' / mem+' + b.mem_offset_mhz + validatedTag);
+            updateAutoOcStatus('✓ Auto-tune complete! Saved: core+' + b.core_offset_mhz + ' / mem+' + b.mem_offset_mhz + validatedTag +
+                '. ' + _at2AfterTuneText());
             document.getElementById('oc-auto-progress-fill').style.width = '100%';
             loadOcProfile();
             break;
@@ -7706,6 +7547,11 @@ async function startAutoOc() {
         // Phase-aware stability test
         var verdict = await _runAutoStabilityStep(dur, run);
         if (!owns()) break;
+        if (verdict.start_failed) {
+            // The check never ran, so it is not a result: stop (the code below closes the run).
+            _at2StartFailed('Quick Tune', verdict, "A stability check couldn't start.");
+            break;
+        }
 
         prev = {
             stable: verdict.stable && !verdict.aborted,
@@ -7762,8 +7608,8 @@ async function startAutoOc() {
     // cancels by itself) leaves a session open with a test offset on the
     // card.  Tell the backend, so it resets to stock.
     if (!finished && owns()) {
-        termWrite('gpu-terminal', '⚠ Auto-OC stopped before finishing, resetting to stock', 'error');
-        updateAutoOcStatus('Stopped early, reset to stock');
+        termWrite('gpu-terminal', '⚠ Auto-OC stopped before finishing, taking the overclock off', 'error');
+        updateAutoOcStatus('Stopped early, the overclock was taken off');
         await apiPost('/api/gpu/oc/auto/cancel');
     }
 
@@ -7823,7 +7669,12 @@ async function _runAutoStabilityStep(durationSec, run) {
     var expectedCoreMax = live.ok ? (live.core_max_mhz || 0) : 0;
     if (superseded()) return {};
 
-    await apiPost('/api/gpu/oc/probe/start', { expected_core_max: expectedCoreMax });
+    var started = await apiPost('/api/gpu/oc/probe/start', { expected_core_max: expectedCoreMax });
+    if (!started || started.ok === false) {
+        // No probe was opened: nothing to stress and nothing to score.  The
+        // caller stops and shows err.
+        return { ok: false, start_failed: true, err: (started && started.err) || '', refused: (started && started.refused) || '' };
+    }
     var webgl = superseded() ? null : startWebGLStress();
     var ticks = 0;
     var startMs = Date.now();
@@ -7894,7 +7745,7 @@ async function cancelAutoOc() {
     var benchBtn = document.getElementById('bench-tune-start-btn');
     if (benchBtn) benchBtn.style.display = '';
     document.getElementById('auto-oc-cancel-btn').style.display = 'none';
-    updateAutoOcStatus('⏹ Auto-tune cancelled, reset to stock');
+    updateAutoOcStatus('⏹ Auto-tune cancelled, the overclock was taken off');
     termWrite('gpu-terminal', '⏹ Auto-OC cancelled');
     loadOcProfile();
     pollOcLiveOnce();
@@ -7909,6 +7760,7 @@ async function cancelAutoOc() {
 // ═══════════════════════════════════════════════════════════════
 async function startBenchmarkTune() {
     if (_ocState.autoActive) return;
+    if (_at2TestRefused('Benchmark Tune')) return;
     if (!_ocState.capability || _ocState.capability.vendor !== 'nvidia') {
         showErrorToast('Benchmark Tune requires an NVIDIA GPU.');
         return;
@@ -7917,15 +7769,16 @@ async function startBenchmarkTune() {
     // actual performance peak instead of just the rough one Quick Tune finds.
     if (!confirm('Benchmark Tune: Performance-Optimised Auto-OC\n\n' +
         '• Maxes power limit FIRST\n' +
-        '• Walks the CORE ladder in 25 MHz steps (0, 25, 50 ... up to 600 MHz)\n' +
+        '• Walks the CORE clock up in 25 MHz steps (0, 25, 50 ... up to 600 MHz)\n' +
         '   Per step: 90s WebGL benchmark → records FPS, 1% lows, frametime σ, temp\n' +
-        '   Picks the offset with the BEST score\n' +
+        '   Picks the step with the BEST score\n' +
         '• Repeats for MEMORY in 100 MHz steps (0, 100, 200 ... up to 2500 MHz)\n' +
         '• Final 120s validation pass with both winners\n' +
         '• Saves the winning combo to a profile\n\n' +
-        'Runtime: 45-90 minutes (stops early if your GPU crashes at a low offset).\n' +
+        'Takes about 30 to 90 minutes (less with a saved overclock, which it starts near). ' +
+        'It stops early if the graphics card crashes.\n' +
         'Use Quick Tune if you just want the maximum stable OC.\n' +
-        'Use this when you want the offset with the best ACTUAL performance.\n\n' +
+        'Use this when you want the clocks with the best ACTUAL performance.\n\n' +
         'Continue?')) return;
 
     _ocState.autoActive = true;
@@ -7939,7 +7792,7 @@ async function startBenchmarkTune() {
     document.getElementById('oc-auto-status').innerHTML = '';
     updateAutoOcStatus('▶ Starting Benchmark Tune...');
 
-    termWrite('gpu-terminal', '🏁 Benchmark Tune started (measures real performance per offset)');
+    termWrite('gpu-terminal', '🏁 Benchmark Tune started (measures real performance at each step)');
 
     var startResp = await apiPost('/api/gpu/oc/benchmark-tune/start', {
         core_max_offset: 600,    // v2.9.9.1 — was 300 (matches new defaults)
@@ -7950,6 +7803,17 @@ async function startBenchmarkTune() {
         // Cancelled while starting: the run may have opened after that cancel
         // reached the backend, so close it again (unless a new run is going).
         if (startResp && startResp.ok && !_ocState.autoActive) apiPost('/api/gpu/oc/benchmark-tune/cancel');
+        return;
+    }
+    if (startResp && startResp.refused) {
+        // Refused: nothing was changed, so nothing is cancelled (a cancel takes
+        // the overclock off the card, and a game is using it).
+        _ocState.autoActive = false;
+        updateAutoOcStatus('✗ ' + _at2StartFailed('Benchmark Tune', startResp, "Benchmark Tune couldn't start."));
+        document.getElementById('auto-oc-start-btn').style.display = '';
+        document.getElementById('bench-tune-start-btn').style.display = '';
+        document.getElementById('auto-oc-cancel-btn').style.display = 'none';
+        document.getElementById('oc-auto-progress-bar').style.display = 'none';
         return;
     }
     if (!startResp || !startResp.ok) {
@@ -7995,10 +7859,10 @@ async function startBenchmarkTune() {
             var b = nxt.best || {};
             termWrite('gpu-terminal', '🏆 Benchmark Tune complete!');
             termWrite('gpu-terminal', '   Winner: core+' + b.core_offset_mhz + ' MHz / mem+' + b.mem_offset_mhz + ' MHz');
-            termWrite('gpu-terminal', '   Score: ' + b.best_score + ' (gain: ' + (b.gain_pct >= 0 ? '+' : '') + b.gain_pct + '% vs stock)');
+            termWrite('gpu-terminal', '   Score: ' + b.best_score + ' (gain: ' + (b.gain_pct >= 0 ? '+' : '') + b.gain_pct + '% over default clocks)');
             termWrite('gpu-terminal', '   FPS: ' + b.avg_fps + ' avg, ' + b.min_fps + ' 1% low, frametime σ: ' + b.frametime_std_ms + ' ms');
             updateAutoOcStatus('✓ Benchmark Tune complete. Saved: core+' + b.core_offset_mhz + ' / mem+' + b.mem_offset_mhz +
-                ' (+' + b.gain_pct + '% vs stock)');
+                ' (+' + b.gain_pct + '% over default clocks). ' + _at2AfterTuneText());
             document.getElementById('oc-auto-progress-fill').style.width = '100%';
             _renderBenchmarkLadder(nxt.core_results || [], nxt.mem_results || [], b);
             loadOcProfile();
@@ -8031,6 +7895,11 @@ async function startBenchmarkTune() {
         // Re-use the auto-stability step (same WebGL stress + verdict pipeline)
         var verdict = await _runAutoStabilityStep(dur, run);
         if (!owns()) break;
+        if (verdict.start_failed) {
+            // The measurement never ran, so it is not a result: stop (the code below closes the run).
+            _at2StartFailed('Benchmark Tune', verdict, "A measurement couldn't start.");
+            break;
+        }
 
         // v2.9.9.4 — clamp the verdict values before they get displayed
         // OR scored.  If something slipped through the per-draw filter,
@@ -8076,7 +7945,7 @@ async function startBenchmarkTune() {
             termWrite('gpu-terminal', '🛑 Hard crash during benchmark, stopping (GPU recovering)', 'error');
             await _showCrashBanner('Benchmark Tune stopped',
                 'GPU crash at ' + label + ': ' + (prev.abort_reason || 'unknown') +
-                '. Offsets reset to stock to let the GPU recover. ' +
+                '. The overclock was taken off the card to let the GPU recover. ' +
                 'Re-run Benchmark Tune with a lower core/mem ceiling if this keeps happening.');
             await new Promise(function(r){ setTimeout(r, 4000); });   // GPU settle
             break;
@@ -8087,8 +7956,8 @@ async function startBenchmarkTune() {
     // still open, with a test offset on the card.  Cancel it, as Quick Tune
     // does, so it resets to stock.
     if (!finished && owns()) {
-        termWrite('gpu-terminal', '⚠ Benchmark Tune stopped before finishing, resetting to stock', 'error');
-        updateAutoOcStatus('Stopped early, reset to stock');
+        termWrite('gpu-terminal', '⚠ Benchmark Tune stopped before finishing, taking the overclock off', 'error');
+        updateAutoOcStatus('Stopped early, the overclock was taken off');
         await apiPost('/api/gpu/oc/benchmark-tune/cancel');
     }
 
@@ -8255,7 +8124,7 @@ async function _refreshDependencyBanner() {
               '<span style="color:var(--warning);font-weight:600">⟳ Restart needed</span>' +
               '<span style="color:var(--text-secondary);font-size:12px;flex:1">' +
                 'New drivers were installed (' + escHtml(sources.join(', ')) + '). ' +
-                'A restart finishes the install. Frame telemetry won\'t work fully until then.' +
+                'A restart finishes the install. What was installed may not work fully until then.' +
               '</span>' +
               '<button class="btn btn-sm btn-primary" onclick="restartNowAfterDeps()">Restart now (10 s)</button>' +
               '<button class="btn btn-sm" onclick="restartLater()">Later</button>' +
@@ -8385,7 +8254,6 @@ function _showRecoveryDetailsModal() {
 // doesn't stare at stale state for 30 s waiting for the next tick.
 _onVisible(function() {
     try { _refreshDependencyBanner(); } catch (e) {}
-    try { if (typeof _refreshAdaptiveLive === 'function') _refreshAdaptiveLive(); } catch (e) {}
 });
 
 

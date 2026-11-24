@@ -21,9 +21,11 @@ borderless WebView2 window on top (pywebview), plus a tray icon.
   tournament mode and idle mode.
 - **Latency**: a one-click competitive-latency bundle, a read-only Latency
   Doctor, and per-game advice for the settings only the game itself can change.
-- **GPU** (NVIDIA): overclocking with stability testing and auto-tune, per-game
-  adaptive tuning, a hard temperature ceiling, crash recovery, driver updates.
-- **Monitoring**: live hardware sensors and frame-time telemetry (PresentMon).
+- **GPU** (NVIDIA): overclocking with stability testing and auto-tune, Adaptive
+  Tuning (runs games on your saved overclock and eases it off per game if the
+  graphics driver keeps having problems there), a hard temperature ceiling,
+  crash recovery, driver updates.
+- **Monitoring**: live hardware sensors.
 - **Capture**: instant-replay clips (FFmpeg or OBS), screenshots, stream helper.
 - **Crosshair overlay**: a custom crosshair in its own see-through window, never
   touching the game. Works over windowed, borderless and most fullscreen games;
@@ -60,6 +62,7 @@ release server, which serves `version.json` + the exe per channel.
 python tests/run_all.py            # everything (about a minute)
 python tests/run_all.py reset game # only the files whose name contains a word
 python tests/run_all.py -v         # list every test, not just failures
+python tests/run_all.py --allow-skips   # a skipped test does not fail the run
 ```
 
 Run it before a release, with the interpreter the release is built with.

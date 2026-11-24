@@ -4,7 +4,6 @@ known state when a reset, a cancel or a crash signal arrives while something
 else is mid-way.  The NVIDIA interface is always a stand-in here."""
 import json
 import os
-import re
 import threading
 import time
 
@@ -140,28 +139,21 @@ def test_going_to_stock_disarms_the_watchdog_before_writing():
         assert events == [("disarm",), ("write", 0, 0)]
         del events[:]
         GO.apply_oc(core_offset_mhz=100, mem_offset_mhz=0, power_pct=None)
-        assert events == [("write", 100, 0), ("arm", 100, 0)], "an overclock still arms after it is written"
+        assert events == [("arm", 100, 0), ("write", 100, 0)], (
+            "an overclock arms BEFORE it is written: armed after, a tick in between wrote the old one back")
     finally:
         restore()
 
 
 # ── the stability probe ───────────────────────────────────────────────
-TDRS: list = []      # timestamps of the TDR events the fake event log holds
-
-
-def _event_log(command):
-    if "Get-WinEvent" not in command:
-        return None
-    back = int(re.search(r"AddSeconds\(-(\d+)\)", command).group(1))
-    since = time.time() - back
-    hits = [{"Id": 153, "TimeCreated": "", "LevelDisplayName": "Error", "Msg": "TDR"} for ts in TDRS if ts >= since]
-    return m.R(json.dumps(hits) if hits else "")
+def tdr(ts):
+    """The graphics driver's error (nvlddmkm 153) in the sandbox's System
+    event log, logged at `ts`.  The probe reads the log in this process."""
+    m.EVENTS.add("driver_error", ts)
 
 
 def rig_probe():
     m.fresh()
-    del TDRS[:]
-    m.PS_HOOKS.append(_event_log)
     m.CMD_HOOKS.append(lambda a: m.R(LIVE_CSV) if a[0] == "nvidia-smi" and a[1].startswith("--query-gpu=clocks.current")
                        else None)
     nv = FakeNvapi()
@@ -208,7 +200,7 @@ def test_a_tdr_seen_by_the_probe_resets_the_card():
     nv = rig_probe()
     try:
         GO.start_stability_probe(expected_core_max=2900)
-        TDRS.append(time.time())
+        tdr(time.time())
         ticks = [GO.run_probe_tick(frame_time_ms=10.0) for _ in range(5)]
         assert ticks[-1]["kind"] == "tdr"
         assert nv.resets == 1 and GO.get_crash_state()["kind"] == "tdr"
@@ -216,12 +208,13 @@ def test_a_tdr_seen_by_the_probe_resets_the_card():
 
         nv.resets = 0
         GO.clear_crash_state()
-        del TDRS[:]
+        m.EVENTS.clear()
         GO.start_stability_probe(expected_core_max=2900)
         GO.run_probe_tick(frame_time_ms=10.0)
-        TDRS.append(time.time())            # in the last seconds, after the tick's last look
+        tdr(time.time())                    # in the last seconds, after the tick's last look
         verdict = GO.end_stability_probe()
         assert verdict["kind"] == "tdr" and nv.resets == 1, "a late TDR resets the card too"
+        assert m.ps_ran("Get-WinEvent") == [], "the event log is read in this process, not by PowerShell"
     finally:
         restore()
 
@@ -232,11 +225,32 @@ def test_a_tdr_just_before_the_probe_does_not_hide_one_during_it():
     crash) was subtracted from a count that no longer held it."""
     rig_probe()
     try:
-        TDRS.append(time.time() - 7)
+        tdr(time.time() - 7)
         GO.start_stability_probe(expected_core_max=2900)
-        TDRS.append(time.time())
+        tdr(time.time())
         ticks = [GO.run_probe_tick(frame_time_ms=10.0) for _ in range(5)]
         assert ticks[-1]["kind"] == "tdr", f"missed the new TDR: {ticks[-1]}"
+    finally:
+        restore()
+
+
+def test_a_burst_of_driver_errors_is_counted_in_full():
+    """The PowerShell scan stopped at 25 records, so a burst of more than 25
+    errors before a probe and as many during it compared 25 with 25 and
+    the probe passed."""
+    nv = rig_probe()
+    try:
+        now = time.time()
+        for n in range(30):
+            tdr(now - 4 + n * 0.01)                     # just before the start
+        GO.start_stability_probe(expected_core_max=2900)
+        for n in range(30):
+            tdr(time.time() + n * 0.001)                # and during the probe
+        time.sleep(0.05)
+        ticks = [GO.run_probe_tick(frame_time_ms=10.0) for _ in range(5)]
+        assert ticks[-1]["kind"] == "tdr", ticks[-1]
+        assert nv.resets == 1
+        GO.end_stability_probe()
     finally:
         restore()
 
@@ -435,9 +449,12 @@ def test_the_crash_toast_says_what_happened():
             assert r["blacklisted"] and r["step_down"] == {"core": 125, "mem": 400}, r
             msg = toasts[-1]
             assert "saved as the new profile" not in msg and "—" not in msg
-            assert msg.endswith("Your saved OC profile was not changed."), msg
-            assert ("Stepped down to core+125 / mem+400 for now." in msg) is applied, msg
-            assert ("could not be stepped down" in msg) is (not applied), msg
+            assert msg.endswith("Your saved overclock was not changed."), msg
+            assert ("It is lowered to +125 / +400 for now." in msg) is applied, msg
+            assert ("It could not be lowered." in msg) is (not applied), msg
+            assert "+150 MHz core, +500 MHz memory" in msg
+            low = msg.lower()                       # plain words: none of the terms the app no longer uses
+            assert not any(w in low for w in ("offset", "tdr", "blacklist", "baseline", "stock", "strike")), msg
     finally:
         NOTIFIER.toast, CR.detect_crash = real_toast, real_detect
         restore()

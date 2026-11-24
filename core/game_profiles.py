@@ -332,6 +332,16 @@ KNOWN_GAME_EXES = {
 }
 
 _GAME_HINTS = ["-win64-shipping","-win32-shipping","game","dx11","dx12","vulkan","client-win","unreal"]
+# A name that looks like a game only because of one of the hints above is not
+# one when it also says what it really is: "game" alone took in
+# EpicGamesUpdater.exe and the "GameSir Connect Setup" installers, and each
+# got a game mode session.  So did GameSir Connect itself, a controller tool
+# with the word in its brand ("gamesir"): with Adaptive Tuning that would be
+# a session on the saved overclock at the desktop, and a real game's driver
+# errors set aside as "another game was running" while its window is open.
+# Never applied to the known list or to a game the user added (see _is_game).
+_NOT_A_GAME = ("setup", "install", "updater", "update", "launcher", "helper",
+               "crashhandler", "crashreport", "unins", "redist", "dxsetup", "gamesir")
 
 # Streaming / content-creation companions — these are prioritized when a game
 # is running so streamers aren't disadvantaged. They are NOT treated as games
@@ -417,6 +427,7 @@ _engine = {
     "power_applied": [],            # [(scheme, setting, value)] set for this session, for the re-checks
     "streamer_prior": {},           # pid -> (priority class a streaming app had before it was raised, created)
     "exit_ticks": 0,                # ticks since the last process of the game went away
+    "exit_seen_at": None,           # when that was first seen (time.time())
     "tick": 0,
     # Background programs in efficiency mode for the session (see _eco_sweep).
     "eco_on": False,
@@ -429,6 +440,10 @@ _engine = {
     # pid -> creation time of each process of a game the user forced normal
     # mode back on mid-game: not taken up again while it runs (see _held_off).
     "held_off": {},
+    # The process frame telemetry was started for (the crosshair's
+    # exclusive-fullscreen check reads it), or None when game mode did not
+    # start it: see _sync_frame_tracking.
+    "frames_pid": None,
 }
 # One session start, tick or restore at a time.  Two monitor threads used to
 # overlap for a moment when the monitor was restarted (adding a custom game
@@ -440,22 +455,6 @@ _EXIT_GRACE_TICKS = 4               # ~12 s: a game that restarts itself is back
 _SYSTEM_CHECK_TICKS = 10            # system-wide settings are re-read every ~30 s
 _REAPPLY_LIMIT = 5                  # per process, within _REAPPLY_WINDOW_S; past that the game wins
 _REAPPLY_WINDOW_S = 300
-
-
-def note_active_oc(core: int, mem: int) -> None:
-    """beta.5 — Adaptive Tuning calls this whenever it applies a NEW offset so
-    the crash-recovery snapshot (_engine['active_oc_*']) always reflects what is
-    ACTUALLY on the card, not the value captured once at game-start.
-
-    Without it, AT's startup-guard fast-forward (and any subsequent step-up)
-    changed the real clocks while _engine stayed frozen at baseline — so a
-    climbed offset that TDR-crashed the game got mis-attributed to baseline,
-    never blacklisted, and re-applied every launch (an indefinite crash loop).
-    Only meaningful while a game is active; a no-op otherwise so stray AT/manual
-    applies outside gaming mode don't leave a phantom active OC behind."""
-    if _engine.get("gaming_mode"):
-        _engine["active_oc_core"] = int(core)
-        _engine["active_oc_mem"]  = int(mem)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1082,7 +1081,9 @@ def _eco_sweep() -> None:
         seen[pid] = exe
         # Another game running alongside is not a background program: the
         # user may be playing it, or switch to it at any moment.
-        if pid in (0, 4) or pid in tree or exe == game_exe or _eco_keep(exe) or _is_game(exe):
+        # (_game_match, not _is_game: what detection no longer starts a session
+        # for, an updater with "game" in its name, is left alone here as before.)
+        if pid in (0, 4) or pid in tree or exe == game_exe or _eco_keep(exe) or _game_match(exe):
             continue
         service = session is not None and process_tuning.session_of(pid) != session
         if service and exe not in _ECO_SERVICES:
@@ -1187,7 +1188,36 @@ def _apply_session_extras(exe_name: str) -> None:
         log.debug(f"background pauser hook failed: {e}")
 
 
-# ── Per-game optimization target dispatch (beta.13) ──────────────────
+# ── Per-game posture ──────────────────────────────────────────────────
+# What a game gets for its session on top of the usual game mode, picked by
+# its exe:
+#   max_fps      the Ultimate Performance power plan (GPU-bound titles)
+#   low_latency  Competitive Latency for the session (CPU-bound shooters)
+# The table came from the old Adaptive Tuning, which also let the user set a
+# target per game; that choice went away with its card.  Nothing here writes
+# the graphics card's clocks: in a game those are Adaptive Tuning's alone.
+AUTO_TARGET = {
+    # Spider-Man PC ports (Nixxes): GPU-bound, raw frame rate
+    "spider-man.exe":       "max_fps",
+    "milesmorales.exe":     "max_fps",
+    "spider-man2.exe":      "max_fps",
+    "marvel-spiderman.exe": "max_fps",
+    "spiderman2.exe":       "max_fps",
+    # Call of Duty, every IW-engine title: input timing and frame times
+    "modernwarfare.exe":    "low_latency",
+    "blackopscoldwar.exe":  "low_latency",
+    "vanguard.exe":         "low_latency",
+    "cod22-cod.exe":        "low_latency",
+    "cod23-cod.exe":        "low_latency",
+    "cod.exe":              "low_latency",   # the Call of Duty launcher exe (BO6, Warzone, MW2 and MW3)
+}
+
+
+def _target_for(exe) -> str:
+    """This exe's posture from AUTO_TARGET, "auto" (nothing) for any other."""
+    return AUTO_TARGET.get(str(exe or "").lower().strip(), "auto")
+
+
 # Holds what apply_target() changed for the CURRENTLY-tracked game, so
 # restore_target() can reverse exactly that on exit.  The engine tracks
 # one game at a time, so a single slot is sufficient.
@@ -1230,49 +1260,36 @@ def _active_power_guid() -> str:
 
 
 def apply_target(exe: str) -> None:
-    """Compose the perf posture for this game's optimization target
-    (auto-classified / set in adaptive_tuning state).  Called at game-start,
-    right before AT's own engage.  Reuses existing primitives and captures
-    what it changes so restore_target() can reverse it on exit.
+    """This game's posture for the session, from AUTO_TARGET (it no longer
+    comes from Adaptive Tuning's state).  Called at game start; what it is
+    about to change goes on record first, so restore_target() can put it back
+    at exit, or at the next start after a crash.
 
-      max_fps     → set the FLOOR: the user's proven saved OC at 100% GPU
-                    power + Ultimate power plan.  Adaptive Tuning (enabled +
-                    visual for max_fps games) then climbs ABOVE this floor
-                    for more frames, gated by stability + temp ceiling.
-      low_latency → engage Competitive Latency for the session (timer,
-                    flip-model, 1:1 mouse, DVR/throttle off).  GPU OC isn't
-                    the lever for these CPU-bound titles, so it's untouched.
-      auto/balanced → nothing; the normal mode-driven AT flow runs.
+      max_fps      the Ultimate Performance power plan.
+      low_latency  Competitive Latency for the session (timer, flip model,
+                   1:1 mouse, DVR and throttling off), unless it is on anyway.
+      anything else: nothing.
+
+    It never writes the overclock.  A max_fps game used to get the saved
+    profile at 100% power from here, and again at exit: a second writer next
+    to Adaptive Tuning, which put the full overclock on a game that had been
+    eased and left it on the card after the game for users who do not apply
+    it at startup.
     """
     global _target_restore
-    try:
-        from core import adaptive_tuning
-        target = (adaptive_tuning.get_game_state(exe) or {}).get("target", "auto")
-    except Exception:
-        target = "auto"
-    if target in ("auto", "balanced"):
+    target = _target_for(exe)
+    if target not in ("max_fps", "low_latency"):
         _target_restore = {}
         _save_target_restore({})
         return
     restore = {"target": target, "exe": exe}
     try:
         if target == "max_fps":
-            from core import gpu_overclock, optimizer
+            from core import optimizer
             restore["power_guid"] = _active_power_guid()
-            prof = gpu_overclock.load_profile()
-            has = bool(prof.get("exists"))
-            restore["oc"] = {
-                "core":  int(prof.get("core_offset_mhz", 0) or 0) if has else 0,
-                "mem":   int(prof.get("mem_offset_mhz", 0) or 0) if has else 0,
-                "power": int(prof.get("power_pct", 100) or 100) if has else 100,
-            }
             _save_target_restore(restore)       # on disk before anything changes
             optimizer.apply_ultimate_power_plan()
-            gpu_overclock.apply_oc(core_offset_mhz=restore["oc"]["core"],
-                                   mem_offset_mhz=restore["oc"]["mem"],
-                                   power_pct=100)
-            log.info(f"  Max-FPS target: held OC core+{restore['oc']['core']}/"
-                     f"mem+{restore['oc']['mem']} @ 100% power + Ultimate power plan")
+            log.info("  Max-FPS target: Ultimate power plan for this session")
         elif target == "low_latency":
             from core import competitive_latency
             already = bool(competitive_latency.status().get("enabled"))
@@ -1289,34 +1306,25 @@ def apply_target(exe: str) -> None:
 
 
 def restore_target() -> None:
-    """Reverse whatever apply_target() applied for the just-exited game."""
+    """Reverse whatever apply_target() applied for the just-exited game.
+
+    Also undoes a record left on disk by 3.7.0, whose max_fps target held the
+    saved overclock as well (the record's "oc"): the power plan goes back, and
+    the clocks are not written from here, whatever the record says."""
     global _target_restore
     r, _target_restore = _target_restore, {}
-    recovered = False
     if not r:
         r = _load_target_restore()      # the app has been restarted since that game started
-        recovered = bool(r)
     _save_target_restore({})
     if not r:
         return
     target = r.get("target")
     try:
         if target == "max_fps":
-            from core import gpu_overclock
-            oc = r.get("oc") or {}
-            # Re-apply the saved profile (resets GPU power_pct to the user's
-            # normal value) then restore the prior power plan.
-            # Not after a restart: the card is back at its own defaults by
-            # then, and whether the saved profile is applied at start-up is
-            # the user's setting — not something to override from here.
-            if not recovered:
-                gpu_overclock.apply_oc(core_offset_mhz=int(oc.get("core", 0)),
-                                       mem_offset_mhz=int(oc.get("mem", 0)),
-                                       power_pct=int(oc.get("power", 100)))
             guid = str(r.get("power_guid") or "")
             if len(guid) == 36 and guid.count("-") == 4:
                 run_cmd(["powercfg", "/setactive", guid], timeout=6)
-            log.info("  Max-FPS target released: restored saved OC + prior power plan")
+            log.info("  Max-FPS target released: prior power plan restored")
         elif target == "low_latency":
             if r.get("we_enabled_latency"):
                 from core import competitive_latency
@@ -1342,8 +1350,24 @@ def _restore_normal_mode(reason: str):
     _exit_seen_ts = time.time()      # for crash detection, which runs after all of this
     # Does game mode have anything applied: a session, or one cut short (the flag)?
     applied = bool(_engine.get("gaming_mode")) or _is_gaming_flag_set()
-    # beta.13 — reverse any per-game optimization-target posture first
-    # (GPU OC / power plan / competitive latency), before the generic tweaks.
+    # Game mode ending without the game closing (put back by hand or from the
+    # tray, the monitor stopped, the app quitting, the start-up check, the
+    # cleanup before a shutdown): the game may still be running, so Adaptive
+    # Tuning's session is released, which judges nothing and hands the card
+    # back (the engine keeps the session's values on the card until the game
+    # closes when handing back would raise the clocks under a game that is
+    # still running).  Without this the session stayed open after the game
+    # closed, since no exit is ever reported for a game that game mode has let
+    # go of.  First of all, so that nothing further down can fail before the
+    # card is handed back.
+    if reason != "game exit":
+        try:
+            from core import adaptive_tuning
+            adaptive_tuning.end_active_session(reason)
+        except Exception as e:
+            log.warning(f"adaptive_tuning.end_active_session failed: {e}")
+    # The per-game posture first (power plan, Competitive Latency), before
+    # the generic tweaks.
     restore_target()
     # The game's processes that are still running (game mode switched off
     # mid-game): priority, affinity and throttling back as they were.  After
@@ -1513,45 +1537,31 @@ def _restore_normal_mode(reason: str):
     except Exception as e:
         log.debug(f"updater hook failed: {e}")
 
-    # v3 — release the perf sampler's game-mode consumer slot.  It
-    # keeps running if hwmon-page or adaptive-tuning are still using it.
-    try:
-        from core import perf_monitor
-        perf_monitor.stop(consumer="game-mode")
-    except Exception as e:
-        log.debug(f"perf_monitor stop failed: {e}")
-
-    # v3 — crash detection THEN adaptive-tuning session update.  Run in
-    # a background thread so the restore_normal_mode call returns
-    # immediately (event-log query takes 1-2s).  Notification fires
-    # within ~5s of game exit.  Only on real game exits — boot-recovery
-    # and user-quit reasons skip this.
+    # A real exit: Adaptive Tuning FIRST (it hands the card back at once and
+    # judges the exit itself), and crash_recovery only for a game it was not
+    # looking after.  In a background thread so the restore returns at once.
     if reason in ("game exit",) and _prev_exe:
         def _post_exit_chain():
-            was_crash = False
+            handled = False
+            try:
+                from core import adaptive_tuning
+                at_result = adaptive_tuning.on_game_exit(_prev_exe, exit_ts=_exit_seen_ts)
+                handled = bool((at_result or {}).get("handled"))
+            except Exception as e:
+                log.warning(f"adaptive_tuning.on_game_exit failed: {e}")
+            if handled:
+                return
             try:
                 from core import crash_recovery
-                cr_result = crash_recovery.handle_game_exit(
+                crash_recovery.handle_game_exit(
                     exe=_prev_exe,
                     display_name=_prev_game,
                     active_core=_prev_oc_core,
                     active_mem=_prev_oc_mem,
                     exit_ts=_exit_seen_ts,
                 )
-                was_crash = bool(cr_result.get("crashed"))
             except Exception as e:
                 log.warning(f"crash_recovery.handle_game_exit failed: {e}")
-            # Adaptive Tuning learns from this session's outcome
-            try:
-                from core import adaptive_tuning
-                adaptive_tuning.on_game_exit(
-                    exe=_prev_exe,
-                    display_name=_prev_game,
-                    was_crash=was_crash,
-                    exited_at=_exit_seen_ts,
-                )
-            except Exception as e:
-                log.debug(f"adaptive_tuning.on_game_exit failed: {e}")
         threading.Thread(target=_post_exit_chain, daemon=True,
                          name="crash-recovery").start()
 
@@ -1561,6 +1571,13 @@ def _restore_normal_mode(reason: str):
             _notifier.notify_game_exited(_prev_game)
         except Exception as e:
             log.debug(f"Notifier failed: {e}")
+
+    # Frame telemetry was only running for the crosshair's sake (see
+    # _sync_frame_tracking); whatever the reason, the session is over.  Last
+    # of all: stopping PresentMon can take a moment, and nothing above, the
+    # hand-over to crash detection and Adaptive Tuning least of all, should
+    # wait for it.
+    _stop_frame_tracking()
 
 
 # Helper processes a game starts and can leave running after it exits.  Only
@@ -1743,16 +1760,30 @@ def refresh_baseline_after_reset() -> None:
 # Helpers
 # ═══════════════════════════════════════════════════════════════
 
-def _is_game(proc_name: str) -> bool:
-    name = proc_name.lower()
+def _game_match(proc_name: str) -> str:
+    """How a process name counts as a game: "known" (the built-in list, or a
+    game the user added: those are kept in the same set), "hint" (only a
+    tell-tale part of its name), or "" (not a game)."""
+    name = str(proc_name or "").lower()
     if not name.endswith(".exe"): name += ".exe"
-    # Streaming software never triggers gaming mode on its own — it's a companion
-    if name in STREAMING_EXES: return False
-    if name in KNOWN_GAME_EXES: return True
-    if name in _IGNORE_PROCS: return False
+    # Streaming software never triggers gaming mode on its own: it's a companion
+    if name in STREAMING_EXES: return ""
+    if name in KNOWN_GAME_EXES: return "known"
+    if name in _IGNORE_PROCS: return ""
     for hint in _GAME_HINTS:
-        if hint in name: return True
-    return False
+        if hint in name: return "hint"
+    return ""
+
+
+def _is_game(proc_name: str) -> bool:
+    """Does game mode start a session for a process of this name?"""
+    how = _game_match(proc_name)
+    if how == "hint":
+        # An installer, updater, launcher or crash reporter that happens to
+        # carry a hint ("game", "-win64-shipping") in its name.
+        name = str(proc_name or "").lower()
+        return not any(word in name for word in _NOT_A_GAME)
+    return how == "known"
 
 
 def _find_running_streaming_exes() -> list[dict]:
@@ -1768,6 +1799,271 @@ def _nice_name(exe: str) -> str:
         if c.isupper() and i > 0 and name[i-1].islower(): result += " "
         result += c
     return result.strip().title()
+
+
+# ── Display names ─────────────────────────────────────────────────────
+# What a game is called wherever Vispora names it: the Active Game card,
+# toasts, the session report, Adaptive Tuning.  The exe alone gave "Cod",
+# "Cod23-Cod", "Javaw" and "Marvel".
+#
+# A built-in name for an exe that says little or nothing about the game.
+_KNOWN_TITLES = {
+    "cod.exe": "Call of Duty", "cod22-cod.exe": "Call of Duty", "cod23-cod.exe": "Call of Duty",
+    "cod24-cod.exe": "Call of Duty", "modernwarfare.exe": "Call of Duty",
+    "blackopscoldwar.exe": "Call of Duty: Black Ops Cold War",
+    "cs2.exe": "Counter-Strike 2", "csgo.exe": "Counter-Strike: Global Offensive",
+    "javaw.exe": "Minecraft", "minecraft.windows.exe": "Minecraft",
+    "r5apex.exe": "Apex Legends", "r5apex_dx12.exe": "Apex Legends",
+    "marvel-win64-shipping.exe": "Marvel Rivals", "marvelrivals-win64-shipping.exe": "Marvel Rivals",
+    "marvelrivals.exe": "Marvel Rivals",
+    "rainbowsix.exe": "Rainbow Six Siege", "rainbowsix_be.exe": "Rainbow Six Siege",
+    "rainbowsix_vulkan.exe": "Rainbow Six Siege",
+    "fortnite.exe": "Fortnite",
+    "start_protected_game.exe": "Elden Ring", "eldenring.exe": "Elden Ring",
+    "valorant-win64-shipping.exe": "Valorant",
+    "tslgame.exe": "PUBG: Battlegrounds", "tslgame_be.exe": "PUBG: Battlegrounds", "pubg.exe": "PUBG: Battlegrounds",
+    "gta5.exe": "Grand Theft Auto V", "gta5_enhanced.exe": "Grand Theft Auto V",
+    "rdr2.exe": "Red Dead Redemption 2",
+    "ffxiv.exe": "Final Fantasy XIV", "ffxiv_dx11.exe": "Final Fantasy XIV",
+    "eso.exe": "The Elder Scrolls Online", "eso64.exe": "The Elder Scrolls Online",
+    "wow.exe": "World of Warcraft", "wowclassic.exe": "World of Warcraft Classic",
+    "gw2.exe": "Guild Wars 2", "gw2-64.exe": "Guild Wars 2",
+    "bg3.exe": "Baldur's Gate 3", "bg3_dx11.exe": "Baldur's Gate 3", "bg3_vulkan.exe": "Baldur's Gate 3",
+    "destiny2.exe": "Destiny 2", "dota2.exe": "Dota 2",
+    "league of legends.exe": "League of Legends", "leagueclient.exe": "League of Legends",
+    "leagueclientux.exe": "League of Legends",
+    "bf1.exe": "Battlefield 1", "bf3.exe": "Battlefield 3", "bf4.exe": "Battlefield 4",
+    "bfv.exe": "Battlefield V", "bf2042.exe": "Battlefield 2042",
+    "cyberpunk2077.exe": "Cyberpunk 2077", "witcher3.exe": "The Witcher 3",
+    "skyrimse.exe": "Skyrim Special Edition",
+    "fallout4.exe": "Fallout 4", "fallout76.exe": "Fallout 76", "falloutnv.exe": "Fallout: New Vegas",
+    "hogwartslegacy.exe": "Hogwarts Legacy", "helldivers2.exe": "Helldivers 2",
+    "haloinfinite.exe": "Halo Infinite", "mcc-win64-shipping.exe": "Halo: The Master Chief Collection",
+    "escapefromtarkov.exe": "Escape from Tarkov",
+    "rocketleague.exe": "Rocket League",
+    "deadbydaylight-win64-shipping.exe": "Dead by Daylight",
+    "palworld-win64-shipping.exe": "Palworld",
+    "b1-win64-shipping.exe": "Black Myth: Wukong",
+    "stalker2-win64-shipping.exe": "S.T.A.L.K.E.R. 2",
+    "shootergame.exe": "ARK: Survival Evolved", "arkascended.exe": "ARK: Survival Ascended",
+    "client-win64-shipping.exe": "Wuthering Waves",
+    "genshinimpact.exe": "Genshin Impact", "yuanshen.exe": "Genshin Impact",
+    "starrail.exe": "Honkai: Star Rail", "zenlesszonezero.exe": "Zenless Zone Zero",
+    "forzahorizon4.exe": "Forza Horizon 4", "forzahorizon5.exe": "Forza Horizon 5",
+    "pathofexile.exe": "Path of Exile", "pathofexile_x64.exe": "Path of Exile",
+    "pathofexile_x64steam.exe": "Path of Exile",
+    "diablo iv.exe": "Diablo IV", "darksoulsiii.exe": "Dark Souls III",
+    "discovery.exe": "The Finals",
+    "re4.exe": "Resident Evil 4", "re8.exe": "Resident Evil Village",
+    "monsterhunterworld.exe": "Monster Hunter: World", "monsterhunterrise.exe": "Monster Hunter Rise",
+    "monsterhunterwilds.exe": "Monster Hunter Wilds",
+    "streetfighter6.exe": "Street Fighter 6",
+    "spider-man.exe": "Marvel's Spider-Man Remastered", "spider-man2.exe": "Marvel's Spider-Man 2",
+    "milesmorales.exe": "Marvel's Spider-Man: Miles Morales",
+    "ghostoftsushima.exe": "Ghost of Tsushima", "godofwar.exe": "God of War",
+    "horizonzerodawn.exe": "Horizon Zero Dawn", "horizonforbiddenwest.exe": "Horizon Forbidden West",
+    "rustclient.exe": "Rust", "vrchat.exe": "VRChat", "7daystodie.exe": "7 Days to Die",
+    "fc24.exe": "EA Sports FC 24", "fc25.exe": "EA Sports FC 25", "fc26.exe": "EA Sports FC 26",
+    "acs.exe": "Assetto Corsa", "acc.exe": "Assetto Corsa Competizione",
+    "hoi4.exe": "Hearts of Iron IV", "eu4.exe": "Europa Universalis IV", "ck3.exe": "Crusader Kings III",
+    "civilizationvi.exe": "Civilization VI", "civilizationvii.exe": "Civilization VII",
+    "aoe2de_s.exe": "Age of Empires II: Definitive Edition",
+    "arma3.exe": "Arma 3", "arma3_x64.exe": "Arma 3", "dayz.exe": "DayZ", "dayz_x64.exe": "DayZ",
+    "newworld.exe": "New World", "lostark.exe": "Lost Ark", "warframe.x64.exe": "Warframe",
+    "sonsoftheforest.exe": "Sons of the Forest", "fallguys_client.exe": "Fall Guys",
+    "robloxplayerbeta.exe": "Roblox",
+}
+_KNOWN_TITLE_PREFIXES = (
+    ("fortniteclient-win64-shipping", "Fortnite"),      # ..._EAC_EOS.exe, ..._BE.exe
+)
+_TITLE_MARKS = "\u00ae\u2122\u2120\u00a9"               # registered, trademark, service mark, copyright
+_NAME_MAX = 80
+_SHIPPING_SUFFIX = re.compile(r"-win(?:64|32|x64|gdk)-shipping$", re.IGNORECASE)
+# What the two files below said when they were last read:
+# {"custom" | "library": ((path, (mtime, size)), {exe: name})}.  Names are
+# asked for at every scan, and neither file changes often.
+_names_cache: dict = {}
+
+
+def _clean_name(text, scanned: bool = False) -> str:
+    """A name fit to show: no control, invisible or replacement characters,
+    single spaces, not endless.  A scanned title also loses its trademark
+    signs, and "Call of Duty- Modern Warfare 3" (a folder name cannot hold
+    the colon) reads "Call of Duty: Modern Warfare 3" again."""
+    if not isinstance(text, str):
+        return ""
+    kept = []
+    for ch in text:
+        if ch.isspace():
+            kept.append(" ")
+        elif ch == "\ufffd" or not ch.isprintable() or (scanned and ch in _TITLE_MARKS):
+            continue
+        else:
+            kept.append(ch)
+    name = " ".join("".join(kept).split())
+    if scanned:
+        name = re.sub(r"(?<=\S)- ", ": ", name)
+    return name[:_NAME_MAX].strip()
+
+
+def _exe_key(exe) -> str:
+    key = str(exe or "").strip().lower()
+    if key and not key.endswith(".exe"):
+        key += ".exe"
+    return key
+
+
+def _file_stamp(path: str):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _custom_names() -> dict:
+    """exe -> the name the user gave a game they added.  Read again only when
+    the file has changed.  Cleaned like a scanned title, because it often is
+    one: the Installed Games list adds a game under the title the scan found
+    ("Call of Duty- Black Ops 6")."""
+    path = os.path.join(PROFILES_DIR, "custom_exes.json")
+    stamp = _file_stamp(path)
+    if stamp is None:
+        return {}
+    hit = _names_cache.get("custom")
+    if hit and hit[0] == (path, stamp):
+        return hit[1]
+    names: dict = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        log.debug(f"could not read the custom games for their names: {e}")
+        return {}                       # (not kept: read again next time)
+    for c in data if isinstance(data, list) else []:
+        if isinstance(c, dict) and isinstance(c.get("exe"), str):
+            name = _clean_name(c.get("name"), scanned=True)
+            if name:
+                names[_exe_key(c["exe"])] = name
+    _names_cache["custom"] = ((path, stamp), names)
+    return names
+
+
+def _library_titles() -> dict:
+    """exe -> the title the installed-games scan found for it.  An exe that
+    two different titles share (a "launcher.exe") names neither of them."""
+    try:
+        from core import library_scanner
+        path = library_scanner.CACHE_FILE
+        stamp = _file_stamp(path)
+        if stamp is None:
+            return {}
+        hit = _names_cache.get("library")
+        if hit and hit[0] == (path, stamp):
+            return hit[1]
+        games = (library_scanner.get_cached() or {}).get("games") or []
+    except Exception as e:
+        log.debug(f"could not read the installed games for their titles: {e}")
+        return {}
+    titles, shared = {}, set()
+    for g in games if isinstance(games, list) else []:
+        if not isinstance(g, dict) or not isinstance(g.get("exe"), str) or not g["exe"].strip():
+            continue
+        title = _clean_name(g.get("title"), scanned=True)
+        if not title:
+            continue
+        key = _exe_key(g["exe"])
+        if titles.setdefault(key, title).lower() != title.lower():
+            shared.add(key)
+    for key in shared:
+        titles.pop(key, None)
+    _names_cache["library"] = ((path, stamp), titles)
+    return titles
+
+
+def _plain_name(exe) -> str:
+    """The exe itself made readable (_nice_name), whatever its case."""
+    text = str(exe or "").strip()
+    stem = text[:-4] if text.lower().endswith(".exe") else text
+    return _clean_name(_nice_name(_SHIPPING_SUFFIX.sub("", stem))) or _clean_name(text)
+
+
+def display_name_for(exe) -> str:
+    """The name to show for a game's exe: the name the user gave it when they
+    added it, else the title the installed-games scan found for that exe, else
+    a built-in name for an exe that says nothing ("cod.exe", "javaw.exe"),
+    else the exe made readable.  Never raises."""
+    try:
+        key = _exe_key(exe)
+        if key:
+            name = _custom_names().get(key)
+            # A game added without a name was saved under the name made up
+            # from its exe: that one is not the user's choice, and must not
+            # hide a better one below.
+            if name and name != _nice_name(key):
+                return name
+            name = _library_titles().get(key) or _KNOWN_TITLES.get(key)
+            if name:
+                return name
+            for prefix, title in _KNOWN_TITLE_PREFIXES:
+                if key.startswith(prefix):
+                    return title
+    except Exception as e:
+        log.debug(f"display name lookup failed for {exe!r}: {e}")
+    try:
+        return _plain_name(exe)
+    except Exception:
+        return str(exe or "")
+
+
+# ── Frame telemetry for the crosshair ──────────────────────────────────
+# The crosshair hides itself while a game is in exclusive fullscreen, and it
+# learns that from PresentMon's present mode.  The old Adaptive Tuning was
+# the only thing that ever started PresentMon; with the crosshair switched
+# on, game mode does now, for the tracked game and nothing else.
+def _crosshair_enabled() -> bool:
+    try:
+        from core import crosshair
+        return bool(crosshair.is_enabled())
+    except Exception as e:
+        log.debug(f"could not ask whether the crosshair is on: {e}")
+        return False
+
+
+def _sync_frame_tracking() -> None:
+    """Frame telemetry follows the tracked game's process while the crosshair
+    is on, and stops when it is switched off.  Called at session start and at
+    every tick (the game can restart into a new process; the crosshair can be
+    switched mid-game).  Only stops what game mode itself started.  Never
+    raises."""
+    try:
+        pid = _engine.get("active_pid") if _engine.get("gaming_mode") else None
+        want = int(pid) if pid and _crosshair_enabled() else None
+        have = _engine.get("frames_pid")
+        if want == have:
+            return
+        from core import frame_telemetry
+        if have is not None:
+            _engine["frames_pid"] = None
+            frame_telemetry.stop_tracking()
+        if want is not None:
+            # Set first: a start that fails is not tried again at every tick.
+            _engine["frames_pid"] = want
+            frame_telemetry.start_tracking(want, _engine.get("active_exe") or "")
+    except Exception as e:
+        log.debug(f"frame telemetry for the crosshair failed: {e}")
+
+
+def _stop_frame_tracking() -> None:
+    """The session is over: stop the frame telemetry game mode started."""
+    if _engine.get("frames_pid") is None:
+        return
+    _engine["frames_pid"] = None
+    try:
+        from core import frame_telemetry
+        frame_telemetry.stop_tracking()
+    except Exception as e:
+        log.debug(f"could not stop frame telemetry: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1808,8 +2104,15 @@ def _scan_game_candidates() -> list[dict]:
 
     Each entry: {pid, exe, name, ws_mb, foreground, score}
     Only processes with a visible main window are considered — a real
-    game always has one.
+    game always has one.  A scan that fails finds nothing.
     """
+    return _scan_windowed_games() or []
+
+
+def _scan_windowed_games():
+    """_scan_game_candidates(), but None when the scan itself failed (the
+    PowerShell call failed or answered something that is not a process list),
+    so a caller can tell "no game is running" from "could not look"."""
     # Pull PID, ProcessName, and WorkingSet64 (in MB) in a single PS call.
     # Filter out background processes so we don't waste time on services.
     r = run_ps(
@@ -1818,21 +2121,30 @@ def _scan_game_candidates() -> list[dict]:
         "| ConvertTo-Json -Compress",
         timeout=10,
     )
-    if not (r["ok"] and r["out"]):
-        return []
+    if not r["ok"]:
+        return None
+    if not (r["out"] or "").strip():
+        return []                       # (no process with a window at all)
     try:
         procs = json.loads(r["out"])
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(procs, list):
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(procs, dict):
         procs = [procs]
+    if not isinstance(procs, list):
+        return None
 
     fg_pid = _get_foreground_pid()
     candidates = []
     for p in procs:
-        pname = (p.get("ProcessName") or "").strip()
+        if not isinstance(p, dict):
+            continue
+        pname = str(p.get("ProcessName") or "").strip()
         pid = p.get("Id", 0)
-        ws_mb = int(p.get("WS") or 0)
+        try:
+            ws_mb = int(p.get("WS") or 0)
+        except (TypeError, ValueError):
+            ws_mb = 0
         if not pname or not pid:
             continue
         exe = pname + ".exe"
@@ -1847,7 +2159,7 @@ def _scan_game_candidates() -> list[dict]:
         candidates.append({
             "pid":        pid,
             "exe":        exe,
-            "name":       _nice_name(exe),
+            "name":       display_name_for(exe),
             "ws_mb":      ws_mb,
             "foreground": (pid == fg_pid),
             "score":      round(score, 1),
@@ -1855,6 +2167,34 @@ def _scan_game_candidates() -> list[dict]:
     # Sort highest-score first so callers can just take [0].
     candidates.sort(key=lambda c: c["score"], reverse=True)
     return candidates
+
+
+def running_game_candidates():
+    """The processes with a visible main window that game mode would take as
+    a game, whether or not it is tracking them: [{"exe", "pid", "name"}, ...],
+    the one in front first.  None when the scan failed (PowerShell did not
+    answer), which a caller must not take for "no game is running".
+
+    For Adaptive Tuning ("is another game running beside this one?") and the
+    start-up task.  Takes no lock of game mode's and changes nothing of its
+    state (the games held off after Force normal mode are still listed: they
+    are still being played), so it can be called from any thread, also from
+    one that game mode is waiting for.  One PowerShell call (seconds under
+    load); never raises."""
+    try:
+        found = _scan_windowed_games()
+    except Exception as e:
+        log.debug(f"could not look for running games: {e}")
+        return None
+    if found is None:
+        return None
+    out = []
+    for c in found:
+        try:
+            out.append({"exe": str(c["exe"]), "pid": int(c["pid"]), "name": str(c["name"])})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
 
 
 def _held_off(candidates: list) -> list:
@@ -1925,12 +2265,29 @@ def _start_session(best: dict, gen: int) -> None:
         _engine["gaming_mode"] = True
         _set_gaming_flag()
         reg_originals.note("gamemode_reg_recorded")
-        # Fire the notification BEFORE the tweaks — user sees it immediately.
+        # Fire the notification BEFORE the tweaks: the user sees it immediately.
         if _notifier:
             try:
                 _notifier.notify_game_detected(display, exe)
             except Exception as e:
                 log.debug(f"Notifier failed: {e}")
+
+        # Adaptive Tuning next, before the registry, power and network steps:
+        # a game it has eased must not load and compile its shaders on the
+        # full overclock while those run.  The idle un-park above has already
+        # put a parked overclock back, so what it records as "on the card
+        # before the game" is the user's own.
+        try:
+            from core import adaptive_tuning
+            at_result = adaptive_tuning.on_game_start(exe, display, pid) or {}
+            if at_result.get("engaged"):
+                log.info(f"  Adaptive Tuning looks after {display}: level {at_result.get('level_name')}, "
+                         f"core{int(at_result.get('core') or 0):+d} / mem{int(at_result.get('mem') or 0):+d}")
+            else:
+                log.info(f"  Adaptive Tuning does not look after {display} "
+                         f"({at_result.get('reason') or 'no reason given'})")
+        except Exception as e:
+            log.warning(f"adaptive_tuning.on_game_start failed: {e}")
 
         # 1. The game's own processes first — what Task Manager shows, done in
         #    milliseconds — then the system-wide values.
@@ -1949,48 +2306,26 @@ def _start_session(best: dict, gen: int) -> None:
         _apply_registry_tweaks()
         _apply_session_extras(exe)
 
-        # v3 — snapshot the OC offsets that are active right now
-        # so crash_recovery can blacklist them if the game crashes.
+        # What the app holds on the card right now, for crash_recovery if the
+        # game crashes and Adaptive Tuning is not looking after it.  Read after
+        # the idle un-park above, which has put a parked overclock back, and
+        # after Adaptive Tuning, whose values these are when it took the game
+        # on.  (This used to subtract clocks under keys the stock record does
+        # not have: 0 / 0 at every game start.)
         try:
             from core import gpu_overclock
-            st = gpu_overclock.read_live_state()
-            # We want the OFFSETS (over stock baseline), not raw clocks
-            bl = gpu_overclock.get_stock_baseline() or {}
-            if st.get("ok") and bl:
-                _engine["active_oc_core"] = max(
-                    0, int(st.get("core_max_mhz", 0))
-                    - int(bl.get("core_max_mhz", st.get("core_max_mhz", 0))))
-                _engine["active_oc_mem"]  = max(
-                    0, int(st.get("mem_app_mhz", 0))
-                    - int(bl.get("mem_app_mhz", st.get("mem_app_mhz", 0))))
-            else:
-                # Fallback: read from saved profile
-                p = gpu_overclock.load_profile()
-                if p.get("exists"):
-                    _engine["active_oc_core"] = int(p.get("core_offset_mhz", 0))
-                    _engine["active_oc_mem"]  = int(p.get("mem_offset_mhz", 0))
-                else:
-                    _engine["active_oc_core"] = 0
-                    _engine["active_oc_mem"]  = 0
+            held = gpu_overclock.get_applied_oc() or {}
+            _engine["active_oc_core"] = int(held.get("core") or 0)
+            _engine["active_oc_mem"]  = int(held.get("mem") or 0)
             log.info(f"  Captured active OC at game-start: "
-                     f"core+{_engine['active_oc_core']} / "
-                     f"mem+{_engine['active_oc_mem']}")
+                     f"core{_engine['active_oc_core']:+d} / "
+                     f"mem{_engine['active_oc_mem']:+d}")
         except Exception as e:
             log.debug(f"Could not capture active OC: {e}")
             _engine["active_oc_core"] = 0
             _engine["active_oc_mem"]  = 0
-        # v3 — start the perf sampler so we have data ready
-        # for crash diagnostics and Adaptive Tuning.
-        try:
-            from core import perf_monitor
-            perf_monitor.start(consumer="game-mode")
-        except Exception as e:
-            log.debug(f"perf_monitor start failed: {e}")
-
-        # beta.13 — apply this game's optimization TARGET posture
-        # (max_fps / low_latency) BEFORE AT engages.  For targeted
-        # games AT is auto-disabled, so on_game_start below no-ops
-        # for them and won't fight the posture we just set.
+        # This game's posture, if it has one (see AUTO_TARGET): a power plan
+        # or Competitive Latency.  It does not touch the overclock.
         try:
             apply_target(exe)
         except Exception as e:
@@ -2009,27 +2344,17 @@ def _start_session(best: dict, gen: int) -> None:
         except Exception as e:
             log.debug(f"network priority failed: {e}")
 
-        # v3 — engage Adaptive Tuning if this game is opted in.
-        # AT applies its own learned offsets (overriding the
-        # current OC) and starts the per-game tuning loop.
-        try:
-            from core import adaptive_tuning
-            at_result = adaptive_tuning.on_game_start(exe, display)
-            if at_result.get("engaged"):
-                log.info(f"  Adaptive Tuning engaged: starting at "
-                         f"core+{at_result['starting_core']}/"
-                         f"mem+{at_result['starting_mem']}")
-                # Update our OC snapshot now that AT applied its own
-                _engine["active_oc_core"] = at_result["starting_core"]
-                _engine["active_oc_mem"]  = at_result["starting_mem"]
-        except Exception as e:
-            log.debug(f"adaptive_tuning.on_game_start failed: {e}")
+        # Last: it can start PresentMon, and nothing above should wait for it.
+        _sync_frame_tracking()
         _log_checks()
 
 
-def _switch_game(new: dict) -> None:
+def _switch_game(new: dict, gone_ts=None) -> None:
     """Another known game is still running: track that one.  The system-wide
-    tweaks carry over; the per-process ones go to the new game's processes."""
+    tweaks carry over; the per-process ones go to the new game's processes.
+
+    `gone_ts`: when the old game was first seen gone (its last process had
+    exited), None when it may still be running."""
     log.info(f"  Other known game(s) still running: switching tracker to {new['name']} (PID {new['pid']})")
     old_exe, old_game = _engine.get("active_exe", ""), _engine.get("active_game")
     ident = process_tuning.identity(new["pid"])
@@ -2037,13 +2362,47 @@ def _switch_game(new: dict) -> None:
                    game_image=ident.get("image") or "", game_procs={}, exit_ticks=0, proc_prior=None)
     _engine["checks"] = [c for c in _engine["checks"] if not c["key"].startswith("proc:") and c["key"] != "waiting"]
     _tune_game_processes(process_tuning.find_image(_engine["game_image"], new["exe"]) or [new["pid"]])
-    # Notify AT so it can switch its target too
+    _sync_frame_tracking()          # (the crosshair's frame telemetry follows the tracker)
+    # Adaptive Tuning follows the tracker.  The old game has closed (the
+    # tracker only moves once no process of it is left), so that is reported
+    # as its exit, like any other: the card is handed back at once, before the
+    # new game's session reads what is on it, and a graphics driver error just
+    # before it is judged ("another game was running" is the judgement's own
+    # business).  It used to be a release, which judges nothing: a game that
+    # closed on a driver error while another game's window was open left no
+    # trace.  Only when the old game may still be running is it released.
     try:
         from core import adaptive_tuning as _at
-        _at.on_game_exit(old_exe, old_game, was_crash=False, reason="game-mode tracker switch")
-        _at.on_game_start(new["exe"], new["name"])
+        if old_exe and gone_ts is not None:
+            _at.on_game_exit(old_exe, exit_ts=gone_ts)
+        else:
+            _at.end_active_session(f"game-mode tracker switch from {old_exe or old_game}")
     except Exception as e:
-        log.debug(f"AT switch failed: {e}")
+        log.warning(f"Adaptive Tuning could not be told that {old_game or old_exe or 'the game'} closed: {e}")
+    try:
+        from core import adaptive_tuning as _at
+        _at.on_game_start(new["exe"], new["name"], new["pid"])
+    except Exception as e:
+        log.warning(f"Adaptive Tuning could not follow the tracker switch: {e}")
+
+
+def _relaunch_to_adaptive_tuning(exe: str, name, pid, gone_ts: float) -> None:
+    """The tracked game came back under a new process within the grace.  For
+    game mode it never left, but its process did close, perhaps on a graphics
+    driver error.  Adaptive Tuning is told both, in this order: the new process
+    (the open session is carried on, or a new one taken), then the exit at the
+    time the old process was first seen gone, so an error just before it is
+    judged as "the game closed" and the running game is lowered at once if
+    that eases it.  The exit is only reported when the start was taken on: a
+    session that was not carried on could otherwise be closed, and its card
+    handed back, under a game that is running again.  Never raises."""
+    try:
+        from core import adaptive_tuning as _at
+        started = _at.on_game_start(exe, name, pid) or {}
+        if started.get("engaged"):
+            _at.on_game_exit(exe, exit_ts=gone_ts)
+    except Exception as e:
+        log.warning(f"Adaptive Tuning could not be told that {name or exe} started again: {e}")
 
 
 def _session_tick() -> None:
@@ -2053,17 +2412,24 @@ def _session_tick() -> None:
     exe = _engine.get("active_exe") or "the game"
     pids = _live_game_pids()
     if pids:
+        relaunched_after = None
         if _engine.get("exit_ticks"):
             log.info(f"  {exe} is running again (PID {', '.join(map(str, pids))}), so game mode stays on")
             _engine["checks"] = [c for c in _engine["checks"] if c["key"] != "waiting"]
             _engine["changes"] = [c["text"] for c in _engine["checks"]]
+            if _engine.get("active_pid") not in pids:
+                relaunched_after = _engine.get("exit_seen_at")      # a new process: the old one did close
         _engine["exit_ticks"] = 0
         if _engine.get("active_pid") not in pids:
             log.info(f"  {exe}: following its new process (PID {_engine.get('active_pid')} -> {pids[0]})")
             _engine["active_pid"] = pids[0]
+        if relaunched_after is not None and _engine.get("active_exe"):
+            _relaunch_to_adaptive_tuning(_engine["active_exe"], _engine.get("active_game"), pids[0],
+                                         relaunched_after)
         recheck = _engine["tick"] % _SYSTEM_CHECK_TICKS == 0
         _tune_game_processes(pids, recheck=recheck)
         _eco_tick()
+        _sync_frame_tracking()
         try:
             session_report.tick(pids)
         except Exception as e:
@@ -2075,10 +2441,11 @@ def _session_tick() -> None:
     # No process of the game is running any more.
     _engine["exit_ticks"] = _engine.get("exit_ticks", 0) + 1
     if _engine["exit_ticks"] == 1:
+        _engine["exit_seen_at"] = time.time()      # when it was first seen gone
         log.info(f"Tracked game exited: {_engine.get('active_game') or 'Unknown'} (PID {_engine.get('active_pid')})")
         others = _held_off(_scan_game_candidates())
         if others:
-            _switch_game(others[0])
+            _switch_game(others[0], gone_ts=_engine["exit_seen_at"])
             return
         # Some games close and start again (an update, a restart after the
         # first launch, an anti-cheat handshake).  Normal mode used to come
@@ -2306,6 +2673,32 @@ def auto_enable_on_boot_if_set() -> dict:
     return start_monitoring()
 
 
+# The app's start-up task has the game monitor on its way: it starts by itself
+# in a moment (after the delay of an autostart).  Set and cleared by app.py.
+_monitor_starting = [False]
+
+
+def monitor_starting() -> bool:
+    """True while the app's start-up task is about to start the game monitor
+    (and it has not started yet), so the page can say "in a moment" rather
+    than ask the user to press Start Monitoring.  Never raises."""
+    try:
+        return bool(_monitor_starting[0]) and not _engine.get("monitoring")
+    except Exception:
+        return False
+
+
+def set_monitor_starting(flag: bool) -> None:
+    """The start-up task: True when it has the monitor on its way, False once
+    the monitor has started or the task gave up."""
+    _monitor_starting[0] = bool(flag)
+
+
+def is_monitoring() -> bool:
+    """Is the game monitor running?"""
+    return bool(_engine.get("monitoring"))
+
+
 def start_monitoring() -> dict:
     if _engine["monitoring"]: return {"ok": True, "msg": "Already monitoring"}
     _engine["monitoring"] = True
@@ -2419,5 +2812,5 @@ def get_foreground_game() -> dict | None:
     return {
         "exe":     fg_exe,
         "pid":     fg_pid,
-        "name":    _nice_name(fg_exe),
+        "name":    display_name_for(fg_exe),
     }

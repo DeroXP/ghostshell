@@ -1,12 +1,15 @@
 import sandbox as m
-# Game mode and Adaptive Tuning under awkward timing: a session replaced
-# before it was closed, a game relaunched before its exit was handled, a
-# tuning loop still mid-poll when its session ends, a temperature-ceiling
-# reset, a mode changed mid-game, a game that restarts into a new process, a
-# pid that belongs to another process by the time the game closes, and the
-# start-up check meeting values the optimizer set on purpose.  Nothing here
-# touches a real clock: the NVIDIA interface is a stand-in and apply_oc()
-# only records.
+# Game mode under awkward timing, on its own and together with Adaptive
+# Tuning: game mode put back by hand in the middle of a game, the monitor
+# stopped mid-game, a game relaunched seconds after it closed, the tracker
+# moving to a second game, a game that restarts into a new process, a pid that
+# belongs to another process by the time the game closes, and the start-up
+# check meeting values the optimizer set on purpose.
+#
+# Adaptive Tuning is the real engine here (its own tests, with a card that
+# behaves like one, are in tests/test_adaptive_tuning.py).  Nothing touches a
+# real clock: gpu_overclock's apply, light write and read-back are stand-ins
+# that only move the numbers in `card` and `held`.
 
 import os
 import threading
@@ -17,471 +20,81 @@ from core import reg_originals as RO, process_tuning as PT
 GP = m.app("core.game_profiles")
 OPT = m.app("core.optimizer")
 ST = m.app("core.scheduler_tweaks")
-from core import adaptive_tuning as AT, gpu_overclock as GO, perf_monitor as PM          # noqa: E402
-from core import frame_telemetry as FT, gameplay_state as GS, temp_ceiling as TC        # noqa: E402
+from core import adaptive_tuning as AT, gpu_overclock as GO, capabilities as CAP           # noqa: E402
+from core import adaptive_policy as P                                                    # noqa: E402
+from core import crash_recovery as CR, notifier as NOTE                                    # noqa: E402
 from core import background_pauser as BPZ                                                # noqa: E402
 
 PRIO_KEY = r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl"
 HIGH, NORMAL, ABOVE = PT.HIGH_PRIORITY_CLASS, PT.NORMAL_PRIORITY_CLASS, PT.ABOVE_NORMAL_PRIORITY_CLASS
-EXE = "testgame.exe"
+FULL, BEFORE = (450, 2225), (100, 500)
 
-# ── everything around Adaptive Tuning that is not under test ──────────
-applied = {"core": 100, "mem": 500, "power": 100, "active": True}     # what the app holds on the card
-oc_calls: list = []
-tracking: list = []
-targets: list = []
-info = [{"exe": EXE, "display": "Test Game", "pid": 4242, "oc_core": 0, "oc_mem": 0}]
-score = [{"score": 90, "verdict": "healthy", "last_util": 95}]
-score_delay = [0.005]                       # one poll of the loop takes at least this
-apply_delay = [0.0]
+# ── the graphics card, as far as Adaptive Tuning asks about it ────────────
+held = {"core": 100, "mem": 500, "power": 100, "active": True}     # what the app holds on the card
+card = [BEFORE]                                                     # what the card reads back
+oc_calls: list = []         # every clock write: (how, core, mem, who)
+cr_calls: list = []         # what crash_recovery is told at a game exit
+toasts: list = []
 
 
-def _apply_oc(core_offset_mhz=0, mem_offset_mhz=0, power_pct=100):
-    time.sleep(apply_delay[0])
-    oc_calls.append((int(core_offset_mhz), int(mem_offset_mhz)))
-    applied.update(core=int(core_offset_mhz), mem=int(mem_offset_mhz))
+def _apply_oc(core_offset_mhz=0, mem_offset_mhz=0, power_pct=100, owner=None):
+    core, mem = int(core_offset_mhz), int(mem_offset_mhz)
+    oc_calls.append(("apply", core, mem, owner))
+    power = held["power"] if power_pct is None else int(power_pct)
+    held.update(core=core, mem=mem, power=power, active=bool(core or mem or power != 100))
+    card[0] = (core, mem)
     return {"ok": True}
 
 
-def _score(seconds=30):
-    time.sleep(score_delay[0])
-    return dict(score[0])
+def _write_offsets(core=0, mem=0, owner=None, if_seq=None, **more):
+    oc_calls.append(("light", int(core), int(mem), owner))
+    held.update(core=int(core), mem=int(mem), active=bool(core or mem or held["power"] != 100))
+    card[0] = (int(core), int(mem))
+    return {"ok": True, "err": ""}
 
 
 GO.apply_oc = _apply_oc
-GO.get_applied_oc = lambda: dict(applied)
-GO.load_profile = lambda: {"exists": True, "core_offset_mhz": 100, "mem_offset_mhz": 500}
+GO.write_offsets = _write_offsets
+GO.get_applied_oc = lambda: dict(held)
+GO.get_current_offsets = lambda: {"ok": True, "core_offset_mhz": card[0][0], "mem_offset_mhz": card[0][1]}
+GO.load_profile = lambda: {"exists": True, "core_offset_mhz": 450, "mem_offset_mhz": 2225, "power_pct": 100,
+                           "apply_on_startup": True}
 GO.detect_gpu_oc_capability = lambda: {"ok": True, "vendor": "nvidia", "limits": {"power_max_w": 300}}
-PM.start = lambda consumer=None: {"ok": True}
-PM.stop = lambda consumer=None, force=False: {"ok": True}
-PM.get_status = lambda: {"last": {"temp": 60, "power": 100.0}}
-PM.compute_stability_score = _score
-FT.start_tracking = lambda pid=None, exe_name=None: tracking.append(("start", pid)) or {"ok": True}
-FT.stop_tracking = lambda: tracking.append(("stop",)) or {"ok": True}
-FT.get_recent_stats = lambda seconds=30: {"available": False}
-GS.set_target = lambda exe, pid: targets.append((exe, pid))
-GS.observe = lambda exe, **k: {"state": "gameplay", "confidence": 1.0, "reasons": [], "baseline": {}}
-GP.get_active_game_info = lambda: dict(info[0]) if info[0] else None
+GO.is_tuning_active = lambda: False
+GO.wait_startup_apply = lambda timeout=0.0: True
+CAP.detect = lambda force=False: {"has_nvidia": True, "gpu_name": "NVIDIA GeForce RTX 5070 Ti"}
+CR.handle_game_exit = lambda **k: cr_calls.append(k) or {"crashed": False}
+NOTE.toast = lambda title, text, force=False: toasts.append((title, text)) or {"ok": True}
 GP._notifier = None
 BPZ.get_settings = lambda: {"enabled": False, "auto_resume_on_game_exit": True}
 BPZ.resume_now = lambda reason="": {"resumed": []}
-AT._target_process_alive = lambda exe: True
-REAL_LOOP = AT._tuning_loop
-
-
-def idle_loop(exe, name, stop_event):
-    stop_event.wait(30)
-
-
-def at_fresh(loop=idle_loop):
-    """A clean machine, AT switched on for every game, nothing engaged."""
-    if AT._runtime.get("active_exe"):
-        AT.end_active_session("test reset")
-    m.fresh()
-    AT._save_json(AT.SETTINGS_PATH, {"enabled_globally": True, "default_per_game_enabled": True})
-    applied.update(core=100, mem=500, power=100, active=True)
-    del oc_calls[:], tracking[:], targets[:]
-    info[0] = {"exe": EXE, "display": "Test Game", "pid": 4242, "oc_core": 0, "oc_mem": 0}
-    score[0] = {"score": 90, "verdict": "healthy", "last_util": 95}
-    score_delay[0] = 0.005
-    apply_delay[0] = 0.0
-    AT._tuning_loop = loop
-    AT._runtime.update(active_exe=None, loop_stop=None, loop_thread=None, pre_engage_oc=None, target_pid=None)
-
-
-def climb_to(core, mem):
-    """What a tuning loop does on a step-up: the card, the runtime, the record."""
-    _apply_oc(core, mem)
-    AT._runtime.update(current_core=core, current_mem=mem)
-    st = AT.get_game_state(EXE)
-    st.update(current_core=core, current_mem=mem)
-    AT._save_game_state(EXE, st)
-
-
-# ═════════════════════════════════════════════════════════════════════
-# Adaptive Tuning: session starts and ends
-# ═════════════════════════════════════════════════════════════════════
-def test_a_session_still_open_keeps_what_was_on_the_card_before_it():
-    """Game mode put normal mode back mid-game (the tray's Force normal) and
-    detected the game again at its next tick: AT was engaged a second time
-    without the first session being closed, and took its own climbed offset
-    for "what was on the card before AT" - which the game's exit then put
-    back, for the stock watchdog to keep on the desktop."""
-    at_fresh()
-    assert AT.on_game_start(EXE, "Test Game")["engaged"]
-    first = AT._runtime["loop_stop"]
-    assert AT._runtime["pre_engage_oc"]["core"] == 100
-    climb_to(150, 700)
-    assert AT.on_game_start(EXE, "Test Game")["engaged"]        # detected again, nothing closed in between
-    assert first.is_set(), "the first session's loop is told to stop"
-    assert AT._runtime["pre_engage_oc"]["core"] == 100 and AT._runtime["pre_engage_oc"]["mem"] == 500
-    climb_to(150, 700)
-    del oc_calls[:]
-    AT.on_game_exit(EXE, "Test Game")
-    assert oc_calls == [(100, 500)], oc_calls
-    assert (applied["core"], applied["mem"]) == (100, 500), "the card is handed back as AT found it"
-
-
-def test_a_late_exit_leaves_the_relaunched_game_running():
-    """A game relaunched right after a crash: its new session started before
-    the crash check behind the old session's exit was done, and that exit
-    then ended the new session instead."""
-    at_fresh()
-    assert AT.on_game_start(EXE, "Test Game")["engaged"]
-    exited = time.time()
-    time.sleep(0.02)
-    assert AT.on_game_start(EXE, "Test Game")["engaged"]        # the relaunch
-    new = AT._runtime["loop_stop"]
-    r = AT.on_game_exit(EXE, "Test Game", was_crash=True, exited_at=exited)
-    assert r["updated"] is False
-    assert AT._runtime["active_exe"] == EXE and AT._runtime["loop_stop"] is new and not new.is_set()
-    r = AT.on_game_exit(EXE, "Test Game", exited_at=time.time())     # its own exit later
-    assert r["updated"] is True and new.is_set() and AT._runtime["active_exe"] is None
-
-
-def test_a_session_is_closed_once():
-    """The app quitting while the post-exit chain was closing the session:
-    both closed it, and its minutes and stable sessions were counted twice."""
-    at_fresh()
-    assert AT.on_game_start(EXE, "Test Game")["engaged"]
-    climb_to(150, 700)
-    before = AT.get_game_state(EXE)["session_count"]
-    del oc_calls[:]
-    apply_delay[0] = 0.2                            # handing the card back takes a while
-    threads = [threading.Thread(target=AT.on_game_exit, args=(EXE, "Test Game")),
-               threading.Thread(target=AT.end_active_session, args=("user quit",))]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(5)
-    assert AT.get_game_state(EXE)["session_count"] == before + 1
-    assert oc_calls.count((100, 500)) == 1
-
-
-def test_a_loop_whose_session_has_ended_writes_nothing():
-    """on_game_exit put the card back while a tuning loop was mid-poll: the
-    loop's step (or drift re-assert) landed afterwards and stayed."""
-    at_fresh()
-    ev = threading.Event()
-    result = []
-    with AT._session_lock:                          # on_game_exit under way
-        t = threading.Thread(target=lambda: result.append(AT._loop_apply(ev, EXE, 200, 900, "step-up")))
-        t.start()
-        time.sleep(0.05)
-        ev.set()                                    # ...it stops the loop, then hands the card back
-    t.join(5)
-    assert result == [False] and (200, 900) not in oc_calls
-    assert AT._loop_apply(threading.Event(), EXE, 200, 900, "step-up") is True and oc_calls[-1] == (200, 900)
-
-
-class FakeNvapi:
-    def __init__(self, core=0, mem=0):
-        self.now, self.writes = (core, mem), []
-
-    def is_available(self):
-        return {"ok": True}
-
-    def get_current_offsets(self):
-        return {"ok": True, "core_offset_mhz": self.now[0], "mem_offset_mhz": self.now[1]}
-
-    def set_offsets(self, core_offset_mhz=0, mem_offset_mhz=0):
-        self.writes.append((core_offset_mhz, mem_offset_mhz))
-        return {"ok": True}
-
-
-def test_the_drift_check_leaves_a_temperature_ceiling_reset_alone():
-    """The ceiling reset the card to stock and cannot trip again during its
-    cooldown; AT's drift check put the overclock straight back."""
-    at_fresh()
-    real = GO._nvapi
-    GO._nvapi = nv = FakeNvapi(0, 0)                # stock: the ceiling has just reset it
-    try:
-        TC._state["in_cooldown_until"] = time.time() + 60
-        r = AT._at_check_offset_drift(EXE, 150, 700)
-        assert r["drifted"] and not r["reapplied"] and nv.writes == []
-        TC._state["in_cooldown_until"] = None       # cooldown over: AT may carry on
-        r = AT._at_check_offset_drift(EXE, 150, 700)
-        assert r["reapplied"] and nv.writes == [(150, 700)]
-    finally:
-        GO._nvapi = real
-        TC._state["in_cooldown_until"] = None
-
-
-# ═════════════════════════════════════════════════════════════════════
-# Adaptive Tuning: the loop itself, at full speed
-# ═════════════════════════════════════════════════════════════════════
-FAST = {"warmup_seconds": 0, "score_poll_interval_s": 0, "consecutive_good_required": 1}
-
-
-class FastLoop:
-    """The real tuning loop with no warm-up, no start-up guard and no sleep
-    between polls."""
-
-    def __enter__(self):
-        self.saved = ({k: dict(v) for k, v in AT.MODE_PRESETS.items()}, AT.STARTUP_GUARD_SEC, AT.OPENING_PHASE_SEC)
-        for preset in AT.MODE_PRESETS.values():
-            preset.update(FAST)
-        AT.STARTUP_GUARD_SEC = AT.OPENING_PHASE_SEC = 0
-        at_fresh(loop=REAL_LOOP)
-        self.before = {x.ident for x in threading.enumerate()}
-        return self
-
-    def __exit__(self, *exc):
-        t = AT._runtime.get("loop_thread")
-        AT.end_active_session("test over")
-        # A test that called on_game_exit itself left no loop_thread to join, but
-        # that loop can still be finishing its last poll: it would then decide
-        # (and save the game's record) under the next test's fakes.
-        loops = [x for x in threading.enumerate()
-                 if x.name.startswith("adaptive-tuning-") and x.ident not in self.before]
-        for t in [t] + loops:
-            if t:
-                t.join(5)
-        presets, AT.STARTUP_GUARD_SEC, AT.OPENING_PHASE_SEC = self.saved
-        for k, v in presets.items():
-            AT.MODE_PRESETS[k].clear()
-            AT.MODE_PRESETS[k].update(v)
-        AT._tuning_loop = idle_loop
-
-
-def steps_up():
-    return [c for c in oc_calls if c[0] > 100 or c[1] > 500]
-
-
-def test_a_mode_changed_mid_game_applies_at_the_next_poll():
-    """set_game_mode() says the running loop picks the new mode up at its
-    next poll, and tournament mode relies on that; the loop read the preset
-    once, so it went on stepping at the old mode's thresholds."""
-    with FastLoop():
-        for preset in AT.MODE_PRESETS.values():
-            preset.update(max_core_offset=800, max_mem_offset=3000)     # (room to climb all test long)
-        AT.MODE_PRESETS["competitive"]["min_score_to_step_up"] = 95       # 90 is not enough here
-        score_delay[0] = 0.04
-        assert AT.on_game_start(EXE, "Test Game")["engaged"]
-        assert m.wait(lambda: len(steps_up()) >= 2), "balanced: 90 is a healthy score, it steps up"
-        AT.set_game_mode(EXE, "competitive")
-        time.sleep(0.1)                             # (a poll already past the check may still finish)
-        n = len(steps_up())
-        time.sleep(0.5)
-        assert len(steps_up()) == n, "no step-up below the competitive threshold"
-        assert AT._runtime["loop_thread"].is_alive()
-
-
-def test_telemetry_follows_the_game_to_its_new_process():
-    """Some games restart into a new process at launch (an anti-cheat
-    bootstrap); game mode follows them.  AT's classifier stayed on the old
-    PID - the game never counted as in the foreground, so no decision was
-    made all session - and PresentMon watched a process that was gone."""
-    with FastLoop():
-        score[0] = {"score": None, "verdict": "idle", "last_util": 0}
-        assert AT.on_game_start(EXE, "Test Game")["engaged"]
-        assert targets[-1] == (EXE, 4242) and tracking[-1] == ("start", 4242)
-        info[0] = dict(info[0], pid=4545)          # game mode now follows PID 4545
-        assert m.wait(lambda: targets[-1] == (EXE, 4545))
-        assert m.wait(lambda: tracking[-2:] == [("stop",), ("start", 4545)]), tracking
-        n = len(tracking)
-        time.sleep(0.2)
-        assert len(tracking) == n, "once, not at every poll"
-
-
-def learned(core, mem):
-    """An offset an earlier session climbed to, above the 100/500 baseline."""
-    st = AT.get_game_state(EXE)
-    st.update(current_core=core, current_mem=mem)
-    AT._save_game_state(EXE, st)
-
-
-def test_no_jump_to_the_learned_offset_while_at_is_paused():
-    """A manual pause holds AT so the clocks stay still; the jump after the
-    start-up guard changed them anyway."""
-    with FastLoop():
-        AT.STARTUP_GUARD_SEC = 0.3
-        score[0] = {"score": None, "verdict": "idle", "last_util": 0}
-        learned(150, 700)
-        assert AT.on_game_start(EXE, "Test Game")["climb_target_core"] == 150
-        AT.pause("capture")                         # starts during the guard
-        try:
-            assert m.wait(lambda: (AT._runtime.get("last_reason") or "").startswith("paused"))
-            assert (150, 700) not in oc_calls and oc_calls[-1] == (100, 500)
-        finally:
-            AT.resume("capture")
-
-
-def test_no_jump_to_the_learned_offset_once_at_is_switched_off():
-    with FastLoop():
-        AT.STARTUP_GUARD_SEC = 0.3
-        learned(150, 700)
-        assert AT.on_game_start(EXE, "Test Game")["climb_target_core"] == 150
-        AT.set_settings(enabled_globally=False)     # switched off during the guard
-        assert m.wait(lambda: AT._runtime["active_exe"] is None), "the session ends"
-        assert (150, 700) not in oc_calls, "the clocks were changed after AT had been switched off"
-
-
-# ═════════════════════════════════════════════════════════════════════
-# Adaptive Tuning: what it remembers, and a run that dies mid-game
-# ═════════════════════════════════════════════════════════════════════
-def saved():
-    st = AT.get_game_state(EXE)
-    return (st["current_core"], st["current_mem"])
-
-
-def test_a_session_that_ends_in_the_start_up_guard_keeps_the_learned_offset():
-    """The game closed before the start-up guard was over: the session saved
-    the baseline it held over the offset AT had climbed to, so every short
-    session sent the next launch back to the bottom."""
-    at_fresh()
-    learned(150, 700)
-    sessions = AT.get_game_state(EXE)["stable_sessions"]
-    assert AT.on_game_start(EXE, "Test Game")["climb_target_core"] == 150
-    AT.on_game_exit(EXE, "Test Game")
-    assert saved() == (150, 700)
-    assert AT.get_game_state(EXE)["stable_sessions"] == sessions, "the session never ran it"
-    assert AT.on_game_start(EXE, "Test Game")["climb_target_core"] == 150, "the next launch goes back to it"
-
-
-def test_a_crash_in_the_start_up_guard_keeps_the_learned_offset():
-    """The card held the baseline when the game crashed, so the crash says
-    nothing against the learned offset (and the guard exists so that it
-    can't be blamed); it used to be replaced with the baseline."""
-    at_fresh()
-    learned(150, 700)
-    AT.on_game_start(EXE, "Test Game")
-    AT.on_game_exit(EXE, "Test Game", was_crash=True)
-    assert saved() == (150, 700)
-    assert AT.get_game_state(EXE)["stable_sessions"] == 0
-
-
-class HotStart(FastLoop):
-    """The real loop, with the jump to the learned offset deferred (the card
-    is too hot for it), so it climbs back toward it from the baseline."""
-
-    def __init__(self, target):
-        self.target = target
-
-    def __enter__(self):
-        super().__enter__()
-        self.real_safe = AT._is_safe_to_step_to
-        AT._is_safe_to_step_to = lambda exe, c, mm, axis="either": (
-            (False, "thermal: 86C") if (c, mm) == self.target else (True, ""))
-        score_delay[0] = 0.03
-        return self
-
-    def __exit__(self, *exc):
-        try:
-            return super().__exit__(*exc)
-        finally:
-            AT._is_safe_to_step_to = self.real_safe
-
-
-def test_climbing_back_after_a_hot_start_keeps_the_learned_offset():
-    """A hot start defers the jump and AT climbs back from the baseline.
-    Every step up wrote the record, so leaving the game (or Vispora dying)
-    before it got there cost the learned climb, although the comment there
-    promised the next launch would go back to it."""
-    with HotStart((900, 3500)):
-        learned(900, 3500)
-        assert AT.on_game_start(EXE, "Test Game")["climb_target_core"] == 900
-        assert m.wait(lambda: len(steps_up()) >= 2), oc_calls
-        assert saved() == (900, 3500), "the record keeps it while the session is below it"
-        AT.on_game_exit(EXE, "Test Game")
-        assert saved() == (900, 3500)
-
-
-def test_a_step_down_below_the_learned_offset_drops_it():
-    """Instability on the way back up says the learned offset is too high."""
-    with HotStart((900, 3500)):
-        learned(900, 3500)
-        AT.on_game_start(EXE, "Test Game")
-        assert m.wait(lambda: len(steps_up()) >= 2), oc_calls
-        score[0] = {"score": 20, "verdict": "unstable", "last_util": 95}
-        assert m.wait(lambda: AT._runtime.get("keep_learned") is None)
-        AT.on_game_exit(EXE, "Test Game")
-        assert saved()[0] < 900 and saved() != (900, 3500), saved()
-
-
-def test_converging_below_the_learned_offset_drops_it():
-    """Blocked on both axes for good (a blacklist, a cap): nothing above is
-    reachable, so the learned offset above it is not kept either."""
-    with HotStart((900, 3500)):
-        AT._is_safe_to_step_to = lambda exe, c, mm, axis="either": (
-            (False, "thermal: 86C") if (c, mm) == (900, 3500) else (False, "blacklisted for this game"))
-        learned(900, 3500)
-        AT.on_game_start(EXE, "Test Game")
-        assert m.wait(lambda: AT.get_game_state(EXE).get("converged")), oc_calls
-        assert AT._runtime.get("keep_learned") is None and saved() == (100, 500), saved()
-
-
-def test_climbing_past_the_learned_offset_records_the_session_again():
-    with HotStart((125, 500)):                      # one core step above the 100/500 baseline
-        learned(125, 500)
-        AT.on_game_start(EXE, "Test Game")
-        assert m.wait(lambda: AT._runtime.get("keep_learned") is None), oc_calls
-        assert m.wait(lambda: saved() != (125, 500))
-        core, mem = saved()
-        assert core >= 125 and mem >= 500, saved()
-
-
-def end_without_closing():
-    """What a crash or a kill of Vispora leaves: no session end ran."""
-    AT._runtime["loop_stop"].set()
-    AT._runtime.update(active_exe=None, loop_stop=None, loop_thread=None, keep_learned=None)
-
-
-def test_a_run_that_died_mid_session_hands_the_card_back_at_the_next_start():
-    """Vispora crashed, or was killed, mid-game: no session end ran, AT's
-    climbed offset stayed on the card with nothing watching it, and nothing
-    put it back at the next start."""
-    at_fresh()
-    assert AT.on_game_start(EXE, "Test Game")["engaged"]       # the card held 100/500 before
-    assert AT._apply_offsets(EXE, 175, 800, "step-up")
-    end_without_closing()
-    real = GO._nvapi
-    GO._nvapi = FakeNvapi(175, 800)                 # what the card still holds
-    try:
-        del oc_calls[:]
-        r = AT.recover_interrupted_session()
-        assert r["recovered"] and oc_calls == [(100, 500)], (r, oc_calls)
-        assert not os.path.exists(AT.SESSION_PATH)
-        assert AT.recover_interrupted_session()["recovered"] is False, "once"
-    finally:
-        GO._nvapi = real
-
-
-def test_after_a_reboot_the_card_is_left_as_it_is():
-    """A power cut: the card came back at stock.  Putting the old offsets
-    back then would apply an overclock at boot that nobody asked for."""
-    at_fresh()
-    AT.on_game_start(EXE, "Test Game")
-    AT._apply_offsets(EXE, 175, 800, "step-up")
-    end_without_closing()
-    real = GO._nvapi
-    GO._nvapi = FakeNvapi(0, 0)
-    try:
-        del oc_calls[:]
-        r = AT.recover_interrupted_session()
-        assert not r["recovered"] and oc_calls == [], (r, oc_calls)
-        assert not os.path.exists(AT.SESSION_PATH)
-    finally:
-        GO._nvapi = real
-
-
-def test_a_session_that_ended_normally_leaves_nothing_to_recover():
-    at_fresh()
-    AT.on_game_start(EXE, "Test Game")
-    assert os.path.exists(AT.SESSION_PATH)
-    AT._apply_offsets(EXE, 175, 800, "step-up")
-    AT.on_game_exit(EXE, "Test Game")
-    assert not os.path.exists(AT.SESSION_PATH)
-    assert AT.recover_interrupted_session()["recovered"] is False
-
-
-def test_applying_the_best_offset_outside_a_session_records_nothing():
-    at_fresh()
-    st = AT.get_game_state(EXE)
-    st.update(best_stable_core=150, best_stable_mem=700)
-    AT._save_game_state(EXE, st)
-    assert AT.apply_best_stable(EXE)["ok"]
-    assert not os.path.exists(AT.SESSION_PATH)
+AT._WATCH_THREAD = False        # (its polls are tested in test_adaptive_tuning.py; no thread outlives a test here)
+AT._uptime_s = lambda: 30 * 86400.0     # Windows has been up for a month (not this PC's own uptime)
+AT._defer = lambda fn: fn()     # the second half of an exit runs at once
+
+
+def at_switch(on: bool) -> None:
+    """Adaptive Tuning's own switch (it is off after m.fresh(), as on a new install)."""
+    with AT._state_lock:
+        AT._save_settings(dict(AT._default_settings(), enabled=on))
+
+
+def card_reset() -> None:
+    held.update(core=100, mem=500, power=100, active=True)
+    card[0] = BEFORE
+    del oc_calls[:], cr_calls[:], toasts[:]
+    AT._last_game = AT._last_closed = None
+    AT._recheck_scheduled[0] = False
+    AT._failed_reads[0] = 0
+    AT._supported_cache.update(ok=None)
+    AT._health_cache.update(at=None, value=None)
+    tail = getattr(AT, "_burst_tail", None)         # (what was judged of a burst: one test's error is not the next's)
+    if hasattr(tail, "clear"):
+        tail.clear()
+
+
+def mine() -> list:
+    return [c[:3] for c in oc_calls if c[3] == "adaptive_tuning"]
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -546,15 +159,6 @@ def test_stopping_the_monitor_during_a_restore_does_not_restore_twice():
         GP._engine["gaming_mode"] = False
 
 
-def test_the_cross_game_blacklist_keeps_the_newest_entries():
-    m.fresh()
-    AT._save_cross_game_blacklist([{"core": i, "mem": 0, "ts": i, "source_exe": "", "reason": ""}
-                                   for i in range(500)])
-    AT.add_cross_game_blacklist(900, 3000, source_exe=EXE)
-    assert AT._is_cross_game_blacklisted(900, 3000), "the newest crash used to be the one dropped"
-    assert len(AT.get_cross_game_blacklist()) == 500 and not AT._is_cross_game_blacklisted(0, 0)
-
-
 # ═════════════════════════════════════════════════════════════════════
 # Game mode with the monitor running (as in test_game_mode.py: a "game"
 # is whatever the stand-in scanner returns, and a tick takes 20 ms)
@@ -581,12 +185,16 @@ GO.read_live_state = lambda: {"ok": False}
 GO.get_stock_baseline = lambda: {}
 
 
-def gm_fresh():
+def gm_fresh(adaptive=False):
+    """A clean machine with the monitor stopped.  `adaptive`: Adaptive Tuning
+    switched on (the app holds +100 / +500 on the card, the saved overclock is
+    +450 / +2225)."""
     GP.stop_monitoring()
     time.sleep(0.12)                                # let a running loop notice and leave
-    if AT._runtime.get("active_exe"):
-        AT.end_active_session("test reset")
+    AT.end_active_session("test reset")
     m.fresh(plan=m.BALANCED)
+    card_reset()
+    at_switch(adaptive)
     os.makedirs(GP.PROFILES_DIR, exist_ok=True)
     del candidates[:]
     GP._engine.update(gaming_mode=False, active_game=None, active_exe=None, active_pid=None, changes=[],
@@ -675,13 +283,281 @@ def test_idle_mode_is_released_before_game_mode_records_the_plan():
     user's own plan was lost."""
     gm_fresh()
     m.PLAN["active"] = m.USERPLAN
-    AT.set_game_target("game.exe", "max_fps")
-    m.PLAN["active"] = m.BALANCED                   # Idle Mode engaged: Balanced, the user's plan on record
-    IM._state.update(engaged=True, restore={"power_guid": m.USERPLAN, "oc": None})
+    GP.AUTO_TARGET["game.exe"] = "max_fps"          # (game mode's own table: it no longer asks the tuner's state)
+    try:
+        m.PLAN["active"] = m.BALANCED               # Idle Mode engaged: Balanced, the user's plan on record
+        IM._state.update(engaged=True, restore={"power_guid": m.USERPLAN, "oc": None})
+        assert launch()
+        assert IM._state["engaged"] is False
+        assert GP._load_target_restore()["power_guid"] == m.USERPLAN
+        m.exit_proc(4242)
+        assert m.wait(lambda: not GP._engine["gaming_mode"])
+        assert m.PLAN["active"] == m.USERPLAN, "Balanced was put back as the user's plan"
+        stop()
+    finally:
+        GP.AUTO_TARGET.pop("game.exe", None)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Game mode and Adaptive Tuning together (the real engine, the monitor
+# running)
+# ═════════════════════════════════════════════════════════════════════
+def looked_after(exe="game.exe"):
+    s = AT._sess
+    return s is not None and s["exe"] == exe and card[0] == FULL
+
+
+def test_a_game_is_looked_after_from_its_start_to_its_exit():
+    gm_fresh(adaptive=True)
     assert launch()
-    assert IM._state["engaged"] is False
-    assert GP._load_target_restore()["power_guid"] == m.USERPLAN
+    assert m.wait(looked_after), (AT._sess, card)
+    assert AT._sess["pre"] == [100, 500, 100] and AT._sess["pid"] == 4242 and AT._sess["name"] == "Game"
+    assert (GP._engine["active_oc_core"], GP._engine["active_oc_mem"]) == FULL, "what the session runs the game at"
+    assert os.path.exists(AT.session_path())
     m.exit_proc(4242)
     assert m.wait(lambda: not GP._engine["gaming_mode"])
-    assert m.PLAN["active"] == m.USERPLAN, "Balanced was put back as the user's plan"
+    assert m.wait(lambda: AT._sess is None and card[0] == BEFORE), "the card is handed back as it was found"
+    assert mine() == [("apply", 450, 2225), ("apply", 100, 500)]
+    assert not os.path.exists(AT.session_path())
+    time.sleep(0.15)
+    assert cr_calls == [], "Adaptive Tuning handled the exit: crash_recovery is not asked as well"
+    assert m.wait(lambda: AT.get_state()["games"][0]["sessions"] == 1)
+    stop()
+
+
+def test_switched_off_it_writes_nothing_and_crash_recovery_keeps_its_job():
+    gm_fresh(adaptive=False)
+    assert launch()
+    time.sleep(0.1)
+    assert AT._sess is None and oc_calls == [] and AT.get_state()["games"] == []
+    m.exit_proc(4242)
+    assert m.wait(lambda: cr_calls)
+    assert (cr_calls[0]["active_core"], cr_calls[0]["active_mem"]) == BEFORE and oc_calls == []
+    stop()
+
+
+def test_the_switch_turned_on_mid_game_takes_on_the_game_that_game_mode_tracks():
+    """The engine's own links to game mode, with nothing standing in for
+    them: which game is tracked, whether the monitor runs, and whether a
+    session is open (which the tests on the GPU page ask through
+    gpu_overclock).  Each of them could be bent without a test noticing."""
+    gm_fresh(adaptive=False)
+    assert launch()
+    time.sleep(0.1)
+    assert AT._sess is None and oc_calls == []
+    state = AT.set_settings(enabled=True)["state"]      # the switch on the card, while the game runs
+    assert AT._sess is not None and AT._sess["exe"] == "game.exe" and AT._sess["pid"] == 4242, AT._sess
+    assert card[0] == FULL and mine() == [("apply", 450, 2225)]
+    assert state["watching"] is True and state["session"]["exe"] == "game.exe"
+    assert state["game"] == {"exe": "game.exe", "name": "Game", "looked_after": True, "reason": ""}
+    # a test on the GPU page is refused while the game is looked after, and while its session is left alone
+    refusal = {"ok": False, "refused": "adaptive_session", "err": GO.SESSION_REFUSAL}
+    assert GO.start_stability_probe() == refusal
+    AT._sess["held"] = "manual"
+    assert AT.session_active() is True and GO.start_stability_probe() == refusal
+    AT._sess["held"] = None
+    # the game's own switch off: said about the game that is running, by its real name
+    state = AT.set_game_enabled("game.exe", False)["state"]
+    assert AT._sess is None and card[0] == BEFORE, "handing back only lowers here, so it is done at once"
+    assert state["game"] == {"exe": "game.exe", "name": "Game", "looked_after": False, "reason": "switched_off"}
+    assert state["session"] is None and state["watching"] is True
+    state = AT.set_game_enabled("game.exe", True)["state"]
+    assert AT._sess is not None and card[0] == FULL and state["game"]["looked_after"] is True
+    stop()
+    assert m.wait(lambda: AT._sess is None and card[0] == BEFORE)
+    assert AT.get_state()["watching"] is False
+
+
+def test_forcing_normal_mode_mid_game_ends_the_session_and_hands_the_card_back():
+    """Game mode only reports an exit for a game it is still tracking.  After
+    Force normal mode the game is let go of, so its session was never ended:
+    the card stayed on the session's values, the drift watchdog stayed paused
+    and every test on the GPU page was refused until Vispora restarted."""
+    gm_fresh(adaptive=True)
+    assert launch()
+    assert m.wait(looked_after)
+    GP.restore_normal_mode("user-tray")
+    assert AT._sess is None and card[0] == BEFORE and not AT.session_active()
+    assert mine()[-1] == ("apply", 100, 500) and "adaptive_tuning" not in GO._oc_watchdog_pause_sources
+    assert AT.get_state()["history"] == [], "a release is not judged as a crash"
+    time.sleep(0.3)                                 # a dozen ticks: the same game is not taken up again
+    assert AT._sess is None and card[0] == BEFORE
+    m.exit_proc(4242)
+    assert m.wait(lambda: not GP._engine["held_off"])
+    time.sleep(0.1)
+    assert len(mine()) == 2 and cr_calls == []
+    assert launch(pid=4545), "its next launch is looked after as usual"
+    assert m.wait(looked_after)
+    stop()
+    assert AT._sess is None and card[0] == BEFORE
+
+
+L50 = (225, 1113)
+
+
+def eased_and_running():
+    """game.exe, which the graphics driver eased to 50% some time ago, is
+    being played.  The app held the full saved overclock before it (applied at
+    start-up), so handing the card back would raise the clocks."""
+    gm_fresh(adaptive=True)
+    held.update(core=450, mem=2225, power=100, active=True)
+    card[0] = FULL
+    with AT._state_lock:
+        st = AT._load_state()
+        game = P.new_game("game.exe", "Game", time.time() - 86400)
+        game.update(level=2, limit_at_level=[450, 2225], minutes=900.0, sessions=20)
+        st["games"]["game.exe"] = game
+        AT._save_state(st)
+    assert launch()
+    assert m.wait(lambda: AT._sess is not None and card[0] == L50), (AT._sess, card)
+    assert AT._sess["pre"] == [450, 2225, 100] and mine() == [("apply", 225, 1113)]
+    return AT._sess
+
+
+def the_game_closes(s, pid=4242):
+    """What the watch thread does once the game is gone (no thread runs here)."""
+    m.exit_proc(pid)
+    for _ in range(AT.MISSES_TO_CLOSE):
+        AT._poll(s["id"])
+
+
+def test_forcing_normal_mode_on_an_eased_game_never_raises_the_card():
+    """Force normal mode handed the card back at once: the full saved
+    overclock went under a game that had been eased because it fails on it,
+    while that game was still being played."""
+    s = eased_and_running()
+    GP.restore_normal_mode("user-tray")
+    assert AT._sess is s and s["held"] == "released", "the session is kept until the game closes"
+    assert card[0] == L50 and mine() == [("apply", 225, 1113)], "nothing was written"
+    assert "adaptive_tuning" in GO._oc_watchdog_pause_sources, "nor may the drift watchdog put the old value back"
+    assert [h["text"] for h in AT.get_state()["history"]] == [P.HELD_RELEASED("Game")]
+    assert AT.get_state()["session"]["held"] == "released" and AT.session_active()
+    time.sleep(0.3)                                 # a dozen ticks of the monitor: still nothing
+    assert card[0] == L50 and len(mine()) == 1
+    the_game_closes(s)
+    assert AT._sess is None and card[0] == FULL, "handed back once the game has closed"
+    assert mine() == [("apply", 225, 1113), ("apply", 450, 2225)]
+    assert "adaptive_tuning" not in GO._oc_watchdog_pause_sources and not os.path.exists(AT.session_path())
+    state = AT.get_state()
+    assert state["games"][0]["level"] == 2 and len(state["history"]) == 1, "a release judges nothing"
+    assert AT.report_line("game.exe", time.time()) == "Overclock: kept until the game closed"
+    assert cr_calls == []
+    stop()
+
+
+def test_stopping_the_monitor_on_an_eased_game_never_raises_the_card_and_it_is_found_again():
+    s = eased_and_running()
+    stop()
+    assert AT._sess is s and s["held"] == "released" and card[0] == L50 and len(mine()) == 1
+    assert AT.get_state()["watching"] is False
+    GP._engine["held_off"] = {}
+    GP.start_monitoring()                           # Start Monitoring again while the game still runs
+    assert m.wait(lambda: GP._engine["gaming_mode"] and AT._sess is s and s["held"] is None), (s["held"],)
+    assert card[0] == L50 and len(mine()) == 1, "looked after again, and nothing had to be written"
+    m.exit_proc(4242)
+    assert m.wait(lambda: AT._sess is None and card[0] == FULL)
+    assert mine()[-1] == ("apply", 450, 2225) and cr_calls == []
+    stop()
+
+
+def test_stopping_the_monitor_mid_game_ends_the_session():
+    gm_fresh(adaptive=True)
+    assert launch()
+    assert m.wait(looked_after)
+    stop()
+    assert m.wait(lambda: AT._sess is None and card[0] == BEFORE)
+    assert not os.path.exists(AT.session_path()) and cr_calls == []
+
+
+def test_a_game_relaunched_right_after_it_closed_is_looked_after_again():
+    """The game was detected again 3 to 4 s after normal mode came back (after
+    2 of the 3 real driver crashes on the owner's PC).  The new session was
+    refused, or was closed by the old one's exit."""
+    gm_fresh(adaptive=True)
+    assert launch()
+    assert m.wait(looked_after)
+    m.exit_proc(4242)
+    assert m.wait(lambda: not GP._engine["gaming_mode"])
+    assert launch(pid=4545)                         # at the very next tick
+    assert m.wait(lambda: looked_after() and AT._sess["pid"] == 4545)
+    assert AT._sess["pre"] == [100, 500, 100], "not the first session's own clocks"
+    time.sleep(0.2)
+    assert looked_after(), "the first session's exit did not close the new one"
+    m.exit_proc(4545)
+    assert m.wait(lambda: AT._sess is None and card[0] == BEFORE)
+    assert m.wait(lambda: AT.get_state()["games"][0]["sessions"] == 2)
+    stop()
+
+
+def test_the_session_follows_the_tracker_to_the_other_game():
+    gm_fresh(adaptive=True)
+    assert launch()
+    assert m.wait(looked_after)
+    m.proc(5151, exe="other.exe")
+    candidates.append({"pid": 5151, "exe": "other.exe", "name": "Other", "ws_mb": 900, "foreground": False,
+                       "score": 900})
+    m.exit_proc(4242)                               # the first game closes, the second is still running
+    assert m.wait(lambda: looked_after("other.exe")), AT._sess
+    assert AT._sess["pre"] == [100, 500, 100] and AT._sess["pid"] == 5151
+    assert mine() == [("apply", 450, 2225), ("apply", 100, 500), ("apply", 450, 2225)]
+    assert AT.get_state()["history"] == []
+    assert [g["sessions"] for g in AT.get_state()["games"] if g["exe"] == "game.exe"] == [1], \
+        "the first game's session ended as an exit"
+    m.exit_proc(5151)
+    assert m.wait(lambda: AT._sess is None and card[0] == BEFORE)
+    stop()
+
+
+def test_a_game_that_closes_on_a_driver_error_while_another_game_has_a_window_is_judged():
+    """The tracker moved to the other game and released the first one's
+    session, which judges nothing: the driver error that closed the game was
+    never looked at (no line, no count), however often it happened."""
+    gm_fresh(adaptive=True)
+    assert launch()
+    assert m.wait(looked_after)
+    m.proc(5151, exe="other.exe")
+    candidates.append({"pid": 5151, "exe": "other.exe", "name": "Other", "ws_mb": 900, "foreground": False,
+                       "score": 900})
+    m.EVENTS.add("driver_error", time.time())       # the driver fails ...
+    m.exit_proc(4242)                               # ... and the game closes on it
+    assert m.wait(lambda: looked_after("other.exe")), AT._sess
+    history = [h["text"] for h in AT.get_state()["history"]]
+    assert history == [P.W_ENDED("Game")], history
+    assert mine() == [("apply", 450, 2225), ("apply", 100, 500), ("apply", 450, 2225)], \
+        "handed back before the other game's session read the card"
+    m.exit_proc(5151)
+    assert m.wait(lambda: AT._sess is None and card[0] == BEFORE)
+    stop()
+
+
+def test_a_game_relaunched_inside_the_grace_is_judged_as_closed_and_carried_on():
+    """It closed on a driver error and was started again before game mode's
+    grace ran out: game mode stayed on and told Adaptive Tuning nothing, so
+    the error was later judged as one the game "kept running" through."""
+    gm_fresh(adaptive=True)
+    assert launch()
+    assert m.wait(looked_after)
+    first = AT._sess["id"]
+    fast = GP.time
+
+    class _SlowerClock(_FastClock):
+        def sleep(self, seconds):
+            time.sleep(0.2)                         # (the grace is 4 ticks: long enough to come back in)
+
+    GP.time = _SlowerClock()
+    try:
+        m.EVENTS.add("driver_error", time.time())
+        m.exit_proc(4242)
+        assert m.wait(lambda: GP._engine["exit_ticks"] >= 1)
+        m.proc(4545, exe="game.exe")                # back within the grace
+        assert m.wait(lambda: GP._engine["active_pid"] == 4545)
+    finally:
+        GP.time = fast
+    assert m.wait(lambda: AT.get_state()["history"]), "judged now, not two minutes later"
+    assert [h["text"] for h in AT.get_state()["history"]] == [P.W_ENDED("Game")]
+    assert AT._sess is not None and AT._sess["id"] == first and AT._sess["pid"] == 4545, "the session carried on"
+    assert card[0] == FULL and mine() == [("apply", 450, 2225)], "nothing handed back under the running game"
+    assert GP._engine["gaming_mode"]
+    m.exit_proc(4545)
+    assert m.wait(lambda: AT._sess is None and card[0] == BEFORE)
     stop()

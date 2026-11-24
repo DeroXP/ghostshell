@@ -169,7 +169,7 @@
                     </div>
                     <div style="flex:1;min-width:200px">
                         <div style="font-size:14px;font-weight:600;color:var(--text-bright);letter-spacing:-0.01em">Tournament Mode</div>
-                        <div id="tournament-summary" style="font-size:12.5px;color:var(--text-secondary);margin-top:2px">One-button "before a match" macro: pauses browsers, kills OneDrive, mutes notifications, switches to High Performance, applies competitive AT.</div>
+                        <div id="tournament-summary" style="font-size:12.5px;color:var(--text-secondary);margin-top:2px">One-button "before a match" macro: pauses browsers, kills OneDrive, mutes notifications, switches to High Performance.</div>
                     </div>
                     <div id="tournament-status-pill" class="status-badge neutral">OFF</div>
                 </div>
@@ -954,24 +954,24 @@
                 <div id="temp-ceiling-trips" style="margin-top:14px;font-size:12.5px;color:var(--text-secondary);display:none"></div>
             </div>
 
-            <!-- Crash recovery — per-game blacklist + step-down history -->
+            <!-- Crash Recovery: its history, and the clocks it remembered per game -->
             <div class="card" id="crash-recovery-card">
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg></div>
                 <div class="card-title">Crash Recovery</div>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:640px">
-                    When a tracked game closes, Vispora looks for TDR / driver-crash events in the Windows Event Log over the last 10 seconds. If a crash is detected with active OC, the failing offset goes on a permanent per-game blacklist and the saved profile auto-steps-down (–25 MHz core / –100 MHz mem) so the next launch runs safely. A toast fires within 5 s.
+                    Works for games Adaptive Tuning is not looking after. When one of them closes, Vispora checks the Windows event log for a graphics driver error in the two minutes before. If there was one while the card held more than your saved overclock, the clocks are lowered for now and those values are remembered for that game. Your saved overclock is never changed. A notification tells you what happened.
                 </p>
                 <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
                     <span style="font-size:12.5px;color:var(--text-secondary)">Total recorded crashes:</span>
-                    <span id="crash-recovery-count" class="oc-slider-val" style="font-size:18px">—</span>
+                    <span id="crash-recovery-count" class="oc-slider-val" style="font-size:18px">…</span>
                     <span id="crash-recovery-last" style="font-size:12px;color:var(--text-tertiary);margin-left:auto"></span>
                 </div>
                 <div id="crash-recovery-history" style="font-size:13px;color:var(--text-secondary);max-height:280px;overflow-y:auto"></div>
                 <div class="btn-group" style="margin-top:14px">
                     <button class="btn btn-sm" onclick="loadCrashRecoveryHistory()">Refresh</button>
-                    <button class="btn btn-sm" onclick="testCrashRecovery()">Test crash event</button>
+                    <button class="btn btn-sm" onclick="testCrashRecovery()">Run a test check</button>
                     <button class="btn btn-sm btn-danger" onclick="clearCrashRecoveryHistory()">Clear history</button>
-                    <button class="btn btn-sm btn-danger" onclick="clearCrashRecoveryBlacklist()">Clear blacklist</button>
+                    <button class="btn btn-sm btn-danger" onclick="clearCrashRecoveryBlacklist()">Clear remembered clocks</button>
                 </div>
             </div>
 
@@ -991,6 +991,12 @@
                     <span>Live, refreshing every second</span>
                     <button class="btn btn-sm" style="margin-left:auto;display:none" onclick="toggleOcLive()"><span id="oc-live-toggle-label">Pause</span></button>
                 </div>
+            </div>
+
+            <!-- Shown while a game session is open: the four test buttons below are off then. -->
+            <div class="warn-box" id="at2-gpu-note" style="display:none">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                <div>Close the game first. A test can't run while a game is using the graphics card.</div>
             </div>
 
             <div class="bento-grid two">
@@ -1024,8 +1030,8 @@
                     <div class="btn-group" style="margin-top:18px">
                         <button class="btn btn-sm btn-primary" onclick="applyOcSliders()">Apply</button>
                         <button class="btn btn-sm" onclick="verifyAppliedOc()">Verify</button>
-                        <button class="btn btn-sm" onclick="runStabilityTest(60)">60 s Stability</button>
-                        <button class="btn btn-sm" onclick="runBenchmarkComparison()">Benchmark</button>
+                        <button class="btn btn-sm" id="at2-gpu-test-stability" onclick="runStabilityTest(60)">60 s Stability</button>
+                        <button class="btn btn-sm" id="at2-gpu-test-benchmark" onclick="runBenchmarkComparison()">Benchmark</button>
                         <button class="btn btn-sm" onclick="saveCurrentOcProfile()">Save Profile</button>
                         <button class="btn btn-sm btn-danger" onclick="resetOc()">Reset</button>
                     </div>
@@ -1037,8 +1043,8 @@
                         <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg></div>
                         <div class="card-title">Auto Overclock</div>
                         <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.6">
-                            <b style="color:var(--accent)">Quick Tune</b>: binary search, fastest path to stable max (~3–5 min).<br>
-                            <b style="color:var(--text-bright)">Benchmark Tune</b>: tests each offset, scores FPS + 1 % lows + stability, picks best actual performance (~5–7 min).
+                            <b style="color:var(--accent)">Quick Tune</b>: binary search, fastest path to stable max (about 5 to 8 minutes).<br>
+                            <b style="color:var(--text-bright)">Benchmark Tune</b>: tests each step, scores FPS + 1 % lows + stability, picks best actual performance (about 30 to 90 minutes).
                         </p>
                         <div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;font-size:12.5px;color:var(--text-secondary)">
                             <label>Core jump
@@ -1537,7 +1543,7 @@
                 <div class="page-header-row">
                     <div>
                         <div class="section-title">Game Profiles</div>
-                        <div class="section-subtitle">Auto-detect any game from the 280-entry database, apply hard performance tweaks, revert everything when the game exits.</div>
+                        <div class="section-subtitle">Auto-detect any game Vispora recognises or you added, apply hard performance tweaks, revert everything when the game exits.</div>
                     </div>
                 </div>
             </div>
@@ -1585,71 +1591,70 @@
             </details>
 
             <div class="section-divider">Adaptive Tuning</div>
-            <div class="card" id="adaptive-card">
-                <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
-                <div class="card-title">Per-Game Auto-Tuning</div>
-                <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:680px">
-                    During real gameplay, Vispora nudges your GPU OC offsets up while watching the live stability score (clock variance, temp, util consistency). When stable, it bumps. When the score drops or a crash happens, it steps down and remembers: that offset is permanently blacklisted for that game. Each game gets its own learned profile that improves over time.
-                </p>
-                <div class="toggle-row">
+            <!-- Adaptive Tuning: everything in this card is drawn from GET /api/adaptive/state
+                 (ids and classes start with at2-; the code is the ADAPTIVE TUNING section of app.js). -->
+            <div class="card" id="at2-card">
+                <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg></div>
+                <div class="card-title">Adaptive Tuning</div>
+                <p class="at2-lead" id="at2-lead">Adaptive Tuning runs your games on your saved overclock and eases it off, just for that game, if the graphics driver keeps having problems there. It never raises anything above what you saved.</p>
+                <p class="at2-levels" id="at2-levels">Each repeat problem takes that game one step down: full, 75%, 50%, then no overclock. You can undo any step.</p>
+
+                <div class="at2-note" id="at2-note" style="display:none">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                    <div class="at2-note-text" id="at2-note-text"></div>
+                    <button class="btn btn-sm" onclick="at2DismissNote()">Got it</button>
+                </div>
+
+                <div class="toggle-row at2-main-row">
                     <div class="toggle-info">
                         <div class="toggle-name">Adaptive Tuning</div>
-                        <div class="toggle-desc">Master switch (opt-in). Per-game toggles below let you control which titles AT touches.</div>
+                        <div class="toggle-desc" id="at2-status" aria-live="polite">Loading…</div>
                     </div>
-                    <div class="toggle-switch" id="toggle-adaptive-global" onclick="toggleAdaptiveGlobal(this)"></div>
+                    <button type="button" class="toggle-switch at2-pending" id="at2-toggle-enabled" role="switch" aria-checked="false" aria-disabled="true" aria-label="Adaptive Tuning" aria-describedby="at2-status" onclick="at2ToggleEnabled(this)"></button>
                 </div>
-                <div id="adaptive-live" style="margin-top:14px;padding:12px 14px;border-radius:var(--radius-sm);background:var(--bg-overlay);font-size:13px;display:none">
-                    <span style="color:var(--text-tertiary);font-size:11px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase">Live</span>
-                    <div id="adaptive-live-content" style="margin-top:6px"></div>
-                </div>
+                <div class="at2-status-extra" id="at2-status-extra"></div>
+                <div class="at2-health" id="at2-health" style="display:none"></div>
 
-                <!-- v3.2 — diagnostic panel: "what is AT actually seeing right now?".
-                     Always visible (collapsed by default).  Helps the user see WHY
-                     AT might be idle and what telemetry sources are alive. -->
-                <details id="adaptive-diagnostics-wrap" style="margin-top:14px" ontoggle="if(this.open) startAdaptiveDiagnosticsPoll(); else stopAdaptiveDiagnosticsPoll()">
-                    <summary style="cursor:pointer;font-size:11.5px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase;padding:6px 0">
-                        Diagnostics: what is AT seeing right now?
-                    </summary>
-                    <div id="adaptive-diagnostics" style="margin-top:10px;font-size:12.5px"></div>
-                </details>
-                <div class="filter-row" style="margin-top:18px;margin-bottom:8px">
-                    <span class="filter-row-label">Manual control</span>
-                    <button class="btn btn-sm" onclick="pauseAtManually()" title="Stop AT from tuning until you resume. Useful before running benchmarks or while you try manual offsets.">Pause AT</button>
-                    <button class="btn btn-sm" onclick="resumeAtManually()" title="Release a manual pause.">Resume AT</button>
+                <div id="at2-body" style="display:none">
+                    <div class="at2-sub">Your games</div>
+                    <div class="at2-main-off-line" id="at2-main-off-line" style="display:none"></div>
+                    <div id="at2-games"></div>
+
+                    <details class="at2-fold" id="at2-history-fold">
+                        <summary>What happened</summary>
+                        <div class="at2-history" id="at2-history"></div>
+                    </details>
+
+                    <details class="at2-fold" id="at2-advanced-fold">
+                        <summary>Advanced</summary>
+                        <div class="toggle-row at2-adv-row">
+                            <div class="toggle-info">
+                                <div class="toggle-name">Tell me when it changes something</div>
+                            </div>
+                            <button type="button" class="toggle-switch" id="at2-toggle-notify" role="switch" aria-checked="false" aria-label="Tell me when it changes something" onclick="at2ToggleNotify(this)"></button>
+                        </div>
+                        <div class="at2-adv-field">
+                            <label class="form-label" for="at2-sensitivity">Ease a game</label>
+                            <select id="at2-sensitivity" onchange="at2SetSensitivity(this.value)">
+                                <option value="balanced">At the second graphics driver error within 10 hours of play (recommended)</option>
+                                <option value="strict">At the first graphics driver error</option>
+                                <option value="watch">Only tell me, change nothing</option>
+                            </select>
+                        </div>
+                        <button class="btn btn-sm btn-danger" onclick="at2ResetAll()">Forget everything it learned</button>
+                    </details>
                 </div>
-                <div class="filter-row" style="margin-top:18px;margin-bottom:8px">
-                    <span class="filter-row-label">Per-game state</span>
-                    <button class="btn btn-sm" onclick="loadAdaptiveGames()">Refresh</button>
-                    <button class="btn btn-sm btn-danger" onclick="resetAdaptiveAll()">Wipe all learned profiles</button>
-                </div>
-                <div id="adaptive-games-list" style="font-size:13px"></div>
-                <details style="margin-top:18px" ontoggle="if (this.open) loadCrossGameBlacklist()">
-                    <summary style="cursor:pointer;font-size:12px;color:var(--text-tertiary);font-weight:600;letter-spacing:0.04em;text-transform:uppercase;padding:6px 0">Cross-game offset blacklist</summary>
-                    <div style="margin-top:8px;font-size:12px;color:var(--text-secondary);line-height:1.55">
-                        Offsets that caused a <b>driver-level</b> crash (TDR, BSOD, WER, thermal trip, stuck clocks).  AT will refuse to step into these in ANY game until you clear them, because driver-level crashes signal the offset is bad regardless of game.
-                    </div>
-                    <div id="adaptive-cross-blacklist" style="margin-top:8px"></div>
-                    <button class="btn btn-sm btn-danger" onclick="clearCrossGameBlacklist()" style="margin-top:8px">Clear cross-game blacklist</button>
-                </details>
-                <div class="filter-row" style="margin-top:18px;margin-bottom:8px">
-                    <span class="filter-row-label">Step history</span>
-                </div>
-                <div id="adaptive-history" style="max-height:240px;overflow-y:auto;font-size:12.5px"></div>
             </div>
 
-            <div class="section-divider">Detected Library</div>
+            <div class="section-divider">Installed Games</div>
             <div class="card" id="library-card">
                 <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg></div>
                 <div class="card-title">Installed Games</div>
-                <p style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.55;max-width:680px">
-                    Scans Steam, Epic, Riot, Battle.net, GOG, Ubisoft, EA and Microsoft Store and lists every game Vispora can recognize.  One click enables Adaptive Tuning for an installed title, with no need to launch it first.  Re-scan after installing a new game.
-                </p>
+                <p class="at2-lead" id="at2-lib-lead">Lists the games installed on this PC. Vispora watches the recognised ones by itself. Add the others so game mode and Adaptive Tuning can see them.</p>
                 <div id="library-summary" style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">Loading…</div>
                 <div class="filter-row" style="margin-bottom:10px">
                     <button class="btn btn-sm btn-primary" onclick="scanLibrary()">Scan now</button>
-                    <button class="btn btn-sm" onclick="enableATForLibrary(true)">Enable AT for all known</button>
-                    <button class="btn btn-sm" onclick="enableATForLibrary(false)">Disable AT for all known</button>
-                    <span id="library-known-toggle-label" style="font-size:12px;color:var(--text-tertiary);margin-left:auto">Show: <a href="#" onclick="setLibraryFilter('known');return false" id="lib-filter-known" style="color:var(--accent);font-weight:600">recognized</a> · <a href="#" onclick="setLibraryFilter('all');return false" id="lib-filter-all" style="color:var(--text-secondary)">all</a></span>
+                    <span id="library-known-toggle-label" style="font-size:12px;color:var(--text-tertiary);margin-left:auto">Show: <a href="#" class="at2-filter active" onclick="setLibraryFilter('all');return false" id="lib-filter-all">all</a> · <a href="#" class="at2-filter" onclick="setLibraryFilter('known');return false" id="lib-filter-known">recognised</a></span>
                 </div>
                 <div id="library-list" style="font-size:13px"></div>
             </div>
@@ -2390,7 +2395,7 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h4"/><path d="M14 12h.01"/><path d="M18 12h.01"/></svg>
                         Game Mode
                     </div>
-                    <div class="card-section-desc">When game mode is on, Vispora watches for any game from the ~280-entry database and applies the gaming profile automatically (priority, every CPU core, OC, network QoS, foreground-priority). Reverts everything when the game exits.</div>
+                    <div class="card-section-desc">When game mode is on, Vispora watches for any game it recognises or you added and applies the gaming profile automatically (priority, every CPU core, OC, network QoS, foreground-priority). Reverts everything when the game exits.</div>
                     <div id="settings-gamemode-rows">
                         <div style="font-size:13px;color:var(--text-secondary);padding:8px 0">Loading…</div>
                     </div>

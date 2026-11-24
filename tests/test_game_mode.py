@@ -9,6 +9,7 @@ the fake kernel32, and a "game" is whatever _scan_game_candidates returns.
 """
 import sandbox as m
 
+import json
 import os
 import re
 import threading
@@ -19,8 +20,11 @@ from core import reg_originals as RO, process_tuning as PT
 GP = m.app("core.game_profiles")
 OPT = m.app("core.optimizer")
 CL = m.app("core.competitive_latency")
-from core import gpu_overclock as GO, adaptive_tuning as AT, perf_monitor as PM   # noqa: E402
+from core import gpu_overclock as GO, adaptive_tuning as AT                        # noqa: E402
 from core import crash_recovery as CR, background_pauser as BPZ                   # noqa: E402
+from core import frame_telemetry as FT, library_scanner as LS, idle_mode as IM    # noqa: E402
+
+XH = m.app("core.crosshair")
 
 PRIO_KEY = r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl"
 PROFILE_KEY = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
@@ -28,11 +32,25 @@ STOCK = {"idle": [0, 0], "park_e": [100, 10], "park_p": [0, 5]}     # like the p
 HIGH, NORMAL = PT.HIGH_PRIORITY_CLASS, PT.NORMAL_PRIORITY_CLASS
 
 # ── everything around the engine that is not under test ───────────────
-TARGET = ["auto"]
 cl_calls: list = []
-oc_calls: list = []
+oc_calls: list = []         # every overclock anybody asks gpu_overclock to apply
+ft_calls: list = []         # frame telemetry started and stopped
+at_starts: list = []        # what Adaptive Tuning is told at a game start: (exe, display name, pid)
+at_exits: list = []         # ...at a game exit: (exe, exit_ts)
+at_ends: list = []          # ...when game mode ends without the game closing: the reason
+AT_START = [{"engaged": False, "reason": "off"}]     # what it answers at a start
+AT_EXIT = [{"handled": False}]                       # ...and at an exit
+order: list = []            # the order of the steps a test asks about
+cr_calls: list = []         # what crash_recovery is told at a game exit
+live_reads: list = []       # the clock read-outs the "captured overclock" used to be worked out from
 refreshes: list = []
 candidates: list = []
+CROSSHAIR = [False]         # is the crosshair switched on
+NOT_HELD = {"core": 0, "mem": 0, "power": 100, "active": False}
+SAVED = {"exists": True, "core_offset_mhz": 450, "mem_offset_mhz": 2225, "power_pct": 100, "apply_on_startup": False}
+APPLIED = [dict(NOT_HELD)]  # what the app holds on the card
+PROFILE = [{"exists": False}]
+REAL_SCAN = GP._scan_game_candidates
 REAL_STREAMERS = GP._find_running_streaming_exes
 REAL_REFRESH = GP._post_game_refresh
 REAL_EXTRAS = GP._apply_session_extras
@@ -41,16 +59,33 @@ GP._post_game_refresh = lambda name=None, pids=None: refreshes.append((name, set
 GP._find_running_streaming_exes = lambda: []
 GP._scan_game_candidates = lambda: [c for c in candidates
                                     if c["pid"] in m.ALIVE and c["pid"] != GP._engine.get("active_pid")]
-GO.read_live_state = lambda: {"ok": False}
-GO.get_stock_baseline = lambda: {}
-GO.load_profile = lambda: {"exists": False}
-GO.apply_oc = lambda **k: oc_calls.append(k) or {"ok": True}
-AT.on_game_start = lambda exe, name: {"engaged": False}
-AT.on_game_exit = lambda *a, **k: None
-AT.get_game_state = lambda exe: {"target": TARGET[0]}
-PM.start = lambda consumer=None: None
-PM.stop = lambda consumer=None: None
-CR.handle_game_exit = lambda **k: {"crashed": False}
+GO.read_live_state = lambda: live_reads.append("live") or {"ok": False}
+GO.get_stock_baseline = lambda: live_reads.append("stock") or {}
+GO.load_profile = lambda: dict(PROFILE[0])
+GO.get_applied_oc = lambda: dict(APPLIED[0])
+GO.apply_oc = lambda *a, **k: oc_calls.append(k) or {"ok": True}
+
+
+def _at_start(exe, display_name=None, pid=None):
+    order.append("adaptive tuning start")
+    at_starts.append((exe, display_name, pid))
+    return dict(AT_START[0])
+
+
+def _at_exit(exe, exit_ts=None):
+    order.append("adaptive tuning exit")
+    at_exits.append((exe, exit_ts))
+    return dict(AT_EXIT[0])
+
+
+AT.on_game_start = _at_start
+AT.on_game_exit = _at_exit
+AT.end_active_session = lambda reason="": (order.append("adaptive tuning release") or at_ends.append(reason)
+                                            or {"ended": False, "reason": "no active session"})
+FT.start_tracking = lambda pid=None, exe_name=None: ft_calls.append(("start", pid, exe_name)) or {"ok": True}
+FT.stop_tracking = lambda: ft_calls.append(("stop",)) or {"ok": True}
+XH.is_enabled = lambda: CROSSHAIR[0]
+CR.handle_game_exit = lambda **k: order.append("crash recovery") or cr_calls.append(k) or {"crashed": False}
 CL.status = lambda: {"enabled": False}
 CL.apply = lambda: cl_calls.append("apply") or {"ok": True}
 CL.reset = lambda: cl_calls.append("reset") or {"ok": True}
@@ -80,7 +115,7 @@ def qos_ok(command):
     return None
 
 
-def fresh(target="auto", plan=m.BALANCED):
+def fresh(plan=m.BALANCED):
     GP.stop_monitoring()
     time.sleep(0.12)                                # let a running loop notice and leave
     m.fresh(plan=plan)
@@ -89,10 +124,14 @@ def fresh(target="auto", plan=m.BALANCED):
     m.rset(PROFILE_KEY, "SystemResponsiveness", 20)
     m.rset(PROFILE_KEY, "NetworkThrottlingIndex", 10)
     del candidates[:], cl_calls[:], oc_calls[:], refreshes[:]
-    TARGET[0] = target
+    del ft_calls[:], at_starts[:], at_exits[:], at_ends[:], cr_calls[:], live_reads[:], order[:]
+    AT_START[0], AT_EXIT[0] = {"engaged": False, "reason": "off"}, {"handled": False}
+    CROSSHAIR[0] = False
+    APPLIED[0], PROFILE[0] = dict(NOT_HELD), {"exists": False}
     GP._engine.update(gaming_mode=False, active_game=None, active_exe=None, active_pid=None, changes=[],
                       proc_prior=None, game_procs={}, checks=[], exit_ticks=0, streamer_prior={},
-                      eco_on=False, eco_seen={}, eco_procs={}, eco_failed=0)
+                      eco_on=False, eco_seen={}, eco_procs={}, eco_failed=0, frames_pid=None, held_off={})
+    GP._names_cache.clear()
     m.CPU_LAYOUT.update(logical=24, p=8, e=16, hybrid=True)
     GP._target_restore = {}
     GP._find_running_streaming_exes = lambda: []
@@ -438,34 +477,42 @@ def test_monitor_restarted_during_a_session_start_does_not_start_a_second_one():
 # ═════════════════════════════════════════════════════════════════════
 # Per-game targets
 # ═════════════════════════════════════════════════════════════════════
+MAX_FPS_GAME, LOW_LATENCY_GAME = "spider-man2.exe", "cod.exe"       # from game mode's own table
+
+
 def test_max_fps_tweaks_land_on_the_plan_the_game_runs_on():
-    fresh(target="max_fps")
-    assert launch()
+    fresh()
+    PROFILE[0] = dict(SAVED)                        # an overclock is saved; it is not on the card
+    assert launch(exe=MAX_FPS_GAME)
     clone = m.PLAN["active"]
     assert clone not in (m.BALANCED, m.HIGH_PERF), "switched to the Ultimate Performance copy"
     assert plan_vals(clone)["idle"][0] == 1 and plan_vals(clone)["park_p"][0] == 100
     assert plan_vals(m.BALANCED) == STOCK, "they used to go to the plan it had just left"
-    assert oc_calls and oc_calls[0]["power_pct"] == 100
+    assert oc_calls == [], "the saved overclock at 100% power used to be put on the card from here"
     assert quit_game()
     assert m.PLAN["active"] == m.BALANCED, "back on the user's plan"
     assert plan_vals(clone) == STOCK, "the performance plan is left as it was found, not with idle off for good"
     assert plan_vals(m.BALANCED) == STOCK and RO.summary()["power"] == 0
+    assert oc_calls == [], "and again at exit, where it stayed on for a user who does not apply it at startup"
 
 
 def test_low_latency_target_engages_competitive_latency_for_the_session():
-    fresh(target="low_latency")
-    assert launch()
+    fresh()
+    assert launch(exe=LOW_LATENCY_GAME)
     assert cl_calls == ["apply"] and plan_vals(m.BALANCED)["idle"][0] == 1
     assert quit_game()
     assert cl_calls == ["apply", "reset"] and plan_vals(m.BALANCED) == STOCK
+    assert oc_calls == []
 
 
 def test_per_game_posture_survives_an_app_restart():
-    fresh(target="max_fps")
-    assert launch()
+    fresh()
+    PROFILE[0] = dict(SAVED)
+    assert launch(exe=MAX_FPS_GAME)
     assert os.path.exists(GP._TARGET_RESTORE_FILE), "on disk before anything changes"
     saved = GP._load_target_restore()
     assert saved["target"] == "max_fps" and saved["power_guid"] == m.BALANCED
+    assert "oc" not in saved, "nothing about the overclock is on record: it is not game mode's to put back"
     GP._engine["monitor_gen"] += 1                  # the app dies: no clean-up runs
     GP._engine["monitoring"] = False
     time.sleep(0.15)
@@ -477,7 +524,61 @@ def test_per_game_posture_survives_an_app_restart():
     GP.check_and_restore_on_boot()                  # next start
     assert m.PLAN["active"] == m.BALANCED, "the plan the game left is returned to"
     assert not os.path.exists(GP._TARGET_RESTORE_FILE)
-    assert oc_calls == [], "the card is at its own defaults after a restart: no overclock is re-applied"
+    assert oc_calls == [], "no overclock is applied from here"
+
+
+def test_the_target_is_game_modes_own_table_and_the_tuner_is_not_asked():
+    assert GP.AUTO_TARGET == {
+        "spider-man.exe": "max_fps", "milesmorales.exe": "max_fps", "spider-man2.exe": "max_fps",
+        "marvel-spiderman.exe": "max_fps", "spiderman2.exe": "max_fps",
+        "modernwarfare.exe": "low_latency", "blackopscoldwar.exe": "low_latency", "vanguard.exe": "low_latency",
+        "cod22-cod.exe": "low_latency", "cod23-cod.exe": "low_latency", "cod.exe": "low_latency",
+    }, "the table as the old tuner had it"
+    assert GP._target_for(" COD.exe ") == "low_latency" and GP._target_for("Spider-Man2.exe") == "max_fps"
+    assert GP._target_for("game.exe") == "auto" and GP._target_for(None) == "auto"
+    fresh()                                         # a game with no entry in the table: no posture
+    assert launch()
+    assert m.PLAN["active"] == m.BALANCED and cl_calls == [] and not os.path.exists(GP._TARGET_RESTORE_FILE)
+    assert quit_game()
+    assert not hasattr(AT, "get_game_state"), "a target set in the old tuner ended with it: there is no state to ask"
+    assert oc_calls == []
+
+
+def test_a_posture_left_on_disk_by_3_7_0_is_undone_without_writing_the_clocks():
+    """3.7.0's max_fps target also held the saved overclock ("oc" in its
+    record) and wrote the profile back when the game closed.  The record of a
+    session cut short by the update is still undone: the power plan goes back,
+    the clocks are not written."""
+    fresh()
+    PROFILE[0] = dict(SAVED)
+    old = {"target": "max_fps", "exe": "spider-man2.exe", "power_guid": m.BALANCED,
+           "oc": {"core": 450, "mem": 2225, "power": 100}}
+    m.PLAN["active"] = m.HIGH_PERF                  # where that session left the PC
+    GP.atomic_write_json(GP._TARGET_RESTORE_FILE, old)
+    GP.check_and_restore_on_boot()                  # the first start after the update
+    assert m.PLAN["active"] == m.BALANCED and not os.path.exists(GP._TARGET_RESTORE_FILE)
+    assert oc_calls == []
+    GP._target_restore = dict(old)                  # the same record in memory: 3.7.0 wrote the profile here
+    m.PLAN["active"] = m.HIGH_PERF
+    GP.restore_target()
+    assert m.PLAN["active"] == m.BALANCED and GP._target_restore == {} and oc_calls == []
+    GP.atomic_write_json(GP._TARGET_RESTORE_FILE,   # Competitive Latency it switched on for a Call of Duty session
+                         {"target": "low_latency", "exe": "cod.exe", "we_enabled_latency": True})
+    GP.check_and_restore_on_boot()
+    assert cl_calls == ["reset"] and not os.path.exists(GP._TARGET_RESTORE_FILE)
+    GP.atomic_write_json(GP._TARGET_RESTORE_FILE, {"target": "balanced", "exe": "game.exe"})   # a user-set target
+    GP.check_and_restore_on_boot()
+    assert not os.path.exists(GP._TARGET_RESTORE_FILE) and cl_calls == ["reset"] and oc_calls == []
+
+
+def test_game_mode_has_no_call_that_writes_the_clocks():
+    """In a game the clocks are Adaptive Tuning's alone: nothing in game mode
+    writes them or the saved profile, and it does not read the tuner's state."""
+    with open(GP.__file__, "r", encoding="utf-8") as f:
+        src = f.read()
+    calls = re.findall(r"\b(apply_oc|write_offsets|reset_oc|emergency_reset_oc|save_profile|delete_profile)\s*\(", src)
+    assert calls == [], calls
+    assert "get_game_state" not in src
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -785,7 +886,8 @@ def test_a_program_opened_mid_game_is_moved_too():
     assert launch()
     m.proc(720, exe="notepad.exe")
     assert m.wait(lambda: thr(720) == ECO)
-    assert check("eco")["text"].endswith("(1 program, 1 process)")
+    # (the status line follows a moment later, after the record is on disk)
+    assert m.wait(lambda: check("eco")["text"].endswith("(1 program, 1 process)")), check("eco")
     assert quit_game() and thr(720) == UNSET
 
 
@@ -1414,3 +1516,848 @@ def test_real_process_queries_against_windows():
         assert st["ok"] and st["system"] and st["affinity"]
     finally:
         PT._k32 = saved
+
+
+# ═════════════════════════════════════════════════════════════════════
+# What a game is called
+# ═════════════════════════════════════════════════════════════════════
+# custom_exes.json and library_cache.json as they are on the owner's PC (the
+# scan was saved by 3.7.0, so it still carries the old mode_hint).
+OWNER_CUSTOM = [{"exe": "robloxstudiobeta.exe", "name": "rbxStudio"}, {"exe": "cod.exe", "name": "Call of Duty"},
+                {"exe": "megabonk.exe", "name": "Megabonk"}, {"exe": "capcut.exe", "name": "capcut"}]
+OWNER_LIBRARY = [
+    {"title": "Call of Duty- Modern Warfare 3", "exe": "cod23-cod.exe", "launcher": "Xbox", "known": True,
+     "mode_hint": None},
+    {"title": "Rocket League®", "exe": "launcher.exe", "launcher": "Epic", "known": True, "mode_hint": None},
+    {"title": "Terraria", "exe": "terraria.exe", "launcher": "Steam", "known": True, "mode_hint": None},
+    {"title": "Call of Duty- Black Ops 6", "exe": "cod24-cod.exe", "launcher": "Xbox", "known": False,
+     "mode_hint": None},
+    {"title": "Marvel's Spider-Man 2", "exe": "spider-man2.exe", "launcher": "Steam", "known": False,
+     "mode_hint": "visual"},
+    {"title": "Marvel’s Spider-Man Remastered", "exe": "spider-man.exe", "launcher": "Steam", "known": False,
+     "mode_hint": "visual"},
+]
+CUSTOM_FILE = os.path.join(GP.PROFILES_DIR, "custom_exes.json")
+
+
+def owner_files(custom=OWNER_CUSTOM, library=OWNER_LIBRARY):
+    fresh()
+    if custom is not None:
+        assert GP.atomic_write_json(CUSTOM_FILE, custom)
+    if library is not None:
+        assert LS.atomic_write_json(LS.CACHE_FILE, {"games": library, "scanned_at": time.time(),
+                                                    "total": len(library), "known": 3})
+
+
+def windows(*rows):
+    """PowerShell listing the processes that have a window, the way the real
+    scan asks for them: (pid, process name, MB)."""
+    def hook(command):
+        if "MainWindowHandle" not in command:
+            return None
+        return m.R(json.dumps([{"Id": pid, "ProcessName": name, "WS": ws} for pid, name, ws in rows
+                               if pid in m.ALIVE]))
+    return hook
+
+
+def test_display_names_on_the_owners_pc():
+    owner_files()
+    want = {
+        "cod.exe": "Call of Duty",                              # the name the owner typed when adding it
+        "robloxstudiobeta.exe": "rbxStudio", "capcut.exe": "capcut", "megabonk.exe": "Megabonk",
+        "cod23-cod.exe": "Call of Duty: Modern Warfare 3",      # the installed-games scan ("- " read as ": ")
+        "cod24-cod.exe": "Call of Duty: Black Ops 6",
+        "terraria.exe": "Terraria",
+        "launcher.exe": "Rocket League",                        # the scan's exe for it; no trademark sign
+        "spider-man.exe": "Marvel’s Spider-Man Remastered", "spider-man2.exe": "Marvel's Spider-Man 2",
+        "modernwarfare.exe": "Call of Duty",                    # the built-in names
+        "rainbowsix.exe": "Rainbow Six Siege", "rainbowsix_be.exe": "Rainbow Six Siege",
+        "javaw.exe": "Minecraft", "r5apex.exe": "Apex Legends", "r5apex_dx12.exe": "Apex Legends",
+        "marvel-win64-shipping.exe": "Marvel Rivals", "cs2.exe": "Counter-Strike 2",
+        "start_protected_game.exe": "Elden Ring", "vrchat.exe": "VRChat",
+        "fortniteclient-win64-shipping.exe": "Fortnite", "fortniteclient-win64-shipping_eac_eos.exe": "Fortnite",
+        "xerces_spike_dx11.exe": "Xerces Spike Dx11",           # nothing knows it: the exe, made readable
+        "gamesir connect.exe": "Gamesir Connect",
+    }
+    assert {exe: GP.display_name_for(exe) for exe in want} == want
+    # in whatever case the exe comes, with or without its ending
+    assert GP.display_name_for("Cod23-Cod.exe") == "Call of Duty: Modern Warfare 3"
+    assert GP.display_name_for("Marvel-Win64-Shipping.exe") == "Marvel Rivals"
+    assert GP.display_name_for(" COD ") == "Call of Duty" and GP.display_name_for("JAVAW.EXE") == "Minecraft"
+    # the fallback is the name game mode has always shown
+    assert GP.display_name_for("EpicGamesUpdater.exe") == "Epic Games Updater"
+    assert GP.display_name_for("game.exe") == "Game" and GP.display_name_for("other.exe") == "Other"
+    assert GP.display_name_for("Something-Win64-Shipping.exe") == "Something"
+    assert GP.display_name_for("something-win64-shipping.exe") == "Something", "lower case too"
+    for odd in (None, "", "   ", 7, object()):
+        assert isinstance(GP.display_name_for(odd), str), "never raises"
+    assert GP.display_name_for(None) == "" and GP.display_name_for("") == ""
+
+
+def test_display_names_with_nothing_on_disk():
+    fresh()
+    assert not os.path.exists(CUSTOM_FILE) and not os.path.exists(LS.CACHE_FILE)
+    assert GP.display_name_for("cod.exe") == "Call of Duty" and GP.display_name_for("cod23-cod.exe") == "Call of Duty"
+    assert GP.display_name_for("cod24-cod.exe") == "Call of Duty" and GP.display_name_for("terraria.exe") == "Terraria"
+
+
+def test_a_game_added_without_a_name_does_not_hide_a_better_one():
+    """add_custom_game saves a game added without a name under the name made
+    up from its exe; that one is not the user's choice."""
+    owner_files(custom=[{"exe": "cod24-cod.exe", "name": "Cod24-Cod"}, {"exe": "javaw.exe", "name": "Javaw"},
+                        {"exe": "cs2.exe", "name": "CS2 (my settings)"}, {"exe": "nameless.exe"},
+                        {"exe": "blank.exe", "name": "  \x00 "}, "not an entry", {"name": "no exe"}])
+    assert GP._nice_name("cod24-cod.exe") == "Cod24-Cod" and GP._nice_name("javaw.exe") == "Javaw"
+    assert GP.display_name_for("cod24-cod.exe") == "Call of Duty: Black Ops 6", "the scan's title"
+    assert GP.display_name_for("javaw.exe") == "Minecraft", "the built-in name"
+    assert GP.display_name_for("cs2.exe") == "CS2 (my settings)", "a name the user typed wins over everything"
+    assert GP.display_name_for("nameless.exe") == "Nameless" and GP.display_name_for("blank.exe") == "Blank"
+
+
+def test_a_game_added_from_the_installed_games_list_is_named_as_cleanly():
+    """That list adds an unrecognised game under the title the scan found,
+    so the name arrives exactly as the folder or the launcher spells it."""
+    owner_files(library=None, custom=[{"exe": "cod24-cod.exe", "name": "Call of Duty- Black Ops 6"},
+                                      {"exe": "rocketleague.exe", "name": "Rocket League\u00ae"},
+                                      {"exe": "cod.exe", "name": "Call of Duty"}, {"exe": "x.exe", "name": "A - B"}])
+    assert GP.display_name_for("cod24-cod.exe") == "Call of Duty: Black Ops 6"
+    assert GP.display_name_for("rocketleague.exe") == "Rocket League"
+    assert GP.display_name_for("cod.exe") == "Call of Duty" and GP.display_name_for("x.exe") == "A - B"
+
+
+def test_scanned_titles_are_cleaned_before_they_are_shown():
+    owner_files(custom=None, library=[
+        {"title": "Rocket League�", "exe": "rocketleague.exe"},
+        {"title": "  Half-Life 2- Episode One™\x00\x07 ", "exe": "hl2.exe"},
+        {"title": "Tom Clancy's Rainbow Six® Siege - Deluxe", "exe": "r6.exe"},
+        {"title": "Zero​Width Space\tTab\nLine", "exe": "zw.exe"},
+        {"title": "�\x00", "exe": "cs2.exe"},
+        {"title": 42, "exe": "dota2.exe"}, {"title": "No exe", "exe": ""}, {"title": "No exe either"}, "not a game",
+        {"title": "x" * 300, "exe": "long.exe"},
+    ])
+    assert GP.display_name_for("rocketleague.exe") == "Rocket League"
+    assert GP.display_name_for("hl2.exe") == "Half-Life 2: Episode One"
+    assert GP.display_name_for("r6.exe") == "Tom Clancy's Rainbow Six Siege - Deluxe", "a real dash stays a dash"
+    assert GP.display_name_for("zw.exe") == "ZeroWidth Space Tab Line"
+    assert GP.display_name_for("cs2.exe") == "Counter-Strike 2", "nothing readable left: the next source"
+    assert GP.display_name_for("dota2.exe") == "Dota 2"
+    assert len(GP.display_name_for("long.exe")) == 80
+
+
+def test_an_exe_two_installed_titles_share_names_neither():
+    owner_files(custom=None, library=[
+        {"title": "Rocket League", "exe": "launcher.exe"}, {"title": "Fall Guys", "exe": "Launcher.exe"},
+        {"title": "Cyberpunk 2077", "exe": "cyberpunk2077.exe", "launcher": "GOG"},
+        {"title": "Cyberpunk 2077", "exe": "cyberpunk2077.exe", "launcher": "Steam"}])
+    assert GP.display_name_for("launcher.exe") == "Launcher"
+    assert GP.display_name_for("cyberpunk2077.exe") == "Cyberpunk 2077", "the same game from two launchers"
+
+
+def test_names_follow_the_files_and_a_damaged_file_is_no_problem():
+    owner_files()
+    reads = []
+    real_cached = LS.get_cached
+    LS.get_cached = lambda: reads.append(1) or real_cached()
+    try:
+        for _ in range(40):
+            assert GP.display_name_for("terraria.exe") == "Terraria"
+            assert GP.display_name_for("cod.exe") == "Call of Duty"
+        assert reads == [1], "the scan is read once, not at every question (detection asks every 3 s)"
+        GP.atomic_write_json(CUSTOM_FILE, [{"exe": "cod.exe", "name": "CoD HQ"}])
+        assert GP.display_name_for("cod.exe") == "CoD HQ", "a changed file is read again"
+        assert GP.display_name_for("capcut.exe") == "Capcut", "no longer a custom game"
+        LS.atomic_write_json(LS.CACHE_FILE, {"games": [{"title": "Terraria (modded)", "exe": "terraria.exe"}]})
+        assert GP.display_name_for("terraria.exe") == "Terraria (modded)"
+        with open(CUSTOM_FILE, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        with open(LS.CACHE_FILE, "w", encoding="utf-8") as f:
+            f.write("[1, 2")
+        assert GP.display_name_for("cod.exe") == "Call of Duty" and GP.display_name_for("terraria.exe") == "Terraria"
+        with open(CUSTOM_FILE, "w", encoding="utf-8") as f:
+            f.write('{"exe": "cod.exe"}')               # JSON, but not the list it should be
+        with open(LS.CACHE_FILE, "w", encoding="utf-8") as f:
+            f.write("[1, 2, 3]")
+        assert GP.display_name_for("cod.exe") == "Call of Duty" and GP.display_name_for("cod23-cod.exe") == "Call of Duty"
+    finally:
+        LS.get_cached = real_cached
+
+
+def test_detection_names_games_properly():
+    """The real scan, on what PowerShell lists: the owner's log has 179
+    "Game detected: Cod23-Cod", 83 "Cod", 9 "Javaw" and 3 "Marvel"."""
+    owner_files()
+    rows = [(100, "cod", 900), (104, "cod23-cod", 2400), (108, "javaw", 1500), (112, "EpicGamesUpdater", 19),
+            (116, "GameSir Connect Setup 1.14.2", 18), (120, "start_protected_game", 60), (124, "chrome", 800),
+            (128, "Marvel-Win64-Shipping", 3000), (132, "ExitedGame", 500)]
+    for pid, name, _ in rows[:-1]:
+        m.proc(pid, exe=name + ".exe")
+    m.PS_HOOKS.append(windows(*rows))
+    real_fg = GP._get_foreground_pid
+    GP._get_foreground_pid = lambda: 104
+    try:
+        found = REAL_SCAN()
+    finally:
+        GP._get_foreground_pid = real_fg
+    assert [(c["exe"], c["name"]) for c in found] == [
+        ("cod23-cod.exe", "Call of Duty: Modern Warfare 3"),        # the one in front comes first
+        ("Marvel-Win64-Shipping.exe", "Marvel Rivals"), ("javaw.exe", "Minecraft"), ("cod.exe", "Call of Duty"),
+        ("start_protected_game.exe", "Elden Ring")], "and neither the updater nor the installer is a game"
+    assert found[0]["foreground"] is True and found[0]["pid"] == 104
+
+
+class _Toasts:
+    """Stands in for core.notifier."""
+
+    def __init__(self):
+        self.seen = []
+
+    def notify_game_detected(self, name, exe):
+        self.seen.append(("detected", name, exe))
+
+    def notify_game_exited(self, name):
+        self.seen.append(("closed", name))
+
+    def toast(self, *a, **k):
+        self.seen.append(("toast",) + a)
+        return {"ok": True}
+
+
+def test_the_hero_the_toasts_and_the_report_use_the_display_name():
+    owner_files()
+    m.run_cpu(0, 0, 0)
+    m.proc(4242, exe="cod.exe", cpu=0)
+    m.PS_HOOKS.append(windows((4242, "cod", 900)))
+    toasts = _Toasts()
+    stand_in, real_fg = GP._scan_game_candidates, GP._get_foreground_pid
+    GP._scan_game_candidates, GP._get_foreground_pid, GP._notifier = REAL_SCAN, (lambda: 4242), toasts
+    try:
+        GP.start_monitoring()
+        assert m.wait(lambda: GP._engine["gaming_mode"] and any("CPU idle" in c for c in GP._engine["changes"]))
+        status = GP.get_engine_status()
+        assert status["active_game"] == "Call of Duty" and status["active_exe"] == "cod.exe"
+        assert GP.get_active_game_info()["display"] == "Call of Duty"
+        assert m.wait(lambda: at_starts) and at_starts[0] == ("cod.exe", "Call of Duty", 4242), "Adaptive Tuning too"
+        time.sleep(0.1)                                      # a tick reads the starting point
+        m.run_cpu(600, 0.6, 0.2)
+        m.K.procs[4242]["cpu"] = int(0.25 * 600 * 24 * 1e7)
+        time.sleep(0.1)
+        assert quit_game()
+        assert m.wait(lambda: ("closed", "Call of Duty") in toasts.seen), toasts.seen
+    finally:
+        GP._scan_game_candidates, GP._get_foreground_pid, GP._notifier = stand_in, real_fg, None
+    assert toasts.seen[0] == ("detected", "Call of Duty", "cod.exe")
+    assert GP.get_engine_status()["last_report"]["lines"][0].startswith("Last session: Call of Duty, 10.0 min")
+    assert cl_calls == ["apply", "reset"], "and its posture is still Call of Duty's"
+
+
+def test_the_installed_games_list_carries_the_name_game_mode_shows():
+    owner_files()
+    cached = LS.get_cached()
+    names = {g["exe"]: g["display_name"] for g in cached["games"]}
+    assert names["cod23-cod.exe"] == "Call of Duty: Modern Warfare 3" and names["launcher.exe"] == "Rocket League"
+    assert names["cod24-cod.exe"] == "Call of Duty: Black Ops 6" and names["terraria.exe"] == "Terraria"
+    assert [g["title"] for g in cached["games"]] == [g["title"] for g in OWNER_LIBRARY], "the title stays as found"
+    assert [g["display_name"] for g in LS.scan_all(force=False)["games"]] == [g["display_name"] for g in cached["games"]]
+    with open(LS.CACHE_FILE, encoding="utf-8") as f:
+        assert "display_name" not in f.read(), "the file on disk is not changed"
+    owner_files(custom=None, library=[{"title": "�\x00", "exe": "xerces_spike_dx11.exe"},
+                                      {"title": "Half-Life 2- Episode One™", "exe": "hl2.exe"},
+                                      {"title": 42, "exe": ""}, "not a game"])
+    games = LS.get_cached()["games"]
+    assert [g["display_name"] if isinstance(g, dict) else g for g in games] == [
+        "Xerces Spike Dx11", "Half-Life 2: Episode One", "", "not a game"]
+    with open(LS.CACHE_FILE, "w", encoding="utf-8") as f:
+        f.write("[1, 2, 3]")                        # not the dict a scan saves: handed on as it was
+    assert LS.get_cached() == [1, 2, 3]
+
+
+def test_the_crosshair_names_games_the_way_game_mode_does_and_asks_once_per_exe():
+    """It named them with the old _nice_name ("Cod23-Cod")."""
+    owner_files()
+    XH._names["stamp"] = None
+    asked = []
+    real = GP.display_name_for
+    GP.display_name_for = lambda exe: asked.append(exe) or real(exe)
+    try:
+        settings = XH._load()
+        hint = {g["exe"]: g["name"] for g in XH._games_hint(settings, {"last_games": ["cod23-cod.exe"]})}
+        assert hint["cod23-cod.exe"] == "Call of Duty: Modern Warfare 3" and hint["javaw.exe"] == "Minecraft"
+        assert hint["cod.exe"] == "Call of Duty" and hint["marvel-win64-shipping.exe"] == "Marvel Rivals"
+        first = len(asked)
+        assert first >= len(GP.KNOWN_GAME_EXES) - 20, "every known game is named"
+        assert {g["exe"]: g["name"] for g in XH._games_hint(settings, {"last_games": ["cod23-cod.exe"]})} == hint
+        assert len(asked) == first, "asked once per exe, not at every read"
+        GP.atomic_write_json(CUSTOM_FILE, OWNER_CUSTOM + [{"exe": "javaw.exe", "name": "My Java game"}])
+        again = {g["exe"]: g["name"] for g in XH._games_hint(XH._load(), {"last_games": []})}
+        assert again["javaw.exe"] == "My Java game" and len(asked) > first, "a changed file is read again"
+    finally:
+        GP.display_name_for = real
+        XH._names["stamp"] = None
+
+
+def test_the_foreground_game_is_named_the_same_way():
+    owner_files()
+    real = GP._foreground_exe_via_user32
+    try:
+        GP._foreground_exe_via_user32 = lambda: (104, "cod23-cod.exe")
+        assert GP.get_foreground_game() == {"exe": "cod23-cod.exe", "pid": 104,
+                                            "name": "Call of Duty: Modern Warfare 3"}
+        GP._foreground_exe_via_user32 = lambda: (108, "notepad.exe")
+        assert GP.get_foreground_game() is None
+    finally:
+        GP._foreground_exe_via_user32 = real
+
+
+# ═════════════════════════════════════════════════════════════════════
+# What counts as a game
+# ═════════════════════════════════════════════════════════════════════
+def test_an_installer_or_updater_is_not_a_game_because_of_a_hint_in_its_name():
+    """On the owner's PC the bare "game" hint started game mode sessions for
+    EpicGamesUpdater.exe (twice, 15 s each) and three GameSir installers, and
+    nine more for GameSir Connect itself, a controller tool."""
+    not_games = ["epicgamesupdater.exe", "EpicGamesUpdater.exe", "gamesir connect setup 1.14.2.exe",
+                 "GameSir Connect Setup 1.14.5.exe", "gamesir connect setup 1.14.2(1).exe",
+                 "CrashReportClient-Win64-Shipping.exe", "UnrealEngineLauncher.exe", "MyGame_Installer.exe",
+                 "GameUpdate.exe", "gamehelper.exe", "unins000_game.exe", "vulkan_redist.exe",
+                 "SomeGame-CrashHandler64.exe", "game_dxsetup.exe",
+                 "gamesir connect.exe", "GameSir Connect.exe", "GameSir Nexus.exe"]
+    assert [e for e in not_games if GP._game_match(e) != "hint"] == [], "each of them only matches a hint"
+    assert [e for e in not_games if GP._is_game(e)] == []
+    for word in GP._NOT_A_GAME:
+        assert any(word in e.lower() for e in not_games), word
+    assert set(GP._NOT_A_GAME) == {"setup", "install", "updater", "update", "launcher", "helper", "crashhandler",
+                                   "crashreport", "unins", "redist", "dxsetup", "gamesir"}
+    still_games = ["xerces_spike_dx11.exe", "Something-Win64-Shipping.exe", "start_protected_game.exe",
+                   "mygame.exe", "boardgame arena.exe"]
+    assert [e for e in still_games if not GP._is_game(e)] == [], "a hint alone still makes a game"
+    known = ["launcher.exe", "minecraftlauncher.exe", "arma3launcher.exe", "starcitizenlauncher.exe",
+             "genshinimpactlauncher.exe", "cod.exe"]
+    assert [e for e in known if GP._game_match(e) != "known" or not GP._is_game(e)] == [], \
+        "the known list is never second-guessed"
+    GP.KNOWN_GAME_EXES.add("my game launcher setup.exe")        # what adding a custom game does
+    try:
+        assert GP._is_game("My Game Launcher Setup.exe") is True, "nor is a game the user added"
+    finally:
+        GP.KNOWN_GAME_EXES.discard("my game launcher setup.exe")
+    assert GP._is_game("My Game Launcher Setup.exe") is False
+    for exe in ("chrome.exe", "obs64.exe", "epicgameslauncher.exe", "notepad.exe", "gamebarpresencewriter.exe"):
+        assert GP._is_game(exe) is False and GP._game_match(exe) == "", exe
+    assert GP._is_game("cs2") is True and GP._is_game("") is False and GP._is_game(None) is False
+
+
+def test_an_updater_named_like_a_game_stays_off_the_efficiency_cores_as_before():
+    """Only detection changed: the sweep that moves background programs to
+    the efficiency cores leaves alone what it left alone before."""
+    fresh()
+    m.proc(700, exe="EpicGamesUpdater.exe")
+    m.proc(701, exe="notepad.exe")
+    assert launch()
+    assert thr(700) == UNSET and thr(701) == ECO
+    stop()
+
+
+def test_the_installed_games_scan_no_longer_carries_a_tuner_mode():
+    fresh()
+    assert LS._enrich({"title": "Counter-Strike 2", "exe": "cs2.exe"}) == \
+        {"title": "Counter-Strike 2", "exe": "cs2.exe", "known": True}
+    assert LS._enrich({"title": "Unknown", "exe": "nope.exe"}) == {"title": "Unknown", "exe": "nope.exe",
+                                                                  "known": False}
+    owner_files()                                   # a scan 3.7.0 saved, mode_hint and all
+    cached = LS.get_cached()
+    assert [g["exe"] for g in cached["games"]] == [g["exe"] for g in OWNER_LIBRARY]
+    assert not any("mode_hint" in g for g in cached["games"])
+    assert not any("mode_hint" in g for g in LS.scan_all(force=False)["games"]), "(answered from the saved scan)"
+    assert not any("mode_hint" in g for g in LS.get_known_only())
+    with open(LS.__file__, "r", encoding="utf-8") as f:
+        src = f.read()
+    assert "adaptive_tuning" not in src and "AUTO_CLASSIFY" not in src, "the scanner does not import the tuner"
+
+
+# ═════════════════════════════════════════════════════════════════════
+# The overclock on record for the session
+# ═════════════════════════════════════════════════════════════════════
+def test_the_overclock_the_app_holds_is_recorded_at_game_start():
+    """It came out as 0 / 0 on all 399 game starts in the owner's log: the
+    clocks were subtracted under keys the stock record does not have."""
+    fresh()
+    APPLIED[0] = {"core": 450, "mem": 2225, "power": 100, "active": True}
+    order = []
+    real_release, real_read = IM.manual_release, GO.get_applied_oc
+    IM.manual_release = lambda: order.append("idle un-park") or {"ok": True}
+    GO.get_applied_oc = lambda: order.append("read") or dict(APPLIED[0])
+    try:
+        assert launch()
+        assert order[:2] == ["idle un-park", "read"], "read after a parked overclock is back"
+        assert (GP._engine["active_oc_core"], GP._engine["active_oc_mem"]) == (450, 2225)
+        info = GP.get_active_game_info()
+        assert (info["oc_core"], info["oc_mem"]) == (450, 2225)
+        from core.utils import get_log_buffer
+        assert any("Captured active OC at game-start: core+450 / mem+2225" in e["msg"] for e in get_log_buffer())
+        assert live_reads == [], "not worked out from clock read-outs any more"
+        assert quit_game()
+    finally:
+        IM.manual_release, GO.get_applied_oc = real_release, real_read
+    assert m.wait(lambda: cr_calls), "the exit is handed on"
+    assert (cr_calls[-1]["active_core"], cr_calls[-1]["active_mem"]) == (450, 2225)
+    assert cr_calls[-1]["exe"] == "game.exe" and oc_calls == []
+    assert (GP._engine["active_oc_core"], GP._engine["active_oc_mem"]) == (0, 0), "cleared with the session"
+
+
+def test_a_saved_overclock_the_app_is_not_holding_is_not_recorded():
+    fresh()
+    PROFILE[0] = dict(SAVED)                        # saved, not applied (or parked, or another tool's)
+    assert launch()
+    assert (GP._engine["active_oc_core"], GP._engine["active_oc_mem"]) == (0, 0)
+    assert quit_game()
+    assert m.wait(lambda: cr_calls) and (cr_calls[-1]["active_core"], cr_calls[-1]["active_mem"]) == (0, 0)
+
+
+def test_a_card_that_cannot_be_asked_does_not_stop_the_session():
+    fresh()
+    real_read = GO.get_applied_oc
+
+    def broken():
+        raise OSError("no driver")
+
+    GO.get_applied_oc = broken
+    try:
+        assert launch()
+        assert (GP._engine["active_oc_core"], GP._engine["active_oc_mem"]) == (0, 0)
+        assert check("proc:priority")["ok"], "the session started all the same"
+        assert quit_game()
+        GO.get_applied_oc = lambda: None            # nothing to say
+        assert launch(pid=4343)
+        assert (GP._engine["active_oc_core"], GP._engine["active_oc_mem"]) == (0, 0)
+        assert quit_game(4343)
+    finally:
+        GO.get_applied_oc = real_read
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Frame telemetry for the crosshair
+# ═════════════════════════════════════════════════════════════════════
+# The crosshair's "is the game in exclusive fullscreen" check reads the
+# present mode PresentMon reports; the old tuner was the only thing that
+# ever started it.
+START = ("start", 4242, "game.exe")
+
+
+def test_frame_telemetry_runs_for_the_crosshair_and_stops_with_the_game():
+    fresh()
+    CROSSHAIR[0] = True
+    assert launch()
+    assert m.wait(lambda: ft_calls == [START]), ft_calls
+    assert GP._engine["frames_pid"] == 4242
+    time.sleep(0.3)                                 # a dozen ticks
+    assert ft_calls == [START], "started once, not at every tick"
+    assert quit_game()
+    assert m.wait(lambda: ft_calls == [START, ("stop",)]), ft_calls     # (the last step of the exit)
+    assert GP._engine["frames_pid"] is None
+
+
+def test_no_frame_telemetry_with_the_crosshair_off():
+    fresh()
+    assert launch()
+    time.sleep(0.3)
+    assert quit_game()
+    time.sleep(0.1)
+    assert ft_calls == [], "nothing started, so nothing to stop either"
+
+
+def test_the_crosshair_switched_on_or_off_mid_game_is_followed():
+    fresh()
+    assert launch()
+    time.sleep(0.1)
+    assert ft_calls == []
+    CROSSHAIR[0] = True
+    assert m.wait(lambda: ft_calls == [START]), ft_calls
+    CROSSHAIR[0] = False
+    assert m.wait(lambda: ft_calls == [START, ("stop",)]), ft_calls
+    assert quit_game()
+    time.sleep(0.1)
+    assert ft_calls == [START, ("stop",)], "not stopped a second time"
+
+
+def test_frame_telemetry_follows_a_game_that_restarts_itself():
+    fresh()
+    CROSSHAIR[0] = True
+    assert launch()
+    assert m.wait(lambda: ft_calls == [START])
+    GP.time.delay = 0.1
+    try:
+        m.exit_proc(4242)
+        assert m.wait(lambda: GP._engine["exit_ticks"] >= 2)
+        m.proc(4545, exe="game.exe")
+        assert m.wait(lambda: GP._engine["active_pid"] == 4545)
+    finally:
+        GP.time.delay = 0.02
+    assert m.wait(lambda: ft_calls == [START, ("stop",), ("start", 4545, "game.exe")]), ft_calls
+    assert quit_game(4545)
+    assert m.wait(lambda: ft_calls[3:] == [("stop",)]), ft_calls
+
+
+def test_frame_telemetry_follows_the_tracker_to_a_second_game():
+    fresh()
+    CROSSHAIR[0] = True
+    assert launch()
+    assert m.wait(lambda: ft_calls == [START])
+    m.proc(5151, exe="other.exe")
+    candidates.append({"pid": 5151, "exe": "other.exe", "name": "Other", "ws_mb": 700, "foreground": False,
+                       "score": 900})
+    m.exit_proc(4242)
+    assert m.wait(lambda: ft_calls == [START, ("stop",), ("start", 5151, "other.exe")]), ft_calls
+    assert quit_game(5151)
+    assert m.wait(lambda: ft_calls[3:] == [("stop",)]), ft_calls
+
+
+def test_frame_telemetry_stops_when_normal_mode_is_forced_mid_game():
+    fresh()
+    CROSSHAIR[0] = True
+    assert launch()
+    assert m.wait(lambda: ft_calls == [START])
+    GP.restore_normal_mode("manual")
+    assert ft_calls == [START, ("stop",)] and not GP._engine["gaming_mode"]
+    time.sleep(0.2)
+    assert ft_calls == [START, ("stop",)], "the held-off game does not start it again"
+    stop()
+
+
+def test_frame_telemetry_that_fails_never_gets_in_the_way_of_the_session():
+    fresh()
+    CROSSHAIR[0] = True
+    tries = []
+    real_start, real_stop, real_enabled = FT.start_tracking, FT.stop_tracking, XH.is_enabled
+
+    def broken_start(pid=None, exe_name=None):
+        tries.append(pid)
+        raise RuntimeError("PresentMon would not start")
+
+    def broken_stop():
+        tries.append("stop")
+        raise RuntimeError("nor stop")
+
+    FT.start_tracking, FT.stop_tracking = broken_start, broken_stop
+    try:
+        assert launch()
+        assert m.wait(lambda: tries == [4242])
+        time.sleep(0.3)                             # a dozen ticks
+        assert tries == [4242], "one try for the process, not one every 3 seconds"
+        assert GP._engine["gaming_mode"] and check("proc:priority")["ok"]
+        assert quit_game(), "and the exit goes through"
+        assert reg_now() == (0x26, 20, 10)
+        assert m.wait(lambda: tries == [4242, "stop"]), tries
+
+        def broken_question():
+            raise RuntimeError("settings unreadable")
+
+        XH.is_enabled = broken_question             # the crosshair cannot say: taken as off
+        del tries[:]
+        assert launch(pid=4343)
+        time.sleep(0.2)
+        assert tries == [] and GP._engine["gaming_mode"]
+        assert quit_game(4343)
+    finally:
+        FT.start_tracking, FT.stop_tracking, XH.is_enabled = real_start, real_stop, real_enabled
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Adaptive Tuning's call sites (the engine itself is a stand-in here; it
+# is tested in tests/test_adaptive_tuning.py)
+# ═════════════════════════════════════════════════════════════════════
+def test_adaptive_tuning_is_told_right_after_the_idle_un_park_and_before_the_slow_steps():
+    """It used to be the last step of a game start, after the registry, power
+    and PowerShell network steps: a game it had eased ran its launch and its
+    shader compile on the full overclock."""
+    fresh()
+    real_release, real_reg, real_net = IM.manual_release, GP._apply_registry_tweaks, GP._apply_network_priority
+    IM.manual_release = lambda: order.append("idle un-park") or {"ok": True}
+    GP._apply_registry_tweaks = lambda *a, **k: order.append("registry") or real_reg(*a, **k)
+    GP._apply_network_priority = lambda *a, **k: order.append("network") or real_net(*a, **k)
+
+    def engaged(exe, display_name=None, pid=None):
+        order.append("adaptive tuning start")
+        at_starts.append((exe, display_name, pid))
+        APPLIED[0] = {"core": 338, "mem": 1669, "power": 100, "active": True}      # what its session put on the card
+        return {"engaged": True, "level": 1, "level_name": "75%", "core": 338, "mem": 1669, "applied_ok": True}
+    AT.on_game_start = engaged
+    try:
+        assert launch()
+        assert at_starts == [("game.exe", "Game", 4242)], "the exe, the display name and the pid"
+        steps = [s for s in order if s in ("idle un-park", "adaptive tuning start", "registry", "network")]
+        assert steps[:4] == ["idle un-park", "adaptive tuning start", "registry", "network"], order
+        # the overclock on record for the session is what Adaptive Tuning runs the game at
+        assert (GP._engine["active_oc_core"], GP._engine["active_oc_mem"]) == (338, 1669)
+        assert quit_game()
+    finally:
+        IM.manual_release, GP._apply_registry_tweaks, GP._apply_network_priority = real_release, real_reg, real_net
+        AT.on_game_start = _at_start
+
+
+def test_a_game_start_survives_adaptive_tuning_failing():
+    fresh()
+
+    def broken(*a, **k):
+        raise RuntimeError("state file locked")
+    AT.on_game_start = broken
+    try:
+        assert launch() and check("proc:priority")["ok"]
+        assert quit_game()
+    finally:
+        AT.on_game_start = _at_start
+    fresh()
+    AT.on_game_start = lambda *a, **k: None         # (an answer that is not a dict)
+    try:
+        assert launch()
+        assert quit_game()
+    finally:
+        AT.on_game_start = _at_start
+
+
+def test_the_exit_goes_to_adaptive_tuning_first_and_crash_recovery_only_hears_of_a_game_it_did_not_handle():
+    """crash_recovery used to run first and Adaptive Tuning second.  Both
+    judged the same exit, and crash_recovery could lower the clocks after
+    Adaptive Tuning had handed the card back."""
+    fresh()
+    APPLIED[0] = {"core": 450, "mem": 2225, "power": 100, "active": True}
+    AT_EXIT[0] = {"handled": True, "restored": True}
+    assert launch()
+    before = time.time()
+    assert quit_game()
+    assert m.wait(lambda: at_exits)
+    exe, exit_ts = at_exits[0]
+    assert exe == "game.exe" and before <= exit_ts <= time.time(), "the time game mode saw the game gone"
+    time.sleep(0.2)
+    assert cr_calls == [] and at_ends == [], "handled: crash_recovery is not asked, and an exit is not a release"
+
+    fresh()                                         # not handled (switched off, say): crash_recovery, afterwards
+    APPLIED[0] = {"core": 450, "mem": 2225, "power": 100, "active": True}
+    assert launch()
+    assert quit_game()
+    assert m.wait(lambda: cr_calls)
+    assert [s for s in order if s in ("adaptive tuning exit", "crash recovery")] == ["adaptive tuning exit",
+                                                                                     "crash recovery"]
+    assert cr_calls[0]["exe"] == "game.exe" and cr_calls[0]["exit_ts"] == at_exits[0][1]
+
+    fresh()                                         # Adaptive Tuning failing must not lose the crash check
+    def broken(*a, **k):
+        raise RuntimeError("boom")
+    AT.on_game_exit = broken
+    try:
+        assert launch()
+        assert quit_game()
+        assert m.wait(lambda: cr_calls)
+    finally:
+        AT.on_game_exit = _at_exit
+
+
+def test_ending_game_mode_without_the_game_closing_releases_adaptive_tunings_session():
+    """Game mode only reports an exit for "game exit".  Put back by hand, from
+    the tray or by stopping the monitor, the session was never ended: the card
+    stayed on its values and every later game was refused."""
+    for how, reason in ((lambda: GP.restore_normal_mode("manual"), "manual"),
+                        (lambda: GP.restore_normal_mode("user-tray"), "user-tray"),
+                        (lambda: GP.stop_monitoring(), "monitor stopped")):
+        fresh()
+        assert launch()
+        how()
+        assert m.wait(lambda: not GP._engine["gaming_mode"])
+        assert m.wait(lambda: at_ends == [reason]), (reason, at_ends)
+        time.sleep(0.15)
+        assert at_exits == [] and cr_calls == [], "not judged as a game exit: the game is still running"
+    fresh()                                         # a real exit is not a release
+    assert launch()
+    assert quit_game()
+    assert m.wait(lambda: at_exits) and at_ends == []
+
+
+def test_the_tracker_moving_to_another_game_reports_the_old_ones_exit_and_takes_on_the_new_one():
+    """The tracker only moves once no process of the old game is left, so the
+    old game has closed: that is an exit.  It used to be a release, which
+    judges nothing: a game that closed on a graphics driver error while
+    another game's window was open left no trace at all."""
+    fresh()
+    assert launch()
+    m.proc(5151, exe="other.exe")
+    candidates.append({"pid": 5151, "exe": "other.exe", "name": "Other", "ws_mb": 900, "foreground": False,
+                       "score": 900})
+    gone = time.time()
+    m.exit_proc(4242)
+    assert m.wait(lambda: GP._engine["active_pid"] == 5151)
+    assert m.wait(lambda: len(at_starts) == 2)
+    switched = time.time()
+    assert at_starts[1] == ("other.exe", "Other", 5151)
+    assert at_ends == [], "not a release"
+    assert len(at_exits) == 1 and at_exits[0][0] == "game.exe", at_exits
+    assert gone <= at_exits[0][1] <= switched, "the time the old game was first seen gone"
+    assert [s for s in order if s.startswith("adaptive tuning")] == [
+        "adaptive tuning start", "adaptive tuning exit", "adaptive tuning start"], \
+        "the old game's exit first: the card is handed back before the new session reads it"
+    time.sleep(0.15)
+    assert cr_calls == [], "nothing more than before at a switch: crash_recovery was never asked there"
+    assert quit_game(5151)
+    assert m.wait(lambda: len(at_exits) == 2) and at_exits[1][0] == "other.exe"
+
+
+def test_a_tracker_switch_still_moves_on_when_adaptive_tuning_fails():
+    fresh()
+    assert launch()
+
+    def broken(*a, **k):
+        raise RuntimeError("boom")
+
+    AT.on_game_exit = broken
+    try:
+        m.proc(5151, exe="other.exe")
+        candidates.append({"pid": 5151, "exe": "other.exe", "name": "Other", "ws_mb": 900, "foreground": False,
+                           "score": 900})
+        m.exit_proc(4242)
+        assert m.wait(lambda: GP._engine["active_pid"] == 5151)
+        assert m.wait(lambda: len(at_starts) == 2), "the new game is still taken on"
+    finally:
+        AT.on_game_exit = _at_exit
+    assert quit_game(5151)
+
+
+def test_a_game_relaunched_inside_the_grace_is_reported_as_started_again_then_as_closed():
+    """Game mode waits about 12 s for a game that closes to come back.  When
+    it does, under a new process, game mode stays on as before, but Adaptive
+    Tuning is now told: the new process first (its session is carried on),
+    then the exit at the time the old process was first seen gone, so a
+    graphics driver error just before it is judged as "the game closed"
+    instead of "it kept running"."""
+    fresh()
+    AT_START[0] = {"engaged": True, "adopted": True, "level": 0}
+    assert launch()
+    GP.time.delay = 0.1                             # (slower ticks, so the gap below is a real one)
+    try:
+        gone = time.time()
+        m.exit_proc(4242)
+        assert m.wait(lambda: GP._engine["exit_ticks"] >= 2), "the monitor has seen it gone"
+        back = time.time()
+        m.proc(4545, exe="game.exe")
+        assert m.wait(lambda: GP._engine["active_pid"] == 4545)
+    finally:
+        GP.time.delay = 0.02
+    assert m.wait(lambda: at_exits)
+    assert at_starts == [("game.exe", "Game", 4242), ("game.exe", "Game", 4545)], at_starts
+    assert len(at_exits) == 1 and at_exits[0][0] == "game.exe"
+    assert gone <= at_exits[0][1] <= back, "when the old process was first seen gone, not when it came back"
+    assert [s for s in order if s.startswith("adaptive tuning")] == [
+        "adaptive tuning start", "adaptive tuning start", "adaptive tuning exit"], order
+    assert at_ends == [] and GP._engine["gaming_mode"] and refreshes == [], "game mode itself stays on as before"
+    time.sleep(0.15)
+    assert len(at_exits) == 1 and cr_calls == [], "reported once"
+    assert quit_game(4545)
+    assert m.wait(lambda: len(at_exits) == 2) and at_exits[1][0] == "game.exe"
+
+
+def test_a_relaunch_adaptive_tuning_did_not_take_on_is_not_reported_as_an_exit():
+    """Not taken on (switched off, say): an exit reported now could close a
+    session and hand its card back under a game that is running again."""
+    fresh()
+    assert launch()                                 # AT_START answers "off"
+    GP.time.delay = 0.1
+    try:
+        m.exit_proc(4242)
+        assert m.wait(lambda: GP._engine["exit_ticks"] >= 2)
+        m.proc(4545, exe="game.exe")
+        assert m.wait(lambda: GP._engine["active_pid"] == 4545)
+    finally:
+        GP.time.delay = 0.02
+    assert m.wait(lambda: len(at_starts) == 2) and at_starts[1] == ("game.exe", "Game", 4545)
+    time.sleep(0.15)
+    assert at_exits == [] and at_ends == []
+    assert quit_game(4545)
+
+
+def test_a_new_process_of_the_game_with_no_gap_is_not_an_exit():
+    """A pid that changes between two ticks without the game ever being seen
+    gone (a game that restarts itself at once): followed as before, nothing
+    is reported."""
+    fresh()
+    AT_START[0] = {"engaged": True, "level": 0}
+    assert launch()
+    m.proc(4545, exe="game.exe")                    # the new process is there before the old one goes
+    m.exit_proc(4242)
+    assert m.wait(lambda: GP._engine["active_pid"] == 4545)
+    time.sleep(0.15)
+    assert len(at_starts) == 1 and at_exits == [] and at_ends == [], (at_starts, at_exits, at_ends)
+    assert quit_game(4545)
+
+
+def test_running_game_candidates_lists_the_games_with_a_window_and_says_when_it_could_not_look():
+    owner_files()
+    rows = [(100, "cod", 900), (104, "cod23-cod", 2400), (124, "chrome", 800), (116, "GameSir Connect Setup 1.14.2", 18)]
+    for pid, name, _ in rows:
+        m.proc(pid, exe=name + ".exe")
+    m.PS_HOOKS.append(windows(*rows))
+    real_fg = GP._get_foreground_pid
+    front = [100]
+    GP._get_foreground_pid = lambda: front[0]
+    try:
+        found = GP.running_game_candidates()
+        assert found == [{"exe": "cod.exe", "pid": 100, "name": "Call of Duty"},          # the one in front first
+                         {"exe": "cod23-cod.exe", "pid": 104, "name": "Call of Duty: Modern Warfare 3"}], found
+        # Held off after Force normal mode: game mode leaves it alone, but it is still a game being played.
+        front[0] = 0
+        GP._engine["held_off"] = {100: None}
+        assert [c["exe"] for c in GP.running_game_candidates()] == ["cod23-cod.exe", "cod.exe"]
+        assert GP._engine["held_off"] == {100: None}, "game mode's state is not touched"
+    finally:
+        GP._get_foreground_pid = real_fg
+        GP._engine["held_off"] = {}
+    m.PS_HOOKS.clear()
+    m.PS_HOOKS.append(lambda command: m.R("") if "MainWindowHandle" in command else None)
+    assert GP.running_game_candidates() == [], "nothing with a window"
+    for failed in (m.F("Timed out"), m.R("not json"), m.R('"just a string"')):
+        m.PS_HOOKS.clear()
+        m.PS_HOOKS.append(lambda command, failed=failed: failed if "MainWindowHandle" in command else None)
+        assert GP.running_game_candidates() is None, failed
+        assert GP._scan_game_candidates is not None and REAL_SCAN() == [], "game mode's own scan: nothing, as before"
+    m.PS_HOOKS.clear()
+    m.PS_HOOKS.append(lambda command: m.R(json.dumps({"Id": 100, "ProcessName": "cod", "WS": "x"}))
+                      if "MainWindowHandle" in command else None)
+    assert GP.running_game_candidates() == [{"exe": "cod.exe", "pid": 100, "name": "Call of Duty"}], "one row"
+    m.PS_HOOKS.clear()
+    m.PS_HOOKS.append(lambda command: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert GP.running_game_candidates() is None, "never raises"
+    m.PS_HOOKS.clear()
+
+
+def test_running_game_candidates_takes_no_lock_of_game_modes():
+    """Adaptive Tuning asks it from its own threads, and game mode calls into
+    Adaptive Tuning while it holds its lock."""
+    fresh()
+    m.proc(100, exe="cod.exe")
+    m.PS_HOOKS.append(windows((100, "cod", 900)))
+    answer = []
+    with GP._session_lock:
+        t = threading.Thread(target=lambda: answer.append(GP.running_game_candidates()), daemon=True)
+        t.start()
+        t.join(3)
+    assert answer and [c["exe"] for c in answer[0]] == ["cod.exe"], "answered while game mode held its lock"
+    m.PS_HOOKS.clear()
+
+
+def test_the_monitor_can_say_it_is_on_its_way():
+    fresh()
+    assert GP.monitor_starting() is False
+    GP.set_monitor_starting(True)
+    try:
+        assert GP.monitor_starting() is True and GP.is_monitoring() is False
+        GP.start_monitoring()
+        assert GP.is_monitoring() is True and GP.monitor_starting() is False, "once it runs, it is not on its way"
+        GP.stop_monitoring()
+    finally:
+        GP.set_monitor_starting(False)
+    assert GP.monitor_starting() is False
+
+
+def test_game_mode_no_longer_runs_the_sampler_nobody_reads():
+    """The 5 Hz clock sampler was started for every session for the old
+    tuner; the hardware page starts its own."""
+    with open(os.path.join(m.REPO, "core", "game_profiles.py"), encoding="utf-8") as f:
+        src = f.read()
+    assert "perf_monitor" not in src
+    for gone in ("was_crash=", "exited_at=", "starting_core", "gameplay_state"):
+        assert gone not in src, gone

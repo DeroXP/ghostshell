@@ -107,6 +107,7 @@ def _find_presentmon_path() -> Optional[str]:
 # can't see (Minecraft Java, older Source-engine games, etc).
 
 PM2_SERVICE_NAMES = (
+    "PresentMonSharedService",   # 2.4 (display name "PresentMon Shared Service")
     "Intel PresentMon Service",
     "InspectionMonitor",   # alt name used in some builds
     "PresentMonService",
@@ -176,9 +177,15 @@ def _find_pm2_cli() -> Optional[str]:
                     if after and os.path.isfile(after):
                         # walk up from <root>/Service/PresentMonService.exe
                         root = os.path.dirname(os.path.dirname(after))
-                        cli = _walk_for_pm2_cli(root)
-                        if cli:
-                            return cli
+                        # 2.4 keeps the service in its own folder beside the
+                        # install (Intel\PresentMonSharedService next to
+                        # Intel\PresentMon): look in that sibling first, not
+                        # through everything else under Intel.
+                        sibling = os.path.join(root, "PresentMon")
+                        for base in ((sibling, root) if os.path.isdir(sibling) else (root,)):
+                            cli = _walk_for_pm2_cli(base)
+                            if cli:
+                                return cli
             break
 
     except Exception as e:
@@ -969,7 +976,7 @@ def is_available() -> dict:
             "" if (pm2_svc.get("installed") and pm2_svc.get("running") and pm2_cli) else
             "service not installed: get the MSI from Microsoft's GitHub release"
             if not pm2_svc.get("installed") else
-            "service installed but stopped (AT will start it on engage)"
+            "service installed but stopped (Vispora starts it when it is needed)"
             if pm2_svc.get("installed") and not pm2_svc.get("running") else
             "service running but CLI not found in standard install paths"
         ),

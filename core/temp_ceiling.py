@@ -73,6 +73,7 @@ _state: dict[str, Any] = {
     "tripped_count":      0,        # since this app boot
     "last_trip_at":       None,     # epoch
     "last_trip_temp_c":   None,
+    "last_trip_action":   None,     # what that trip did: "reset" or "notify"
     "in_cooldown_until":  None,     # epoch — won't trip again until then
 }
 _lock = threading.Lock()
@@ -202,18 +203,34 @@ def get_status() -> dict[str, Any]:
         "tripped_count":       st["tripped_count"],
         "last_trip_at":        st["last_trip_at"],
         "last_trip_temp_c":    st["last_trip_temp_c"],
+        # "reset" (the overclock was taken off) or "notify" (only a toast;
+        # the card was left as it was), set together with last_trip_at.
+        "last_trip_action":    st.get("last_trip_action"),
         "cooldown_remaining_s": cooldown,
     }
 
 
 # ─── Watchdog loop ────────────────────────────────────────────────────────
 def _do_trip(temp_c: int, settings: dict) -> None:
-    """Execute the configured action when the ceiling is crossed."""
+    """Execute the configured action when the ceiling is crossed.
+
+    The trip is on record (last_trip_at, last_trip_action, the cooldown)
+    BEFORE the overclock is reset: whoever looks while the reset is still
+    under way (an Adaptive Tuning poll, a game that closes) already sees the
+    trip, not just a write it cannot place.  The cooldown is counted again from
+    the end of the reset."""
     ceiling = int(settings["ceiling_c"])
     action  = settings["action"]
+    cooldown_s = int(settings.get("cooldown_seconds", 60))
     log.warning(
         f"⚠ TEMP CEILING TRIPPED: GPU at {temp_c}°C, ceiling {ceiling}°C, action={action}"
     )
+    with _lock:
+        _state["last_trip_at"]      = time.time()
+        _state["last_trip_temp_c"]  = temp_c
+        _state["last_trip_action"]  = "reset" if action == "reset" else "notify"
+        _state["above_since"]       = None
+        _state["in_cooldown_until"] = time.time() + cooldown_s
 
     reset_result: dict = {}
     if action == "reset":
@@ -241,12 +258,8 @@ def _do_trip(temp_c: int, settings: dict) -> None:
 
     with _lock:
         _state["tripped_count"]    += 1
-        _state["last_trip_at"]      = time.time()
-        _state["last_trip_temp_c"]  = temp_c
         _state["above_since"]       = None
-        _state["in_cooldown_until"] = (
-            time.time() + int(settings.get("cooldown_seconds", 60))
-        )
+        _state["in_cooldown_until"] = max(_state["in_cooldown_until"] or 0.0, time.time() + cooldown_s)
 
 
 def _watchdog_loop(stop_event: threading.Event) -> None:

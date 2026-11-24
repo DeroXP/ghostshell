@@ -175,7 +175,17 @@ _NEVER_TOUCH_NAMES = {
     "gpu_oc_profile.json", "gpu_stock_baseline.json",
     "obs_settings.json", "power_baseline.json",
     "stream_helper_settings.json", "temp_ceiling_settings.json",
+    # Adaptive Tuning's own files: its settings, the games it looks after,
+    # and the open game session (what to put back on the card after a run
+    # that died mid-game).
+    "adaptive_tuning_v2_settings.json", "adaptive_tuning_v2_games.json",
+    "adaptive_tuning_v2_session.json",
+    # The old tuner's files (3.6.8, 3.7.0), which it still reads if the user
+    # goes back to that version, and where a build in between moved its record.
     "adaptive_tuning_settings.json", "adaptive_tuning_state.json",
+    "adaptive_tuning_session.json", "adaptive_tuning_state.v1.json",
+    # What the app held on the card over time, and when a test ran.
+    "gpu_oc_timeline.json", "gpu_tuning_windows.json",
     "integrity_scan_settings.json", "integrity_scan_history.json",
     "integrity_scan_status.json",
     # Updater & active binary cache

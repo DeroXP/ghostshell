@@ -19,10 +19,13 @@ Safety rails:
   * Temp abort at 85°C — auto-rolls back and marks step unstable
   * Clock-lock via `nvidia-smi -lgc` always includes a minimum so idle behavior works
 """
+import functools
 import json
 import os
+import sys
 import threading
 import time
+from collections import deque
 from typing import Optional
 from core.utils import run_cmd, run_ps, get_logger, atomic_write_json
 from config import APPDATA_DIR
@@ -46,6 +49,12 @@ OC_HISTORY_PATH       = os.path.join(APPDATA_DIR, "gpu_oc_history.json")
 # remembers the value with the offset *backed out* so subsequent runs
 # always see real stock, even if the OC tool re-applies its boost.
 STOCK_BASELINE_PATH   = os.path.join(APPDATA_DIR, "gpu_stock_baseline.json")
+# What this app held on the card over time (ts, core, mem; a line per change)
+# and when a test ran on the GPU page.  Adaptive Tuning's health line reads
+# both: was an overclock on the card when the driver logged an error, and was
+# the error provoked by a test.
+OC_TIMELINE_PATH      = os.path.join(APPDATA_DIR, "gpu_oc_timeline.json")
+TUNING_WINDOWS_PATH   = os.path.join(APPDATA_DIR, "gpu_tuning_windows.json")
 
 # v2.9.9.1 — extreme-headroom clamps for users on golden samples / sub-ambient
 # cooling.  Almost no card will reach these in practice (a great Blackwell die
@@ -717,8 +726,31 @@ def verify_oc_applied(
 # Apply / reset
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _a_clock_write(owner_position: Optional[int]):
+    """For apply_oc, reset_oc, emergency_reset_oc and delete_profile: from the
+    moment one of them is called until it returns, wait_external_writes()
+    knows a clock write is under way, unless Adaptive Tuning is the writer
+    (owner="adaptive_tuning", by name or at `owner_position`)."""
+    def wrap(fn):
+        @functools.wraps(fn)
+        def call(*args, **kwargs):
+            owner = kwargs.get("owner")
+            if owner is None and owner_position is not None and len(args) > owner_position:
+                owner = args[owner_position]
+            if owner == ADAPTIVE_OWNER:
+                return fn(*args, **kwargs)
+            _external_write_begin()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _external_write_end()
+        return call
+    return wrap
+
+
+@_a_clock_write(owner_position=3)
 def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0,
-             power_pct: Optional[int] = 100) -> dict:
+             power_pct: Optional[int] = 100, owner: Optional[str] = None) -> dict:
     """Apply core/memory clock offsets and power limit.
 
     Args:
@@ -729,6 +761,10 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0,
                    exactly as it is; callers that only mean to move the clocks
                    (Adaptive Tuning, crash step-down, tuning probes) must, or
                    they silently undo a limit the user raised.
+        owner: who is writing.  Adaptive Tuning passes "adaptive_tuning" for
+               its own session writes; every other write (the default) is
+               counted in external_write_seq(), which is how a game session
+               notices that the user or another part of the app took over.
 
     Returns dict with per-step results.  `ok` is True only if the clock
     offsets were actually written.
@@ -740,6 +776,9 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0,
     # Clamp
     core_offset_mhz = _clamp(int(core_offset_mhz), -500, MAX_CORE_OFFSET_MHZ)
     mem_offset_mhz = _clamp(int(mem_offset_mhz), -1000, MAX_MEM_OFFSET_MHZ)
+    # Counted before anything is changed: a game session that looks while this
+    # call is still working (it takes seconds) already sees someone else writing.
+    _note_clock_write(owner)
     keep_power = power_pct is None
     if keep_power:
         # For bookkeeping only (the watchdog's target, the "applied" block
@@ -804,30 +843,47 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0,
 
     applied_method = "none"
     nvapi_usable = False
+    nvapi_avail: dict = {}
+    nvapi_result: dict = {}
+    if _nvapi is not None:
+        nvapi_avail = _nvapi.is_available()
+        nvapi_usable = bool(nvapi_avail.get("ok"))
 
     # 3 & 4. Core + Memory clock offsets — prefer NVAPI because it modifies
     #        the actual clock offset rather than a simple cap.
-    if _nvapi is not None:
-        nvapi_avail = _nvapi.is_available()
-        if nvapi_avail.get("ok"):
-            nvapi_usable = True
+    #
+    # The watchdog's target is moved BEFORE the write, and both happen under
+    # the lock its re-assert takes.  It used to be moved last, after the slow
+    # verification: a tick in between saw the new offsets as drift from the
+    # OLD target and wrote the old ones back (the overclock put back at game
+    # start after an idle park was undone within the same second, and the
+    # verification then blamed the driver).  Now a tick either re-asserts the
+    # old target before this write, or finds the target changed and writes
+    # nothing.  Armed even when the write then fails, as before: the user
+    # asked for these offsets, so they are what the watchdog keeps trying.
+    arm = core_offset_mhz != 0 or mem_offset_mhz != 0 or power_pct != 100
+    with _active_oc_lock:
+        if arm:
+            _activate_oc_watchdog(core_offset_mhz, mem_offset_mhz, power_pct)
+        if nvapi_usable:
             nvapi_result = _nvapi.set_offsets(core_offset_mhz=core_offset_mhz, mem_offset_mhz=mem_offset_mhz)
-            if nvapi_result.get("ok"):
-                applied_method = "nvapi"
-                steps.append({
-                    "name": f"NVAPI: core{core_offset_mhz:+d} MHz / memory{mem_offset_mhz:+d} MHz (struct V{nvapi_result.get('struct_version_used','?')})",
-                    "ok": True,
-                    "err": "",
-                })
-                log.info(f"NVAPI applied: core{core_offset_mhz:+d} mem{mem_offset_mhz:+d}")
-            else:
-                err = nvapi_result.get("err", "unknown NVAPI error")
-                steps.append({"name": f"NVAPI offset apply failed: {err}", "ok": False, "err": err})
-                log.warning(f"NVAPI failed, falling back to nvidia-smi: {err}")
-        else:
-            steps.append({"name": f"NVAPI not available: {nvapi_avail.get('err', '?')}", "ok": False, "err": ""})
-    else:
+    _timeline_flush()
+    if _nvapi is None:
         steps.append({"name": "NVAPI module failed to import: clock offsets unavailable", "ok": False, "err": ""})
+    elif not nvapi_usable:
+        steps.append({"name": f"NVAPI not available: {nvapi_avail.get('err', '?')}", "ok": False, "err": ""})
+    elif nvapi_result.get("ok"):
+        applied_method = "nvapi"
+        steps.append({
+            "name": f"NVAPI: core{core_offset_mhz:+d} MHz / memory{mem_offset_mhz:+d} MHz (struct V{nvapi_result.get('struct_version_used','?')})",
+            "ok": True,
+            "err": "",
+        })
+        log.info(f"NVAPI applied: core{core_offset_mhz:+d} mem{mem_offset_mhz:+d}")
+    else:
+        err = nvapi_result.get("err", "unknown NVAPI error")
+        steps.append({"name": f"NVAPI offset apply failed: {err}", "ok": False, "err": err})
+        log.warning(f"NVAPI failed, falling back to nvidia-smi: {err}")
 
     # Verify the result against the pre-apply baselines.
     verification = verify_oc_applied(
@@ -888,8 +944,8 @@ def apply_oc(core_offset_mhz: int = 0, mem_offset_mhz: int = 0,
     # explicitly requested these offsets; if NVAPI's accepting writes
     # but the boost ceiling didn't move, the watchdog won't fix that
     # particular bug but it also won't make things worse.
-    if core_offset_mhz != 0 or mem_offset_mhz != 0 or power_pct != 100:
-        _activate_oc_watchdog(core_offset_mhz, mem_offset_mhz, power_pct)
+    # (It was armed with these offsets BEFORE they were written, further up:
+    # armed here, after the slow verification, it raced its own old target.)
     # This used to be True no matter what, and callers act on it: Adaptive
     # Tuning records the offset as applied and climbs on from there.  Without
     # a usable NVAPI the only thing this call can have changed is the power
@@ -964,6 +1020,7 @@ def _cache_power_default(default_w) -> None:
         pass
 
 
+@_a_clock_write(owner_position=None)
 def emergency_reset_oc(reason: str = "unspecified") -> dict:
     """Best-effort, never-raises reset for crash recovery.
 
@@ -974,13 +1031,22 @@ def emergency_reset_oc(reason: str = "unspecified") -> dict:
 
     Should be safe to call from any thread, including from inside the
     crash detection probe tick — never blocks more than ~3 seconds total.
+
+    A `reason` starting with "temp_ceiling" (the temperature ceiling's own
+    reset) is also counted in ceiling_reset_seq().
     """
     log.warning(f"EMERGENCY RESET requested (reason: {reason})")
+    # Never Adaptive Tuning's own write: a game session that sees this count
+    # move leaves the card alone from then on.
+    try: _note_clock_write(None, reason)
+    except Exception: pass
     # Disarm the drift watchdog before touching anything: its whole job is to
     # re-apply the last requested offsets when they disappear, which is
     # exactly what this reset is about to make happen.  Left armed, it undid
     # a temp-ceiling trip or crash recovery on its next 5 s tick.
     try: _deactivate_oc_watchdog()
+    except Exception: pass
+    try: _timeline_flush()
     except Exception: pass
     # A stability probe running now is no longer measuring the offset it was
     # started for, so it must not be able to end "stable" (a temperature
@@ -1093,18 +1159,23 @@ def clear_crash_state():
     _crash_state["recovery_attempted"] = False
 
 
-def reset_oc() -> dict:
+@_a_clock_write(owner_position=0)
+def reset_oc(owner: Optional[str] = None) -> dict:
     """Fully revert to stock clocks and power.
 
     v2.9.1 — uses the aggressive `force_reset_all()` path so a stuck VF-curve
     offset from a previous session can be cleared even when SetPstates20 is
     rejecting full-blob writes.  Each NVAPI sub-step is reported individually
     so the UI shows exactly which lever moved.
+
+    `owner` as in apply_oc(): left out, the reset counts in external_write_seq().
     """
+    _note_clock_write(owner)
     # Tell the watchdog to stop re-asserting offsets BEFORE resetting them —
     # done afterwards, a tick landing mid-reset wrote the old offsets back.
     # (Before anything else, so it stops even if the card can't be reset.)
     _deactivate_oc_watchdog()
+    _timeline_flush()
 
     cap = detect_gpu_oc_capability()
     if cap["vendor"] != "nvidia":
@@ -1156,12 +1227,632 @@ def get_applied_oc() -> dict:
         return dict(_active_oc)
 
 
+# A stability test or a stock-vs-OC benchmark is driven by the GPU page.  When
+# the page goes away mid-run nothing ever clears its flag, and everything that
+# asks is_tuning_active() (Adaptive Tuning before it looks after a game, Idle
+# Mode before it parks) was told "a test is running" until the app restarted.
+# So those two only count while the page is still driving them.  (Quick Tune
+# and Benchmark Tune have their own clean-up: _abandon_orphaned_tuning.)
+_TEST_STALE_S = 180.0
+
+
+def _test_still_driven(sess: dict) -> bool:
+    if not sess.get("active"):
+        return False
+    last = sess.get("last_tick") or sess.get("started") or 0
+    if not last:
+        return True         # no time on record: count it rather than guess
+    return (time.time() - float(last)) < _TEST_STALE_S
+
+
 def is_tuning_active() -> bool:
-    """True while an Auto-OC or Benchmark-Tune run, a stability probe or a
-    stock-vs-OC benchmark is in progress — i.e. while the offsets on the card
-    are an experiment rather than something the user settled on."""
-    return any(bool(sess.get("active")) for sess in
-               (_auto_oc_session, _benchmark_oc_session, _stability_session, _benchmark_state))
+    """True while a Quick Tune or Benchmark Tune run, a stability test or a
+    benchmark is in progress, i.e. while the offsets on the card are an
+    experiment rather than something the user settled on.  A stability test
+    or benchmark counts only while its last start or tick is under 180 s old.
+    Quick Tune, Benchmark Tune and the benchmark count from the moment their
+    start got past the check for a game session, not only once their slow
+    first step is done."""
+    if _tuning_starts or _auto_oc_session.get("active") or _benchmark_oc_session.get("active"):
+        return True
+    return _test_still_driven(_stability_session) or _test_still_driven(_benchmark_state)
+
+
+# Quick Tune, Benchmark Tune and the benchmark only marked themselves active
+# after a slow first step (a reset, a power limit write: seconds on a real
+# PC).  A game found in those seconds was taken on by Adaptive Tuning, and the
+# run then went on under it.  This counts the starts still under way.
+_tuning_starts = 0
+_tuning_starts_lock = threading.Lock()
+
+
+def _counts_from_its_start(kind: str):
+    """For auto_oc_start, benchmark_oc_start and benchmark_start: refuse while
+    a game session is open, and otherwise count as a running test (for
+    is_tuning_active) from right after that check until the start returns.
+    A start that raised closes its window on record and lets Adaptive Tuning
+    look again, as the end of a run does."""
+    def wrap(fn):
+        @functools.wraps(fn)
+        def call(*args, **kwargs):
+            global _tuning_starts
+            with _tuning_starts_lock:
+                refused = _refused_for_game_session()
+                if refused:
+                    return refused
+                _tuning_starts += 1
+            returned = False
+            try:
+                result = fn(*args, **kwargs)
+                returned = True
+                return result
+            finally:
+                with _tuning_starts_lock:
+                    _tuning_starts -= 1
+                if not returned:
+                    _test_run_ended(kind)
+        return call
+    return wrap
+
+
+# ===========================================================================
+# Sharing the card with a game session (Adaptive Tuning)
+# ===========================================================================
+# While a game runs, Adaptive Tuning holds the clocks.  Three things keep it
+# and the rest of the app from writing over each other:
+#   * every clock write that is not its own is counted (external_write_seq),
+#     so its watch thread can tell "someone else changed the overclock" from
+#     "the driver dropped it" and leave the card alone in the first case;
+#   * the tests on the GPU page refuse to start while a session is open, and
+#     tell it when they end so a game that started meanwhile gets looked after;
+#   * write_offsets() is the light way to re-assert or lower the clocks during
+#     play: one NVAPI write, no process started.
+# core.adaptive_tuning imports this module, so it is reached through
+# sys.modules, and only if it is loaded: no session can be open otherwise.
+
+ADAPTIVE_OWNER = "adaptive_tuning"
+SESSION_REFUSAL = "Close the game first. A test can't run while a game is using the graphics card."
+
+_external_write_seq = 0
+_ceiling_reset_seq = 0              # how many of those were the temperature ceiling's own resets
+_external_write_lock = threading.Lock()
+_external_writes_under_way = 0      # apply_oc / reset_oc / emergency_reset_oc / delete_profile calls not yet returned
+_external_writes_idle = threading.Event()
+_external_writes_idle.set()
+
+
+def _note_clock_write(owner: Optional[str], reason: Optional[str] = None) -> None:
+    """Count a clock write that is not Adaptive Tuning's own; a `reason`
+    starting with "temp_ceiling" is a ceiling reset and counted as one too.
+    Both numbers move together, under one lock."""
+    global _external_write_seq, _ceiling_reset_seq
+    if owner == ADAPTIVE_OWNER:
+        return
+    ceiling = isinstance(reason, str) and reason.startswith("temp_ceiling")
+    with _external_write_lock:
+        _external_write_seq += 1
+        if ceiling:
+            _ceiling_reset_seq += 1
+
+
+def external_write_seq() -> int:
+    """Goes up with every clock write that is not Adaptive Tuning's own:
+    apply_oc() and write_offsets() without owner="adaptive_tuning", reset_oc(),
+    emergency_reset_oc() (so a temperature-ceiling trip too) and deleting the
+    profile.  It moves BEFORE the card is touched."""
+    with _external_write_lock:
+        return _external_write_seq
+
+
+def ceiling_reset_seq() -> int:
+    """How many of the writes counted by external_write_seq() were the
+    temperature ceiling's own resets (emergency_reset_oc with a reason that
+    starts with "temp_ceiling").  Moves with it, under the same lock, before
+    the card is touched."""
+    with _external_write_lock:
+        return _ceiling_reset_seq
+
+
+def external_write_counts() -> tuple:
+    """(external_write_seq(), ceiling_reset_seq()) read together, so the
+    number of writes that were not ceiling resets is never off by one in
+    between."""
+    with _external_write_lock:
+        return _external_write_seq, _ceiling_reset_seq
+
+
+def _external_write_begin() -> None:
+    global _external_writes_under_way
+    with _external_write_lock:
+        _external_writes_under_way += 1
+        _external_writes_idle.clear()
+
+
+def _external_write_end() -> None:
+    global _external_writes_under_way
+    with _external_write_lock:
+        _external_writes_under_way = max(0, _external_writes_under_way - 1)
+        if _external_writes_under_way == 0:
+            _external_writes_idle.set()
+
+
+def wait_external_writes(timeout: float) -> bool:
+    """Wait up to `timeout` seconds until no clock write by anyone but
+    Adaptive Tuning is under way: an apply_oc(), reset_oc(),
+    emergency_reset_oc() or delete_profile() from the moment it was called
+    until it returned (they take seconds, and count themselves in
+    external_write_seq() before they touch the card).  True when none is.
+    Never raises; takes no lock while it waits."""
+    try:
+        seconds = max(0.0, float(timeout or 0.0))
+    except (TypeError, ValueError):
+        seconds = 0.0
+    return _external_writes_idle.wait(seconds)
+
+
+def drop_hold() -> None:
+    """Stop holding the overclock this app last put on the card: the drift
+    watchdog has no target any more, and get_applied_oc() says nothing is
+    held.  The card is not written, the power limit is not touched, and
+    external_write_seq() does not move.  The record of what was last put on
+    the card (held_at) is left as it is: those clocks are still on it.
+    For Adaptive Tuning, after it handed back clocks the app was not holding
+    before the game."""
+    with _active_oc_lock:
+        _active_oc.update({"core": 0, "mem": 0, "power": 100, "active": False})
+    log.info("OC watchdog target dropped (the card was left as it is)")
+
+
+def _adaptive_tuning_fn(name: str):
+    at = sys.modules.get("core.adaptive_tuning")
+    fn = getattr(at, name, None) if at is not None else None
+    return fn if callable(fn) else None
+
+
+def _game_session_open() -> bool:
+    """Is Adaptive Tuning holding the card for a game right now?  False when it
+    cannot be asked: a test must never be blocked by a failure in here."""
+    try:
+        fn = _adaptive_tuning_fn("session_active")
+        return bool(fn()) if fn else False
+    except Exception as e:
+        log.debug(f"session_active() failed, treating as no session: {e}")
+        return False
+
+
+def _refused_for_game_session() -> Optional[dict]:
+    """What a test starter returns instead of starting while a game session is open."""
+    if _game_session_open():
+        return {"ok": False, "err": SESSION_REFUSAL, "refused": "adaptive_session"}
+    return None
+
+
+def _test_run_ended(kind: str) -> None:
+    """A Quick Tune, Benchmark Tune, stability test or benchmark finished, was
+    cancelled or was cleaned up.  Closes its window on record and, when no
+    other test is still going, lets Adaptive Tuning pick up a game that
+    started while it ran.  Never called with a lock held; never raises."""
+    try:
+        if is_tuning_active():          # a step's probe inside a longer run
+            _tuning_window_touch()
+            return
+        _tuning_window_close()
+    except Exception as e:
+        log.debug(f"closing the {kind} window failed: {e}")
+    try:
+        fn = _adaptive_tuning_fn("try_engage_running_game")
+        if fn:
+            fn()
+    except Exception as e:
+        log.warning(f"Adaptive Tuning could not be told that the {kind} run ended: {e}")
+
+
+def write_offsets(core=0, mem=0, owner: Optional[str] = None, if_seq: Optional[int] = None,
+                  core_offset_mhz: Optional[int] = None, mem_offset_mhz: Optional[int] = None) -> dict:
+    """Write clock offsets the light way: one NVAPI write, with the watchdog's
+    target moved first under the lock its re-assert takes.  No process is
+    started (apply_oc() runs a tool scan and several nvidia-smi calls), the
+    power limit is not touched and nothing is verified: read back with
+    get_current_offsets().  For Adaptive Tuning's re-asserts and for lowering
+    a game's clocks while it runs.
+
+    core / mem: MHz, clamped like apply_oc() (core_offset_mhz / mem_offset_mhz
+    are accepted as other names for them).
+    owner: as in apply_oc().
+    if_seq: when given, nothing is written unless external_write_seq() still
+            has this value, checked under the same lock as the write; the
+            answer then carries "superseded": True.  It closes the gap between
+            "nobody else wrote" and the write itself.
+
+    Returns {"ok", "err"}; ok is True only if the driver accepted the write."""
+    try:
+        core = _clamp(int(core if core_offset_mhz is None else core_offset_mhz), -500, MAX_CORE_OFFSET_MHZ)
+        mem = _clamp(int(mem if mem_offset_mhz is None else mem_offset_mhz), -1000, MAX_MEM_OFFSET_MHZ)
+    except (TypeError, ValueError):
+        return {"ok": False, "err": "The clock values must be whole numbers."}
+    if _nvapi is None:
+        return {"ok": False, "err": "The graphics card's clock interface is not available."}
+    try:
+        avail = _nvapi.is_available()
+        if not avail.get("ok"):
+            return {"ok": False, "err": avail.get("err") or "The graphics card's clock interface is not available."}
+        with _active_oc_lock:
+            if if_seq is not None and external_write_seq() != int(if_seq):
+                return {"ok": False, "err": "Something else changed the overclock first.", "superseded": True}
+            _note_clock_write(owner)
+            power = int(get_applied_oc().get("power", 100) or 100)
+            if core != 0 or mem != 0 or power != 100:
+                _activate_oc_watchdog(core, mem, power)
+            else:
+                _deactivate_oc_watchdog()
+            r = _nvapi.set_offsets(core_offset_mhz=core, mem_offset_mhz=mem) or {}
+    except Exception as e:
+        log.warning(f"write_offsets(core{core:+d}, mem{mem:+d}) raised: {e}")
+        return {"ok": False, "err": str(e)}
+    finally:
+        _timeline_flush()
+    ok = bool(r.get("ok"))
+    if ok:
+        log.info(f"Offsets written: core{core:+d} mem{mem:+d} (light path, owner={owner or 'app'})")
+    else:
+        log.warning(f"write_offsets(core{core:+d}, mem{mem:+d}) was not accepted: {r.get('err')}")
+    return {"ok": ok, "err": "" if ok else (r.get("err") or "The graphics driver did not accept the change.")}
+
+
+# -- start-up: has the saved profile been applied (or skipped) yet? ----
+# A game that is already running when the app starts is picked up while the
+# saved profile may still be on its way to the card.  Adaptive Tuning waits
+# for this before it records what to hand the card back to.
+_startup_apply_done = threading.Event()
+
+
+def mark_startup_apply_done() -> None:
+    """The saved-profile apply at start-up has finished or was skipped."""
+    _startup_apply_done.set()
+
+
+def wait_startup_apply(timeout: float = 0.0) -> bool:
+    """Wait up to `timeout` seconds for mark_startup_apply_done().  True when
+    it has been called."""
+    try:
+        return _startup_apply_done.wait(max(0.0, float(timeout or 0.0)))
+    except (TypeError, ValueError):
+        return _startup_apply_done.is_set()
+
+
+# -- the two records below: read, and set aside when damaged -----------
+def _load_record(path: str, key: str):
+    """A record file as (state, rows, data): state "none" (no file), "ok",
+    "busy" (it is there but could not be opened just now: leave it alone) or
+    "damaged" (it opened but holds no record: set it aside before a new one
+    is saved).  rows is the list under `key` (or the whole file, an older
+    shape), [] unless the state is "ok"; data is the whole file."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return "none", [], None
+    except (ValueError, UnicodeDecodeError) as e:      # not JSON, cut short
+        log.warning(f"{os.path.basename(path)} cannot be read ({type(e).__name__})")
+        return "damaged", [], None
+    except OSError as e:
+        log.debug(f"{os.path.basename(path)} could not be opened: {e}")
+        return "busy", [], None
+    rows = data.get(key) if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        log.warning(f"{os.path.basename(path)} holds no {key}")
+        return "damaged", [], data
+    return "ok", rows, data
+
+
+def _set_aside(path: str) -> bool:
+    """name.json becomes name.damaged.json, kept for a look.  False when that
+    failed (then nothing may be saved over it)."""
+    stem, ext = os.path.splitext(path)
+    try:
+        os.replace(path, f"{stem}.damaged{ext}")
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        log.warning(f"{os.path.basename(path)} is damaged and could not be set aside: {e}")
+        return False
+    log.warning(f"{os.path.basename(path)} was damaged and was set aside as {os.path.basename(stem)}.damaged{ext}")
+    return True
+
+
+# -- what this app held on the card, over time -------------------------
+# One line per change of (core, mem), newest last.  held_at(ts) answers "was an
+# overclock on the card when the driver logged that error?", for at least the
+# last _TIMELINE_KEEP_DAYS days: the lines of those days are kept, plus the one
+# in force when they began, at most _TIMELINE_MAX of them.  A change is queued
+# where it happens (under _active_oc_lock) and written to disk afterwards,
+# outside that lock.
+_TIMELINE_KEEP_DAYS = 100
+_TIMELINE_MAX = 3000
+_timeline_pending: deque = deque(maxlen=1000)
+_timeline_lock = threading.Lock()
+
+
+def _timeline_queue(core, mem) -> None:
+    try:
+        _timeline_pending.append((time.time(), int(core), int(mem)))
+    except Exception:
+        pass
+
+
+def _timeline_rows(rows: list) -> list:
+    out = []
+    for row in rows:
+        try:
+            if isinstance(row, dict):
+                out.append([float(row["ts"]), int(row["core"]), int(row["mem"])])
+            else:
+                out.append([float(row[0]), int(row[1]), int(row[2])])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _timeline_read() -> Optional[list]:
+    """[[ts, core, mem], ...] oldest first; [] when there is none, None when
+    it is there but cannot be read."""
+    state, rows, _data = _load_record(OC_TIMELINE_PATH, "entries")
+    if state in ("busy", "damaged"):
+        return None
+    return _timeline_rows(rows)
+
+
+def _timeline_trim(entries: list, now: float) -> list:
+    """The lines of the last _TIMELINE_KEEP_DAYS days and the one in force when
+    they began, at most the newest _TIMELINE_MAX."""
+    cutoff = now - _TIMELINE_KEEP_DAYS * 86400.0
+    first = 0
+    while first + 1 < len(entries) and entries[first + 1][0] <= cutoff:
+        first += 1
+    return entries[first:][-_TIMELINE_MAX:]
+
+
+def _timeline_flush() -> None:
+    """Write queued changes to gpu_oc_timeline.json.  A file that cannot be
+    opened just now is left alone (the changes wait for the next write); a
+    damaged one is set aside first.  Never raises."""
+    if not _timeline_pending:
+        return
+    try:
+        with _timeline_lock:
+            pending = []
+            while True:
+                try:
+                    pending.append(_timeline_pending.popleft())
+                except IndexError:
+                    break
+            if not pending:
+                return
+            state, rows, _data = _load_record(OC_TIMELINE_PATH, "entries")
+            if state == "damaged" and not _set_aside(OC_TIMELINE_PATH):
+                state = "busy"
+            if state == "busy":
+                _timeline_pending.extendleft(reversed(pending))
+                return
+            entries = _timeline_rows(rows)
+            changed = False
+            for ts, core, mem in pending:
+                if entries and (entries[-1][1], entries[-1][2]) == (core, mem):
+                    continue
+                if entries and ts < entries[-1][0]:
+                    ts = entries[-1][0]         # the clock was set back: keep the order
+                entries.append([ts, core, mem])
+                changed = True
+            if changed or state == "damaged":
+                atomic_write_json(OC_TIMELINE_PATH, {"version": 1, "entries": [
+                    {"ts": round(ts, 3), "core": core, "mem": mem}
+                    for ts, core, mem in _timeline_trim(entries, time.time())]})
+    except Exception as e:
+        log.debug(f"overclock timeline not saved: {e}")
+
+
+def held_at(ts) -> Optional[tuple]:
+    """The (core, mem) offsets this app was holding on the card at time `ts`,
+    (0, 0) when it held none, or None when that is not known: before the first
+    line on record, or when the record cannot be read.  "Held" is what the app
+    last applied: after it was closed, or the PC restarted, the last value
+    stands until the app writes again (drop_hold() writes nothing, so it does
+    not change this either)."""
+    try:
+        t = float(ts)
+    except (TypeError, ValueError):
+        return None
+    _timeline_flush()
+    with _timeline_lock:
+        entries = _timeline_read()
+    if entries is None:
+        return None
+    found = None
+    for e_ts, core, mem in entries:
+        if e_ts > t:
+            break
+        found = (core, mem)
+    return found
+
+
+# -- when a test ran on the GPU page ----------------------------------
+# [start, end] of every Quick Tune, Benchmark Tune, stability test and
+# benchmark run, the last 50, and "since": when this record began (the first
+# start of this version, or when a damaged record was set aside).  Tests crash
+# the driver on purpose, so the errors logged inside these windows say nothing
+# about the user's games; errors from before "since" cannot be told apart from
+# a test's.  A run's probes (one per step) belong to the run's own window.
+_TUNING_WINDOWS_KEEP = 50
+_TUNING_WINDOW_SAVE_EVERY_S = 30.0      # how stale the saved end of a running test may get
+_TUNING_WINDOW_STALE_S = 10 * 60        # a sign of life after this long is a new run
+_TUNING_WINDOW_GRACE_S = 120.0          # see tuning_windows()
+_tuning_window = {"open": False, "start": 0.0, "last": 0.0, "saved": 0.0}
+_tuning_windows_unsaved: list = []      # ended windows not on disk yet (the file could not be saved)
+_tuning_window_lock = threading.Lock()
+
+
+def _tuning_windows_load():
+    """(state, windows, since) of gpu_tuning_windows.json; state as in
+    _load_record.  since is None when the file does not say (or is not "ok")."""
+    state, rows, data = _load_record(TUNING_WINDOWS_PATH, "windows")
+    wins = []
+    for row in rows:
+        try:
+            start, end = float(row[0]), float(row[1])
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+        if end >= start:
+            wins.append([start, end])
+    since = None
+    if state == "ok" and isinstance(data, dict):
+        try:
+            since = float(data.get("since"))
+        except (TypeError, ValueError):
+            since = None
+        if since is not None and not (since == since and abs(since) < 1e12):       # NaN, inf, nonsense
+            since = None
+    return state, wins, since
+
+
+def _merge_windows(*groups) -> list:
+    """Windows from several places, oldest first, one per start (its latest end)."""
+    by_start: dict = {}
+    for group in groups:
+        for start, end in group:
+            key = round(start, 3)
+            if key in by_start:
+                by_start[key][1] = max(by_start[key][1], end)
+            else:
+                by_start[key] = [start, end]
+    return sorted(by_start.values())
+
+
+def _tuning_windows_with_open_locked() -> list:
+    """The saved windows, the ended ones not saved yet and the one in
+    progress.  Caller holds the lock."""
+    _state, wins, _since = _tuning_windows_load()
+    w = _tuning_window
+    return _merge_windows(wins, _tuning_windows_unsaved, [[w["start"], w["last"]]] if w["open"] else [])
+
+
+def _tuning_window_save_locked() -> bool:
+    """Save the windows on record and when the record began.  A file that
+    cannot be opened just now is left alone; a damaged one is set aside, and
+    the record begins again now.  False when nothing was saved (what is not on
+    disk yet stays in memory for the next save).  Caller holds the lock."""
+    now = time.time()
+    state, wins, since = _tuning_windows_load()
+    if state == "busy" or (state == "damaged" and not _set_aside(TUNING_WINDOWS_PATH)):
+        return False
+    if state == "damaged":
+        wins, since = [], now
+    w = _tuning_window
+    merged = _merge_windows(wins, _tuning_windows_unsaved, [[w["start"], w["last"]]] if w["open"] else [])
+    if since is None:
+        # The record's first save (or a file from before it said when it began).
+        since = min([now] + [start for start, _end in merged])
+    if len(merged) > _TUNING_WINDOWS_KEEP:
+        merged = merged[-_TUNING_WINDOWS_KEEP:]
+        since = max(since, merged[0][0])        # the windows dropped are no longer on record
+    if not atomic_write_json(TUNING_WINDOWS_PATH, {"version": 1, "since": round(since, 3), "windows": [
+            [round(s, 3), round(e, 3)] for s, e in merged]}):
+        return False
+    del _tuning_windows_unsaved[:]
+    w["saved"] = now
+    return True
+
+
+def _tuning_window_end_locked() -> None:
+    """The window in progress ends at its last sign of life.  Caller holds the lock."""
+    w = _tuning_window
+    if w["open"]:
+        _tuning_windows_unsaved.append([w["start"], w["last"]])
+        del _tuning_windows_unsaved[:-_TUNING_WINDOWS_KEEP]
+        w["open"] = False
+
+
+def _tuning_window_begin() -> None:
+    """A test run starts.  Never raises."""
+    try:
+        now = time.time()
+        with _tuning_window_lock:
+            _tuning_window_end_locked()             # one that never ended: closed at its last sign of life
+            _tuning_window.update(open=True, start=now, last=now)
+            _tuning_window_save_locked()
+    except Exception as e:
+        log.debug(f"test window not recorded: {e}")
+
+
+def _tuning_window_touch() -> None:
+    """A running test shows a sign of life (a step, a tick).  Never raises."""
+    try:
+        now = time.time()
+        with _tuning_window_lock:
+            w = _tuning_window
+            if not w["open"] or now - w["last"] > _TUNING_WINDOW_STALE_S:
+                _tuning_window_end_locked()
+                w.update(open=True, start=now, last=now)
+                _tuning_window_save_locked()
+                return
+            w["last"] = now
+            if now - w["saved"] >= _TUNING_WINDOW_SAVE_EVERY_S:
+                _tuning_window_save_locked()
+    except Exception as e:
+        log.debug(f"test window not updated: {e}")
+
+
+def _tuning_window_close() -> None:
+    """The test run is over.  Never raises."""
+    try:
+        with _tuning_window_lock:
+            w = _tuning_window
+            if not w["open"]:
+                return
+            w["last"] = time.time()
+            _tuning_window_end_locked()
+            _tuning_window_save_locked()
+    except Exception as e:
+        log.debug(f"test window not closed: {e}")
+
+
+def tuning_windows(grace_s: Optional[float] = None) -> list:
+    """[(start, end), ...] of every Quick Tune, Benchmark Tune, stability test
+    and benchmark run on record, oldest first (the last 50).
+
+    Each end is `grace_s` later than the run's last sign of life (120 s unless
+    given): the driver often logs a few more errors right after a test crashed
+    it and the card was reset, and those belong to the test.  Pass 0 for the
+    times as recorded.  A run still going ends at its latest step or tick.
+    Only runs from tuning_windows_since() on are known."""
+    grace = _TUNING_WINDOW_GRACE_S if grace_s is None else max(0.0, float(grace_s))
+    try:
+        with _tuning_window_lock:
+            wins = _tuning_windows_with_open_locked()
+    except Exception as e:
+        log.debug(f"test windows not read: {e}")
+        return []
+    return [(s, e + grace) for s, e in wins]
+
+
+def tuning_windows_since() -> Optional[float]:
+    """Since when tuning_windows() knows every test run: when this version
+    first kept the record (3.7.0 kept none), or when a damaged record was set
+    aside, or the start of the oldest window still on record once older ones
+    were dropped.  A driver error from before this time may have been a
+    test's.  The record is created, starting now, when there is none yet.
+    None when it cannot be opened or saved just now.  Never raises."""
+    try:
+        with _tuning_window_lock:
+            state, _wins, since = _tuning_windows_load()
+            if state == "ok" and since is not None:
+                return since
+            if state == "busy" or not _tuning_window_save_locked():
+                return None
+            state, _wins, since = _tuning_windows_load()
+            return since if state == "ok" else None
+    except Exception as e:
+        log.debug(f"test windows not read: {e}")
+        return None
 
 
 def _offsets_read_back_as_stock() -> Optional[bool]:
@@ -1248,7 +1939,9 @@ _active_oc = {
     "power":  100,
     "active": False,
 }
-_active_oc_lock     = threading.Lock()
+# Re-entrant: apply_oc() and write_offsets() hold it around moving the target
+# (_activate_oc_watchdog, which takes it too) and the NVAPI write.
+_active_oc_lock     = threading.RLock()
 _oc_watchdog_thread: Optional[threading.Thread] = None
 _oc_watchdog_stop:   Optional[threading.Event]  = None
 _oc_watchdog_drift_corrections = 0       # total drift events since process start
@@ -1297,9 +1990,16 @@ def _abandon_orphaned_tuning(source: str) -> None:
     sess = globals().get(_TUNING_PAUSE_SOURCES.get(source, ""))
     if isinstance(sess, dict):
         sess["active"] = False
-    ok, _detail = _reset_to_stock_hard(attempts=2)
-    log.warning(f"Abandoned {source} run cleaned up: reset to stock "
-                f"{'confirmed' if ok else 'could NOT be confirmed'}")
+    if _game_session_open():
+        # Should not happen (no game session opens while a run counts as
+        # active).  If it does, the clocks on the card are the session's by
+        # now, not what this run left behind, so they are not reset.
+        log.warning(f"Abandoned {source} run ended; a game session holds the card, so it was left as it is")
+    else:
+        ok, _detail = _reset_to_stock_hard(attempts=2)
+        log.warning(f"Abandoned {source} run cleaned up: reset to stock "
+                    f"{'confirmed' if ok else 'could NOT be confirmed'}")
+    _test_run_ended(source)
 
 
 def _activate_oc_watchdog(core_offset_mhz: int, mem_offset_mhz: int, power_pct: int) -> None:
@@ -1312,6 +2012,7 @@ def _activate_oc_watchdog(core_offset_mhz: int, mem_offset_mhz: int, power_pct: 
             "power":  int(power_pct),
             "active": True,
         })
+        _timeline_queue(core_offset_mhz, mem_offset_mhz)
     if _oc_watchdog_thread and _oc_watchdog_thread.is_alive():
         return
     _oc_watchdog_stop = threading.Event()
@@ -1329,6 +2030,7 @@ def _deactivate_oc_watchdog() -> None:
     so a subsequent apply_oc lights it back up without a thread restart."""
     with _active_oc_lock:
         _active_oc.update({"core": 0, "mem": 0, "power": 100, "active": False})
+        _timeline_queue(0, 0)
     log.info("OC watchdog deactivated")
 
 
@@ -1405,6 +2107,12 @@ def _oc_watchdog_loop(stop: threading.Event) -> None:
             # other user of it (get_applied_oc, the activate / deactivate
             # calls, emergency_reset_oc too) blocked for minutes on Python 3.12.
             if not active:
+                # Nothing to hold, but an abandoned tuning run must still be
+                # noticed: its pause only expires when somebody looks.  A run
+                # that crashed the driver (reset to stock, so nothing held)
+                # and was then left stayed "active" until the app restarted,
+                # and Adaptive Tuning looked after no game in the meantime.
+                is_oc_watchdog_paused()
                 stop.wait(_OC_WATCHDOG_INTERVAL_SEC); continue
 
             # beta.14 — skip drift checks entirely while another subsystem
@@ -1535,7 +2243,14 @@ def get_oc_watchdog_status() -> dict:
 # Driver-event scan — TDR (Timeout Detection & Recovery) is the surest sign
 # that an OC crashed the GPU.  Windows logs nvlddmkm Event ID 153 (typically)
 # or 4101 ("Display driver stopped responding and has recovered") when this
-# happens.  amdkmdag is the AMD equivalent.
+# happens.
+#
+# Read through core.gpu_events, in this process: the same records Adaptive
+# Tuning counts (nvlddmkm 153, 13 and 14, and Display 4101 naming nvlddmkm).
+# This used to be a Get-WinEvent pipeline that asked for five driver names;
+# PowerShell exits with code 1 for every name a PC does not have (and when
+# nothing matched), so the answer was "could not be read" on every real PC and
+# the tests on the GPU page and crash recovery never saw a driver error.
 # ═══════════════════════════════════════════════════════════════════════════
 
 def check_driver_events(seconds_back: int = 300) -> dict:
@@ -1547,65 +2262,37 @@ def check_driver_events(seconds_back: int = 300) -> dict:
     Returns:
         {
           'ok': bool,
-          'tdr_count': int,        # count of recovery / timeout events
-          'crash_count': int,      # count of severe / non-recoverable
-          'events': [{'id': int, 'time': str, 'msg': str}, ...]  # latest 5
+          'tdr_count': int,        # graphics driver errors in the window
+          'crash_count': int,      # always 0 (kept for the callers)
+          'events': [{'id': int, 'time': str, 'level': str, 'msg': str}, ...]  # latest 5, newest first
         }
+        and 'err' (str) when the log could not be read: then the counts are 0.
     """
-    seconds_back = max(1, int(seconds_back))
-    # Single PS pipeline. -ErrorAction SilentlyContinue keeps an empty result quiet.
-    cmd = (
-        f"$start = (Get-Date).AddSeconds(-{seconds_back}); "
-        "Get-WinEvent -FilterHashtable @{LogName='System'; "
-        "ProviderName=@('nvlddmkm','nvlddmkmoem','amdkmdag','iaLPSSi_GPIO'); "
-        "StartTime=$start} -MaxEvents 25 -ErrorAction SilentlyContinue | "
-        "Select-Object Id, TimeCreated, LevelDisplayName, "
-        "@{N='Msg';E={$_.Message.Substring(0,[Math]::Min(180,$_.Message.Length))}} "
-        "| ConvertTo-Json -Compress"
-    )
-    r = run_ps(cmd, timeout=10)
-    if not r["ok"]:
-        return {"ok": False, "tdr_count": 0, "crash_count": 0, "events": [],
-                "err": r.get("err") or "Get-WinEvent failed"}
-
-    out = (r.get("out") or "").strip()
-    if not out:
-        return {"ok": True, "tdr_count": 0, "crash_count": 0, "events": []}
-
     try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
+        seconds_back = max(1, int(seconds_back))
+        now = time.time()
+        from core import gpu_events
+        r = gpu_events.query(now - seconds_back, now, kinds="driver_error")
+    except Exception as e:
+        r = {"ok": False, "events": [], "err": f"The Windows event log could not be read ({type(e).__name__})"}
+    if not r.get("ok"):
         return {"ok": False, "tdr_count": 0, "crash_count": 0, "events": [],
-                "err": "Could not parse Get-WinEvent JSON output"}
-
-    if not isinstance(data, list):
-        data = [data]
-
-    # Event IDs commonly logged on TDR / driver hang
-    TDR_IDS = {153, 4101, 1003}            # 4101 = recovered, 153 = timeout reset
-    CRASH_IDS = {141, 142, 143, 4102}      # 141 = bug-check, 4102 = not recoverable
-
-    tdr = 0
-    crash = 0
+                "err": r.get("err") or "The Windows event log could not be read."}
+    from datetime import datetime, timezone
+    found = list(r.get("events") or [])
     events = []
-    for ev in data[:25]:
+    for ev in reversed(found[-5:]):
         try:
-            evid = int(ev.get("Id") or 0)
-        except (TypeError, ValueError):
-            evid = 0
-        if evid in TDR_IDS:
-            tdr += 1
-        elif evid in CRASH_IDS:
-            crash += 1
-        if len(events) < 5:
-            events.append({
-                "id": evid,
-                "time": str(ev.get("TimeCreated") or ""),
-                "level": str(ev.get("LevelDisplayName") or ""),
-                "msg": str(ev.get("Msg") or "")[:180],
-            })
-
-    return {"ok": True, "tdr_count": tdr, "crash_count": crash, "events": events}
+            when = datetime.fromtimestamp(float(ev.get("ts") or 0), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            when = ""
+        events.append({
+            "id": int(ev.get("event_id") or 0),
+            "time": when,
+            "level": "Warning" if str(ev.get("provider") or "").lower() == "display" else "Error",
+            "msg": str(ev.get("detail") or "")[:180],
+        })
+    return {"ok": True, "tdr_count": len(found), "crash_count": 0, "events": events}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1643,6 +2330,19 @@ def start_stability_probe(expected_core_max: int = 0) -> dict:
         expected_core_max: target boost clock ceiling. Used to detect clock-dips
                            (sign of TDP throttling at this OC level).
     """
+    refused = _refused_for_game_session()
+    if refused:
+        # A probe still flagged from a test whose page went away must not be
+        # picked up by the ticks of the test that was just refused: they
+        # could end in a reset of the card under the running game.
+        _stability_session["active"] = False
+        return refused
+    # On record as a test of its own, or as part of the run it is a step of.
+    if (_auto_oc_session.get("active") or _benchmark_oc_session.get("active")
+            or _test_still_driven(_benchmark_state)):
+        _tuning_window_touch()
+    else:
+        _tuning_window_begin()
     # Snapshot driver event count NOW so we only count NEW events during the test
     # (over the same 5 s lead-in the later checks add: a longer one counted a
     # TDR from 5-10 s before the start here but not there, hiding a new one).
@@ -1655,6 +2355,7 @@ def start_stability_probe(expected_core_max: int = 0) -> dict:
     _stability_session.update({
         "active": True,
         "started": time.time(),
+        "last_tick": time.time(),
         "samples": [],
         "max_temp": 0,
         "min_core": 999999,
@@ -1699,6 +2400,8 @@ def run_probe_tick(frame_time_ms: float = None, context_lost: bool = False, pixe
         return {"ok": False, "err": "No active probe session"}
 
     sess = _stability_session
+    sess["last_tick"] = time.time()         # the page is still driving it (is_tuning_active)
+    _tuning_window_touch()
 
     # Signal 1: WebGL context lost (immediate fail) — GPU likely TDR'd
     if context_lost:
@@ -1957,6 +2660,7 @@ def end_stability_probe() -> dict:
     log.info(f"Stability probe ended: stable={stable}, max_temp={sess['max_temp']}, fps={avg_fps:.1f}, variance={variance_pct:.0f}%, reason={sess['abort_reason'] or 'OK'}")
     _last_probe_verdict.clear()
     _last_probe_verdict.update(verdict)
+    _test_run_ended("stability test")
     return verdict
 
 
@@ -2039,6 +2743,7 @@ _auto_oc_session = {
 }
 
 
+@_counts_from_its_start("Quick Tune")
 def auto_oc_start(core_step_mhz: int = 75, mem_step_mhz: int = 250, max_steps: int = 14, max_power: bool = True) -> dict:
     """Begin a binary-search auto-OC session.
 
@@ -2053,10 +2758,14 @@ def auto_oc_start(core_step_mhz: int = 75, mem_step_mhz: int = 250, max_steps: i
     The frontend drives it via repeated calls to auto_oc_next(prev_result).
     Each response includes `recommended_duration_s` for the stress test.
     """
+    refused = _refused_for_game_session()
+    if refused:
+        return refused
     cap = detect_gpu_oc_capability()
     if cap["vendor"] != "nvidia":
         return {"ok": False, "err": "Auto-OC only supported on NVIDIA cards"}
     _cache_power_default(cap.get("limits", {}).get("power_default_w"))
+    _tuning_window_begin()
 
     # beta.9 — pause the drift watchdog for the whole tuning session.  Otherwise
     # it re-asserts the offset mid-stress (masking the instability we're trying
@@ -2248,7 +2957,14 @@ def auto_oc_next(prev_result: dict = None) -> dict:
     # Never alongside auto_oc_cancel(): a cancel that arrived while a step was
     # applying its offset reset first, and the probe offset landed after it.
     with _session_lock:
-        return _auto_oc_next(prev_result)
+        was_active = bool(_auto_oc_session.get("active"))
+        result = _auto_oc_next(prev_result)
+        ended = was_active and not _auto_oc_session.get("active")
+    if ended:
+        _test_run_ended("Quick Tune")       # outside the lock: it may start a game session
+    elif was_active:
+        _tuning_window_touch()
+    return result
 
 
 def _auto_oc_next(prev_result: dict = None) -> dict:
@@ -2889,8 +3605,16 @@ def auto_oc_cancel() -> dict:
     # beta.9 — always hand the watchdog back, then fail-loud reset.
     try: resume_oc_watchdog("auto_oc")
     except Exception: pass
+    if not was_active and _game_session_open():
+        # Nothing was running, so there is no test offset to take off, and
+        # the clocks on the card belong to the game that is running.  (The
+        # page sends this cancel after a start that was refused.)
+        log.info("Auto-OC cancel with no run active during a game session: card left alone")
+        return {"ok": True, "reset_ok": None, "reset_warning": None, "skipped": "adaptive_session"}
     reset_ok, reset_detail = _reset_to_stock_hard(attempts=3)
     log.info(f"Auto-OC cancelled (was_active={was_active}), reset_ok={reset_ok}")
+    if was_active:
+        _test_run_ended("Quick Tune")
     return {
         "ok": True,
         "reset_ok": reset_ok,
@@ -3042,6 +3766,7 @@ def _default_mem_ladder(max_offset: int, proven: int = 0) -> list[int]:
     return _build_ladder(max_offset, MAX_MEM_OFFSET_MHZ, BENCH_MEM_STEP_MHZ, proven)
 
 
+@_counts_from_its_start("Benchmark Tune")
 def benchmark_oc_start(core_max_offset: int = 600, mem_max_offset: int = 2500,
                        max_power: bool = True) -> dict:
     """Begin a Benchmark-Tune session.
@@ -3057,10 +3782,14 @@ def benchmark_oc_start(core_max_offset: int = 600, mem_max_offset: int = 2500,
     Total runtime depends on where the GPU starts crashing (early crash =
     early stop); typical 45-90 minutes.
     """
+    refused = _refused_for_game_session()
+    if refused:
+        return refused
     cap = detect_gpu_oc_capability()
     if cap["vendor"] != "nvidia":
         return {"ok": False, "err": "Benchmark-Tune only supported on NVIDIA cards"}
     _cache_power_default(cap.get("limits", {}).get("power_default_w"))
+    _tuning_window_begin()
 
     # beta.9 — pause the drift watchdog for the whole benchmark session so it
     # can't re-assert an offset mid-measurement or fight post-crash recovery.
@@ -3139,6 +3868,18 @@ def benchmark_oc_start(core_max_offset: int = 600, mem_max_offset: int = 2500,
 
 
 def benchmark_oc_next(prev_result: Optional[dict] = None) -> dict:
+    """Drive the benchmark state machine (see _benchmark_oc_next), and say so
+    when this call ended the run."""
+    was_active = bool(_benchmark_oc_session.get("active"))
+    result = _benchmark_oc_next(prev_result)
+    if was_active and not _benchmark_oc_session.get("active"):
+        _test_run_ended("Benchmark Tune")
+    elif was_active:
+        _tuning_window_touch()
+    return result
+
+
+def _benchmark_oc_next(prev_result: Optional[dict] = None) -> dict:
     """Drive the benchmark state machine.
 
     Frontend pattern (mirrors auto_oc_next):
@@ -3524,12 +4265,20 @@ def benchmark_oc_next(prev_result: Optional[dict] = None) -> dict:
 
 def benchmark_oc_cancel() -> dict:
     """Abort benchmark-tune and reset to stock.  Idempotent."""
+    was_active = bool(_benchmark_oc_session.get("active"))
     _benchmark_oc_session["active"] = False
     _benchmark_oc_session["done"]   = False
     try: resume_oc_watchdog("bench_oc")
     except Exception: pass
+    if not was_active and _game_session_open():
+        # As in auto_oc_cancel(): nothing of this run is on the card, and the
+        # clocks belong to the game that is running.
+        log.info("Benchmark-Tune cancel with no run active during a game session: card left alone")
+        return {"ok": True, "reset_ok": None, "reset_warning": None, "skipped": "adaptive_session"}
     reset_ok, _ = _reset_to_stock_hard(attempts=3)
     log.info(f"Benchmark-Tune cancelled, reset_ok={reset_ok}")
+    if was_active:
+        _test_run_ended("Benchmark Tune")
     return {
         "ok": True,
         "reset_ok": reset_ok,
@@ -3562,6 +4311,7 @@ _benchmark_state = {
 }
 
 
+@_counts_from_its_start("benchmark")
 def benchmark_start(saved_oc: dict = None) -> dict:
     """Start a before/after benchmark. Frontend will drive the workload.
 
@@ -3569,6 +4319,9 @@ def benchmark_start(saved_oc: dict = None) -> dict:
         saved_oc: dict with core_offset_mhz, mem_offset_mhz, power_pct to apply
                   during the OC phase. If None, uses current saved profile.
     """
+    refused = _refused_for_game_session()
+    if refused:
+        return refused
     cap = detect_gpu_oc_capability()
     if cap["vendor"] != "nvidia":
         return {"ok": False, "err": "Benchmark requires NVIDIA GPU"}
@@ -3585,12 +4338,14 @@ def benchmark_start(saved_oc: dict = None) -> dict:
         }
 
     # First step: reset to stock for the baseline measurement
+    _tuning_window_begin()
     reset_oc()
 
     _benchmark_state.update({
         "active": True,
         "phase": "stock_measure",
         "started": time.time(),
+        "last_tick": time.time(),
         "stock_result": None,
         "oc_result": None,
         "saved_profile": saved_oc,
@@ -3615,6 +4370,8 @@ def benchmark_record_result(result: dict) -> dict:
         return {"ok": False, "err": "No active benchmark"}
 
     sess = _benchmark_state
+    sess["last_tick"] = time.time()
+    _tuning_window_touch()
     if sess["phase"] == "stock_measure":
         sess["stock_result"] = result
         # Now apply OC
@@ -3645,6 +4402,7 @@ def benchmark_record_result(result: dict) -> dict:
         # missing keys would otherwise raise TypeError inside the log call.
         _fps_pct = delta.get('fps_pct') or 0.0
         log.info(f"Benchmark complete: stock {stock.get('avg_fps')} FPS vs OC {oc.get('avg_fps')} FPS (Δ {_fps_pct:+.1f}%)")
+        _test_run_ended("benchmark")
         return {
             "ok": True,
             "phase": "done",
@@ -3693,6 +4451,12 @@ def _compute_benchmark_delta(stock: dict, oc: dict) -> dict:
 
 def benchmark_cancel() -> dict:
     """Abort benchmark. Restores OC profile if one was active."""
+    was_active = bool(_benchmark_state.get("active"))
+    if not was_active and _game_session_open():
+        # No benchmark to abort, and the clocks belong to the game that is
+        # running: do not put a profile on the card under it.
+        _benchmark_state["phase"] = "idle"
+        return {"ok": True, "skipped": "adaptive_session"}
     if _benchmark_state.get("phase") in ("oc_measure", "done"):
         # OC was applied; leave it
         pass
@@ -3703,6 +4467,8 @@ def benchmark_cancel() -> dict:
             apply_oc(**p)
     _benchmark_state["active"] = False
     _benchmark_state["phase"] = "idle"
+    if was_active:
+        _test_run_ended("benchmark")
     return {"ok": True}
 
 
@@ -3778,9 +4544,13 @@ def load_profile() -> dict:
         return {"exists": False, "err": str(e)}
 
 
+@_a_clock_write(owner_position=None)
 def delete_profile() -> dict:
     """Remove the saved profile and reset GPU to stock."""
     try:
+        # Counted even if the reset below cannot run: a game session must
+        # not put a deleted overclock back.
+        _note_clock_write(None)
         if os.path.exists(OC_PROFILE_PATH):
             os.remove(OC_PROFILE_PATH)
         reset_oc()
@@ -3801,7 +4571,15 @@ def get_history() -> list:
 
 
 def apply_saved_profile_on_startup() -> dict:
-    """Called from app.py at startup. Loads profile and applies it silently."""
+    """Called from app.py at startup. Loads profile and applies it silently.
+    However it ends, wait_startup_apply() is released afterwards."""
+    try:
+        return _apply_saved_profile_on_startup()
+    finally:
+        mark_startup_apply_done()
+
+
+def _apply_saved_profile_on_startup() -> dict:
     p = load_profile()
     if not p.get("exists") or not p.get("apply_on_startup", True):
         return {"applied": False, "reason": "No saved profile or apply-on-startup disabled"}

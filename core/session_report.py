@@ -141,5 +141,15 @@ def latest() -> Optional[dict]:
     if other:
         lines.append(f"Same game with efficiency cores {'on' if other.get('eco_on') else 'off'} "
                      f"({time.strftime('%b %d', time.localtime(other['ended']))}): {_line(other)}")
+    # What Adaptive Tuning did with the overclock in that session.  Asked for
+    # here, when the report is shown, and not when it is written: the report
+    # is finished before Adaptive Tuning has judged how the game closed.
+    try:
+        from core import adaptive_tuning
+        oc_line = adaptive_tuning.report_line(r.get("exe"), r.get("ended"))
+        if oc_line:
+            lines.append(oc_line)
+    except Exception as e:
+        log.debug(f"no overclock line for the session report: {e}")
     r["lines"] = lines
     return r

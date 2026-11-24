@@ -31,6 +31,7 @@ DESIGN PRINCIPLES (deliberate):
     power-plan lever.  Any error degrades to a no-op, never a crash.
 """
 import functools
+import sys
 import threading
 import time
 from typing import Any, Optional
@@ -144,6 +145,25 @@ def _one_transition(fn):
     return run
 
 
+def _game_session_open() -> bool:
+    """Is Adaptive Tuning holding the card for a game right now?  Parking
+    would write over the clocks it set, and it would then take that for the
+    user changing the overclock and leave the game without one.  The module
+    imports this one's neighbours, so it is reached through sys.modules, and
+    only if it is loaded (no session can be open otherwise)."""
+    at = sys.modules.get("core.adaptive_tuning")
+    fn = getattr(at, "session_active", None) if at is not None else None
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn())
+    except Exception as e:
+        # Fail safe, as _a_game_is_running() does: if it can't be asked, a
+        # session may be open, and not parking costs nothing.
+        log.debug(f"session_active() failed, not parking to be safe: {e}")
+        return True
+
+
 def _current_power_guid() -> str:
     """The GUID of the currently-active power scheme, or '' if unknown."""
     r = run_cmd(["powercfg", "/getactivescheme"], timeout=6)
@@ -160,6 +180,9 @@ def _current_power_guid() -> str:
 def _engage() -> None:
     """Capture the current posture, then apply the cool/quiet levers.
     Assumes caller holds nothing — grabs _lock internally."""
+    if _game_session_open():
+        log.info("Idle Mode not engaged: a game session is holding the graphics card")
+        return
     s = _load()
     with _lock:
         if _state["engaged"]:
@@ -298,7 +321,10 @@ def _loop(stop: threading.Event) -> None:
                 # Never park in the middle of a tuning run: the step being
                 # measured would run at stock / reduced power and be recorded
                 # as a pass for an offset that was never actually under test.
-                if not engaged and idle_for >= grace_s and not gpu_overclock.is_tuning_active():
+                # Nor while Adaptive Tuning holds the card for a game the
+                # scanner above no longer lists.
+                if (not engaged and idle_for >= grace_s and not gpu_overclock.is_tuning_active()
+                        and not _game_session_open()):
                     _engage()
 
             if stop.wait(poll):

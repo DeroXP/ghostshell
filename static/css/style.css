@@ -2320,3 +2320,170 @@ body, .nav-item, .toggle-name, .toggle-desc, .card-title, .stat-value,
 .xh-legacy-row { display: flex; align-items: flex-start; gap: 14px; }
 .xh-legacy-icon { margin-bottom: 0; flex-shrink: 0; }
 .xh-legacy-text { flex: 1; font-size: 13px; color: var(--text-secondary); line-height: 1.55; padding-top: 2px; }
+
+/* ═══════════════════════════════════════════════════════════════
+   Profiles page: Adaptive Tuning card and Installed Games card
+   (ids and classes start with at2-)
+   ═══════════════════════════════════════════════════════════════ */
+.at2-lead { font-size: 13px; color: var(--text-secondary); line-height: 1.55; max-width: 720px; margin-bottom: 6px; }
+.at2-levels { font-size: 12px; color: var(--text-secondary); line-height: 1.5; max-width: 720px; margin-bottom: 14px; }
+#library-card .at2-lead { margin-bottom: 14px; }
+
+/* Not loaded yet: neither on nor off.  Disabled: this PC can't use it. */
+.toggle-switch.at2-pending { opacity: 0.45; pointer-events: none; border-style: dashed; }
+.toggle-switch.at2-pending::after { opacity: 0; }
+.toggle-switch.at2-disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* The one-time note after the upgrade */
+.at2-note {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    border-radius: var(--radius);
+    border: 1px solid rgba(196, 193, 255, 0.22);
+    background: var(--accent-soft);
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text);
+}
+.at2-note svg { width: 18px; height: 18px; color: var(--accent); flex-shrink: 0; }
+.at2-note-text { flex: 1; }
+
+/* The switch and the status line under its name */
+.at2-main-row { padding: 14px 0 0; border-top: 1px solid var(--border-faint); border-bottom: none; align-items: flex-start; }
+.at2-main-row .toggle-desc { font-size: 13px; line-height: 1.5; max-width: 760px; }
+.at2-main-row .toggle-desc.at2-warn { color: var(--warning); }
+.at2-main-row .toggle-desc.at2-live { color: var(--text); }
+.at2-main-row .toggle-switch { margin-top: 2px; }
+.at2-status-extra { margin-top: 10px; }
+.at2-status-extra:empty { display: none; }
+.at2-health { margin-top: 10px; font-size: 12.5px; color: var(--text-secondary); line-height: 1.5; max-width: 760px; }
+.at2-health.at2-warn { color: var(--warning); }
+
+/* A change is being saved: the card shows it and takes no other click until the answer */
+#at2-card.at2-saving { cursor: progress; }
+#at2-card.at2-saving .toggle-switch,
+#at2-card.at2-saving .btn,
+#at2-card.at2-saving select { pointer-events: none; opacity: 0.6; }
+
+/* Your games */
+.at2-sub {
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-tertiary);
+    margin: 22px 0 4px;
+}
+.at2-empty { font-size: 12.5px; color: var(--text-secondary); padding: 8px 0; }
+/* Adaptive Tuning is off: what that means for the games below */
+.at2-main-off-line {
+    margin: 8px 0 4px;
+    padding: 8px 12px;
+    border-radius: var(--radius);
+    background: var(--bg-hover);
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    max-width: 760px;
+}
+.at2-game { padding: 12px 0; border-bottom: 1px solid var(--border-faint); }
+.at2-game:last-child { border-bottom: none; }
+.at2-game-now { padding-left: 12px; box-shadow: inset 2px 0 0 var(--accent); }
+.at2-game-head { display: flex; align-items: center; gap: 10px; }
+.at2-game-name {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--text-bright);
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.at2-game-off .at2-game-name { color: var(--text-secondary); }
+.at2-game-played { margin-left: auto; font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
+.at2-game-switch { margin-left: 6px; }
+.at2-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 9px;
+    border-radius: var(--radius-pill);
+    font-size: 11.5px;
+    font-weight: 600;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+.at2-chip-l0 { background: var(--accent-soft); color: var(--accent); }
+.at2-chip-l1, .at2-chip-l2, .at2-chip-l3 { background: var(--warning-soft); color: var(--warning); }
+.at2-chip-off { background: var(--bg-hover); color: var(--text-secondary); }
+.at2-game-problem { margin-top: 6px; font-size: 12.5px; color: var(--text); line-height: 1.5; max-width: 760px; }
+.at2-game-hint { margin-top: 4px; font-size: 12.5px; color: var(--text-secondary); line-height: 1.5; max-width: 760px; }
+.at2-game-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.at2-game-actions .btn { padding: 4px 10px; font-size: 12px; }
+.at2-game-actions .btn.at2-quiet {
+    margin-left: auto;
+    background: transparent;
+    border-color: transparent;
+    color: var(--text-secondary);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+}
+.at2-game-actions .btn.at2-quiet:hover { background: transparent; border-color: transparent; color: var(--danger); }
+
+/* What happened, Advanced */
+.at2-fold { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-faint); }
+.at2-fold > summary {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+}
+.at2-fold > summary::-webkit-details-marker { display: none; }
+.at2-fold > summary::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    margin-left: 2px;
+    border-right: 2px solid var(--text-tertiary);
+    border-bottom: 2px solid var(--text-tertiary);
+    transform: rotate(-45deg);
+    transition: transform 120ms linear;
+}
+.at2-fold[open] > summary::before { transform: rotate(45deg); }
+.at2-fold > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.at2-history { margin-top: 10px; max-height: 260px; overflow-y: auto; padding-right: 6px; }
+.at2-hist-row { display: flex; gap: 14px; padding: 5px 0; font-size: 12.5px; line-height: 1.5; border-bottom: 1px solid var(--border-faint); }
+.at2-hist-row:last-child { border-bottom: none; }
+.at2-hist-date { flex: 0 0 116px; color: var(--text-secondary); white-space: nowrap; }
+.at2-hist-text { flex: 1; color: var(--text-secondary); }
+.at2-adv-row { margin-top: 4px; }
+.at2-adv-field { padding: 12px 0 14px; }
+.at2-adv-field select { max-width: min(560px, 100%); }
+
+/* GPU page: "Open the GPU page" from the Adaptive Tuning card points at Quick Tune */
+#oc-auto-card.at2-flash { animation: at2-flash 2.4s ease-out 1; }
+@keyframes at2-flash {
+    0%, 40% { box-shadow: 0 0 0 2px var(--accent); }
+    100% { box-shadow: 0 0 0 2px transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+    #oc-auto-card.at2-flash { animation: none; box-shadow: 0 0 0 2px var(--accent); }
+}
+
+/* Installed Games */
+.at2-filter { color: var(--text-secondary); text-decoration: none; }
+.at2-filter:hover { color: var(--text-bright); }
+.at2-filter.active { color: var(--accent); font-weight: 600; }
+.at2-lib-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border-faint); }
+.at2-lib-row:last-child { border-bottom: none; }
+.at2-lib-info { flex: 1; min-width: 0; }
+.at2-lib-title { font-size: 13.5px; font-weight: 600; color: var(--text-bright); }
+.at2-lib-sub { margin-top: 2px; font-size: 12px; color: var(--text-tertiary); }
+.at2-lib-state { font-size: 12px; color: var(--text-tertiary); white-space: nowrap; }

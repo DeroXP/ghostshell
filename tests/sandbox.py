@@ -14,7 +14,8 @@ Importing it
     system setting - or even start a process: subprocess.Popen raises;
   * stands in for the Windows APIs app modules call directly: process priority
     and affinity, the mouse-acceleration call, the timer-resolution request,
-    and the NVIDIA clock interface (which simply reports "not available").
+    the NVIDIA clock interface (which simply reports "not available") and the
+    Windows event log (EVENTS, empty until a test puts records in it).
 
 The fakes answer the way Windows does where the app depends on it: `reg query`
 prints DWORDs as hex, `powercfg /query` leaves hidden settings out while `/qh`
@@ -77,6 +78,17 @@ def _refuse(what):
 os.system = _refuse("os.system")
 if hasattr(os, "startfile"):
     os.startfile = _refuse("os.startfile")
+
+# Python's own platform module asks WMI for the Windows version and, when that
+# query fails or times out (now and then it does), falls back to running the
+# `ver` command: a real process, which the rule above turns into a failed
+# test that has nothing to do with the app.  Answer the way the module does
+# when the command is not there (it then reads sys.getwindowsversion()).
+import platform as _platform     # noqa: E402
+
+if hasattr(_platform, "_syscmd_ver"):
+    _platform._syscmd_ver = (lambda system="", release="", version="", supported_platforms=():
+                             (system, release, version))
 
 
 def spawn(args, env=None, cwd=None, timeout=120):
@@ -1490,6 +1502,296 @@ class FakeOverlayWin:
         return 1 if index == 23 and self.swapped else 0       # SM_SWAPBUTTON
 
 
+# ═════════════════════════════════════════════════════════════════════
+# The Windows event log (core.gpu_events)
+# ═════════════════════════════════════════════════════════════════════
+import calendar as _calendar                              # noqa: E402
+from xml.sax.saxutils import escape as _xml_escape        # noqa: E402
+
+
+class FakeEventLog:
+    """Stands in for wevtapi.dll behind core.gpu_events._api.  The one instance
+    is `EVENTS`; the log is empty until a test puts records in it:
+
+        EVENTS.add(kind, ts, exe="", module="", pid=0, code=None, record_id=None,
+                   provider=None, event_id=None)
+            a record of that kind, shaped like the one Windows writes.  kind is
+            "driver_error", "app_crash", "gpu_bugcheck", "unexpected_shutdown"
+            or "boot".  provider / event_id pick another source of the same
+            kind (see SOURCES; the first one listed is the default).  code is
+            the bugcheck code (default 0x116 for a gpu_bugcheck, 0x141 for the
+            Windows Error Reporting one, 0 for an unexpected_shutdown) or, for
+            an app_crash, the exception code.  A code that would make the
+            record another kind is refused.  ts is seconds since 1970 and may
+            be any time from 0 on, so a test's own clock works.  Returns the
+            record id (they count up from 1001).
+        EVENTS.add_xml(channel, xml)
+            any record, as the XML text EvtRender returns ("System" or
+            "Application").  Returns the record id.
+
+    Switches: `fail` (the log cannot be read; `fail_stage` says where: "query",
+    "next" or "render") and `loose` (hand back every record in the time window,
+    whatever providers and ids the query asked for).  What the code under test
+    did: `open_handles` (handles it has not closed), `queries` (every EvtQuery
+    as (channel, xpath, flags)), `next_counts` and `render_sizes` (the size
+    argument of every EvtNext / EvtRender), `bad` (misuse: a handle closed
+    twice, a call on a handle that is not open).  clear() empties everything.
+
+    Like Windows it keeps to the absolute time bounds and the provider / id
+    list in the query text, hands records back in record-id order (which is
+    not always time order), fails an EvtRender whose buffer is too small with
+    122 and the size it needs in BYTES, and refuses a query it cannot parse
+    (15001).
+    """
+    SOURCES = {
+        # kind: (provider, event ids, channel), the default source first
+        "driver_error": (("nvlddmkm", (153, 13, 14), "System"), ("Display", (4101,), "System")),
+        "app_crash": (("Application Error", (1000,), "Application"), ("Application Hang", (1002,), "Application")),
+        "gpu_bugcheck": (("Microsoft-Windows-Kernel-Power", (41,), "System"),
+                         ("Microsoft-Windows-WER-SystemErrorReporting", (1001,), "System"),
+                         ("Windows Error Reporting", (1001,), "Application")),
+        "unexpected_shutdown": (("Microsoft-Windows-Kernel-Power", (41,), "System"), ("EventLog", (6008,), "System")),
+        "boot": (("EventLog", (6005,), "System"),),
+    }
+    GPU_CODES = (0x116, 0x117, 0x119, 0x141, 0x10E)
+    LIVE_CODES = (0x141, 0x117)
+    CHANNELS = ("System", "Application")
+    COMPUTER = "DESKTOP-TEST"
+
+    _QUERY = re.compile(r"^\*\[System\[(?:\((?P<sel>.+)\) and )?TimeCreated\[@SystemTime>='(?P<lo>[^']+)'"
+                        r"(?: and @SystemTime<='(?P<hi>[^']+)')?\]\]\]$")
+    _GROUP = re.compile(r"\(Provider\[@Name='([^']+)'\] and "
+                        r"(?:(EventID=\d+)|\((EventID=\d+(?: or EventID=\d+)+)\))\)")
+    _STAMP = re.compile(r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?Z$")
+    _HEAD = (re.compile(r"<Provider\s[^>]*?Name=['\"]([^'\"]*)['\"]"),
+             re.compile(r"<EventID[^>]*>\s*(\d+)\s*</EventID>"),
+             re.compile(r"<TimeCreated\s[^>]*?SystemTime=['\"]([^'\"]+)['\"]"),
+             re.compile(r"<EventRecordID>\s*(\d+)\s*</EventRecordID>"))
+
+    def __init__(self):
+        self._lock = _threading.RLock()
+        self.records: list = []         # {"channel", "provider", "event_id", "ts", "record_id", "xml"}
+        self.queries: list = []
+        self.next_counts: list = []
+        self.render_sizes: list = []
+        self.bad: list = []
+        self._handles: dict = {}        # handle -> ["query", rows still to hand out] | ["event", record]
+        self._last_handle = 0x7000
+        self.clear()
+
+    def clear(self) -> None:
+        with self._lock:
+            self.fail, self.fail_stage, self.loose = False, "query", False
+            for box in (self.records, self.queries, self.next_counts, self.render_sizes, self.bad):
+                del box[:]
+            self._handles.clear()
+            self._last_record = 1000
+
+    @property
+    def open_handles(self) -> int:
+        return len(self._handles)
+
+    # ---- putting records in the log ----
+    @classmethod
+    def _seconds(cls, text: str) -> float:
+        mo = cls._STAMP.match(text.strip())
+        if not mo:
+            raise ValueError(f"not an event log time: {text!r}")
+        whole = _calendar.timegm(tuple(int(g) for g in mo.groups()[:6]) + (0, 0, 0))
+        return float("%d.%s" % (whole, mo.group(7) or "0"))
+
+    @staticmethod
+    def stamp(ts: float) -> str:
+        """Seconds since 1970 as the log writes them: UTC with seven digits."""
+        if ts < 0:
+            raise ValueError("the event log has no times before 1970")
+        whole, _, fraction = ("%.7f" % float(ts)).partition(".")
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(int(whole))) + "." + fraction + "Z"
+
+    def add_xml(self, channel: str, xml: str) -> int:
+        if channel not in self.CHANNELS:
+            raise ValueError(f"the fake event log has no {channel!r} channel")
+        found = [rx.search(xml) for rx in self._HEAD]
+        if not all(found):
+            raise ValueError("add_xml needs a Provider Name, an EventID, a TimeCreated SystemTime and an EventRecordID")
+        record = {"channel": channel, "provider": found[0].group(1), "event_id": int(found[1].group(1)),
+                  "ts": self._seconds(found[2].group(1)), "record_id": int(found[3].group(1)), "xml": xml}
+        with self._lock:
+            self.records.append(record)
+            self._last_record = max(self._last_record, record["record_id"])
+        return record["record_id"]
+
+    def add(self, kind, ts, exe="", module="", pid=0, code=None, record_id=None, provider=None, event_id=None) -> int:
+        sources = self.SOURCES.get(kind)
+        if not sources:
+            raise ValueError(f"unknown event kind {kind!r}")
+        for name, ids, channel in sources:
+            if provider in (None, name) and (event_id is None or event_id in ids):
+                break
+        else:
+            raise ValueError(f"no {kind} source with provider {provider!r} and event id {event_id!r}")
+        event_id = ids[0] if event_id is None else event_id
+        with self._lock:
+            if record_id is None:
+                record_id = self._last_record + 1
+            self._last_record = max(self._last_record, record_id)
+        esc = _xml_escape
+        guid, qualifiers, level, pid_attr, user = "", None, 2, 4, ""
+        if name == "nvlddmkm":
+            qualifiers = 0
+            data = ("<Data>\\Device\\Video3</Data><Data>Error occurred on GPUID: 100</Data>"
+                    "<Binary>00000000020030000000000099000000000000000000000000000000000000000000000000000000</Binary>")
+        elif name == "Display":                                     # layout from documentation
+            qualifiers, level = 0, 3
+            data = "<Data>nvlddmkm</Data><Data></Data>"
+        elif name == "Microsoft-Windows-Kernel-Power":
+            code = (0x116 if kind == "gpu_bugcheck" else 0) if code is None else code
+            if (code in self.GPU_CODES) != (kind == "gpu_bugcheck"):
+                raise ValueError(f"a Kernel-Power 41 with bugcheck code {code:#x} is not a {kind}")
+            guid, level, user = "{331c3b3a-2005-44c2-ac5e-77220c37d6b4}", 1, "S-1-5-18"
+            rest = (("BugcheckParameter1", "0x0"), ("BugcheckParameter2", "0x0"), ("BugcheckParameter3", "0x0"),
+                    ("BugcheckParameter4", "0x0"), ("SleepInProgress", "0"), ("PowerButtonTimestamp", "0"),
+                    ("BootAppStatus", "0"), ("Checkpoint", "0"), ("ConnectedStandbyInProgress", "false"),
+                    ("SystemSleepTransitionsToOn", "0"), ("CsEntryScenarioInstanceId", "0"),
+                    ("BugcheckInfoFromEFI", "false"), ("CheckpointStatus", "0"),
+                    ("CsEntryScenarioInstanceIdV2", "0"), ("LongPowerButtonPressDetected", "false"),
+                    ("LidReliability", "false"), ("InputSuppressionState", "0"),
+                    ("PowerButtonSuppressionState", "0"), ("LidState", "3"), ("WHEABootErrorCount", "0"))
+            data = "<Data Name='BugcheckCode'>%d</Data>" % code + "".join(
+                "<Data Name='%s'>%s</Data>" % pair for pair in rest)
+        elif name == "Microsoft-Windows-WER-SystemErrorReporting":    # layout from documentation
+            code = 0x116 if code is None else code
+            if code not in self.GPU_CODES:
+                raise ValueError(f"bugcheck code {code:#x} is not a graphics one")
+            qualifiers, pid_attr = 16384, 0
+            data = ("<Data Name='param1'>0x%08x (0xffffb38f5c2d6010, 0xfffff8056b9a4c30, 0xffffffffc000009a, "
+                    "0x0000000000000004)</Data><Data Name='param2'>C:\\WINDOWS\\MEMORY.DMP</Data>"
+                    "<Data Name='param3'>5f3b0d1c-6a52-4d0e-9c1b-0e6f2a7d9b11</Data>" % code)
+        elif name == "EventLog" and event_id == 6008:
+            qualifiers, pid_attr, mark = 32768, 2344, chr(0x200E)
+            data = ("<Data>5:48:57 PM</Data><Data>" + mark + "10/" + mark + "25/" + mark + "2026</Data><Data></Data>"
+                    "<Data></Data><Data>18012</Data><Data></Data><Data></Data>"
+                    "<Binary>EA070A00000019001100300039001603EA070A00000019001600300039001603DC0500003C000000"
+                    "01000000DC050000010000001E0000000000000000000000</Binary>")
+        elif name == "EventLog":
+            qualifiers, level, pid_attr = 32768, 4, 2376
+            data = "<Binary>EA070B0005000D00130014002600A6030000000000000000</Binary>"
+        elif name == "Application Error":
+            code = 0xC0000005 if code is None else code
+            guid, pid_attr, user = "{a0e9b465-b939-57d7-b27d-95d8e925ff57}", 4328, "S-1-5-18"
+            fields = (("AppName", exe), ("AppVersion", "1.0.0.0"), ("AppTimeStamp", "6a630000"),
+                      ("ModuleName", module), ("ModuleVersion", "1.0.0.0"), ("ModuleTimeStamp", "69c66187"),
+                      ("ExceptionCode", "%08x" % code), ("FaultingOffset", "0000000000145880"),
+                      ("ProcessId", "0x%x" % pid), ("ProcessCreationTime", "0x1dd716f6a550f16"),
+                      ("AppPath", "C:\\Games\\" + exe), ("ModulePath", "C:\\Games\\" + module),
+                      ("IntegratorReportId", "7665ee08-81f6-44f3-b5ee-50b2f660fd65"),
+                      ("PackageFullName", ""), ("PackageRelativeAppId", ""))
+            data = "".join("<Data Name='%s'>%s</Data>" % (n, esc(v)) for n, v in fields)
+        elif name == "Application Hang":                              # classic layout, from documentation
+            qualifiers, pid_attr = 0, 0
+            values = (exe, "1.0.0.0", "%x" % pid, "01dd716f6a550f16", "4294967295", "C:\\Games\\" + exe,
+                      "0d2e7a4c-91d2-4c0b-8a37-3b5a7c1e9f20", "", "", "Top level window is idle")
+            data = ("".join("<Data>%s</Data>" % esc(v) for v in values)
+                    + "<Binary>55006E006B006E006F0077006E0000000000</Binary>")
+        else:                                                           # Windows Error Reporting, from documentation
+            code = 0x141 if code is None else code
+            if code not in self.LIVE_CODES:
+                raise ValueError(f"live kernel event {code:x} is not a graphics one")
+            qualifiers, pid_attr = 0, 0
+            values = ("", "0", "LiveKernelEvent", "Not available", "0", "%x" % code, "ffffb38f5c2d6010",
+                      "fffff8056b9a4c30", "0", "3f04", "10_0_26100", "0_0", "768_1", "", "",
+                      "\\\\?\\C:\\WINDOWS\\LiveKernelReports\\WATCHDOG\\WATCHDOG-20261101-2214.dmp", "",
+                      "\\\\?\\C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportArchive\\Kernel_%x_1" % code, "", "0",
+                      "9a1f6c0e-2b7d-4c55-8f0a-6d3e1b2c4a59", "262144", "", "0")
+            data = "".join("<Data>%s</Data>" % esc(v) for v in values)
+        xml = ("<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+               "<Provider Name='%s'%s/><EventID%s>%d</EventID><Version>0</Version><Level>%d</Level><Task>0</Task>"
+               "<Opcode>0</Opcode><Keywords>0x80000000000000</Keywords><TimeCreated SystemTime='%s'/>"
+               "<EventRecordID>%d</EventRecordID><Correlation/><Execution ProcessID='%d' ThreadID='8'/>"
+               "<Channel>%s</Channel><Computer>%s</Computer><Security%s/></System><EventData>%s</EventData></Event>"
+               % (name, " Guid='%s'" % guid if guid else "",
+                  "" if qualifiers is None else " Qualifiers='%d'" % qualifiers, event_id, level, self.stamp(ts),
+                  record_id, pid_attr, channel, self.COMPUTER, " UserID='%s'" % user if user else "", data))
+        return self.add_xml(channel, xml)
+
+    # ---- the adapter core.gpu_events calls ----
+    def _handle(self, entry) -> int:
+        self._last_handle += 8
+        self._handles[self._last_handle] = entry
+        return self._last_handle
+
+    def _selection(self, xpath: str):
+        """(providers and ids asked for or None for all, lower bound, upper bound)."""
+        if xpath == "*":
+            return None, float("-inf"), float("inf")
+        mo = self._QUERY.match(xpath)
+        if not mo:
+            raise ValueError(xpath)
+        wanted = None
+        if mo.group("sel") is not None:
+            groups = list(self._GROUP.finditer(mo.group("sel")))
+            if " or ".join(g.group(0) for g in groups) != mo.group("sel"):
+                raise ValueError(xpath)
+            wanted = {(g.group(1), int(i)) for g in groups for i in re.findall(r"EventID=(\d+)", g.group(0))}
+        hi = float("inf") if mo.group("hi") is None else self._seconds(mo.group("hi"))
+        return wanted, self._seconds(mo.group("lo")), hi
+
+    def EvtQuery(self, channel, xpath, flags):
+        with self._lock:
+            self.queries.append((channel, xpath, flags))
+            if self.fail and self.fail_stage == "query":
+                return 0, 5                                 # access denied
+            if channel not in self.CHANNELS:
+                return 0, 15007                             # ERROR_EVT_CHANNEL_NOT_FOUND
+            try:
+                wanted, lo, hi = self._selection(xpath)
+            except ValueError:
+                return 0, 15001                             # ERROR_EVT_INVALID_QUERY
+            rows = [r for r in self.records if r["channel"] == channel and lo <= r["ts"] <= hi
+                    and (wanted is None or self.loose or (r["provider"], r["event_id"]) in wanted)]
+            rows.sort(key=lambda r: r["record_id"], reverse=bool(flags & 0x200))
+            return self._handle(["query", rows]), 0
+
+    def EvtNext(self, query, count, timeout_ms):
+        with self._lock:
+            self.next_counts.append(count)
+            entry = self._handles.get(query)
+            if entry is None or entry[0] != "query":
+                self.bad.append(("EvtNext on a handle that is not an open query", query))
+                return [], 6                                # invalid handle
+            if self.fail and self.fail_stage == "next":
+                return [], 1722                             # the RPC server is unavailable
+            if not entry[1]:
+                return [], 259                              # no more items
+            batch, entry[1] = entry[1][:count], entry[1][count:]
+            return [self._handle(["event", r]) for r in batch], 0
+
+    def EvtRender(self, event, size):
+        with self._lock:
+            self.render_sizes.append(size)
+            entry = self._handles.get(event)
+            if entry is None or entry[0] != "event":
+                self.bad.append(("EvtRender on a handle that is not an open event", event))
+                return False, "", 0, 6
+            if self.fail and self.fail_stage == "render":
+                return False, "", 0, 14                     # not enough memory
+            xml = entry[1]["xml"]
+            need = len(xml.encode("utf-16-le", "surrogatepass")) + 2       # with the terminator, in bytes
+            if size < need:
+                return False, "", need, 122                 # ERROR_INSUFFICIENT_BUFFER
+            return True, xml, need, 0
+
+    def EvtClose(self, handle):
+        with self._lock:
+            if self._handles.pop(handle, None) is None:
+                self.bad.append(("EvtClose on a handle that is not open", handle))
+                return False
+            return True
+
+
+EVENTS = FakeEventLog()
+
+
 def wire(module):
     """Call on an app module after importing it, if it talks to Windows
     directly; modules that only use run_cmd / run_ps / winreg need nothing.
@@ -1497,6 +1799,8 @@ def wire(module):
     name = module.__name__
     if name == "core.crosshair_overlay":
         module._win = FakeOverlayWin()
+    elif name == "core.gpu_events":
+        module._api = EVENTS
     elif name == "core.competitive_latency":
         module.ctypes = _CtypesShim()
     elif name == "core.timer_manager":
@@ -1521,6 +1825,13 @@ def app(name: str):
 from core import crosshair_overlay as _crosshair_overlay     # noqa: E402
 
 wire(_crosshair_overlay)
+
+# core.gpu_events reads the Windows event log only through its `_api` adapter.
+# Wire it here too, whoever imports it later, so no test reads the real log.
+from core import gpu_events as _gpu_events                   # noqa: E402
+
+wire(_gpu_events)
+_EVENTS_NOW = _gpu_events._now          # fresh() puts the clock seam back
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -1635,6 +1946,9 @@ def fresh(plan: str = USERPLAN) -> None:
     WSL_DISTROS[0] = ""
     K.procs.clear()
     K.win10 = False
+    EVENTS.clear()
+    _gpu_events._api, _gpu_events._now = EVENTS, _EVENTS_NOW
+    _gpu_events.reset_cache()
     seed_system()
     PLAN["active"] = plan
     _wipe_app_data()

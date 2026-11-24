@@ -8,10 +8,13 @@ detection + install + restart logic in one place.
 
 Dependencies tracked
 ────────────────────
-  PresentMon 1.x     — frame timing for D3D9-12.  Bundled / auto-DL.
-                        Already handled by core/frame_telemetry.py.
-  PresentMon 2.x     — frame timing for D3D + OpenGL + Vulkan.
-                        Auto-installed via GitHub MSI + msiexec /quiet.
+  PresentMon 1.x:      frame timing for D3D9-12.  Downloaded by
+                        core/frame_telemetry.py.  Only for the crosshair:
+                        installed when it is switched on (and at start-up
+                        while it is on), not for everyone.
+  PresentMon 2.x:      frame timing for D3D + OpenGL + Vulkan.
+                        GitHub MSI + msiexec /quiet, the same way and only
+                        for the crosshair.
                         Service install — may need restart on first run.
   RTSS (standalone)  — broadest frame coverage (DLL injection).
                         Guru3D doesn't expose stable download URLs, so
@@ -63,7 +66,10 @@ INSTALLER_DIR   = os.path.join(APPDATA_DIR, "installers")
 # "Intel PresentMon Service" (display) / "PresentMonService" (short name).
 PM2_VERSION     = "2.4.1"
 PM2_MSI_URL     = f"https://github.com/GameTechDev/PresentMon/releases/download/v{PM2_VERSION}/PresentMon-v{PM2_VERSION}.msi"
-PM2_SVC_NAMES   = ("Intel PresentMon Service", "PresentMonService")
+# 2.4 registers it as "PresentMonSharedService" (display name "PresentMon
+# Shared Service").  Without that name the boot check never found the service
+# it had installed and ran the 122 MB installer again on every start.
+PM2_SVC_NAMES   = ("PresentMonSharedService", "Intel PresentMon Service", "PresentMonService")
 
 # RTSS — Guru3D's URLs aren't stable so we just direct users to the page
 RTSS_PAGE_URL    = "https://www.guru3d.com/files-details/rtss-rivatuner-statistics-server-download.html"
@@ -848,11 +854,14 @@ def install_ffmpeg() -> dict:
 # - browser_only: cannot auto-install; opens vendor page in browser
 
 DEPENDENCIES = [
+    # The two PresentMon builds are only read by the crosshair now, so they are
+    # not installed for everyone at start-up: when the crosshair is switched
+    # on, and at start-up while it is on (see install_for_crosshair).
     {
         "key":          "presentmon1",
         "label":        "PresentMon 1.x (frame timing for D3D9-12)",
-        "description":  "Microsoft's frame-timing tool. Used by Adaptive Tuning to read FPS, 1%-low, and frametime σ for D3D9-12 games.",
-        "auto_install": True,
+        "description":  "Frame-timing tool. Lets the crosshair tell when a game is in exclusive fullscreen (DirectX 9 to 12 games).",
+        "auto_install": False,
         "detect":       lambda: bool(_detect_pm1_path()),
         "install":      lambda: _install_pm1_wrapper(),
         "size":         "380 KB",
@@ -860,8 +869,8 @@ DEPENDENCIES = [
     {
         "key":          "presentmon2",
         "label":        "PresentMon 2.x (frame timing, adds OpenGL + Vulkan)",
-        "description":  "Microsoft's newer frame-timing service. Captures the full ETW provider set: D3D, OpenGL, and Vulkan. Lets AT see frame data for Minecraft Java and other non-D3D games.",
-        "auto_install": True,
+        "description":  "Newer frame-timing service. Lets the crosshair tell when a game is in exclusive fullscreen in OpenGL and Vulkan games too (Minecraft Java, for example).",
+        "auto_install": False,
         "detect":       lambda: _detect_pm2().get("installed"),
         "install":      install_presentmon2,
         "size":         "122 MB MSI",
@@ -988,7 +997,9 @@ def install_missing(only: Optional[list] = None,
     for the background variant.
 
     Args:
-        only:  if set, install only these dep keys
+        only:  if set, install only these dep keys (also ones that are not
+               installed automatically, such as PresentMon: the user, or the
+               crosshair being switched on, asked for them by name)
         skip_opt_outs: respect the per-dep opt_out list in state
     """
     state    = _load_state()
@@ -999,9 +1010,8 @@ def install_missing(only: Optional[list] = None,
     skipped     = []
     needs_rs    = False
 
-    deps_to_run = [d for d in DEPENDENCIES if d.get("auto_install")
-                   and not d.get("browser_only")
-                   and (only is None or d["key"] in only)]
+    deps_to_run = [d for d in DEPENDENCIES if not d.get("browser_only")
+                   and (d["key"] in only if only is not None else d.get("auto_install"))]
 
     _set_progress(running=True, started_at=time.time(),
                   completed=[], failed=[], needs_restart=False,
@@ -1138,17 +1148,107 @@ def check_on_boot() -> dict:
     except Exception as e:
         log.debug(f"LHM boot-time nudge failed: {e}")
 
-    if missing_auto and auto_install_enabled:
-        log.info(f"auto-installing {len(missing_auto)} missing deps: "
-                 f"{[d['key'] for d in missing_auto]}")
-        r = install_missing()
-        return {"checked": True, "auto_installed": r,
-                "nudges": nudge_results,
-                "manual_pending": [d["key"] for d in missing_manual]}
-    return {"checked": True, "auto_installed": None,
-            "nudges": nudge_results,
-            "missing_auto":   [d["key"] for d in missing_auto],
-            "manual_pending": [d["key"] for d in missing_manual]}
+    try:
+        if missing_auto and auto_install_enabled:
+            log.info(f"auto-installing {len(missing_auto)} missing deps: "
+                     f"{[d['key'] for d in missing_auto]}")
+            r = install_missing()
+            out = {"checked": True, "auto_installed": r,
+                   "nudges": nudge_results,
+                   "manual_pending": [d["key"] for d in missing_manual]}
+        else:
+            out = {"checked": True, "auto_installed": None,
+                   "nudges": nudge_results,
+                   "missing_auto":   [d["key"] for d in missing_auto],
+                   "manual_pending": [d["key"] for d in missing_manual]}
+    finally:
+        # From here on a crosshair switched on installs its tools by itself.
+        _boot_check_done.set()
+    # The crosshair's tools, while it is on (it may have been switched on
+    # while the batch above ran).
+    if _crosshair_on():
+        try:
+            out["crosshair"] = _install_crosshair_tools()
+        except Exception as e:
+            log.debug(f"crosshair tools at start-up: {e}")
+    return out
+
+
+# ─── The crosshair's tools ───────────────────────────────────────────
+# PresentMon 1.x and 2.x: only the crosshair reads them (its check for a game
+# in exclusive fullscreen), so they are installed when it is switched on and
+# at start-up while it is on, not for everyone (the 2.x one is a 122 MB MSI
+# that registers a Windows service).
+CROSSHAIR_DEPS = ("presentmon1", "presentmon2")
+# Set once the start-up check is over.  Before that a crosshair switched on
+# starts nothing itself: the check installs its tools when it is done, so two
+# install batches never run at once.
+_boot_check_done = threading.Event()
+_crosshair_install_lock = threading.Lock()
+
+
+def _crosshair_on() -> bool:
+    try:
+        from core import crosshair
+        return bool(crosshair.is_enabled())
+    except Exception as e:
+        log.debug(f"could not ask whether the crosshair is on: {e}")
+        return False
+
+
+def _install_crosshair_tools() -> dict:
+    """Install whichever of CROSSHAIR_DEPS is missing, in the calling thread,
+    when automatic installs are allowed (opt-outs are respected by
+    install_missing).  One run at a time, and never beside another batch."""
+    if not _load_state().get("auto_install_enabled", True):
+        return {"started": False, "reason": "automatic installs are off"}
+    if not _crosshair_install_lock.acquire(blocking=False):
+        return {"started": False, "reason": "already being installed"}
+    try:
+        with _progress_lock:
+            if _progress["running"]:
+                return {"started": False, "reason": "another install is running"}
+        missing = []
+        for dep in DEPENDENCIES:
+            if dep["key"] not in CROSSHAIR_DEPS:
+                continue
+            try:
+                present = bool(dep["detect"]())
+            except Exception:
+                present = False
+            if not present:
+                missing.append(dep["key"])
+        if not missing:
+            return {"started": False, "reason": "already installed"}
+        log.info(f"installing the crosshair's frame-timing tools: {missing}")
+        return {"started": True, "result": install_missing(only=missing)}
+    finally:
+        _crosshair_install_lock.release()
+
+
+def _install_crosshair_tools_quietly() -> None:
+    try:
+        r = _install_crosshair_tools()
+        log.info(f"crosshair tools: {r}")
+    except Exception as e:
+        log.warning(f"installing the crosshair's tools failed: {e}")
+
+
+def install_for_crosshair() -> dict:
+    """The crosshair was just switched on: install the PresentMon builds it
+    reads when they are missing, in the background (as the Install button
+    does).  Before the start-up check is over nothing starts here: that check
+    does it when it ends.  Returns at once; never raises."""
+    try:
+        if not _boot_check_done.is_set():
+            return {"ok": True, "started": False, "reason": "after the start-up check"}
+        if not _load_state().get("auto_install_enabled", True):
+            return {"ok": True, "started": False, "reason": "automatic installs are off"}
+        threading.Thread(target=_install_crosshair_tools_quietly, daemon=True,
+                         name="dep-install-crosshair").start()
+        return {"ok": True, "started": True}
+    except Exception as e:
+        return {"ok": False, "started": False, "err": str(e)}
 
 
 # ─── Restart helpers ─────────────────────────────────────────────────
