@@ -702,6 +702,20 @@ def set_enabled(on) -> dict:
     return set_settings({"enabled": bool(on)})
 
 
+def _want_presentmon() -> None:
+    """The crosshair was just switched on: PresentMon is how it tells that a
+    game is in exclusive fullscreen, and it is no longer installed for
+    everyone at start-up.  Installed now, in the background, when it is
+    missing (see dependencies.install_for_crosshair).  Never raises."""
+    try:
+        from core import dependencies
+        r = dependencies.install_for_crosshair()
+        if r.get("started"):
+            log.info("crosshair: switched on, so its frame-timing tools are installed if they are missing")
+    except Exception:
+        log.debug("crosshair: could not ask for the frame-timing tools", exc_info=True)
+
+
 # ── settings API ──────────────────────────────────────────────────────
 def _clipper_combos() -> list:
     """[((mods, vk), text, what)] for the clipper's own hotkeys."""
@@ -827,6 +841,8 @@ def set_settings(partial=None, **kw) -> dict:
                 return _err("Couldn't save the crosshair settings.")
             _push(new)
         if new["enabled"]:
+            if not s["enabled"]:
+                _want_presentmon()
             if _ui_ready and not overlay.is_running() and (not s["enabled"] or "enabled" in partial):
                 _start_overlay()
         else:
@@ -856,23 +872,60 @@ def _custom_games() -> list:
     return [c for c in data if isinstance(c, dict)] if isinstance(data, list) else []
 
 
-def _nice(exe: str) -> str:
+# Game names as game mode shows them (game_profiles.display_name_for: the
+# user's own name, else the installed-games title, else a known title, else
+# the exe made readable), kept per exe.  The page's list holds every known
+# game, so they are not looked up again at each read; the cache is dropped
+# when the two files the names come from change.
+_names = {"stamp": None, "by_exe": {}}
+_names_lock = threading.Lock()
+
+
+def _names_stamp():
+    """What the files behind the names look like now, or None if unknown."""
     try:
-        return game_profiles._nice_name(exe) or exe
+        from core import library_scanner
+        return (game_profiles._file_stamp(os.path.join(game_profiles.PROFILES_DIR, "custom_exes.json")),
+                game_profiles._file_stamp(library_scanner.CACHE_FILE))
     except Exception:
-        return exe
+        return None
+
+
+def _name_cache() -> dict:
+    """exe -> name, for this read (see _names).  Asked once per read."""
+    stamp = _names_stamp()
+    with _names_lock:
+        if stamp is None or stamp != _names["stamp"]:
+            _names["stamp"], _names["by_exe"] = stamp, {}
+        return _names["by_exe"]
+
+
+def _nice(exe: str, names: dict | None = None) -> str:
+    """The name to show for a game's exe (see _names).  Never raises."""
+    if names is None:
+        names = _name_cache()
+    hit = names.get(exe)
+    if hit:
+        return hit
+    try:
+        name = game_profiles.display_name_for(exe) or exe
+    except Exception:
+        name = exe
+    names[exe] = name
+    return name
 
 
 def _games_hint(s: dict, st: dict) -> list:
     """Exes for the "add a game" list: custom games, ruled games, the active
     game, the ones seen in front lately, then every other known game."""
     out, seen = [], set()
+    names = _name_cache()
 
     def add(exe, name=None):
         exe = exe.strip().lower() if isinstance(exe, str) else ""
         if exe and exe not in seen:
             seen.add(exe)
-            out.append({"exe": exe, "name": name if isinstance(name, str) and name.strip() else _nice(exe)})
+            out.append({"exe": exe, "name": name if isinstance(name, str) and name.strip() else _nice(exe, names)})
 
     for c in _custom_games():
         add(c.get("exe"), c.get("name"))

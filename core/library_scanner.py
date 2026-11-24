@@ -1,6 +1,6 @@
-"""Game Library Scanner — discover what games are installed across all major
-PC launchers so Vispora can pre-populate AT profiles and surface them on
-the dashboard before the user has to launch each title once.
+"""Game Library Scanner: discover what games are installed across all major
+PC launchers, so Vispora can list them, say which ones it recognises, and name
+a running game by its real title.
 
 Supported launchers:
     Steam        — libraryfolders.vdf + appmanifest_*.acf parsing
@@ -22,7 +22,6 @@ Each detected game is enriched with:
     launcher        — which launcher reported it
     install_path    — root install directory
     known           — True if exe matches KNOWN_GAME_EXES
-    mode_hint       — competitive / visual / balanced (from AUTO_CLASSIFY) or None
 
 Public API:
     scan_all(force=False)   -> {"games": [...], "scanned_at": ts}
@@ -222,19 +221,16 @@ def _pick_best_exe(install_path: str, max_depth: int = 4,
 
 
 def _enrich(detected: dict) -> dict:
-    """Tag a detected game with KNOWN/mode hint based on its exe."""
+    """Tag a detected game as known (or not) by its exe.  (It also carried a
+    "mode_hint" taken from the old Adaptive Tuning's table; nothing has modes
+    any more.)"""
     try:
         from core.game_profiles import KNOWN_GAME_EXES
     except Exception:
         KNOWN_GAME_EXES = set()
-    try:
-        from core.adaptive_tuning import AUTO_CLASSIFY
-    except Exception:
-        AUTO_CLASSIFY = {}
 
     exe_low = (detected.get("exe") or "").lower()
     detected["known"] = exe_low in KNOWN_GAME_EXES
-    detected["mode_hint"] = AUTO_CLASSIFY.get(exe_low)
     return detected
 
 
@@ -601,7 +597,7 @@ def scan_all(force: bool = False) -> dict:
     cached = _load_cache()
     if not force and cached and (time.time() - cached.get("scanned_at", 0)) < 6 * 3600:
         log.info("library scan: returning cached result")
-        return cached
+        return _named(cached)
 
     log.info("library scan: starting full scan")
     games: list[dict] = []
@@ -631,14 +627,51 @@ def scan_all(force: bool = False) -> dict:
     }
     _save_cache(result)
     log.info(f"library scan: {result['total']} total / {result['known']} known")
-    return result
+    return _named(result)
 
 
 def get_cached() -> dict:
     cached = _load_cache()
     if cached:
-        return cached
+        return _named(cached)
     return {"games": [], "scanned_at": 0, "total": 0, "known": 0}
+
+
+def _named(data: dict) -> dict:
+    """The scan as it is handed out: every game also carries "display_name",
+    its title cleaned the way game mode cleans a scanned title before showing
+    it (no trademark signs or stray characters, "Call of Duty- Modern Warfare
+    3" read as "Call of Duty: Modern Warfare 3"), so the library names a game
+    as the rest of the app does.  "title" stays as found, and the file on disk
+    is not changed.  Never raises."""
+    try:
+        games = data.get("games")
+        if not isinstance(games, list):
+            return data
+        try:
+            # (_plain_name, not display_name_for, for a game with no usable
+            # title: display_name_for reads this very scan for its titles.)
+            from core.game_profiles import _clean_name, _plain_name
+        except Exception:
+            _clean_name = _plain_name = None
+        named = []
+        for g in games:
+            if isinstance(g, dict):
+                g = dict(g)
+                title = g.get("title")
+                name = ""
+                if _clean_name is not None:
+                    name = _clean_name(title, scanned=True)
+                    if not name and isinstance(g.get("exe"), str) and g["exe"].strip():
+                        name = _plain_name(g["exe"])
+                elif isinstance(title, str):
+                    name = title.strip()
+                g["display_name"] = name
+            named.append(g)
+        return {**data, "games": named}
+    except Exception as e:
+        log.debug(f"library: display names not added: {e}")
+        return data
 
 
 def get_known_only() -> list[dict]:
@@ -656,9 +689,17 @@ def _load_cache() -> Optional[dict]:
         return None
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, ValueError):
         return None
+    # A scan saved by 3.7.0 or earlier still carries the old "mode_hint".
+    try:
+        for g in data.get("games") or []:
+            if isinstance(g, dict):
+                g.pop("mode_hint", None)
+    except (AttributeError, TypeError):
+        pass                            # (not the dict a scan saves: handed on as it was)
+    return data
 
 
 def _save_cache(data: dict):

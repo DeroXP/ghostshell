@@ -451,28 +451,85 @@ def _check_vispora_state() -> list[dict]:
     except Exception:
         pass
 
-    # Adaptive Tuning?
+    # Adaptive Tuning?  The dashboard's one pointer to it; the card itself is
+    # on the Profiles page.
     try:
-        from core import adaptive_tuning
-        s = adaptive_tuning.get_settings()
-        global_on = bool(s.get("enabled_globally"))
-        # Count enabled games
-        states = adaptive_tuning.get_game_state()
-        enabled_n = sum(1 for v in states.values() if v.get("enabled"))
-        out.append({
-            "id": "vispora.adaptive", "category": "vispora",
-            "name": "Adaptive Tuning",
-            "severity": "ok" if global_on else "warn",
-            "current": (f"On, {enabled_n} game(s) opted in" if global_on
-                        else "Off (master switch)"),
-            "expected": None,
-            "detail": "Tunes per-game OC offsets during real play."
-                      if global_on else
-                      "Master switch is off, so Vispora isn't learning per-game OC profiles.",
-        })
+        row = _adaptive_tuning_row()
+        if row:
+            out.append(row)
     except Exception:
         pass
     return out
+
+
+_AT_DETAIL = ("Runs your games on your saved overclock and eases it off, just for that game, "
+              "if the graphics driver keeps having problems there.")
+
+
+def _int(value) -> int:
+    """A count from the state, 0 for anything that is not one."""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _adaptive_tuning_row(state: dict | None = None) -> dict | None:
+    """The dashboard row for Adaptive Tuning, from its get_state(); None when
+    there is nothing to show (the card is not supported, or its state could
+    not be read).
+
+    Off: a warning when the update switched it off (the user had the old one
+    on), or when the graphics driver logged errors and none of them came with
+    no overclock on the card (with errors also seen at no overclock, the card
+    itself says the overclock may not be the cause, so this does not push).
+    On: "eased" counts only games that are looked after (their own switch on)
+    and that the graphics driver eased, not ones the user set lower.
+    The count of errors covers health.covered_days (1 to 30: less than 30 in
+    the first month after the update, see adaptive_tuning._health), and the
+    sentence says that number, as the card does."""
+    if state is None:
+        from core import adaptive_tuning
+        state = adaptive_tuning.get_state()
+    if not isinstance(state, dict) or state.get("ok") is not True:
+        return None
+    if not (state.get("supported") or {}).get("ok"):
+        return None
+    limit = state.get("limit") or {}
+    has_overclock = bool(limit.get("has_profile")) and (limit.get("core") or limit.get("mem"))
+    severity = "ok"
+    if not has_overclock:
+        current = "No overclock saved yet"
+    elif not state.get("enabled"):
+        health = state.get("health") or {}
+        errors = _int(health.get("errors_30d"))
+        if state.get("upgrade_note") and state.get("old_switch_was_on"):
+            severity = "warn"
+            current = "Off since the update. It now covers every game: turn it on again under Profiles."
+        elif errors > 0:
+            days = _int(health.get("covered_days")) or 30
+            span = "day" if days == 1 else f"{days} days"
+            current = (f"Off. The graphics driver logged errors {errors} "
+                       f"{'time' if errors == 1 else 'times'} in the last {span}.")
+            if _int(health.get("at_stock_90d")) > 0:
+                current += " It also did that with no overclock on the card."
+            else:
+                severity = "warn"
+        else:
+            current = "Off"
+    else:
+        eased = sum(1 for g in state.get("games") or []
+                    if isinstance(g, dict) and g.get("enabled", True) is not False and g.get("eased_by_driver") is True)
+        current = "On" + (f", {eased} {'game' if eased == 1 else 'games'} eased" if eased else "")
+    return {
+        "id": "vispora.adaptive", "category": "vispora",
+        "name": "Adaptive Tuning",
+        "severity": severity,
+        "current": current,
+        "expected": None,
+        "detail": _AT_DETAIL,
+        "fix": {"kind": "navigate", "page": "profiles"},
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════

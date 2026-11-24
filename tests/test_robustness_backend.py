@@ -313,6 +313,36 @@ def test_diagnostics_snapshot_reports_ram_and_drives():
     assert [d["letter"] for d in hw["drives"]] == ["C:"], hw
 
 
+def test_the_snapshot_does_not_depend_on_the_windows_version_query_answering():
+    """platform.platform() and platform.win32_ver() ask WMI, and when that
+    fails Python runs `ver`.  The sandbox refuses real processes, so about one
+    run of this file in fifteen failed on the route above (seen on 3.12)."""
+    import platform
+    a = _app()
+    m.fresh()
+    real_query = getattr(platform, "_wmi_query", None)
+    if real_query is None:
+        raise unittest.SkipTest("this Python's platform module has no WMI query")
+    saved_uname = getattr(platform, "_uname_cache", None)
+    saved_platforms = dict(getattr(platform, "_platform_cache", {}))
+
+    def no_answer(*a, **k):
+        raise OSError("WMI did not answer")
+
+    platform._wmi_query = no_answer
+    platform._uname_cache = None
+    getattr(platform, "_platform_cache", {}).clear()
+    try:
+        assert platform.win32_ver()[1], "read from sys.getwindowsversion(), without a process"
+        r = a.app.test_client().get("/api/diagnostics/snapshot",
+                                    headers={**HOST, a._API_TOKEN_HEADER: a._API_TOKEN})
+        assert r.status_code == 200 and "hardware" in r.get_json(), r.get_json()
+    finally:
+        platform._wmi_query = real_query
+        platform._uname_cache = saved_uname
+        getattr(platform, "_platform_cache", {}).update(saved_platforms)
+
+
 # ── core/capabilities ─────────────────────────────────────────────────
 def test_a_hardware_encoder_only_counts_when_its_gpu_is_there():
     """The Gyan FFmpeg builds list NVENC, AMF and QSV on every PC, so
@@ -339,3 +369,128 @@ def test_a_hardware_encoder_only_counts_when_its_gpu_is_there():
     finally:
         clipper._find_ffmpeg = saved
         m.CMD_HOOKS.remove(ffmpeg)
+
+
+# ── core/dependencies: PresentMon only for the crosshair ──────────────
+class _Installs:
+    """Every dependency's detect and install replaced by stand-ins, so nothing
+    is downloaded or run: `present` says what is installed, `installed`
+    lists the keys each install was asked for."""
+
+    def __init__(self, D, present=()):
+        self.D, self.present, self.installed = D, set(present), []
+        self.saved = [(d, d["detect"], d["install"]) for d in D.DEPENDENCIES]
+        self.saved_lhm = D._detect_lhm
+
+    def __enter__(self):
+        for d in self.D.DEPENDENCIES:
+            d["detect"] = (lambda key=d["key"]: key in self.present)
+            d["install"] = (lambda key=d["key"]: self.installed.append(key) or {"ok": True, "needs_restart": False})
+        self.D._detect_lhm = lambda: {}
+        self.D._boot_check_done.clear()
+        return self
+
+    def __exit__(self, *exc):
+        for d, detect, install in self.saved:
+            d["detect"], d["install"] = detect, install
+        self.D._detect_lhm = self.saved_lhm
+        self.D._boot_check_done.clear()
+
+
+def test_presentmon_is_not_installed_for_everyone_at_start_up_only_while_the_crosshair_is_on():
+    """Both builds (the 2.x one a 122 MB MSI that registers a service) were
+    installed at every start on a PC without them, for the old tuner; only
+    the crosshair reads them now."""
+    m.fresh()
+    D, X = m.app("core.dependencies"), m.app("core.crosshair")
+    entries = {d["key"]: d for d in D.DEPENDENCIES}
+    assert entries["presentmon1"]["auto_install"] is False and entries["presentmon2"]["auto_install"] is False
+    assert set(D.CROSSHAIR_DEPS) == {"presentmon1", "presentmon2"}
+    assert [d["key"] for d in D.check_all()["deps"] if d["key"].startswith("presentmon")] == ["presentmon1",
+                                                                                            "presentmon2"], \
+        "still detected and listed"
+    on = [False]
+    saved = X.is_enabled
+    X.is_enabled = lambda: on[0]
+    try:
+        everything_else = [d["key"] for d in D.DEPENDENCIES if d["key"] not in D.CROSSHAIR_DEPS]
+        with _Installs(D, present=everything_else) as box:
+            r = D.check_on_boot()
+            assert box.installed == [] and "crosshair" not in r, (box.installed, r)
+            assert sorted(r["missing_auto"]) == [], "PresentMon is not missing for a start-up install"
+        with _Installs(D, present=everything_else) as box:
+            on[0] = True
+            r = D.check_on_boot()
+            assert box.installed == ["presentmon1", "presentmon2"], box.installed
+            assert r["crosshair"]["started"] is True
+        with _Installs(D, present=everything_else + ["presentmon1", "presentmon2"]) as box:
+            assert D.check_on_boot()["crosshair"]["started"] is False and box.installed == []
+        with _Installs(D, present=everything_else) as box:
+            D.set_auto_install_enabled(False)
+            try:
+                assert D.check_on_boot()["crosshair"]["started"] is False and box.installed == []
+            finally:
+                D.set_auto_install_enabled(True)
+        with _Installs(D) as box:                   # (FFmpeg and the rest missing too: one batch, then PresentMon)
+            on[0] = False
+            D.check_on_boot()
+            assert "presentmon1" not in box.installed and "presentmon2" not in box.installed and box.installed
+    finally:
+        X.is_enabled = saved
+
+
+def test_switching_the_crosshair_on_installs_presentmon_when_it_is_missing():
+    m.fresh()
+    D, X = m.app("core.dependencies"), m.app("core.crosshair")
+    everything_else = [d["key"] for d in D.DEPENDENCIES if d["key"] not in D.CROSSHAIR_DEPS]
+    with _Installs(D, present=everything_else) as box:
+        r = D.install_for_crosshair()
+        assert r == {"ok": True, "started": False, "reason": "after the start-up check"} and box.installed == [], \
+            "before the start-up check is over it starts nothing (that check does it when it ends)"
+        D._boot_check_done.set()
+        assert D.install_for_crosshair()["started"] is True
+        assert m.wait(lambda: box.installed == ["presentmon1", "presentmon2"]), box.installed
+        assert m.wait(lambda: not D.get_progress()["running"])
+        box.present.update({"presentmon1", "presentmon2"})
+        del box.installed[:]
+        assert D.install_for_crosshair()["started"] is True
+        time.sleep(0.2)
+        assert box.installed == [], "already there: nothing installed"
+        D.set_auto_install_enabled(False)
+        try:
+            assert D.install_for_crosshair()["started"] is False
+        finally:
+            D.set_auto_install_enabled(True)
+        D.set_opt_out("presentmon2", True)          # an opt-out is respected
+        box.present.difference_update({"presentmon1", "presentmon2"})
+        try:
+            assert D.install_for_crosshair()["started"] is True
+            assert m.wait(lambda: box.installed == ["presentmon1"]) and not D.get_progress()["running"]
+            time.sleep(0.1)
+            assert box.installed == ["presentmon1"], box.installed
+        finally:
+            D.set_opt_out("presentmon2", False)
+        # The Install button names them: installed although they are not automatic any more.
+        del box.installed[:]
+        assert D.install_missing(only=["presentmon2"])["completed"] == [{"key": "presentmon2", "ok": True,
+                                                                         "needs_restart": False}]
+        assert box.installed == ["presentmon2"]
+        del box.installed[:]
+        D.install_missing()                          # every automatic one: not PresentMon
+        assert box.installed == []
+
+    asked = []
+    saved = D.install_for_crosshair
+    D.install_for_crosshair = lambda: asked.append(1) or {"ok": True, "started": False}
+    try:
+        assert X.set_settings({"enabled": True})["ok"] and asked == [1], "switched on: asked"
+        assert X.set_settings({"enabled": True, "offset_x": 3})["ok"] and asked == [1], "already on: not again"
+        assert X.set_settings({"enabled": False})["ok"] and X.set_settings({"enabled": True})["ok"]
+        assert asked == [1, 1]
+        D.install_for_crosshair = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        assert X.set_settings({"enabled": False})["ok"] and X.set_settings({"enabled": True})["ok"], \
+            "a failure there never stands in the way of the switch"
+    finally:
+        D.install_for_crosshair = saved
+        X.set_settings({"enabled": False})
+        X.stop()

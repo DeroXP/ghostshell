@@ -2,7 +2,6 @@
 
 When ON:
   - Background Pauser ON + pause now (browsers + AI apps frozen)
-  - AT mode → competitive for whatever game is currently running
   - High Performance power plan
   - System toast notifications disabled
   - Windows Update service paused (no auto-reboot popup mid-match)
@@ -29,9 +28,10 @@ Persistence file: %APPDATA%\\Vispora\\tournament_mode.json
           "widgets_running": bool,
           "onedrive_was_running": bool,
           "toasts_enabled": bool,
-          "at_mode_changes": [{"exe": "...", "prev_mode": "..."}],
           "pauser_was_enabled": bool
       },
+      (A state saved by 3.7.0 or earlier can also list "at_mode_changes":
+      the old tuner's per-game mode, which no longer exists.  It is ignored.)
       "last_actions": [str, ...]    # cosmetic: shown in UI
     }
 """
@@ -244,23 +244,9 @@ def enable(duration_min: int = 60) -> dict:
         log.warning(f"pauser hook failed: {e}")
         actions.append(f"Pauser: error ({e})")
 
-    # 2. AT mode → competitive for the active game
-    baseline["at_mode_changes"] = []
-    try:
-        from core import game_profiles, adaptive_tuning
-        active = game_profiles.get_active_game_info()
-        if active and active.get("exe"):
-            exe = active["exe"]
-            cur_state = adaptive_tuning.get_game_state(exe) or {}
-            prev_mode = cur_state.get("mode") or "balanced"
-            if prev_mode != "competitive":
-                adaptive_tuning.set_game_mode(exe, "competitive")
-                baseline["at_mode_changes"].append(
-                    {"exe": exe, "prev_mode": prev_mode})
-                actions.append(f"AT mode → competitive for {exe} "
-                               f"(was {prev_mode})")
-    except Exception as e:
-        log.debug(f"AT mode swap failed: {e}")
+    # (Step 2 used to switch the old tuner to its "competitive" mode for the
+    # running game.  Adaptive Tuning has no modes: it holds the saved
+    # overclock and never raises it, so there is nothing to switch.)
 
     # 3. Power plan → High Performance
     try:
@@ -348,17 +334,8 @@ def disable(reason: str = "manual") -> dict:
     except Exception as e:
         log.debug(f"pauser restore failed: {e}")
 
-    # 2. Restore AT modes
-    try:
-        from core import adaptive_tuning
-        for change in baseline.get("at_mode_changes", []):
-            try:
-                adaptive_tuning.set_game_mode(change["exe"], change["prev_mode"])
-                actions.append(f"AT mode → {change['prev_mode']} for {change['exe']}")
-            except Exception as e:
-                log.debug(f"AT restore for {change['exe']} failed: {e}")
-    except Exception as e:
-        log.debug(f"AT module import failed: {e}")
+    # (A state saved by an older version may still list "at_mode_changes",
+    # the old tuner's modes to put back.  There is nothing to put back.)
 
     # 3. Power plan
     prev_guid = baseline.get("power_plan_guid")

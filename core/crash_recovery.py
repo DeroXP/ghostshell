@@ -1,11 +1,16 @@
 """Game-exit crash detection + step-down + post-game notification.
 
+Only for a game Adaptive Tuning was not looking after (it judges its own
+sessions and hands the card back itself; game mode asks it first).
+
 When a game closes, this module decides whether it crashed (vs. the
 user quitting normally) by looking at:
-  • Windows Event Log TDR / driver-crash events in the last 10 s
+  • Windows Event Log TDR / driver-crash events in the last 120 s
+    (not the ones logged during a test on the GPU page: those are the test's)
   • The in-app `gpu_overclock.get_crash_state()` flag (set by the
     stress-test probe + GPU live-monitor when context-loss / pixel
-    artifacts / hangs are detected)
+    artifacts / hangs are detected), in the last ~10 s only, and not
+    when a test on the GPU page set it
   • Whether the game exited with active OC offsets
 
 If a crash is detected AND the game had OC offsets active, Vispora:
@@ -20,7 +25,8 @@ Persistent files in `%APPDATA%\\Vispora\\`:
   crash_history.json    — chronological log of all detected crashes
 
 Public API:
-  handle_game_exit(exe, display_name, exit_ts, was_active)  → primary entry
+  handle_game_exit(exe, display_name, active_core, active_mem,
+                   exit_ts, dry_run)                         → primary entry
   detect_crash(exit_ts, lookback_s)                          → bool+detail
   is_offset_blacklisted(exe, core, mem)                      → bool
   add_to_blacklist(exe, core, mem, kind)                     → void
@@ -45,10 +51,21 @@ log = get_logger("crash_recovery")
 BLACKLIST_PATH = os.path.join(APPDATA_DIR, "crash_blacklist.json")
 HISTORY_PATH   = os.path.join(APPDATA_DIR, "crash_history.json")
 
-# Look back this far in the Windows Event Log for TDR signals after a
-# game exit.  10 s captures most "process died right after a TDR" cases
-# without false-positiving on a TDR that happened minutes earlier.
-CRASH_LOOKBACK_S = 10
+# Look back this far in the Windows Event Log for graphics driver errors
+# before a game exit: the same two minutes Adaptive Tuning uses.  It was
+# 10 s, counted from an exit time that is itself 9 to 12 s late (the game
+# monitor waits to see whether the game restarts); on the owner's PC the
+# driver error came 20, 34 and 35 s before that time, so every real driver
+# crash was missed.
+CRASH_LOOKBACK_S = 120
+
+# The in-app crash flag keeps the short look-back it always had.  Only the
+# GPU page's tests set it (their probe saw the driver fail a step, and the
+# test then took the overclock off itself); with the two minutes above, a game
+# closed normally up to two minutes after a failed tune step was announced as
+# "closed after a graphics driver error".  A flag a test set is not counted
+# at all (see _flag_set_by_a_test).
+INAPP_LOOKBACK_S = 10
 
 # Minimum core/mem step-down per axis when we step down (MHz).
 # Bigger steps give a cushion against repeat-crashing the same game.
@@ -125,22 +142,9 @@ def add_to_blacklist(exe: str, core: int, mem: int, kind: str = "tdr") -> None:
     bl[key] = fails
     _save_json(BLACKLIST_PATH, bl)
     log.info(f"Added to crash blacklist: {key} core+{core}/mem+{mem} ({kind})")
-    # v3.1 — driver-level crashes (TDR, BSOD) at a specific offset are
-    # evidence the offset itself is unsafe, not just unsafe-for-this-game.
-    # Mirror to the cross-game blacklist so any other game's AT also
-    # refuses this exact offset.  Game-only crashes (e.g. game.exe died
-    # with a code-fault unrelated to OC) get kind="game-crash" and are
-    # NOT mirrored.
-    DRIVER_LEVEL_KINDS = {"tdr", "bsod", "wer", "driver", "thermal", "stuck-clock"}
-    if (kind or "").lower() in DRIVER_LEVEL_KINDS:
-        try:
-            from core import adaptive_tuning
-            adaptive_tuning.add_cross_game_blacklist(
-                int(core), int(mem),
-                source_exe=key, reason=kind,
-            )
-        except Exception as e:
-            log.debug(f"cross-game blacklist mirror failed: {e}")
+    # (This used to be mirrored into the old tuner's list of clocks to avoid
+    # in every game.  That list went with the old tuner: Adaptive Tuning
+    # never runs a game above the saved overclock, so it has no use for it.)
 
 
 def compute_safe_step_down(exe: str, core: int, mem: int) -> dict:
@@ -189,7 +193,7 @@ def get_history(limit: int = 50) -> list:
 
 def get_recent_crashes(exe: str | None = None,
                        within_sec: float = 86400) -> list:
-    """v3.1 — used by adaptive_tuning's auto-revert detection.  Returns
+    """Returns
     crash entries from the history that fall within `within_sec` of
     'now' and optionally match a specific exe.  History entries with
     no `ts` are skipped."""
@@ -255,17 +259,27 @@ def detect_crash(exit_ts: Optional[float] = None,
     # work on top of the monitor's own poll interval), so "the last N seconds
     # from now" routinely missed the very TDR that killed the game — and the
     # crashing offset was then recorded as a clean, stable session.
+    inapp_window_s = INAPP_LOOKBACK_S
     if exit_ts:
-        lookback_s = int(max(0.0, time.time() - float(exit_ts))) + lookback_s + _EXIT_DETECT_SLACK_S
+        late = int(max(0.0, time.time() - float(exit_ts)))
+        lookback_s = late + lookback_s + _EXIT_DETECT_SLACK_S
+        inapp_window_s = late + INAPP_LOOKBACK_S + _EXIT_DETECT_SLACK_S
 
     # 1) Windows Event Log TDR / driver crash
     drv = gpu_overclock.check_driver_events(seconds_back=lookback_s)
     tdr_count   = int(drv.get("tdr_count")   or 0) if drv.get("ok") else 0
     crash_count = int(drv.get("crash_count") or 0) if drv.get("ok") else 0
     events      = drv.get("events", []) if drv.get("ok") else []
+    if tdr_count > 0:
+        # The errors of a test on the GPU page are the test's, not the game's.
+        tdr_count = _errors_not_a_tests(tdr_count, lookback_s)
+        if tdr_count == 0:
+            events = []
 
     # 2) In-app crash flag (set by the live monitor / stress probe when
-    #    pixel-checksum mismatch / context loss / frame timeout fires)
+    #    pixel-checksum mismatch / context loss / frame timeout fires).  Its
+    #    own short window (the event log's two minutes are for the log only),
+    #    and never one a test on the GPU page set.
     inapp = {}
     try:
         inapp = gpu_overclock.get_crash_state() or {}
@@ -273,9 +287,12 @@ def detect_crash(exit_ts: Optional[float] = None,
         pass
     inapp_recent = False
     if inapp.get("crashed_ts"):
-        age = time.time() - float(inapp["crashed_ts"])
-        if age <= lookback_s + 5:
-            inapp_recent = True
+        try:
+            flag_ts = float(inapp["crashed_ts"])
+            if time.time() - flag_ts <= inapp_window_s + 5 and not _flag_set_by_a_test(flag_ts):
+                inapp_recent = True
+        except (TypeError, ValueError):
+            pass
 
     if crash_count > 0:
         kind = "driver_crash"
@@ -300,6 +317,55 @@ def detect_crash(exit_ts: Optional[float] = None,
     }
 
 
+def _errors_not_a_tests(count: int, lookback_s: float) -> int:
+    """How many of the `count` graphics driver errors of the last `lookback_s`
+    seconds were NOT logged during a test on the GPU page (or in the grace
+    gpu_overclock gives a test's last errors)?  A test crashes the driver on
+    purpose and takes the overclock off itself; a game that is closed in the
+    two minutes after it did not close on those errors.  (Adaptive Tuning
+    leaves them out the same way for the games it looks after.)
+
+    With no test near that time the count comes back as it is and nothing
+    more is read.  In doubt (the record of tests or the event log cannot be
+    read): 0, so nothing is lowered or listed on a guess."""
+    from core import gpu_overclock
+    try:
+        now = time.time()
+        since = now - float(lookback_s)
+        tests = [(float(a), float(b)) for a, b in (gpu_overclock.tuning_windows() or []) if float(b) >= since]
+        if not tests:
+            return int(count)
+        from core import gpu_events
+        r = gpu_events.query(since, now, kinds="driver_error")
+        if not r.get("ok"):
+            return 0
+        return sum(1 for e in r.get("events") or ()
+                   if not any(a <= float(e.get("ts") or 0.0) <= b for a, b in tests))
+    except Exception as e:
+        log.debug(f"could not tell a test's graphics driver errors from the game's: {e}")
+        return 0
+
+
+def _flag_set_by_a_test(flag_ts: float) -> bool:
+    """Was the in-app crash flag set by a test on the GPU page: one is running
+    now, or the flag's time lies inside a test's window on record (with the
+    grace gpu_overclock gives a test's last errors)?  A test crashes the
+    driver on purpose and takes the overclock off itself; that says nothing
+    about the game.  In doubt (the record cannot be read): yes, so nothing is
+    lowered or listed on a guess."""
+    from core import gpu_overclock
+    try:
+        if gpu_overclock.is_tuning_active():
+            return True
+        for start, end in gpu_overclock.tuning_windows() or []:
+            if float(start) <= flag_ts <= float(end):
+                return True
+    except Exception as e:
+        log.debug(f"could not tell whether a test set the crash flag: {e}")
+        return True
+    return False
+
+
 def _proven_oc_floor() -> "tuple[int, int]":
     """beta.5 — the user's PROVEN OC (their saved manual profile) is the floor
     below which a crash is NOT attributable to an OC climb.  Returns (0, 0) if
@@ -316,10 +382,30 @@ def _proven_oc_floor() -> "tuple[int, int]":
         return (0, 0)
 
 
-# ─── Main entry — called by game_profiles on every game exit ─────────────
+def crash_toast(name: str, active_core: int, active_mem: int, step_down, stepped_down: bool) -> tuple:
+    """(title, message) of the notification after a game closed on a graphics
+    driver error.  `step_down`: the lower clocks picked for now ({"core",
+    "mem"}), or None when the overclock was left as it was."""
+    title = f"{name} closed after a graphics driver error"
+    if step_down is not None:
+        msg = (f"The overclock on the card was {int(active_core):+d} MHz core, {int(active_mem):+d} MHz memory, "
+               "more than you have saved. "
+               + (f"It is lowered to {int(step_down['core']):+d} / {int(step_down['mem']):+d} for now. "
+                  if stepped_down else "It could not be lowered. ")
+               + "Your saved overclock was not changed.")
+    elif active_core or active_mem:
+        msg = "The overclock on the card was not above the one you saved, so it was left as it is."
+    else:
+        msg = ("There was no overclock on the card, so this looks like a problem with the game "
+               "or the graphics driver.")
+    return title, msg
+
+
+# ─── Main entry: called by game_profiles when a game closes that ──────
+# ─── Adaptive Tuning was not looking after ────────────────────────────
 def handle_game_exit(exe: str, display_name: str | None,
                      active_core: int, active_mem: int,
-                     exit_ts: Optional[float] = None) -> dict:
+                     exit_ts: Optional[float] = None, dry_run: bool = False) -> dict:
     """Process a game-exit event.  Decides if it was a crash, blacklists,
     steps down, notifies.  Idempotent — safe to call on normal exits too
     (it just returns early).
@@ -329,22 +415,33 @@ def handle_game_exit(exe: str, display_name: str | None,
       display_name: friendly name for the toast
       active_core:  core offset MHz that was active when the game ran
       active_mem:   mem offset MHz that was active when the game ran
+      dry_run:      the Crash Recovery card's Test button: look for a crash,
+                    show the notification and add the history line, but write
+                    no clock and nothing to the per-game list (the made-up
+                    clocks it is given are not the card's)
 
     Returns:
       {'crashed': bool, 'kind': str, 'step_down': {...} or None,
        'blacklisted': bool, 'notification_fired': bool}
+      (a dry run also has 'dry_run': True, and 'step_down' is what WOULD
+      have been applied)
     """
     detection = detect_crash(exit_ts)
     if not detection["crashed"]:
-        return {
+        out = {
             "crashed":            False,
             "kind":               "normal",
             "step_down":          None,
             "blacklisted":        False,
             "notification_fired": False,
         }
+        if dry_run:
+            out["dry_run"] = True
+        return out
 
     name = display_name or exe or "the game"
+    if dry_run:
+        return _dry_run_exit(exe, display_name, name, active_core, active_mem, detection)
     log.warning(f"⚠ {name} crashed during play (kind={detection['kind']}, "
                 f"tdr={detection['tdr_count']}, crash={detection['crash_count']}, "
                 f"oc=core+{active_core}/mem+{active_mem})")
@@ -402,23 +499,8 @@ def handle_game_exit(exe: str, display_name: str | None,
     notif_ok = False
     try:
         from core import notifier
-        if blacklisted and step_down is not None:
-            title = f"{name} crashed"
-            # The step-down is applied for now only; the saved profile is
-            # never changed here (see above).
-            msg = (f"GPU TDR detected at core+{active_core} / mem+{active_mem}. "
-                   + (f"Stepped down to core+{step_down['core']} / mem+{step_down['mem']} "
-                      f"for now. " if stepped_down else
-                      "The overclock could not be stepped down. ")
-                   + "Your saved OC profile was not changed.")
-        elif step_down is None and (active_core or active_mem):
-            title = f"{name} crashed"
-            msg = (f"Detected a {detection['kind']} during play, but no OC "
-                   f"step-down was needed.")
-        else:
-            title = f"{name} crashed"
-            msg = ("Detected a driver crash during play.  Vispora wasn't "
-                   "applying any OC, so this looks like a game / driver issue.")
+        title, msg = crash_toast(name, active_core, active_mem,
+                                 step_down if blacklisted else None, stepped_down)
         notifier.toast(title, msg, force=True)
         notif_ok = True
     except Exception as e:
@@ -445,4 +527,54 @@ def handle_game_exit(exe: str, display_name: str | None,
         "step_down":          step_down,
         "blacklisted":        blacklisted,
         "notification_fired": notif_ok,
+    }
+
+
+TEST_TOAST_TEXT = "This was a test, so nothing on the card or in the crash list was changed."
+
+
+def _dry_run_exit(exe: str, display_name, name: str, active_core: int, active_mem: int,
+                  detection: dict) -> dict:
+    """handle_game_exit's dry run, once a crash was found: what would be done
+    is worked out and said, nothing is written but the history line."""
+    floor_core, floor_mem = _proven_oc_floor()
+    would = None
+    if (active_core > floor_core) or (active_mem > floor_mem):
+        would = compute_safe_step_down(exe, active_core, active_mem)
+    said = f"Crash recovery test: found {detection['kind']} for {name}; nothing written"
+    if would:
+        said += f" (would have lowered the card to {would['core']:+d} / {would['mem']:+d})"
+    log.info(said)
+    notif_ok = False
+    try:
+        from core import notifier
+        title, _msg = crash_toast(name, active_core, active_mem, None, False)
+        notifier.toast(title, TEST_TOAST_TEXT, force=True)
+        notif_ok = True
+    except Exception as e:
+        log.debug(f"crash test toast failed: {e}")
+    try:
+        _append_history({
+            "ts":           time.time(),
+            "exe":          _norm_exe(exe),
+            "display_name": display_name,
+            "kind":         detection["kind"],
+            "tdr_count":    detection["tdr_count"],
+            "crash_count":  detection["crash_count"],
+            "active_core":  active_core,
+            "active_mem":   active_mem,
+            "blacklisted":  False,
+            "step_down":    None,
+            "test":         True,
+            "events":       detection["events"][:3],
+        })
+    except Exception as e:
+        log.debug(f"crash test history line not written: {e}")
+    return {
+        "crashed":            True,
+        "kind":               detection["kind"],
+        "step_down":          would,
+        "blacklisted":        False,
+        "notification_fired": notif_ok,
+        "dry_run":            True,
     }

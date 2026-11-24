@@ -3,6 +3,7 @@
     python tests/run_all.py              every tests/test_*.py
     python tests/run_all.py reset game   only files whose name contains "reset" or "game"
     python tests/run_all.py -v           also list the tests that passed
+    python tests/run_all.py --allow-skips   skipped tests do not fail the run
 
 Each test file runs in its own Python process.  That is deliberate: the files
 install a fake machine (tests/sandbox.py) before importing any app module, and
@@ -10,6 +11,11 @@ several of them change import-time behaviour that cannot be undone in a running
 interpreter.  No third-party test runner is needed — a test is any function
 named test_* in a test_*.py file, and it fails by raising (normally an assert).
 unittest.SkipTest marks a test as skipped.
+
+A skipped test checked nothing.  Without Flask, or without a working headless
+Edge, whole files skip (every route of the app, every sentence of a page), so a
+run with skips is not a pass: it ends with "PASSED, N SKIPPED" and exit code 2.
+Pass --allow-skips on a machine where a skip is expected.
 
 Releases are built with a different interpreter than the default one on this
 machine, so before a release run the suite on that one too:
@@ -79,6 +85,7 @@ def main(argv: list) -> int:
     except (AttributeError, ValueError):
         pass
     verbose = "-v" in argv
+    allow_skips = "--allow-skips" in argv
     wanted = [a.lower() for a in argv if not a.startswith("-")]
     files = sorted(f for f in os.listdir(HERE) if f.startswith("test_") and f.endswith(".py"))
     if wanted:
@@ -119,9 +126,21 @@ def main(argv: list) -> int:
             for ln in tail:
                 print("    " + ln)
     bad = totals["FAIL"] + totals["ERROR"]
-    print(f"\n{totals['PASS']} passed, {bad} failed, {totals['SKIP']} skipped "
-          f"in {time.time() - started:.0f}s" + ("" if bad else "  -  ALL PASS"))
-    return 1 if bad else 0
+    skipped = totals["SKIP"]
+    if bad:
+        verdict = ""
+    elif not skipped:
+        verdict = "  -  ALL PASS"
+    elif allow_skips:
+        verdict = f"  -  PASSED, {skipped} SKIPPED (allowed)"
+    else:
+        verdict = (f"  -  PASSED, {skipped} SKIPPED: not a full run (the SKIP lines above say why; "
+                   "--allow-skips accepts them)")
+    print(f"\n{totals['PASS']} passed, {bad} failed, {skipped} skipped "
+          f"in {time.time() - started:.0f}s" + verdict)
+    if bad:
+        return 1
+    return 2 if (skipped and not allow_skips) else 0
 
 
 if __name__ == "__main__":

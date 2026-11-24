@@ -590,6 +590,28 @@ def api_gpu_detect():
 # ═══════════════════════════════════════════════════════════════════════════
 # GPU Overclocking API
 # ═══════════════════════════════════════════════════════════════════════════
+def _note_manual_overclock_change() -> None:
+    """The user is about to change the clocks by hand on the GPU page.  Called
+    BEFORE that change is made, by every route that writes the clocks: apply,
+    reset, emergency reset and profile delete (which resets the card).
+    Adaptive Tuning then leaves the card alone until the game closes; with no
+    game being looked after it does nothing.
+
+    Before, not after: a write takes seconds, and a session that looked in the
+    middle of it would put its own values back over the user's.
+
+    Saving a profile is not noted: it writes no clock.  A game's session reads
+    the saved overclock at every look, follows a lower one at once and never
+    a higher one mid-game; a note there held the session as "you changed the
+    overclock", so the card was never handed back after the game.
+
+    A failure in here never stands in the way of the user's own change."""
+    try:
+        adaptive_tuning.note_manual_change()
+    except Exception as e:
+        log.warning(f"Adaptive Tuning could not be told about a manual overclock change: {e}")
+
+
 @app.route("/api/gpu/oc/capability")
 def api_gpu_oc_capability():
     """Detect OC features supported by the current GPU + reported limits."""
@@ -612,20 +634,27 @@ def api_gpu_oc_watchdog():
 @app.route("/api/gpu/oc/apply", methods=["POST"])
 def api_gpu_oc_apply():
     """Apply core/mem offsets + power limit. Body: {core_offset_mhz, mem_offset_mhz, power_pct}."""
-    data = request.get_json(force=True) or {}
+    # Anything but a JSON object is refused, also null and []: those used to
+    # be read as {} and wrote 0 / 0 to the card.
+    data = request.get_json(force=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "err": "Expected a JSON object."}), 400
     # power_pct: null means "leave the power limit as it is" (tuning probes);
-    # a number — or the key being absent — sets it, 100 being stock.
+    # a number, or the key being absent, sets it, 100 being stock.
     power_pct = data.get("power_pct", 100)
-    return jsonify(gpu_overclock.apply_oc(
-        core_offset_mhz=int(data.get("core_offset_mhz", 0)),
-        mem_offset_mhz=int(data.get("mem_offset_mhz", 0)),
-        power_pct=None if power_pct is None else int(power_pct),
-    ))
+    core = int(data.get("core_offset_mhz", 0))
+    mem = int(data.get("mem_offset_mhz", 0))
+    power = None if power_pct is None else int(power_pct)
+    # Only once the request is known to be one that will be carried out, and
+    # before the card is written.
+    _note_manual_overclock_change()
+    return jsonify(gpu_overclock.apply_oc(core_offset_mhz=core, mem_offset_mhz=mem, power_pct=power))
 
 
 @app.route("/api/gpu/oc/reset", methods=["POST"])
 def api_gpu_oc_reset():
     """Fully revert to stock clocks and power."""
+    _note_manual_overclock_change()
     return jsonify(gpu_overclock.reset_oc())
 
 
@@ -800,13 +829,36 @@ def api_gpu_oc_benchmark_tune_status():
 # crash-state endpoint lets the UI poll for recent crashes (so a banner
 # can be shown after the user comes back to the page from a black screen).
 # ═══════════════════════════════════════════════════════════════════════════
+def _driver_reset_is_for_the_game_session_to_judge() -> bool:
+    """The GPU page's stress canvas keeps its WebGL context after a test, so
+    the page reports every later reset of the graphics driver as a lost
+    context and asks for an emergency reset.  During a test that is right: the
+    clocks under test crashed the driver.  While Adaptive Tuning is looking
+    after a game it is not: the overclock came off behind the game's back, the
+    session took that for the user's own change, and the driver error (the
+    very thing it counts) was never counted.
+
+    True only when a session is open that still judges driver errors itself
+    and no test is running.  In any doubt False, and the reset goes ahead as
+    it always did (also with Adaptive Tuning off, and on the desktop)."""
+    try:
+        return bool(adaptive_tuning.judging_driver_errors()) and not gpu_overclock.is_tuning_active()
+    except Exception as e:
+        log.warning(f"Could not tell whether a game session is open, so the reset goes ahead: {e}")
+        return False
+
+
 @app.route("/api/gpu/oc/emergency-reset", methods=["POST"])
 def api_gpu_oc_emergency_reset():
     """Best-effort, never-raises reset for crash recovery.  Body optional."""
-    data = request.get_json(silent=True) or {}
-    return jsonify(gpu_overclock.emergency_reset_oc(
-        reason=str(data.get("reason", "user_triggered"))
-    ))
+    data = request.get_json(silent=True)
+    reason = str(data.get("reason", "user_triggered")) if isinstance(data, dict) else "user_triggered"
+    if reason == "webgl_context_lost" and _driver_reset_is_for_the_game_session_to_judge():
+        log.info("Emergency reset not carried out: the graphics driver reset during a game that Adaptive Tuning "
+                 "is looking after, and it judges that itself")
+        return jsonify({"ok": True, "skipped": "adaptive_session", "reason": reason, "steps": []})
+    _note_manual_overclock_change()
+    return jsonify(gpu_overclock.emergency_reset_oc(reason=reason))
 
 
 @app.route("/api/gpu/oc/crash-state")
@@ -836,7 +888,16 @@ def api_gpu_oc_profile():
 @app.route("/api/gpu/oc/profile", methods=["POST"])
 def api_gpu_oc_profile_save():
     """Save a profile. Body: {core_offset_mhz, mem_offset_mhz, power_pct, apply_on_startup}."""
-    data = request.get_json(force=True) or {}
+    # Anything but a JSON object is refused, also null and []: those used to
+    # be read as {} and saved 0 / 0 over the user's overclock.
+    data = request.get_json(force=True)
+    if not isinstance(data, dict):
+        return jsonify({"ok": False, "err": "Expected a JSON object."}), 400
+    # The saved profile is the limit Adaptive Tuning works from.  Saving one
+    # writes no clock, so it is not a manual change and leaves no note (see
+    # _note_manual_overclock_change): a game's session reads the profile at
+    # its next look, follows a lower one at once and lifts nothing for a
+    # higher one until the game's next start.
     return jsonify(gpu_overclock.save_profile(data))
 
 
@@ -844,7 +905,10 @@ def api_gpu_oc_profile_save():
 def api_gpu_oc_profile_reapply():
     """beta.9 — toggle 'reapply this OC on every boot' on the saved profile.
     Body: {enabled: bool}.  Auto-tuned OCs save with reapply OFF; this is the
-    opt-in switch the user flips once they trust the result."""
+    opt-in switch the user flips once they trust the result.
+
+    (No note to Adaptive Tuning here: this changes when the profile is applied,
+    not the clocks or the limit, so a game's session carries on.)"""
     data = request.get_json(force=True) or {}
     return jsonify(gpu_overclock.set_profile_apply_on_startup(bool(data.get("enabled", False))))
 
@@ -852,6 +916,7 @@ def api_gpu_oc_profile_reapply():
 @app.route("/api/gpu/oc/profile", methods=["DELETE"])
 def api_gpu_oc_profile_delete():
     """Delete saved profile and reset GPU."""
+    _note_manual_overclock_change()
     return jsonify(gpu_overclock.delete_profile())
 
 
@@ -934,15 +999,20 @@ def api_crash_recovery_history_clear():
 
 @app.route("/api/gpu/crash-recovery/test", methods=["POST"])
 def api_crash_recovery_test():
-    """Manually trigger handle_game_exit() with a fake (offset, kind)
-    pair.  Body: { exe, display_name, core, mem }.  Useful for verifying
-    the toast + step-down + blacklist write all fire end-to-end."""
+    """Manually trigger handle_game_exit() with made-up clocks.  Body:
+    { exe, display_name, core, mem }.  A dry run: it looks for a crash and
+    shows the notification and the history line, but writes no clock and
+    nothing to the per-game list.  (It used to apply its lower-for-now step:
+    with one axis of the saved overclock at 0 and a real driver error in the
+    last two minutes, the page's made-up +1 / +1 took the overclock off the
+    card, and held a running game's session as changed by the user.)"""
     data = request.get_json(force=True) or {}
     return jsonify(crash_recovery.handle_game_exit(
         exe=data.get("exe", "test.exe"),
         display_name=data.get("display_name", "Test Game"),
         active_core=int(data.get("core", 100)),
         active_mem=int(data.get("mem", 500)),
+        dry_run=True,
     ))
 
 
@@ -982,310 +1052,115 @@ def api_perf_stop():
     ))
 
 
-# ─── Adaptive Tuning v1 (v3) ────────────────────────────────────────────
-@app.route("/api/adaptive/status")
-def api_adaptive_status():
-    """Live snapshot — current game, current offsets, last score, etc."""
-    return jsonify(adaptive_tuning.get_status())
+# ─── Adaptive Tuning ───────────────────────────────────────────────────
+# Thin wrappers over core/adaptive_tuning.py, which checks every value itself
+# and answers in plain words: {"ok": True, "state": ...} or {"ok": False,
+# "err": ...}, always with HTTP 200.  What is refused here with a 400, before
+# anything is asked of it: a body that is not a JSON object, a field that is
+# missing or of the wrong JSON type, and a field the route does not know (so a
+# request is never carried out in part, and a body meant for an older version
+# of a route is not taken for something else).
+_ADAPTIVE_NOT_AN_OBJECT = "Expected a JSON object."
+_ADAPTIVE_BAD_REQUEST = "Adaptive Tuning did not understand that request."
+_ADAPTIVE_FAILED = "Adaptive Tuning could not do that. Try again."
 
 
-@app.route("/api/adaptive/settings", methods=["GET", "POST"])
+def _adaptive_body(required=None, optional=None):
+    """The JSON object a POST carried, checked: (body, None), or (None, the
+    400 answer).  `required` and `optional` map each field to the JSON type
+    it must have (bool or str); a string field must not be blank."""
+    required, optional = required or {}, optional or {}
+    d = request.get_json(force=True, silent=True)
+    if not isinstance(d, dict):
+        return None, (jsonify({"ok": False, "err": _ADAPTIVE_NOT_AN_OBJECT}), 400)
+    types = {**required, **optional}
+    ok = all(k in d for k in required) and all(
+        k in types and type(v) is types[k] and (types[k] is not str or v.strip())
+        for k, v in d.items())
+    if not ok:
+        return None, (jsonify({"ok": False, "err": _ADAPTIVE_BAD_REQUEST}), 400)
+    return d, None
+
+
+def _adaptive_answer(call):
+    """Make one Adaptive Tuning call and send its answer.  These calls catch
+    their own errors; should one raise all the same, the page gets a plain
+    sentence, not a Python error, and the log gets the traceback."""
+    try:
+        return jsonify(call())
+    except Exception as e:
+        import traceback
+        log.error(f"Adaptive Tuning call for {request.path} raised: {e}\n{traceback.format_exc()}")
+        return jsonify({"ok": False, "err": _ADAPTIVE_FAILED}), 500
+
+
+@app.route("/api/adaptive/state")
+def api_adaptive_state():
+    """Everything the Adaptive Tuning card shows, in one answer."""
+    return _adaptive_answer(adaptive_tuning.get_state)
+
+
+@app.route("/api/adaptive/settings", methods=["POST"])
 def api_adaptive_settings():
-    """GET: current global settings.  POST: partial update + persist."""
-    if request.method == "POST":
-        data = request.get_json(force=True) or {}
-        return jsonify(adaptive_tuning.set_settings(**data))
-    return jsonify(adaptive_tuning.get_settings())
+    """Body: one or more of {enabled: bool, notify: bool, sensitivity:
+    "balanced" | "strict" | "watch"}.  Only these three are passed on."""
+    d, refused = _adaptive_body(optional={"enabled": bool, "notify": bool, "sensitivity": str})
+    if refused:
+        return refused
+    if not d:
+        return jsonify({"ok": False, "err": _ADAPTIVE_BAD_REQUEST}), 400
+    return _adaptive_answer(lambda: adaptive_tuning.set_settings(
+        enabled=d.get("enabled"), notify=d.get("notify"), sensitivity=d.get("sensitivity")))
 
 
-@app.route("/api/adaptive/games")
-def api_adaptive_games():
-    """All per-game state rows.  Each row has enabled, current offsets,
-    best stable, session count, etc."""
-    states = adaptive_tuning.get_game_state()
-    return jsonify({"games": states})
+@app.route("/api/adaptive/game", methods=["POST"])
+def api_adaptive_game():
+    """Body: {exe, enabled: bool}.  A game's own switch."""
+    d, refused = _adaptive_body(required={"exe": str, "enabled": bool})
+    if refused:
+        return refused
+    return _adaptive_answer(lambda: adaptive_tuning.set_game_enabled(d["exe"], d["enabled"]))
 
 
-@app.route("/api/adaptive/game-toggle", methods=["POST"])
-def api_adaptive_game_toggle():
-    """Body: { exe, enabled }.  Toggle AT for one specific game."""
-    data = request.get_json(force=True) or {}
-    return jsonify(adaptive_tuning.set_game_enabled(
-        exe=data.get("exe", ""),
-        enabled=bool(data.get("enabled", False)),
-    ))
+@app.route("/api/adaptive/game/step", methods=["POST"])
+def api_adaptive_game_step():
+    """Body: {exe, to: "faster" | "slower" | "full", confirm?: bool}.  A step
+    up to a level that failed not long ago is answered with {"ok": False,
+    "need_confirm": True, "text": the question}; the page asks, and sends the
+    same body again with confirm true."""
+    d, refused = _adaptive_body(required={"exe": str, "to": str}, optional={"confirm": bool})
+    if refused:
+        return refused
+    return _adaptive_answer(lambda: adaptive_tuning.step_game(d["exe"], d["to"], confirm=d.get("confirm") is True))
+
+
+@app.route("/api/adaptive/game/forget", methods=["POST"])
+def api_adaptive_game_forget():
+    """Body: {exe}.  Forget what was learned about one game."""
+    d, refused = _adaptive_body(required={"exe": str})
+    if refused:
+        return refused
+    return _adaptive_answer(lambda: adaptive_tuning.forget_game(d["exe"]))
 
 
 @app.route("/api/adaptive/reset", methods=["POST"])
 def api_adaptive_reset():
-    """Body: { exe } to reset one game, no body for all."""
-    data = request.get_json(force=True) or {}
-    return jsonify(adaptive_tuning.reset_game_state(exe=data.get("exe")))
+    """Body: {}.  Forget every game and everything that happened; the settings
+    stay.  (Up to 3.7.0 this path took {exe} and reset one game.  A body with
+    anything in it is refused, so that call can never wipe everything.)"""
+    d, refused = _adaptive_body()
+    if refused:
+        return refused
+    return _adaptive_answer(adaptive_tuning.reset_all)
 
 
-@app.route("/api/adaptive/reseed", methods=["POST"])
-def api_adaptive_reseed():
-    """Body: { exe } to reseed one game from the user's current OC
-    baseline, no body to reseed all games.  Unlike /reset, this keeps
-    session history + warned offsets, just bumps the starting point
-    so AT explores from the user's current OC outwards instead of
-    crawling up from 0 or from a stale low baseline."""
-    data = request.get_json(silent=True) or {}
-    return jsonify(adaptive_tuning.reseed_from_baseline(exe=data.get("exe")))
-
-
-@app.route("/api/adaptive/history")
-def api_adaptive_history():
-    return jsonify({"history": adaptive_tuning.get_history(limit=50)})
-
-
-# v3.1 — per-game mode (balanced / competitive / visual)
-@app.route("/api/adaptive/game-mode", methods=["POST"])
-def api_adaptive_game_mode():
-    """Body: { exe, mode }.  Set the tuning mode for one game."""
-    data = request.get_json(force=True) or {}
-    return jsonify(adaptive_tuning.set_game_mode(
-        exe=data.get("exe", ""),
-        mode=data.get("mode", "balanced"),
-    ))
-
-
-@app.route("/api/adaptive/game-target", methods=["POST"])
-def api_adaptive_game_target():
-    """Body: { exe, target }.  Set the per-game optimization target
-    (auto | max_fps | low_latency | balanced).  max_fps holds the user's
-    proven OC at full GPU power + Ultimate plan; low_latency engages the
-    competitive-latency tweaks per session.  Both auto-disable AT for the
-    game so the target owns the posture."""
-    data = request.get_json(force=True) or {}
-    return jsonify(adaptive_tuning.set_game_target(
-        exe=data.get("exe", ""),
-        target=data.get("target", "auto"),
-    ))
-
-
-@app.route("/api/adaptive/apply-best", methods=["POST"])
-def api_adaptive_apply_best():
-    """Body: { exe }.  Push this game's recorded best-stable offsets to
-    the GPU + saved profile right now (without waiting for game launch)."""
-    data = request.get_json(force=True) or {}
-    return jsonify(adaptive_tuning.apply_best_stable(exe=data.get("exe", "")))
-
-
-@app.route("/api/adaptive/clear-blacklist", methods=["POST"])
-def api_adaptive_clear_blacklist():
-    """Body: { exe } for one game, no body for all.  Clears the per-game
-    crash blacklist + warned_offsets list, but keeps best_stable +
-    session counts (useful after a driver update)."""
-    data = request.get_json(force=True) or {}
-    return jsonify(adaptive_tuning.clear_blacklist_only(exe=data.get("exe")))
-
-
-# ─── AT v3.1 extensions ────────────────────────────────────────────────
-@app.route("/api/adaptive/pause", methods=["POST"])
-def api_adaptive_pause():
-    """Body: { source? } — defaults to 'user'.  Manually pause AT.  The
-    pause is stacked by source string, so the matching /resume call needs
-    the SAME source to release it."""
-    data = request.get_json(force=True) or {}
-    src = (data.get("source") or "user").strip() or "user"
-    adaptive_tuning.pause(src)
-    return jsonify({"ok": True, "paused": True, "source": src,
-                    "sources": adaptive_tuning.get_pause_sources()})
-
-
-@app.route("/api/adaptive/resume", methods=["POST"])
-def api_adaptive_resume():
-    """Body: { source? } — defaults to 'user'.  Release a pause matching
-    the source.  No-op if that source wasn't previously paused."""
-    data = request.get_json(force=True) or {}
-    src = (data.get("source") or "user").strip() or "user"
-    adaptive_tuning.resume(src)
-    return jsonify({"ok": True, "paused": adaptive_tuning.is_paused(),
-                    "source": src,
-                    "sources": adaptive_tuning.get_pause_sources()})
-
-
-@app.route("/api/adaptive/cross-blacklist", methods=["GET", "POST"])
-def api_adaptive_cross_blacklist():
-    """GET returns the cross-game offset blacklist (driver-level crashes
-    at offsets X mean *no game* gets to try X anymore).  POST adds an
-    entry: body { core, mem, source_exe?, reason? }."""
-    if request.method == "POST":
-        data = request.get_json(force=True) or {}
-        try:
-            core = int(data.get("core", 0))
-            mem  = int(data.get("mem", 0))
-        except (TypeError, ValueError):
-            return jsonify({"ok": False, "err": "core/mem must be integers"}), 400
-        adaptive_tuning.add_cross_game_blacklist(
-            core, mem,
-            source_exe=data.get("source_exe", ""),
-            reason=data.get("reason", "manual"),
-        )
-        return jsonify({"ok": True,
-                        "entries": adaptive_tuning.get_cross_game_blacklist()})
-    return jsonify({"entries": adaptive_tuning.get_cross_game_blacklist()})
-
-
-@app.route("/api/adaptive/clear-cross-blacklist", methods=["POST"])
-def api_adaptive_clear_cross_blacklist():
-    """Wipe the cross-game blacklist.  Use after a driver/firmware update
-    that may have fixed the underlying instability."""
-    adaptive_tuning.clear_cross_game_blacklist()
-    return jsonify({"ok": True,
-                    "entries": adaptive_tuning.get_cross_game_blacklist()})
-
-
-@app.route("/api/adaptive/diagnostics")
-def api_adaptive_diagnostics():
-    """Comprehensive AT diagnostic dump — surfaces every reason AT might
-    be (in)active, plus live GPU/frame readings, plus the engagement
-    state breakdown.  The AT diagnostic panel polls this on a slow
-    interval (~5 s) so the user can see exactly what AT is doing."""
-    return jsonify(adaptive_tuning.get_diagnostics())
-
-
-@app.route("/api/frame-telemetry/status")
-def api_frame_telemetry_status():
-    """Status of the frame telemetry source (RTSS shared memory).  UI
-    shows this in the AT live row + the diagnostics panel."""
-    try:
-        from core import frame_telemetry
-        return jsonify(frame_telemetry.get_status())
-    except Exception as e:
-        return jsonify({"running": False, "available": {"available": False,
-                        "reason": f"frame_telemetry import failed: {e}"}})
-
-
-@app.route("/api/frame-telemetry/start", methods=["POST"])
-def api_frame_telemetry_start():
-    """Body: { pid?, exe_name? }.  Force-start the frame telemetry sampler
-    targeted at this process.  Normally AT does this on engage — but the
-    diagnostic panel exposes a manual trigger for cases where AT isn't
-    engaging (unknown game) but the user still wants to see frame data."""
-    try:
-        from core import frame_telemetry
-        data = request.get_json(force=True) or {}
-        pid = data.get("pid")
-        exe = data.get("exe_name") or data.get("exe")
-        return jsonify(frame_telemetry.start_tracking(
-            pid=int(pid) if pid else None,
-            exe_name=exe,
-        ))
-    except Exception as e:
-        return jsonify({"ok": False, "err": str(e)})
-
-
-@app.route("/api/frame-telemetry/stop", methods=["POST"])
-def api_frame_telemetry_stop():
-    try:
-        from core import frame_telemetry
-        return jsonify(frame_telemetry.stop_tracking())
-    except Exception as e:
-        return jsonify({"ok": False, "err": str(e)})
-
-
-@app.route("/api/frame-telemetry/install", methods=["POST"])
-def api_frame_telemetry_install():
-    """One-click install for PresentMon (Microsoft's frame timing tool,
-    ~600 KB from their official GitHub release).  Runs only when AT
-    engages on a game — no background process.  Non-blocking; poll
-    /api/frame-telemetry/install/progress to see download status."""
-    try:
-        from core import frame_telemetry
-        return jsonify(frame_telemetry.install_presentmon())
-    except Exception as e:
-        return jsonify({"ok": False, "err": str(e)})
-
-
-@app.route("/api/frame-telemetry/install/progress")
-def api_frame_telemetry_install_progress():
-    try:
-        from core import frame_telemetry
-        return jsonify(frame_telemetry.install_progress())
-    except Exception as e:
-        return jsonify({"state": "error", "err": str(e)})
-
-
-# ── v3.2-beta.3: gameplay-vs-menu classifier ────────────────────────
-@app.route("/api/adaptive/gameplay-state")
-def api_adaptive_gameplay_state():
-    """Current gameplay/menu classification for a game.  Defaults to
-    the currently-engaged exe when no `exe` query param is given."""
-    try:
-        from core import gameplay_state
-        exe = request.args.get("exe") or ""
-        if not exe:
-            st = adaptive_tuning.get_status()
-            exe = st.get("active_exe") or ""
-        if not exe:
-            return jsonify({"state": "unknown", "reason": "no active game"})
-        return jsonify(gameplay_state.get_state(exe))
-    except Exception as e:
-        return jsonify({"state": "error", "err": str(e)})
-
-
-@app.route("/api/adaptive/gameplay-baselines")
-def api_adaptive_gameplay_baselines():
-    try:
-        from core import gameplay_state
-        return jsonify({"baselines": gameplay_state.get_all_baselines()})
-    except Exception as e:
-        return jsonify({"baselines": {}, "err": str(e)})
-
-
-@app.route("/api/adaptive/gameplay-recalibrate", methods=["POST"])
-def api_adaptive_gameplay_recalibrate():
-    """Body: { exe }.  Anchor the per-game baseline to the current
-    rolling-window median (marked manual so auto-rebuild doesn't drift
-    it)."""
-    try:
-        from core import gameplay_state
-        data = request.get_json(force=True) or {}
-        exe = data.get("exe") or ""
-        if not exe:
-            st = adaptive_tuning.get_status()
-            exe = st.get("active_exe") or ""
-        if not exe:
-            return jsonify({"ok": False, "err": "no exe provided"})
-        return jsonify(gameplay_state.recalibrate_baseline(exe))
-    except Exception as e:
-        return jsonify({"ok": False, "err": str(e)})
-
-
-@app.route("/api/adaptive/gameplay-reset", methods=["POST"])
-def api_adaptive_gameplay_reset():
-    """Body: { exe }.  Wipe samples + baseline + cached state for one
-    game.  AT will rebuild from scratch on the next engage."""
-    try:
-        from core import gameplay_state
-        data = request.get_json(force=True) or {}
-        exe = data.get("exe") or ""
-        if not exe:
-            return jsonify({"ok": False, "err": "no exe provided"})
-        return jsonify(gameplay_state.reset(exe))
-    except Exception as e:
-        return jsonify({"ok": False, "err": str(e)})
-
-
-@app.route("/api/adaptive/menu-signature/add", methods=["POST"])
-def api_adaptive_menu_sig_add():
-    """Body: { exe? }.  Record the current per-game sample (fps, util)
-    as a known menu signature.  Used when the user knows they're in a
-    menu but the auto-classifier hasn't picked it up yet."""
-    try:
-        from core import gameplay_state
-        data = request.get_json(force=True) or {}
-        exe = data.get("exe") or ""
-        if not exe:
-            st = adaptive_tuning.get_status()
-            exe = st.get("active_exe") or ""
-        if not exe:
-            return jsonify({"ok": False, "err": "no exe provided"})
-        return jsonify(gameplay_state.add_menu_signature(exe, source="manual"))
-    except Exception as e:
-        return jsonify({"ok": False, "err": str(e)})
+@app.route("/api/adaptive/note/dismiss", methods=["POST"])
+def api_adaptive_note_dismiss():
+    """Body: {}.  The note about what changed in this version was read."""
+    d, refused = _adaptive_body()
+    if refused:
+        return refused
+    return _adaptive_answer(adaptive_tuning.dismiss_note)
 
 
 # ── v3.2-beta.7: dependency manager ─────────────────────────────────
@@ -2116,42 +1991,6 @@ def _wire_capture_hotkeys(settings: dict) -> None:
     capture_hotkeys.register_binding("screenshot", ss_hk,   _screenshot_cb)
 
 
-@app.route("/api/adaptive/menu-signature/remove", methods=["POST"])
-def api_adaptive_menu_sig_remove():
-    """Body: { exe, index }.  Remove one learned menu signature by index."""
-    try:
-        from core import gameplay_state
-        data = request.get_json(force=True) or {}
-        exe = data.get("exe") or ""
-        idx = int(data.get("index", -1))
-        if not exe or idx < 0:
-            return jsonify({"ok": False, "err": "exe + index required"})
-        return jsonify(gameplay_state.remove_menu_signature(exe, idx))
-    except Exception as e:
-        return jsonify({"ok": False, "err": str(e)})
-
-
-@app.route("/api/adaptive/game-knobs", methods=["POST"])
-def api_adaptive_game_knobs():
-    """Body: { exe, thermal_limit_c?, power_bound_pct?, step_multiplier?,
-    dry_run? }.  Per-game tuning knobs — any omitted field is left
-    untouched.  Returns the resulting state."""
-    data = request.get_json(force=True) or {}
-    exe = (data.get("exe") or "").strip()
-    if not exe:
-        return jsonify({"ok": False, "err": "exe required"}), 400
-    knobs = {}
-    for k in ("thermal_limit_c", "power_bound_pct", "step_multiplier"):
-        if k in data and data[k] is not None:
-            try:
-                knobs[k] = float(data[k])
-            except (TypeError, ValueError):
-                return jsonify({"ok": False, "err": f"{k} must be numeric"}), 400
-    if "dry_run" in data:
-        knobs["dry_run"] = bool(data["dry_run"])
-    return jsonify(adaptive_tuning.set_game_knobs(exe=exe, **knobs))
-
-
 # ─── Crosshair overlay ─────────────────────────────────────────────────
 # Thin wrappers: core/crosshair.py checks, clamps and explains every input
 # itself and never raises.  The only thing refused here is a body that
@@ -2424,24 +2263,6 @@ def api_library_scan():
     return jsonify(library_scanner.scan_all(force=bool(data.get("force", True))))
 
 
-@app.route("/api/library/enable_at", methods=["POST"])
-def api_library_enable_at():
-    """Body: { exe: "...", enabled: true, mode?: "competitive" }.
-    Enables Adaptive Tuning for one detected game and optionally sets the
-    mode at the same time.  No game-launch required — the AT state row is
-    created on the spot."""
-    data = request.get_json(force=True) or {}
-    exe = (data.get("exe") or "").strip()
-    if not exe:
-        return jsonify({"ok": False, "err": "exe required"}), 400
-    enabled = bool(data.get("enabled", True))
-    out = adaptive_tuning.set_game_enabled(exe, enabled)
-    mode = data.get("mode")
-    if mode:
-        adaptive_tuning.set_game_mode(exe, mode)
-    return jsonify({"ok": True, "state": out})
-
-
 # ─── Background Pauser (v3.1) ──────────────────────────────────────────
 @app.route("/api/pauser/status")
 def api_pauser_status():
@@ -2531,35 +2352,6 @@ def api_network_resume_process():
     if not pid:
         return jsonify({"ok": False, "err": "pid required"}), 400
     return jsonify(net_monitor.resume_process(pid))
-
-
-@app.route("/api/library/enable_at_bulk", methods=["POST"])
-def api_library_enable_at_bulk():
-    """Body: { exes: [...], enabled: true, only_known?: true }.  Bulk-flip
-    AT for many games at once.  If only_known=True, the server filters the
-    list down to titles that exist in KNOWN_GAME_EXES (so the user can
-    just say 'enable AT for everything I have installed')."""
-    data = request.get_json(force=True) or {}
-    exes = data.get("exes") or []
-    if not isinstance(exes, list) or not exes:
-        return jsonify({"ok": False, "err": "exes list required"}), 400
-    enabled = bool(data.get("enabled", True))
-
-    if data.get("only_known"):
-        try:
-            from core.game_profiles import KNOWN_GAME_EXES
-            exes = [e for e in exes if (e or "").lower() in KNOWN_GAME_EXES]
-        except Exception:
-            pass
-
-    flipped = 0
-    for exe in exes:
-        try:
-            adaptive_tuning.set_game_enabled(exe, enabled)
-            flipped += 1
-        except Exception as e:
-            log.warning(f"bulk AT enable failed for {exe}: {e}")
-    return jsonify({"ok": True, "flipped": flipped, "total": len(exes)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3447,12 +3239,20 @@ def _restore_system_before_exit(reason: str) -> None:
         # (An overclock the user applied and is simply using is left alone.)
         if gpu_overclock.is_tuning_active():
             gpu_overclock._reset_to_stock_hard(attempts=1)
-        # Likewise an Adaptive Tuning session: close it, which hands the card
-        # back the way AT found it.  restore_normal_mode() above only does
-        # that for a real game exit, not for the app quitting mid-game.
-        adaptive_tuning.end_active_session(reason)
     except Exception as e:
         log.warning(f"GPU state restore during quit failed: {e}")
+    try:
+        # Likewise a game that Adaptive Tuning is still looking after: let go
+        # of its session, which hands the card back as the session found it.
+        # (Not when that would raise the clocks under the game, which is still
+        # running: then its values stay and the session file is kept, and the
+        # next start puts the card back once the game has closed.)
+        # The game mode restore above does that too when game mode is on; this
+        # covers a session that is open without it.  In a try of its own, so
+        # that a failure in the step above cannot skip the hand-back.
+        adaptive_tuning.end_active_session(reason)
+    except Exception as e:
+        log.warning(f"Adaptive Tuning hand-back during quit failed: {e}")
     try:
         # Idle Mode parks the overclock and lowers the GPU power limit.  Its
         # "engaged" flag lives in memory, so if the app exits while parked
@@ -4069,6 +3869,109 @@ def _acquire_single_instance_lock() -> bool:
         return True
 
 
+def _boot_saved_overclock_then_game_monitor(overclock_delay_s: float = 0, monitor_delay_s: float = 0,
+                                            session_kept: bool = False) -> None:
+    """One start-up task, in this order: the saved overclock is applied (when
+    the user has that switched on), gpu_overclock is told that this is over,
+    and only then does the game monitor start.
+
+    These used to be two threads started at the same moment.  A game that was
+    already running could be found while the saved overclock was still on its
+    way to the card: Adaptive Tuning then recorded "no overclock" as what to
+    hand back when the game closes, and the start-up apply landed on top of
+    the game's own level.  Adaptive Tuning waits for mark_startup_apply_done()
+    before it records what was on the card, so that is set however the apply
+    ends, and before the monitor can find a game.
+
+    `session_kept`: the last run died mid-game, that game is still running and
+    recover_interrupted_session() kept its session for the monitor to carry
+    on.  The card still holds that session's values, which may be an eased
+    level, so the saved overclock is not put over them here; the session hands
+    the card back when the game closes.
+
+    Both delays count from the call, and are the ones these two steps always
+    had (15 s and 60 s after an autostart, none after a manual start).  A step
+    that fails does not stop the next one.
+
+    The monitor's delay is cut short when a game is already running (looked
+    for right after the apply, then every 15 s): the saved overclock went on
+    the card at full, and a game Adaptive Tuning had eased ran on it until
+    the monitor found it 45 s later.  While the monitor is on its way,
+    game_profiles.monitor_starting() says so, and the page says "in a moment"
+    rather than asking the user to press Start Monitoring."""
+    started = time.monotonic()
+
+    def left_until(offset_s: float) -> float:
+        return float(offset_s or 0) - (time.monotonic() - started)
+
+    def wait_until(offset_s: float) -> None:
+        left = left_until(offset_s)
+        if left > 0:
+            time.sleep(left)
+
+    monitor_wanted = False
+    try:
+        monitor_wanted = bool(game_profiles.get_settings().get("auto_enable_on_boot", True)) \
+            and not game_profiles.is_monitoring()
+        game_profiles.set_monitor_starting(monitor_wanted)
+    except Exception as e:
+        log.debug(f"Could not tell whether the game monitor starts by itself: {e}")
+
+    wait_until(overclock_delay_s)
+    try:
+        if session_kept:
+            log.info("Saved overclock not applied at start-up: a game from the last run is still running "
+                     "and Adaptive Tuning carries its session on")
+        else:
+            r = gpu_overclock.apply_saved_profile_on_startup()
+            if r.get("applied"):
+                log.info("GPU OC profile applied on startup")
+    except Exception as e:
+        log.warning(f"Failed to apply saved OC profile: {e}")
+    finally:
+        try:
+            gpu_overclock.mark_startup_apply_done()     # applied, skipped or failed: it is over
+        except Exception as e:
+            log.warning(f"Could not mark the start-up overclock apply as done: {e}")
+
+    try:
+        while monitor_wanted:
+            left = left_until(monitor_delay_s)
+            if left <= 0:
+                break
+            if _a_game_is_running_at_start_up():
+                log.info("A game is already running: the game monitor starts now, not after the start-up delay")
+                break
+            time.sleep(min(left, _BOOT_GAME_CHECK_EVERY_S))
+        if not monitor_wanted:
+            wait_until(monitor_delay_s)
+        game_profiles.auto_enable_on_boot_if_set()
+    except Exception as e:
+        log.warning(f"Starting the game monitor at start-up failed: {e}")
+    finally:
+        try:
+            game_profiles.set_monitor_starting(False)       # started, or the task gave up
+        except Exception as e:
+            log.debug(f"Could not clear the game monitor's start-up flag: {e}")
+
+
+# How often the start-up task looks for a running game while it waits to start
+# the game monitor (see _boot_saved_overclock_then_game_monitor).
+_BOOT_GAME_CHECK_EVERY_S = 15.0
+
+
+def _a_game_is_running_at_start_up() -> bool:
+    """For the start-up task: is a game already running (or the monitor
+    started by hand meanwhile)?  A scan that fails says no.  Never raises."""
+    try:
+        if game_profiles.is_monitoring():
+            return True
+        return bool(game_profiles.running_game_candidates())
+    except Exception as e:
+        log.debug(f"Could not look for a running game at start-up: {e}")
+        return False
+
+
 def main():
     global _webview_window
 
@@ -4170,11 +4073,16 @@ def main():
     except Exception as e:
         log.debug(f"popup_killer start failed: {e}")
 
-    # A run that died mid-game left Adaptive Tuning's offset on the card with
-    # nothing watching it.  First, as a game's exit hands AT's offset back
-    # before game mode's own restore.
+    # A run that died mid-game left a game's session open: its values are
+    # still on the card with nothing watching them.  First, before anything
+    # else in this start can touch the card (game mode's own restore, the
+    # saved-overclock apply, Idle Mode, the server and with it the GPU page).
+    # When that game is still running nothing is written here and the session
+    # is kept for the game monitor to carry on.
+    adaptive_session_kept = False
     try:
-        adaptive_tuning.recover_interrupted_session()
+        recovered = adaptive_tuning.recover_interrupted_session()
+        adaptive_session_kept = bool(isinstance(recovered, dict) and recovered.get("kept"))
     except Exception as e:
         log.warning(f"Adaptive Tuning recovery of an interrupted session failed: {e}")
 
@@ -4184,14 +4092,14 @@ def main():
     except Exception as e:
         log.warning(f"Boot recovery of game mode failed: {e}")
 
-    # v3.1 fix — clear AT runtime if a previous run left it tracking a
-    # process that no longer exists (e.g. game closed without firing exit).
+    # A session whose game is no longer running is closed (nothing is open
+    # this early in a start; the watch thread does the same during a run).
     try:
         orphan = adaptive_tuning.clear_runtime_if_orphaned()
         if orphan.get("orphan"):
-            log.warning(f"AT orphan clear at boot: {orphan}")
+            log.warning(f"Adaptive Tuning closed a session whose game was gone: {orphan}")
     except Exception as e:
-        log.debug(f"AT orphan check failed: {e}")
+        log.debug(f"Adaptive Tuning orphan check failed: {e}")
 
     # v3.1 — start the network-burst sampler so the Network tab has data
     # ready when the user opens it, and so the burst-alert system is
@@ -4264,29 +4172,20 @@ def main():
     _delayed(boot_prep_delay,
              lambda: boot_prep.prep_for_gaming_async(on_done=_on_prep_done))
 
-    def _apply_saved_oc():
-        try:
-            r = gpu_overclock.apply_saved_profile_on_startup()
-            if r.get("applied"):
-                log.info("GPU OC profile applied on startup")
-        except Exception as e:
-            log.warning(f"Failed to apply saved OC profile: {e}")
-    _delayed(saved_oc_delay, _apply_saved_oc)
+    # The saved overclock, then the game monitor, as ONE task in that order
+    # (see _boot_saved_overclock_then_game_monitor).  The overclock keeps its
+    # delay and the monitor the boot-prep delay it always had, so that after
+    # an autostart neither competes with Windows during login.  With the
+    # monitor on (the default), any game from the database that starts
+    # afterwards gets game mode, and Adaptive Tuning looks after it.
+    _delayed(0, lambda: _boot_saved_overclock_then_game_monitor(
+        saved_oc_delay, boot_prep_delay, session_kept=adaptive_session_kept))
 
     # v2.9.6 — start the GPU driver updater background loop.
     # Internally schedules: 1 immediate check + a 12h periodic loop
     # (both gated by the auto_check setting).  We wrap it in _delayed()
     # so the autostart-mode startup doesn't fire it during the login storm.
     _delayed(driver_check_delay, driver_updater.check_in_background)
-
-    # v2.9.9.6 — auto-enable game-mode (game-detection monitor) on boot
-    # if the user opted in (default ON).  Uses the same boot-prep delay
-    # so we don't compete with Windows during login.  When enabled, any
-    # game from the ~280-entry database that launches afterwards gets the
-    # gaming profile (priority, affinity, OC, etc.) applied automatically
-    # and reverted when the game closes.
-    _delayed(boot_prep_delay,
-             lambda: game_profiles.auto_enable_on_boot_if_set())
 
     # v3 — start the hard GPU temp-ceiling watchdog.  Polls GPU temp
     # every 1 s and emergency-resets the OC if it sustains above the
@@ -4362,8 +4261,9 @@ def main():
     # v3.2-beta.7: boot-time dependency check + auto-install.  Runs in
     # a background thread so it doesn't delay the UI window.  Honors the
     # user's `auto_install_enabled` setting (default True).  Installs
-    # any missing auto-installable optional deps (PresentMon 1.x and 2.x,
-    # FFmpeg, WebView2, LibreHardwareMonitor) unless the user opted out.
+    # any missing auto-installable optional deps (FFmpeg, WebView2,
+    # LibreHardwareMonitor, and PresentMon 1.x and 2.x only while the
+    # crosshair is on) unless the user opted out.
     def _boot_dep_check():
         try:
             time.sleep(2)   # let Flask + UI settle before we hammer disk
