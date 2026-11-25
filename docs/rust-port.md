@@ -185,8 +185,12 @@ touched until then.
    stays on the app's own page, a link is handed to Explorer and not opened
    with the app's rights, and signing out does not skip the quit.
    Tried for real against the app on the fake machine.
-3. **The tray.** Its icon and menu, which need calls the backend does not
-   have yet, and autostart pointing at the shell.
+3. **The tray (written).** Its icon and menu, as today's: the same three
+   pictures, the same entries, the same clicks. What an entry does is still
+   the backend's to carry out, through calls that were added for it and
+   that an ordinary start of today's app does not have. The entry that
+   starts the app at sign-in names the shell when the app runs behind it.
+   Tried for real against the app on the fake machine, without a mouse.
 4. **One file.** `Vispora.exe` carrying the backend, and unpacking it once
    per version.
 

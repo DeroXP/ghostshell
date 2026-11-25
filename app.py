@@ -11,7 +11,7 @@ import time
 # Ensure the project root is on sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, abort, render_template, jsonify, request
 import config
 from core.utils import get_logger, get_log_buffer, clear_log_buffer, is_admin, create_restore_point
 from core import (system_info, debloater, optimizer, dns_manager, network_tweaks,
@@ -109,7 +109,16 @@ def _take_shell_handoff(argv=None, environ=None):
         raise ShellHandoffError("the shell's hand-over does not say which process the shell is")
     if not (whole(listen) and listen > 0):
         raise ShellHandoffError("the shell's hand-over names no socket to serve on")
-    return {"port": port, "listen": listen, "token": token, "shell_pid": pid, "shell_started": started}
+    # Where the shell's own exe is: what a person starts, and so what an
+    # entry for starting the app at sign-in has to name (core/autostart.py).
+    # A shell that does not say is taken as it is; one that says it in a
+    # way that cannot be used is refused, like the rest.
+    exe = given.get("shell_exe")
+    if exe is not None and not (isinstance(exe, str) and 4 < len(exe) < 1024 and os.path.isabs(exe)
+                                and exe.lower().endswith(".exe") and all(c >= " " and c != '"' for c in exe)):
+        raise ShellHandoffError("the shell's hand-over does not say where the shell is in a way that can be used")
+    return {"port": port, "listen": listen, "token": token, "shell_pid": pid, "shell_started": started,
+            "shell_exe": exe}
 
 
 def _adopt_shell_listener(handle: int, port: int):
@@ -149,6 +158,8 @@ def _serve_for_the_shell(handoff) -> None:
     # the first for its window.  The window is the shell's now, and so is
     # telling a second copy from the first.
     _TOKEN_EXEMPT_PATHS = frozenset()
+    # What a person starts is the shell, not this process.
+    autostart.use_app_exe(handoff.get("shell_exe"))
     _behind_shell = dict(handoff)
 
 
@@ -3334,6 +3345,129 @@ def api_shell_hello():
     build I came with?  (Asked with the secret, like every other call.)"""
     return jsonify({"ok": True, "app": config.APP_NAME, "version": config.APP_VERSION,
                     "pid": os.getpid(), "behind_shell": _behind_shell is not None})
+
+
+# ── The tray, behind the shell ───────────────────────────────────────
+# Behind the shell the tray icon is the shell's.  Today's menu does its
+# work inside this process (_create_tray_icon); the shell's menu asks for
+# the same work with the calls below.  Each does what the entry of the same
+# name in today's menu does, with the same messages, and tests/
+# test_tray_calls.py holds the two against each other.  "Open Vispora" and
+# "Quit" need no call: the window and quitting are the shell's.
+#
+# Started as it always was, the app has its own tray and none of these
+# calls: they answer as a path that does not exist.
+def _for_the_shells_tray(call):
+    @functools.wraps(call)
+    def only_behind_the_shell():
+        if _behind_shell is None:
+            abort(404)
+        return call()
+    return only_behind_the_shell
+
+
+@app.route("/api/tray/state")
+@_for_the_shells_tray
+def api_tray_state():
+    """What the tray shows: which of its three icons, its tooltip, the
+    status line of its menu and the two entries with a tick."""
+    s = {}
+    try:
+        s = game_profiles.get_engine_status()
+    except Exception:
+        pass
+    return jsonify({
+        "ok": True,
+        "monitoring": bool(s.get("monitoring")),
+        "playing": bool(s.get("active_pid")),
+        "active_game": s.get("active_game") or None,
+        "crosshair": bool(crosshair.is_enabled()),
+    })
+
+
+@app.route("/api/tray/game-mode", methods=["POST"])
+@_for_the_shells_tray
+def api_tray_game_mode():
+    """The tray's "Game Mode": off when it was on, on when it was off."""
+    try:
+        if game_profiles.get_engine_status().get("monitoring"):
+            game_profiles.stop_monitoring()
+            notifier.toast("Game Mode", "Monitoring stopped.")
+        else:
+            game_profiles.start_monitoring()
+            notifier.toast("Game Mode", "Now watching for games.")
+    except Exception as e:
+        log.warning(f"tray toggle failed: {e}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/tray/force-normal", methods=["POST"])
+@_for_the_shells_tray
+def api_tray_force_normal():
+    """The tray's "Force Normal Mode"."""
+    def _bg():
+        try:
+            game_profiles.restore_normal_mode("user-tray")
+            notifier.toast("Normal Mode", "All gaming tweaks reverted.")
+        except Exception as e:
+            log.warning(f"tray force normal failed: {e}")
+    threading.Thread(target=_bg, daemon=True, name="tray-force-normal").start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/tray/crosshair", methods=["POST"])
+@_for_the_shells_tray
+def api_tray_crosshair():
+    """The tray's "Crosshair": off when it was on, on when it was off."""
+    want = not crosshair.is_enabled()
+
+    def _bg():
+        # Not while the call waits: turning it on waits for the overlay window.
+        try:
+            r = crosshair.set_enabled(want)
+            err = None
+            if not r.get("ok"):
+                err = r.get("err") or "Couldn't change the crosshair setting."
+            elif want and (r.get("status") or {}).get("reason") == "error":
+                # Saved as on, but the window didn't open: set_enabled
+                # still answers ok, so say why nothing shows.
+                err = r["status"].get("last_error") or "The crosshair window didn't open."
+            if err:
+                log.warning(f"tray crosshair toggle failed: {err}")
+                notifier.toast("Crosshair didn't start" if want else "Crosshair", err)
+        except Exception as e:
+            log.warning(f"tray crosshair toggle failed: {e}")
+    threading.Thread(target=_bg, daemon=True, name="tray-crosshair").start()
+    return jsonify({"ok": True, "want": want})
+
+
+@app.route("/api/tray/refresh-pc", methods=["POST"])
+@_for_the_shells_tray
+def api_tray_refresh_pc():
+    """The tray's "Refresh PC now"."""
+    def _bg():
+        try:
+            power.cleanup_only()
+            notifier.toast("PC Refreshed", "Standby cleared, DNS flushed, MMCSS reset.")
+        except Exception as e:
+            log.warning(f"tray refresh failed: {e}")
+    threading.Thread(target=_bg, daemon=True, name="tray-refresh-pc").start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/tray/clean-ram", methods=["POST"])
+@_for_the_shells_tray
+def api_tray_clean_ram():
+    """The tray's "Clean RAM now"."""
+    def _bg():
+        try:
+            r = cleaner.clean_ram()
+            msg = f"Freed {r.get('freed_mb', 0)} MB" if r.get("ok") else "RAM clean failed"
+            notifier.toast("RAM Cleaned", msg)
+        except Exception as e:
+            log.warning(f"tray clean ram failed: {e}")
+    threading.Thread(target=_bg, daemon=True, name="tray-clean-ram").start()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/window/minimize", methods=["POST"])

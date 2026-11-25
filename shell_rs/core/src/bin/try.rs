@@ -32,7 +32,7 @@ use vispora_shell_core::http::Request;
 use vispora_shell_core::json::Json;
 use vispora_shell_core::platform::Command;
 use vispora_shell_core::shell::Phase;
-use vispora_shell_core::{token, win, Settings, Shell};
+use vispora_shell_core::{token, tray, win, Settings, Shell};
 
 fn text_of(phase: &Phase) -> String {
     match phase {
@@ -83,6 +83,8 @@ fn settings_from(arguments: &[String]) -> Result<Settings, String> {
     }
     let program = program.ok_or("--backend <program> is needed: this tool has no backend of its own")?;
     let mut settings = Settings::new(Command { program, args, cwd }, &appdata);
+    // (as the shell says where it is: this tool stands in for it)
+    settings.shell_exe = std::env::current_exe().ok().map(|exe| exe.to_string_lossy().into_owned());
     if let Some(version) = version {
         settings.version = version;
     }
@@ -140,6 +142,11 @@ fn answer(shell: &Arc<Shell>, asked: &Json) -> Result<Json, String> {
             Ok(Json::object([("phase", text_of(&phase).into())]))
         }
         Some("state") => Ok(state_of(shell)),
+        // A call of the shell's own to its backend, as the tray makes them.
+        Some("own") => {
+            let (method, path) = (asked["method"].as_str().unwrap_or("GET"), asked["path"].as_str().ok_or("\"path\" is missing")?);
+            Ok(Json::object([("answer", shell.ask_backend(method, path).unwrap_or(Json::Null))]))
+        }
         // Start another program the way the shell starts everything that
         // is not its backend: see win::start_without_handles.
         Some("start_other") => {
@@ -158,6 +165,22 @@ fn main() {
     // Where the shell finds the two folders it takes from Windows, and
     // nothing else: for the test that plants variables in the environment
     // and sees the answers stay the same.
+    // What the tray would show for what the backend says ("none": it
+        // has not said anything yet), and one of the tray's pictures as
+        // hexadecimal bytes: for the tests that hold both against today's.
+    if arguments.len() == 2 && arguments[0] == "--tray-look" {
+        let state = match arguments[1].as_str() {
+            "none" => None,
+            said => Json::parse(said).ok().as_ref().and_then(tray::State::from_json),
+        };
+        println!("{}", tray::look(state.as_ref()).to_json());
+        return;
+    }
+    if arguments.len() == 2 && arguments[0] == "--tray-picture" {
+        let Some(icon) = tray::Icon::named(&arguments[1]) else { std::process::exit(2) };
+        println!("{}", tray::picture(icon).iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+        return;
+    }
     if arguments == ["--where"] {
         println!("{}", Json::object([
             ("windows", win::windows_folder().unwrap_or_default().into()),

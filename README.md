@@ -150,8 +150,10 @@ exe can be tried against a made-up install in a temporary folder with
 
 The shell's core has its tests in `shell_rs/core`
 (`cargo test --release --manifest-path shell_rs/core/Cargo.toml`), against a
-backend that exists only in the test. `tests/test_backend_mode.py` and
-`tests/test_shell_rs.py` check the app's side of the arrangement, and, where
+backend that exists only in the test. `tests/test_backend_mode.py`,
+`tests/test_shell_rs.py` and `tests/test_tray_calls.py` check the app's side
+of the arrangement (the last one holds the shell's tray icon against
+today's), and, where
 the shell's trial tool has been built, start it for real with the app on the
 fake machine as its backend. The real backend is never started by a test.
 

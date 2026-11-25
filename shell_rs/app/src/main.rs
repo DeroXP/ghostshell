@@ -11,15 +11,16 @@
 //! are registered, and the page is given no permission for the built-in
 //! ones.
 //!
-//! Not here yet: the tray icon (a hidden window is brought back by starting
-//! the app again), and the backend packed into the exe.  Nothing in a
-//! release uses this program yet.
+//! The tray icon is in tray.rs.  Not here yet: the backend packed into
+//! the exe.  Nothing in a release uses this program yet.
 
 #![windows_subsystem = "windows"]
 
+mod tray;
+
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tauri::http::Response as Answer;
 use tauri::utils::config::Color;
@@ -29,6 +30,7 @@ use vispora_shell_core::http::Request;
 use vispora_shell_core::instance::{self, Begin, Held};
 use vispora_shell_core::json::Json;
 use vispora_shell_core::platform::{Command, Window};
+use vispora_shell_core::trouble::Trouble;
 use vispora_shell_core::{page, paths, win, Settings, Shell, APP_NAME};
 
 /// The build that is meant to ship asks for administrator rights; a trial
@@ -47,6 +49,12 @@ struct Trial {
     backend: Command,
     window: String,
     scripts: Option<String>,
+    /// Where the window's folder is made, in place of the trial's own data
+    /// folder: how a trial sees what is said when it cannot be made.
+    folder_in: Option<String>,
+    /// A file that takes what would otherwise be shown in a message box (a
+    /// box would sit on the screen of whoever is at the PC, and wait).
+    messages: Option<String>,
 }
 
 fn trial() -> Option<Trial> {
@@ -64,7 +72,22 @@ fn trial() -> Option<Trial> {
         },
         window: told["window"].as_str().unwrap_or("hidden").to_string(),
         scripts: told["scripts"].as_str().map(str::to_string),
+        folder_in: told["folder_in"].as_str().map(str::to_string),
+        messages: told["messages"].as_str().map(str::to_string),
     })
+}
+
+/// Tell the person something in a plain Windows message.  (A trial may ask
+/// for it in a file instead.)
+fn tell(trial: Option<&Trial>, text: &str) {
+    match trial.and_then(|trial| trial.messages.as_ref()) {
+        Some(file) => {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
+                let _ = writeln!(file, "{text}");
+            }
+        }
+        None => win::tell(APP_NAME, text),
+    }
 }
 
 /// (trial builds only) Run in the page whatever script turns up in `folder`.
@@ -159,28 +182,33 @@ fn main() {
         backend.args.push("--from-autostart".to_string());
     }
 
-    let code = match run(Settings::new(backend, &folders.appdata_dir), &folders, held, from_autostart, trial.as_ref(), &ignored) {
+    let mut settings = Settings::new(backend, &folders.appdata_dir);
+    // What a person starts is this program: the backend is told where it
+    // is (it needs it where it names the app's exe).
+    settings.shell_exe = std::env::current_exe().ok().map(|exe| exe.to_string_lossy().into_owned());
+    let code = match run(settings, &folders, held, from_autostart, trial.as_ref(), &ignored) {
         Ok(code) => code,
-        Err(why) => {
-            win::tell(APP_NAME, &format!(
-                "Vispora's window could not be opened.\n\n\
-                 It needs Microsoft Edge WebView2, which is part of Windows 11 and of most Windows 10 PCs. \
-                 Installing or repairing \"Microsoft Edge WebView2 Runtime\" usually fixes this.\n\n\
-                 Nothing was changed on this PC.\n\nDetails: {why}"
-            ));
+        // Each kind of trouble in words of its own (core/src/trouble.rs).
+        Err(trouble) => {
+            tell(trial.as_ref(), &trouble.words());
             1
         }
     };
     std::process::exit(code);
 }
 
+/// The window could not be opened, or WebView2 is not there.
+fn no_window(why: impl std::fmt::Display) -> Trouble {
+    Trouble::Window(why.to_string())
+}
+
 /// Open the window, start the backend, and stay until the app is quit.
 fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, from_autostart: bool, trial: Option<&Trial>, ignored: &[String])
-       -> Result<i32, Box<dyn std::error::Error>> {
+       -> Result<i32, Trouble> {
     // Asked before anything is opened: where WebView2 is missing, creating
     // the window does not fail, it waits for ever.
-    let webview2 = tauri::webview_version()?;
-    let shell = Shell::new(settings, win::platform())?;
+    let webview2 = tauri::webview_version().map_err(no_window)?;
+    let shell = Shell::new(settings, win::platform()).map_err(Trouble::Shell)?;
 
     let log = PathBuf::from(paths::join(&folders.appdata_dir, "shell.log"));
     *shell.log_hook.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(move |line: &str| {
@@ -199,19 +227,13 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
     // without administrator rights can rename it or take it away (see
     // win::administrators_folder); a trial keeps it with its own data.
     let (folder_in, open_to) = if ASKS_FOR_RIGHTS {
-        (win::administrators_folder()?, win::OpenTo::Administrators)
+        let place = win::administrators_folder().map_err(|why| Trouble::Folder { place: "Windows' folder for temporary files".to_string(), why })?;
+        (place, win::OpenTo::Administrators)
     } else {
-        (folders.appdata_dir.clone(), win::OpenTo::ThisAccount)
+        (trial.and_then(|trial| trial.folder_in.clone()).unwrap_or_else(|| folders.appdata_dir.clone()), win::OpenTo::ThisAccount)
     };
-    // (only the one copy tidies up: what is there may otherwise be in use)
-    if held.is_some() {
-        let left = win::remove_private_folders(&folder_in, None);
-        if left > 0 {
-            shell.say(&format!("removed {left} folder(s) of the window that an earlier run left behind"));
-        }
-    }
-    let window_folder = win::private_folder(&folder_in, open_to)?;
-    shell.say(&format!("the window's folder for this run: {window_folder}"));
+    let own_folder = win::private_folder(&folder_in, open_to).map_err(|why| Trouble::Folder { place: folder_in.clone(), why })?;
+    shell.say(&format!("the window's folder for this run: {}", own_folder.path));
 
     let for_requests = shell.clone();
     let app = tauri::Builder::default()
@@ -238,11 +260,12 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
                 responder.respond(reply);
             });
         })
-        .build(tauri::generate_context!())?;
+        .build(tauri::generate_context!())
+        .map_err(no_window)?;
 
     // The page's address ends in the run's secret, as it always did: the
     // page takes it from there and out of its address bar.
-    let address = format!("{PAGE}{}", shell.fragment()).parse()?;
+    let address = format!("{PAGE}{}", shell.fragment()).parse().map_err(no_window)?;
     let (own_page, for_links) = (shell.settings.origin.clone(), shell.clone());
     let window = WebviewWindowBuilder::new(&app, "main", WebviewUrl::CustomProtocol(address))
         .title(APP_NAME)
@@ -259,7 +282,7 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
         // the run's secret in its session storage), and what WebView2 does
         // write goes into the folder that is this run's alone.
         .incognito(true)
-        .data_directory(PathBuf::from(&window_folder))
+        .data_directory(PathBuf::from(&own_folder.path))
         // The window stays on the app's own page: the whole of where a
         // page is from is compared, not its host name alone ...
         .on_navigation(move |url| page::is_the_apps_page(url.as_str(), &own_page))
@@ -284,14 +307,35 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
         _ if from_autostart => window.visible(false),
         _ => window.center(),
     }
-    .build()?;
+    .build()
+    .map_err(no_window)?;
 
-    if let Some(folder) = trial.and_then(|trial| trial.scripts.clone()) {
-        run_scripts_from(folder, window.clone());
-    }
+    // What earlier runs left behind is taken away now that the window is
+    // there, on a thread of its own: never in the window's way.  (A folder
+    // that is in use, this run's own or a copy's in another session, is
+    // not touched: see win::remove_private_folders.)
+    let (tidying, tidy_in) = (shell.clone(), folder_in.clone());
+    std::thread::spawn(move || {
+        let began = std::time::Instant::now();
+        let tidied = win::remove_private_folders(&tidy_in);
+        tidying.say(&format!(
+            "the window's old folders: {} entries looked at in {} ms, {} left behind by earlier runs and removed, {} in use and left alone",
+            tidied.entries, began.elapsed().as_millis(), tidied.removed, tidied.left
+        ));
+    });
+
     let out_of_the_way = trial.is_some_and(|trial| trial.window != "shown");
-    let pane = Arc::new(Pane(window, out_of_the_way));
+    let pane = Arc::new(Pane(window.clone(), out_of_the_way));
     *shell.window.lock().unwrap_or_else(|p| p.into_inner()) = Some(pane.clone());
+    // The tray icon, there from the first moment.  Without one the app
+    // still runs (a window that was hidden is then brought back by starting
+    // the app again), as today's app runs without its tray.
+    if let Err(why) = tray::make(&app, shell.clone(), pane.clone(), trial.is_some()) {
+        shell.say(&format!("no tray icon: {why}"));
+    }
+    if let Some(folder) = trial.and_then(|trial| trial.scripts.clone()) {
+        run_scripts_from(folder, window);
+    }
     // Another start of the app asks this copy for its window.
     if let Some(held) = &held {
         let (asked_for, shell) = (pane.clone(), shell.clone());
@@ -301,18 +345,19 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
         }));
     }
     // The shell is gone when the backend's process has ended: then, and
-    // only then, the window's loop is told to end.  Never a loop that is
-    // over already, though: told to end, Tauri ends the process on the spot
-    // when there is no loop left to tell, and what this program still has to
-    // do after its loop (take the window's folder away) would not be done.
-    let over = Arc::new(Mutex::new(false));
-    let (handle, loop_is_over) = (app.handle().clone(), over.clone());
-    *shell.exit_hook.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(move |code| {
-        // (held while the loop is told: the loop cannot end in between)
-        let over = loop_is_over.lock().unwrap_or_else(|p| p.into_inner());
-        if !*over {
-            handle.exit(code);
-        }
+    // only then, the window is taken away, and with its last window gone
+    // the window's loop ends.
+    //
+    // The window is taken away; the loop is not told to end.  WebView2 lets
+    // go of the window's folder only when its window is gone, and the folder
+    // is removed after the loop: with the loop told to end, the window was
+    // still there, the folder stayed, and the quit waited three seconds for
+    // nothing.  And told to end a loop that is over already, Tauri ends the
+    // process on the spot, before anything after the loop is done; taking
+    // away a window that is gone does nothing.
+    let last_window = pane.clone();
+    *shell.exit_hook.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(move |_code| {
+        let _ = last_window.0.destroy();
     }));
 
     shell.start();
@@ -326,7 +371,6 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
         // the process does not end before the backend has put the system
         // back and ended.
         if let RunEvent::Exit = event {
-            *over.lock().unwrap_or_else(|p| p.into_inner()) = true;
             at_the_end.quit_and_wait("the window is gone");
         }
     });
@@ -334,7 +378,7 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
     // WebView2's own programs end with the window, and let go of the folder.
     *shell.window.lock().unwrap_or_else(|p| p.into_inner()) = None;
     drop(pane);
-    if !win::remove_private_folder(&window_folder) {
+    if !own_folder.remove() {
         shell.say("the window's folder is still in use and stays; the next start removes it");
     }
     drop(held);
