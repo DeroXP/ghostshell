@@ -31,3 +31,5 @@ native/target/
 # The Rust updater (updater_rs/): build output of its two crates.
 updater_rs/core/target/
 updater_rs/app/target/
+# (Tauri writes the list of its permissions here at every build; the updater grants none)
+updater_rs/app/gen/

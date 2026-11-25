@@ -397,6 +397,24 @@ impl Clock for RealClock {
 }
 
 // ═════════════════════════════════════════════════════════════════════
+// A plain message, for when the updater's own window cannot be opened
+// ═════════════════════════════════════════════════════════════════════
+
+#[link(name = "user32")]
+extern "system" {
+    fn MessageBoxW(owner: isize, text: *const u16, title: *const u16, kind: u32) -> i32;
+}
+
+/// Show `text` in a plain Windows message box and wait for its OK.
+pub fn tell(title: &str, text: &str) {
+    const MB_ICONWARNING: u32 = 0x30;
+    const MB_SETFOREGROUND: u32 = 0x1_0000;
+    let (text, title) = (wide(text), wide(title));
+    // SAFETY: both strings end in a NUL and outlive the call.
+    unsafe { MessageBoxW(0, text.as_ptr(), title.as_ptr(), MB_ICONWARNING | MB_SETFOREGROUND) };
+}
+
+// ═════════════════════════════════════════════════════════════════════
 // The "pick a folder" dialog
 // ═════════════════════════════════════════════════════════════════════
 // Windows' own file dialog in its folder mode (IFileOpenDialog), through COM

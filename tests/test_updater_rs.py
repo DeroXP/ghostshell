@@ -190,6 +190,120 @@ def test_the_python_updater_is_still_here_and_buildable():
 
 
 # ═════════════════════════════════════════════════════════════════════
+# The window around it (updater_rs/app), which is the exe that ships
+# ═════════════════════════════════════════════════════════════════════
+APP = os.path.join(RS, "app")
+
+
+def app(*path):
+    with open(os.path.join(APP, *path), encoding="utf-8") as f:
+        return f.read()
+
+
+def repo(*path):
+    with open(os.path.join(m.REPO, *path), encoding="utf-8") as f:
+        return f.read()
+
+
+def test_the_exe_carries_the_cores_version():
+    manifest = app("Cargo.toml")
+    assert re.search(r'^version = "([^"]+)"', manifest, re.M).group(1) == rust_version()
+    assert json.loads(app("tauri.conf.json"))["version"] == rust_version(), "what Windows shows in the exe's properties"
+    assert 'vispora-updater-core = { path = "../core" }' in manifest
+    assert '[[bin]]\nname = "VisporaUpdater"\n' in manifest, "the file name the app starts"
+    assert "cli::prepare(&updater, &args, UPDATER_VERSION)" in app("src", "main.rs"), "and what it says of itself"
+
+
+def test_tauri_is_pinned_and_the_lock_file_is_whole():
+    manifest = app("Cargo.toml")
+    pinned = dict(re.findall(r'^(tauri(?:-build)?) = \{ version = "=(\d+\.\d+\.\d+)"', manifest, re.M))
+    assert set(pinned) == {"tauri", "tauri-build"}, "one exact version each"
+    wanted = manifest[manifest.index("[dependencies]"):manifest.index("[profile.release]")]
+    assert sorted(re.findall(r"^([\w-]+) = ", wanted, re.M)) == ["tauri", "tauri-build", "vispora-updater-core"], \
+        "nothing else is asked for by name"
+    lock = app("Cargo.lock")
+    packages = re.split(r"\n\[\[package\]\]\n", lock)[1:]
+    assert len(packages) > 100
+    for name, version in pinned.items():
+        assert f'name = "{name}"\nversion = "{version}"\n' in lock, name
+    for package in packages:
+        name = re.match(r'name = "([^"]+)"', package).group(1)
+        if name in ("vispora-updater", "vispora-updater-core"):
+            assert "source = " not in package, name
+        else:
+            # From crates.io and nowhere else, each with the hash cargo checks
+            # the download against.
+            assert 'source = "registry+https://github.com/rust-lang/crates.io-index"' in package, name
+            assert re.search(r'^checksum = "[0-9a-f]{64}"$', package, re.M), name
+    # ... and the build is told to keep to it.
+    assert "cargo build --release --locked --manifest-path updater_rs/app/Cargo.toml" in repo("updater_rs", "README.md")
+
+
+def test_the_exe_asks_for_administrator_rights_like_the_python_one():
+    assert re.search(r"uac_admin\s*=\s*True", repo("updater_helper.spec"))
+    assert 'level="requireAdministrator"' in app("app.manifest")
+    assert re.search(r'^default = \["elevated"\]$', app("Cargo.toml"), re.M), \
+        "what a plain cargo build makes is the exe that ships"
+    build = app("build.rs")
+    assert 'include_str!("app.manifest")' in build and ".app_manifest(manifest)" in build
+    assert "CARGO_FEATURE_ELEVATED" in build
+    # What keeps a trial's window off the screen is not in the exe that ships.
+    assert 'if cfg!(feature = "elevated") {\n        return None;\n    }' in app("src", "main.rs")
+
+
+def test_the_window_is_the_python_updaters_window():
+    python, main = repo("updater", "main.py"), app("src", "main.rs")
+    width, height = re.search(r"width=(\d+),\s*height=(\d+)", python).groups()
+    least = re.search(r"min_size=\((\d+), (\d+)\)", python).groups()
+    assert f".inner_size({width}.0, {height}.0)" in main and f".min_inner_size({least[0]}.0, {least[1]}.0)" in main
+    colour = re.search(r'background_color="#([0-9a-f]{6})"', python).group(1)
+    red, green, blue = (int(colour[i:i + 2], 16) for i in (0, 2, 4))
+    assert f".background_color(Color({red}, {green}, {blue}, 255))" in main
+    assert "frameless=True" in python and ".decorations(false)" in main
+    assert "resizable=False" in python and ".resizable(false)" in main
+    assert '"Vispora Updater",' in python and 'const TITLE: &str = "Vispora Updater";' in main
+    # The page's own title bar moves the window: WebView2 reads that from the
+    # page's style sheet, which is why the page needed no change.
+    style = repo("updater", "static", "style.css")
+    assert "-webkit-app-region: drag;" in style and "-webkit-app-region: no-drag;" in style
+    # What the page asks goes to the function the cargo tests call.
+    assert "server::handle(&updater, request.method().as_str(), request.uri().path(), request.body())" in main
+    # A closed window does not cut a running install off.
+    assert "stop_install()" in python and "updater.stop_install();" in main
+    # --silent: no window, and the pipeline's exit code.
+    assert "if args.silent { cli::run_silent(&updater) } else { with_window(&updater) }" in main
+
+
+def test_the_page_cannot_reach_tauris_commands():
+    main = app("src", "main.rs")
+    for word in ("invoke_handler", "generate_handler", "tauri::command", ".plugin("):
+        assert word not in main, word
+    conf = json.loads(app("tauri.conf.json"))
+    assert conf["app"]["security"]["capabilities"] == [] and conf["app"]["windows"] == []
+    assert not conf["app"].get("withGlobalTauri")
+    assert not os.path.isdir(os.path.join(APP, "capabilities")), "a capabilities folder hands the page permissions"
+    assert conf["bundle"]["active"] is False, "no installer is made: the exe is the download"
+    assert ".on_navigation(" in main, "the window stays on the updater's own page"
+    assert 'default-features = false, features = ["wry", "custom-protocol"]' in app("Cargo.toml"), \
+        "no developer tools, no tray, no extra protocols"
+
+
+def test_the_trial_cannot_be_pointed_at_the_real_app():
+    """updater_rs/app/try_it.py starts the real exe, and that exe ends the app
+    it is about to replace by file name, wherever the app runs from."""
+    trial = app("try_it.py")
+    name = re.search(r'^APP_NAME = "([^"]+)"$', trial, re.M).group(1)
+    assert name.lower() not in {n.lower() for n in P.APP_EXE_NAMES}
+    assert '"--target-exe", self.app' in trial and '"--source", "server", "--server", self.server.base' in trial
+    for folder in ("APPDATA", "LOCALAPPDATA", "USERPROFILE", "ProgramFiles", "ProgramFiles(x86)"):
+        assert f'("{folder}", ' in trial, folder
+    assert 'refuse("this terminal runs as administrator' in trial
+    assert "b'level=\"requireAdministrator\"' in exe" in trial, "the exe that ships is never started by it"
+    # With its window shown, the trial's server has nothing to install.
+    assert 'Trial("by hand", root, old_build, new_build, offers=False)' in trial
+
+
+# ═════════════════════════════════════════════════════════════════════
 # The same decisions, on a PC where the Rust side has been built
 # ═════════════════════════════════════════════════════════════════════
 def decide(requests):

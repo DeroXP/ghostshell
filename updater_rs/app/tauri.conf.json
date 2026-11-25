@@ -1,0 +1,17 @@
+{
+  "productName": "Vispora Updater",
+  "version": "2.0.0",
+  "identifier": "com.vispora.updater",
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null,
+      "capabilities": []
+    }
+  },
+  "bundle": {
+    "active": false,
+    "publisher": "Vispora",
+    "icon": ["../../assets/vispora.ico"]
+  }
+}
