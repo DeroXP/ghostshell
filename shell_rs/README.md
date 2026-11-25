@@ -15,7 +15,7 @@ are as they were. The pieces:
 | `app/` | The window (Tauri, as for the updater), on the app's own page | written, tried for real against a stand-in backend |
 | the tray | The tray icon and its menu, and what the entry for starting at sign-in names | written, tried for real against a stand-in backend |
 | one file | The exe carrying the backend and unpacking it before it starts it: once per version, into a folder that stays (the owner's choice of two ways) | written, tried for real with the real backend's files and a stand-in started in their place |
-| what has moved | Modules of the backend that the shell now does itself (step 4 of the plan): so far the performance sampler; and the graphics card's own reader, a small program the shell starts for the card's readings | written, proven to give Python's answers on a made-up machine, tried for real in the window against the stand-in backend with the reader reading this PC's card (the shell's own process never opens the driver's library) |
+| what has moved | Modules of the backend that the shell now does itself (step 4 of the plan): so far the performance sampler and the hardware monitor; and the graphics card's own reader, a small program the shell starts for the card's readings | written, proven to give Python's answers on a made-up machine, tried for real in the window against the stand-in backend with the reader reading this PC's card (the shell's own process never opens the driver's library) |
 
 ## How the two sides work together
 
@@ -584,7 +584,7 @@ with it:
 
 ```
 cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
-python shell_rs/app/try_it.py                  # 136 checks; the window is never shown
+python shell_rs/app/try_it.py                  # 145 checks; the window is never shown
 python shell_rs/app/try_it.py --time           # the times
 python shell_rs/app/try_it.py --time --pack P  # ... and what unpacking the pack P costs, both ways
 python shell_rs/app/try_it.py --time --pack P --carried-by E
@@ -690,7 +690,12 @@ pieces").
 So far: **the performance sampler** (`core/src/moved/perf.rs`, which is
 `core/perf_monitor.py`): the graphics card's reading taken five times a
 second while the Monitor page is open, for its live charts and its
-stability score.
+stability score; and **the hardware monitor** (`core/src/moved/hw.rs`,
+which is `core/hw_monitor.py`): the processor, the card, the memory, DPC
+time and a ping, once a second from the first visit to the Monitor page
+until its Stop button or the quit (the page does not stop it when it is
+left, as today), for its tiles. Its list of programs and its benchmark stay the backend's (they
+start PowerShell, and the benchmark writes a file).
 
 The rules every module there keeps:
 
@@ -749,11 +754,34 @@ The rules every module there keeps:
     it beside it is not started (the backend is asked for the card).
 
   **What a person sees:** while the card is being read (today: while the
-  Monitor page is open, and for ten seconds after it was left), Task
-  Manager shows a second process of the app's, `VisporaGpuReader.exe`,
+  Monitor page is open, for the sampler; from the first visit to that
+  page until its Stop button or the quit, for the hardware monitor; and
+  for ten seconds after the last reading), Task Manager shows a second
+  process of the app's, `VisporaGpuReader.exe`,
   with about 30 MB of memory, most of it NVIDIA's library. It is not
   there otherwise. On a PC without an NVIDIA card it is started, says that
   it has no reading, and is ended at once; it is tried again now and then.
+* **The hardware monitor** reads what Python reads, where Python reads
+  it: the processor's times and clock and the memory through the helper
+  (two questions were added to it for the memory and the DPC rate, which
+  Python reads through ctypes), the temperature through WMI in Python's
+  four places, the card through its reader, the ping through the helper.
+  Where Python would start a program (PowerShell, `nvidia-smi`,
+  `ping.exe`), the shell starts none and asks its backend for that part
+  of the pass (`GET /api/monitor/part?name=...`, there only behind the
+  shell), which takes it with the loop's own function. The ping goes
+  only to a target that is an IPv4 address written plainly, as the page's
+  start call names it (`1.1.1.1` when it names none, as today); a name
+  goes to the backend. A start whose body Python might read and the shell
+  cannot is refused, so that the backend's own monitor never runs beside
+  the shell's.
+
+  **What a person sees:** the Monitor page as before. The shell's log
+  says when the monitor is started and stopped, and once, and again when
+  it changes, where the processor's temperature is read from, or that no
+  source has one. The card's reader runs while the monitor runs (it is
+  asked once a second): from the first visit to the Monitor page until
+  its Stop button or the quit.
 * **A real side and a made-up side.** `Real` asks the helper. `Fake`
   answers from a table and tells a time that is set by hand; `FakeReaders`
   are made-up readers for the card, and `FakeBackend` says what the
@@ -780,12 +808,14 @@ The rules every module there keeps:
   a sample of the card, where the reader has a reading.)
 
 ```
-python shell_rs/app/try_it.py --moved   # the real window: the page's calls, the reader from an unpacked pack, a driver's install asked for
-python shell_rs/try_it.py --moved       # what it costs, beside the backend's own (a minute and a half)
+python shell_rs/app/try_it.py --moved   # the real window: the page's calls, the reader from an unpacked pack, a driver's install asked for,
+                                        # the hardware monitor reading this PC (its pings to 127.0.0.1 only)
+python shell_rs/try_it.py --moved       # what the sampler costs, beside the backend's own (a minute and a half)
+python shell_rs/try_it.py --monitor     # what the hardware monitor costs, beside the backend's own (a minute and a half)
 python tools/measure/nvml_release.py    # that NVIDIA's library stays in a process that let go of it
 ```
 
-All three read this PC's graphics card, and only read it. Nothing is
+All of them read this PC's graphics card, and only read it. Nothing is
 installed: the call for a driver's install goes to the stand-in backend,
 which only says that an installer was started, or was not.
 
@@ -795,6 +825,10 @@ has to ask the backend), the reader is there 40 ms after it was started,
 and while the sampler runs the shell and its reader together use 0.18% of
 one core, about what the backend's own sampler takes. The chart's data
 takes the shell 0.13 ms where a call to the backend and back takes 1.1 ms.
+The hardware monitor costs the shell what it costs the backend (about 3%
+of a core while it runs, nearly all of it WMI asking for a
+processor temperature this PC does not have), and its snapshot takes the
+shell under 0.1 ms where the backend takes 0.95.
 
 ## What is where
 
@@ -809,6 +843,7 @@ takes the shell 0.13 ms where a call to the backend and back takes 1.1 ms.
 | `core/src/moved/card.rs` | The graphics card: read by its own reader where one may be asked, by the backend where not; when a reader is started and ended (idle, a driver's install, no reading, the quit) |
 | `core/src/gpu_reader.rs`, `core/src/bin/gpu_reader.rs` | The reader from the shell's side (started with two pipe ends, asked with a limit, ended), and the reader's own program, `VisporaGpuReader.exe` |
 | `core/src/moved/perf.rs` | The performance sampler, moved from `core/perf_monitor.py` |
+| `core/src/moved/hw.rs` | The hardware monitor, moved from `core/hw_monitor.py` |
 | `../backend.spec` | The app built as a folder for the shell to carry (PyInstaller) |
 | `app/try_it.py` | Runs the real window exe against a stand-in backend, out of the way |
 | `core/src/instance.rs` | Is this the one copy, and does it have the rights it needs: the order of a start |
@@ -909,11 +944,15 @@ it is told to start, and the only thing to tell it is the stand-in.
   shell's own account of them, and a test compares the three pictures'
   files with what the app draws.
 * **What has moved has not run with administrator rights, or beside the
-  real backend.** The sampler was tried in the real window against the
-  stand-in, with the reader reading this PC's card. That its answers are
-  the Python module's is proven on a made-up machine. Beside the real
-  backend the fallback is the real `read_live_state()`, which the shell
-  has never asked for on a PC.
+  real backend.** The sampler and the hardware monitor were tried in the
+  real window against the stand-in, the reader reading this PC's card
+  and the monitor this PC. That their answers are the Python modules' is
+  proven on a made-up machine. Beside the real backend the fallbacks are
+  the real `read_live_state()` and the monitor's part call, which the
+  shell has never asked of a real backend; no part was ever answered by
+  a backend that really started PowerShell, `nvidia-smi` or `ping.exe`.
+  The monitor's echo requests went to 127.0.0.1 only, and this PC has no
+  source of a processor temperature in WMI, so none was read for real.
 * **The reader has not run with administrator rights, or from the real
   folder.** In the trials it has the rights of the person at the PC and
   is started from a folder in the trial's own data folder (closed to the

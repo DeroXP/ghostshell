@@ -3113,6 +3113,46 @@ def api_monitor_benchmark():
     return jsonify(hw_monitor.run_benchmark())
 
 
+# ── The hardware monitor, behind the shell ───────────────────────────
+# Behind the shell the monitor's loop is the shell's (shell_rs/core/src/
+# moved/hw.rs): start, stop and snapshot above do not reach this process,
+# and its own loop is never started.  The shell starts no program for a
+# reading.  Where the loop here would start one (nvidia-smi for a card the
+# helper cannot read, PowerShell for a counter that gives nothing, ping.exe
+# for a host name), the shell asks for that part of a pass with the call
+# below, and the part is taken with the very function the loop uses.  So the
+# page is shown what it would have been shown, and the program is started
+# by this process, as it is today.
+#
+# It only reads, as the loop does.  Started as it always was, the app has
+# no such call: it answers as a path that does not exist.
+_MONITOR_PARTS = {
+    "cpu": lambda target: hw_monitor._sample_cpu(),
+    "gpu": lambda target: hw_monitor._sample_gpu(),
+    "ram": lambda target: hw_monitor._sample_ram(),
+    "dpc": lambda target: hw_monitor._sample_dpc(),
+    "ping": lambda target: {"ms": hw_monitor._sample_ping(target)},
+}
+
+
+@app.route("/api/monitor/part")
+def api_monitor_part():
+    """One part of one pass of the hardware monitor, for the shell:
+    ?name=cpu | gpu | ram | dpc | ping (and &target=... for the ping)."""
+    if _behind_shell is None:
+        abort(404)
+    take = _MONITOR_PARTS.get(request.args.get("name"))
+    if take is None:
+        abort(404)
+    try:
+        return jsonify({"ok": True, "reading": take(request.args.get("target", ""))})
+    except Exception as e:
+        # The loop keeps nothing of a pass in which a reading raised, and
+        # says so in the log.  The shell is told, and does the same.
+        log.warning(f"hw_monitor sample failed: {e}")
+        return jsonify({"ok": False, "raised": True, "err": f"{type(e).__name__}: {e}"})
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Full Spectrum (run everything in sequence)
 # ═══════════════════════════════════════════════════════════════════════════

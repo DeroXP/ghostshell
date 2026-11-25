@@ -6,6 +6,8 @@
     python shell_rs/try_it.py --moved    what a module that has moved into the shell costs, beside
                                          the same module in the backend, and what the graphics card's
                                          reader costs (about a minute and a half; it reads this PC's card)
+    python shell_rs/try_it.py --monitor  the same for the hardware monitor (about a minute and a half; it
+                                         reads this PC, and its echo requests go to 127.0.0.1 only)
 
 This starts the shell's trial tool (vispora-shell-try: the shell without a
 window), which starts a backend, and takes the times that matter to somebody
@@ -323,7 +325,169 @@ def moved(program, appdata):
                 p.kill()
 
 
+# The backend's own hardware monitor, for a minute, in a Python process of
+# its own: core/hw_monitor.py with the app's native helper (as a source
+# checkout has it built), its data folder redirected, its echo requests to
+# 127.0.0.1.  It only reads.  It says how many programs it started.
+THE_BACKENDS_MONITOR = r"""
+import atexit, json, os, shutil, statistics, sys, tempfile, time
+root = tempfile.mkdtemp(prefix="vispora_measure_")
+atexit.register(shutil.rmtree, root, True)
+for var, sub in (("APPDATA", "Roaming"), ("LOCALAPPDATA", "Local")):
+    os.environ[var] = os.path.join(root, sub)
+    os.makedirs(os.environ[var], exist_ok=True)
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+import config
+assert config.APPDATA_DIR.startswith(root), config.APPDATA_DIR
+import core.utils as U
+from core import native
+if not native.available():
+    print(json.dumps({"error": "the native helper is not built: " + native.status()["why"]}))
+    sys.exit(0)
+started = []
+_ps, _cmd = U.run_ps, U.run_cmd
+def run_ps(command, timeout=60):
+    started.append("powershell")
+    return _ps(command, timeout)
+def run_cmd(args, timeout=60):
+    started.append(os.path.basename(str(args[0])))
+    return _cmd(args, timeout)
+U.run_ps, U.run_cmd = run_ps, run_cmd
+from core import hw_monitor
+print(json.dumps({"ready": True}), flush=True)
+sys.stdin.readline()
+hw_monitor.start_monitor("127.0.0.1")
+time.sleep(float(sys.argv[2]))
+hw_monitor.stop_monitor()
+time.sleep(1.5)
+passes = len(hw_monitor._metrics["cpu_load"])
+in_the_loop = len(started)
+took = []
+for _ in range(int(sys.argv[3])):
+    began = time.perf_counter()
+    hw_monitor._sample_cpu(); hw_monitor._sample_gpu(); hw_monitor._sample_ram(); hw_monitor._sample_dpc(); hw_monitor._sample_ping("127.0.0.1")
+    spent = time.perf_counter() - began
+    took.append(spent * 1000)
+    time.sleep(max(0.0, 1.0 - spent))
+took.sort()
+print(json.dumps({"passes": passes, "started_in_the_loop": in_the_loop, "started": len(started), "ms": statistics.median(took), "slowest_ms": took[-1],
+                  "latest": hw_monitor._monitor_state["latest"]}, default=str), flush=True)
+"""
+
+
+def monitor(program, appdata, seconds=60, timed=20):
+    """The hardware monitor, the second module that moved into the shell
+    (shell_rs/core/src/moved/hw.rs), beside the same module in the backend.
+
+    Both read this PC, at the same time, for a minute, and only read: the
+    processor's times and clock, the memory and the standby list (read, not
+    emptied), DPCs a second, WMI for the processor's temperature, the
+    graphics card, and one echo request a second to 127.0.0.1.
+
+      * the shell (the trial tool, with the card's reader beside it): its
+        monitor is started by the page's call, and its processor time, its
+        reader's and its backend's are counted (the backend is the stand-in
+        on the fake machine, and is asked for a part of a pass only where
+        this PC leaves the shell without a reading);
+      * the backend's own monitor: core/hw_monitor.py in a Python process of
+        its own, with the native helper as a source checkout has it built.
+
+    Then each takes 20 more passes, one a second, each of them timed."""
+    reader = reader_beside(program)
+    if not os.path.isfile(reader):
+        sys.exit("Not started: %s has not been built (it is built with the trial tool)." % reader)
+    shell = subprocess.Popen([program, "--backend", sys.executable, "--arg", "-u", "--arg", STAND_IN, "--arg", "--backend", "--appdata", appdata,
+                              "--readings", "real", "--card-reader", reader],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=REPO, text=True, encoding="utf-8",
+                             creationflags=NO_WINDOW)
+    python = subprocess.Popen([sys.executable, "-u", "-c", THE_BACKENDS_MONITOR, REPO, str(seconds), str(timed)], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=REPO, text=True, encoding="utf-8", creationflags=NO_WINDOW)
+    # (a third: a shell that passes the monitor's calls on, for the time of
+    # the page's call answered by a backend whose own monitor ran a minute)
+    passing = subprocess.Popen([program, "--backend", sys.executable, "--arg", "-u", "--arg", STAND_IN, "--arg", "--backend", "--appdata", appdata],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=REPO, text=True, encoding="utf-8",
+                               creationflags=NO_WINDOW)
+    try:
+        ask = None
+
+        def asking(p):
+            def ask(**what):
+                p.stdin.write(json.dumps(what) + "\n")
+                p.stdin.flush()
+                line = p.stdout.readline()
+                if not line:
+                    sys.exit("The trial tool ended: " + p.stderr.read())
+                return json.loads(line)
+            return ask
+        ask, ask_passing = asking(shell), asking(passing)
+        json.loads(shell.stdout.readline())
+        assert ask(do="wait", **{"for": "ready"}, within=90)["phase"] == "ready"
+        json.loads(passing.stdout.readline())
+        assert ask_passing(do="wait", **{"for": "ready"}, within=90)["phase"] == "ready"
+        said = ask_passing(do="call", method="POST", target="/api/monitor/start", token=True, body='{"ping_target": "127.0.0.1"}')
+        assert said["status"] == 200, said
+        backend = ask(do="state")["backend_pid"]
+        ready = json.loads(python.stdout.readline() or "{}")
+        if not ready.get("ready"):
+            sys.exit("The backend's monitor could not be measured: %r %s" % (ready, python.stderr.read()[-2000:]))
+        said = ask(do="call", method="POST", target="/api/monitor/start", token=True, body='{"ping_target": "127.0.0.1"}')
+        assert said["status"] == 200 and json.loads(said["body"]) == {"ok": True}, said
+        python.stdin.write("go\n")
+        python.stdin.flush()
+        began = time.perf_counter()
+        counted = {"shell": processor_seconds(shell.pid), "backend": processor_seconds(backend), "python": processor_seconds(python.pid)}
+        print("Both monitors run, the shell's and the backend's own; a minute ...")
+        time.sleep(seconds)
+        wall = time.perf_counter() - began
+        used = {"shell": processor_seconds(shell.pid) - counted["shell"], "backend": processor_seconds(backend) - counted["backend"],
+                "python": processor_seconds(python.pid) - counted["python"]}
+        reader_pid = ask(do="state")["card_reader_pid"]
+        snapshot = json.loads(ask(do="call", method="GET", target="/api/monitor/snapshot", token=True)["body"])
+        answered = {}
+        for name, asks in (("the shell", ask), ("passed on to the backend", ask_passing)):
+            took = sorted(asks(do="call", method="GET", target="/api/monitor/snapshot", token=True)["ms"] for _ in range(300))
+            answered[name] = (statistics.median(took), took[int(len(took) * 0.95)])
+        ask(do="call", method="POST", target="/api/monitor/stop", token=True)
+        reader_used = processor_seconds(reader_pid) if reader_pid else 0.0
+        mine = ask(do="monitor", times=timed, every_ms=1000)
+        theirs = json.loads(python.stdout.readline() or "{}")
+        if "error" in theirs or "ms" not in theirs:
+            sys.exit("The backend's monitor could not be measured: %r %s" % (theirs, python.stderr.read()[-2000:]))
+        print("\nProcessor time used in that minute, as a share of one core (counted in the processor's cycles):\n")
+        print("  %-36s %s" % ("the shell's monitor:", "%.2f%%" % (100 * used["shell"] / wall)))
+        print("  %-36s %s" % ("  its card's reader (since its start):", "%.2f%%" % (100 * reader_used / wall)))
+        print("  %-36s %s" % ("  its backend (the stand-in):", "%.2f%%" % (100 * used["backend"] / wall)))
+        print("  %-36s %s" % ("the backend's own monitor (Python):", "%.2f%%" % (100 * used["python"] / wall)))
+        print("\nPasses in that minute: the shell's %d, the backend's own %d.  Programs started by the backend's own: %d."
+              % (len(snapshot["history"]["cpu_load"]), theirs["passes"], theirs["started_in_the_loop"]))
+        print("The shell asked its backend for a part of a pass %d times (0: this PC gave it every reading itself)." % mine["asked_the_backend"])
+        print("\nThe page's call for the snapshot (a minute of readings), 300 times: the middle value in milliseconds (the slowest in twenty):\n")
+        for name, (middle, slow) in answered.items():
+            print("  %-36s %.3f  (%.3f)" % (name + ":", middle, slow))
+        print("\nOne pass, timed, the middle of %d taken one a second (and the slowest), in milliseconds:\n" % timed)
+        print("  %-36s %.2f  (%.2f)" % ("the shell:", mine["ms"], mine["slowest_ms"]))
+        print("  %-36s %.2f  (%.2f)" % ("the backend's own (Python):", theirs["ms"], theirs["slowest_ms"]))
+        print("\nThe last readings of each, side by side:\n")
+        for name in ("cpu_temp", "cpu_temp_source", "cpu_load", "cpu_clock", "gpu_temp", "gpu_load", "gpu_clock", "gpu_vram_pct", "ram_pct", "ram_standby_mb",
+                     "dpc_pct", "isr_pct", "dpc_rate", "net_ping_ms"):
+            print("  %-18s %-24s %s" % (name, json.dumps(mine["latest"].get(name)), json.dumps(theirs["latest"].get(name))))
+        return 0
+    finally:
+        for p in (shell, python, passing):
+            try:
+                if p is not python:
+                    p.stdin.write(json.dumps({"do": "quit"}) + "\n")
+                    p.stdin.flush()
+                p.wait(30)
+            except (OSError, subprocess.TimeoutExpired):
+                p.kill()
+
+
 def main(argv):
+    if argv == ["--monitor"]:
+        with tempfile.TemporaryDirectory(prefix="vispora-shell-trial-") as appdata:
+            return monitor(tool(), appdata)
     if argv == ["--moved"]:
         with tempfile.TemporaryDirectory(prefix="vispora-shell-trial-") as appdata:
             return moved(tool(), appdata)

@@ -16,6 +16,8 @@ pub const GW_OWNER: u32 = 4;
 // NtQuerySystemInformation classes
 pub const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: u32 = 8;
 pub const SYSTEM_PROCESS_INFORMATION: u32 = 5;
+pub const SYSTEM_INTERRUPT_INFORMATION: u32 = 23;
+pub const SYSTEM_MEMORY_LIST_INFORMATION: u32 = 80;
 pub const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
 
 // CallNtPowerInformation level
@@ -72,6 +74,8 @@ extern "system" {
     pub fn LoadLibraryExW(file_name: *const u16, file: Handle, flags: u32) -> Handle;
     pub fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
     pub fn FreeLibrary(module: Handle) -> i32;
+    pub fn GlobalMemoryStatusEx(status: *mut c_void) -> i32;
+    pub fn GetSystemInfo(info: *mut c_void);
     pub fn GetLastError() -> u32;
 }
 

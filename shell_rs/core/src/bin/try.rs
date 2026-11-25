@@ -25,6 +25,9 @@
 //!     {"do": "state"}        where the shell is, its backend's process id, what it has said
 //!     {"do": "token"}        the run's secret (this is a trial tool)
 //!     {"do": "card", "times": 1000}
+//!     {"do": "monitor", "times": 20, "every_ms": 1000}
+//!         that many passes of the hardware monitor, one every so often, each
+//!         timed (its ping goes where the last start call of the page said)
 //!         read the graphics card that many times the way what has moved
 //!         reads it (with --readings real: it asks the backend): how long
 //!         one took, and what the last one said
@@ -194,6 +197,23 @@ fn answer(shell: &Arc<Shell>, asked: &Json) -> Result<Json, String> {
             ]));
             Ok(Json::object([("ms", took[took.len() / 2].into()), ("slowest_ms", took[took.len() - 1].into()), ("reading", last)]))
         }
+        Some("monitor") => {
+            let moved = shell.moved.lock().unwrap_or_else(|p| p.into_inner()).clone().ok_or("this run was started without --readings real")?;
+            let times = asked["times"].as_int().unwrap_or(1).clamp(1, 10_000) as usize;
+            let every = Duration::from_millis(asked["every_ms"].as_int().unwrap_or(1000).clamp(0, 60_000) as u64);
+            let mut took = Vec::with_capacity(times);
+            for _ in 0..times {
+                let began = Instant::now();
+                moved.hw.step(&moved.card);
+                let spent = began.elapsed();
+                took.push(spent.as_secs_f64() * 1000.0);
+                std::thread::sleep(every.saturating_sub(spent));
+            }
+            took.sort_by(|a, b| a.total_cmp(b));
+            let passes = moved.hw.passes();
+            Ok(Json::object([("ms", took[took.len() / 2].into()), ("slowest_ms", took[took.len() - 1].into()), ("latest", moved.hw.snapshot()["latest"].clone()),
+                             ("kept", passes.kept.into()), ("dropped", passes.dropped.into()), ("asked_the_backend", passes.asked_the_backend.into())]))
+        }
         _ => Err("unknown \"do\"".into()),
     }
 }
@@ -271,7 +291,16 @@ fn main() {
     //     {"do": "now", "time": 1000.0}                        what time it is: time has gone by
     //     {"do": "pcs_clock", "time": 1000.0}                  the PC's own clock is set to another time: none has gone by
     //     {"do": "answers", "question": "gpu_live", "answer": {...}}   what the library says (null: nothing)
+    //     {"do": "answers", "question": "wmi", "with": {"namespace": "...", "query": "..."}, "answer": [...]}
+    //                                     the same for a question that is asked with words of its own
+    //     {"do": "grows", "question": "cpu_times", "each_second": {...}}
+    //                                     the whole numbers in that answer count up as time goes by (null: they stand still)
     //     {"do": "backend_says", "answer": {...}}   what the backend says the card says (null: it does not answer)
+    //     {"do": "backend_is_asked_back", "for": "/api/monitor/"}
+    //                                     from now on, a call of the shell's to its backend that begins like this
+    //                                     is put to whoever drives this tool, at the moment it is made: a line
+    //                                     {"asks_the_backend": "<call>"} goes out, and the next line that comes
+    //                                     in is the backend's answer ({"answer": ...}; null: it does not answer)
     //     {"do": "reader", "says": {...}}  what the card's own reader says from now on: the helper's answer, or one
     //                                     of "none" (it has no reading), "silent" (no answer in time), "garbled";
     //                                     and "cannot_start": true | false
@@ -279,8 +308,9 @@ fn main() {
     //                                     the call that starts a driver's installer, with what the backend answers it
     //     {"do": "tend"}                  what the thread that looks after the reader does in one round
     //     {"do": "step"}                  what the sampling thread does in one round
+    //     {"do": "pass"}                  what the hardware monitor's thread does in one round
     //     {"do": "asked"}                 what the library, the reader and the backend were asked so far
-    //     {"do": "call", "method": "GET", "target": "/api/perf/score", "body": "..."}
+    //     {"do": "call", "method": "GET", "target": "/api/perf/score", "body": "..."}   ("body_hex": "..." for bytes)
     //         the shell's own answer ({"status", "body"}), or {"passed_on": true}
     //
     // Nothing of the PC is read: the machine is the table and the clock,
@@ -295,8 +325,16 @@ fn main() {
             moved.card.reads_with(Arc::new(readers.clone()));
         }
         let out = std::io::stdout();
-        for line in std::io::stdin().lock().lines() {
-            let Ok(line) = line else { break };
+        // (a line at a time, and the input is let go of in between: while a
+        // step is taken, the made-up backend may read its answer from it)
+        let next_line = || {
+            let mut line = String::new();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(read) if read > 0 => Some(line),
+                _ => None,
+            }
+        };
+        while let Some(line) = next_line() {
             if line.trim().is_empty() {
                 continue;
             }
@@ -321,7 +359,33 @@ fn main() {
                     }
                     Some("answers") => {
                         let answer = asked.get("answer").filter(|answer| **answer != Json::Null).cloned();
-                        machine.answers(asked["question"].as_str().unwrap_or(""), answer);
+                        let with: Vec<(&str, Json)> = match asked.get("with") {
+                            Some(Json::Object(pairs)) => pairs.iter().map(|(name, value)| (name.as_str(), value.clone())).collect(),
+                            _ => Vec::new(),
+                        };
+                        machine.answers_with(asked["question"].as_str().unwrap_or(""), &with, answer);
+                        Json::object([("ok", true.into())])
+                    }
+                    Some("grows") => {
+                        machine.grows(asked["question"].as_str().unwrap_or(""), asked.get("each_second").filter(|rates| **rates != Json::Null).cloned());
+                        Json::object([("ok", true.into())])
+                    }
+                    Some("backend_is_asked_back") => {
+                        let begins = asked["for"].as_str().unwrap_or("").to_string();
+                        let usual = backend.clone();
+                        backend.is_answered_by(Arc::new(move |call: &str| {
+                            if !call.starts_with(&begins) {
+                                return usual.says_now(call);
+                            }
+                            {
+                                let mut out = std::io::stdout().lock();
+                                let _ = writeln!(out, "{}", Json::object([("asks_the_backend", call.into())]));
+                                let _ = out.flush();
+                            }
+                            let mut line = String::new();
+                            let _ = std::io::stdin().read_line(&mut line);
+                            Json::parse(&line).ok().and_then(|said| said.get("answer").filter(|answer| **answer != Json::Null).cloned())
+                        }));
                         Json::object([("ok", true.into())])
                     }
                     Some("backend_says") => {
@@ -364,6 +428,9 @@ fn main() {
                             ("from_the_backend", from.backend.into()),
                             ("from_nowhere", from.nowhere.into()),
                             ("library", Json::Array(machine.asked().into_iter().map(Into::into).collect())),
+                            ("waited", machine.waited().into()),
+                            ("passes_kept", moved.hw.passes().kept.into()),
+                            ("passes_dropped", moved.hw.passes().dropped.into()),
                             ("backend", Json::Array(backend.asked().into_iter().map(Into::into).collect())),
                             ("reader", reader.into()),
                             ("reader_gave", gave.into()),
@@ -375,9 +442,14 @@ fn main() {
                         moved.perf.step(&moved.card);
                         Json::object([("ok", true.into())])
                     }
+                    Some("pass") => Json::object([("took_one", moved.hw.round(&moved.card).into())]),
                     Some("call") => {
-                        let request = Request::new(asked["method"].as_str().unwrap_or("GET"), asked["target"].as_str().unwrap_or("/"))
-                            .with_body(asked["body"].as_str().unwrap_or(""));
+                        // (a body that is no text is given as hexadecimal digits)
+                        let body = match asked.get("body_hex").and_then(Json::as_str) {
+                            Some(hex) => (0..hex.len() / 2).filter_map(|at| u8::from_str_radix(hex.get(at * 2..at * 2 + 2)?, 16).ok()).collect(),
+                            None => asked["body"].as_str().unwrap_or("").as_bytes().to_vec(),
+                        };
+                        let request = Request::new(asked["method"].as_str().unwrap_or("GET"), asked["target"].as_str().unwrap_or("/")).with_body(body);
                         match moved.answer(&request) {
                             Some(answer) => Json::object([("status", (answer.status as u32).into()),
                                                           ("body", String::from_utf8_lossy(&answer.body).into_owned().into())]),
