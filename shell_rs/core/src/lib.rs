@@ -17,11 +17,14 @@
 //!   needs;
 //! * `token`: the secret of one run, which tells the shell's own page from a
 //!   stranger and the shell's calls from anybody else's;
+//! * `tray`: which picture the tray icon shows, its tooltip and its menu,
+//!   decided from what the backend says;
+//! * `trouble`: what the person is told when the app cannot start;
 //! * `platform` and `win`: the doors to the outside (starting a program,
 //!   random numbers), and the real ones.
 //!
-//! The window itself is the crate next to this one (shell_rs/app).  The
-//! tray is not here yet.  Nothing in a release uses this crate yet.
+//! The window and the tray icon themselves are the crate next to this one
+//! (shell_rs/app).  Nothing in a release uses this crate yet.
 //!
 //! No outside crates (see Cargo.toml).
 
@@ -35,6 +38,8 @@ pub mod platform;
 pub mod router;
 pub mod shell;
 pub mod token;
+pub mod tray;
+pub mod trouble;
 pub mod win;
 
 pub use vispora_updater_core::json;

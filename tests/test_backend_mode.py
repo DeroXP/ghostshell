@@ -103,8 +103,11 @@ def test_the_hand_over_is_read_and_taken_out_of_the_environment():
     env = {**environment(), "PATH": "x"}
     got = a._take_shell_handoff(["Vispora.exe", "--backend", "--from-autostart"], env)
     assert got == {"port": PORT, "listen": LISTEN, "token": TOKEN, "shell_pid": SHELL_PID,
-                   "shell_started": SHELL_STARTED}
+                   "shell_started": SHELL_STARTED, "shell_exe": None}
     assert env == {"PATH": "x"}, "the secret is not inherited by the programs the app starts"
+    # A shell that says where it is: that is passed on too.
+    said = a._take_shell_handoff(["x", "--backend"], environment(shell_exe=r"C:\Program Files\Vispora\Vispora.exe"))
+    assert said["shell_exe"] == r"C:\Program Files\Vispora\Vispora.exe"
 
 
 def test_a_hand_over_that_cannot_be_used_is_refused():
@@ -120,6 +123,10 @@ def test_a_hand_over_that_cannot_be_used_is_refused():
                                            ["x" * 40])]
     bad += [environment(shell_pid=p) for p in (0, -5, "4321", True, 1.5, None)]
     bad += [environment(shell_started=s) for s in (0, -1, "134088000000000000", True, 1.5, None)]
+    # Where the shell is: a whole path to an exe, or nothing at all.
+    bad += [environment(shell_exe=e) for e in ("", "Vispora.exe", r"..\Vispora.exe", r"C:\Vispora\Vispora.bat", 7, True,
+                                               ["C:\\Vispora.exe"], 'C:\\Vis"pora\\Vispora.exe', "C:\\Vispora\n.exe",
+                                               "C:\\" + "v" * 1100 + ".exe")]
     bad += [environment(listen=h) for h in (0, -1, "812", True, 8.5, None)]
     for env in bad:
         try:

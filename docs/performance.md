@@ -471,7 +471,20 @@ real PC and which do not:
 | The backend answers | (the same process) | 0.6 s after the shell started it | A trial's. Python 3.14 from source on the fake machine: no unpacking, no start-up work. A real backend does more |
 | A call the page makes | straight to Flask | 0.8 ms through the shell and back (1.0 ms for the slowest in twenty) | Real for the way through the shell; the route asked is the cheapest one |
 | A call the shell answers itself | (goes to Flask) | under 0.05 ms | Real |
-| Quit, until both processes are gone | not measured (see Quitting) | 0.1 s until the backend has ended. With the window: 0.24 s from closing it until the shell's process has ended too, because the shell takes its window's folder away first and WebView2 has to let go of it | A trial's: on the fake machine a quit has nothing to undo. What is real: the fixed half second before the old exit is not waited behind the shell |
+| Quit, until both processes are gone | not measured (see Quitting) | 0.1 s until the backend has ended. With the window: 0.25 s from closing it until the shell's process has ended too, because the shell takes its window's folder away first and WebView2 has to let go of it. Quit from the tray's menu: 0.3 s | A trial's: on the fake machine a quit has nothing to undo. What is real: the fixed half second before the old exit is not waited behind the shell |
+
+The tray icon costs the start nothing that shows: the window is on screen
+after 36 ms with it, as without it. What the icon shows is asked of the
+backend every three seconds, as today's tray asks: one call on this PC that
+starts no program.
+
+Taking away what an earlier run left behind is not in the window's way any
+more. It is done once the window is there, on a thread of its own, and by
+name first. In a trial: one earlier run's folder of 129 files, with 5,000
+other files beside it, 20 ms on the shell's own clock, and the window on
+screen after 36 ms in that run as in every other. (The place the app as it
+ships uses, Windows' own folder for temporary files, often holds thousands
+of files that are nothing of the app's.)
 
 What the shell changes about waiting, whatever the numbers turn out to be:
 

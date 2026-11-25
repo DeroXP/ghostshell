@@ -38,7 +38,8 @@ fn the_backend_is_started_with_a_hand_over_and_asked_whether_it_is_up() {
     let Json::Object(fields) = &given else { panic!("{given}") };
     let mut names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
     names.sort();
-    assert_eq!(names, ["listen", "port", "shell_pid", "shell_started", "token"]);
+    assert_eq!(names, ["listen", "port", "shell_exe", "shell_pid", "shell_started", "token"]);
+    assert_eq!(given["shell_exe"], Json::Null, "a shell that does not know where its exe is says nothing, not something made up");
     assert_eq!((given["shell_pid"].as_int(), given["shell_started"].as_int()), (Some(4242), Some(SHELL_STARTED as i128)));
     assert_eq!((given["listen"].as_int(), given["port"].as_int()), (Some(HANDLE as i128), Some(rig.shell.port() as i128)));
     assert!(backend.port >= 1024 && backend.port == rig.stage.port());
@@ -54,6 +55,41 @@ fn the_backend_is_started_with_a_hand_over_and_asked_whether_it_is_up() {
     assert!(history.contains("backend started (pid 1000") && history.contains("backend ready after"), "{history}");
     assert!(!history.contains(&backend.token), "the secret is in no log line");
     assert!(rig.shell.timings().0.is_some());
+}
+
+#[test]
+fn the_shells_own_calls_carry_the_secret_and_never_wait_for_a_backend() {
+    // (the tray makes them: what to show, and what a menu entry asks for)
+    let mut how = settings();
+    how.own_calls_within = Duration::from_millis(300);
+    how.shell_exe = Some("C:\\Program Files\\Vispora\\Vispora.exe".into());
+    let rig = Rig::with(vec![Behaviour::default()], how);
+    // No backend yet: nothing is asked, and nothing is waited for.
+    let began = Instant::now();
+    assert_eq!(rig.shell.ask_backend("GET", "/api/echo"), None);
+    assert!(began.elapsed() < Duration::from_millis(100));
+    rig.shell.start();
+    assert_eq!(rig.wait_ready(), Phase::Ready);
+    // The backend is told where the shell's exe is: that is what a person starts.
+    let given = Json::parse(&rig.stage.last().handoff).unwrap();
+    assert_eq!(given["shell_exe"].as_str(), Some("C:\\Program Files\\Vispora\\Vispora.exe"));
+
+    let said = rig.shell.ask_backend("POST", "/api/echo").expect("an answer");
+    assert_eq!((said["method"].as_str(), said["target"].as_str(), said["body"].as_str()), (Some("POST"), Some("/api/echo"), Some("{}")));
+    assert_eq!(said["headers"]["x-vispora-token"].as_str(), Some(rig.shell.token().as_str()));
+    assert_eq!(said["headers"]["content-type"].as_str(), Some("application/json"));
+    assert_eq!(said["headers"]["origin"], Json::Null, "it is not a page's call");
+    let said = rig.shell.ask_backend("GET", "/api/echo").expect("an answer");
+    assert_eq!((said["method"].as_str(), said["body"].as_str()), (Some("GET"), Some("")));
+    // Anything but "200" is no answer, and neither is one that takes too long.
+    assert_eq!(rig.shell.ask_backend("GET", "/api/no-such-call"), None);
+    assert_eq!(rig.shell.ask_backend("GET", "/api/empty"), None);
+    let began = Instant::now();
+    assert_eq!(rig.shell.ask_backend("GET", "/api/slow?2000"), None);
+    assert!(began.elapsed() < Duration::from_millis(1500), "it waited {:?}", began.elapsed());
+    // After the quit there is nobody to ask.
+    assert_eq!(rig.shell.quit_and_wait("test"), 0);
+    assert_eq!(rig.shell.ask_backend("GET", "/api/echo"), None);
 }
 
 #[test]

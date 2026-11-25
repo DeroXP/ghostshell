@@ -130,7 +130,10 @@ def test_the_shell_and_the_app_agree_on_the_hand_over():
     handed = re.findall(r'\("(\w+)", ', start)
     taken = a._take_shell_handoff(["Vispora.exe", "--backend"], {a._SHELL_HANDOFF_VAR: json.dumps(
         {"port": 50000, "listen": 812, "token": "x" * 43, "shell_pid": 9, "shell_started": 134088000000000000})})
-    assert sorted(handed) == sorted(taken) == ["listen", "port", "shell_pid", "shell_started", "token"]
+    assert sorted(handed) == sorted(taken) == ["listen", "port", "shell_exe", "shell_pid", "shell_started", "token"]
+    # Where the shell is: said by the shell that knows it, as nothing by one that does not.
+    assert '("shell_exe", self.settings.shell_exe.as_deref().map_or(Json::Null, Json::from)),' in shell
+    assert "settings.shell_exe = std::env::current_exe().ok()" in app_crate("src", "main.rs")
     # The secret the shell makes is one the app takes: 43 of these letters.
     assert 'b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"' in token
     # The win.rs door puts it in the environment and nowhere else.
@@ -192,7 +195,12 @@ def test_the_port_is_never_free_for_somebody_else_to_listen_on():
     assert '("listen", self.listening.handle().into()),' in shell
     assert "forward::send(self.listening.port(), &ask, &limits)" in shell, "the first question"
     assert "Phase::Ready => return Ok(self.listening.port())," in shell, "what is passed on"
-    assert shell.count("forward::send(") == 2 and "(self.listening.port(), st.was_ready)" in shell, "and the quit"
+    assert "(self.listening.port(), st.was_ready)" in shell, "and the quit"
+    # ... and the shell's own calls (the tray's), which go there too.
+    own = shell[shell.index("pub fn ask_backend("):shell.index("/// End the backend now, without asking it.")]
+    assert "if self.phase() != Phase::Ready {\n            return None;\n        }" in own
+    assert "forward::send(self.listening.port(), &ask, &limits)" in own and ".with_header(token::HEADER, self.token.as_str())" in own
+    assert shell.count("forward::send(") == 3, "the first question, the quit, and the shell's own calls: nothing else is sent"
     # The app's side: it serves on that socket and opens no port of its own.
     a = app()
     assert "fd=_shell_listener.fileno()" in repo("app.py")
@@ -328,13 +336,21 @@ def registry_source(crate, *path):
 # ═════════════════════════════════════════════════════════════════════
 # The window (shell_rs/app)
 # ═════════════════════════════════════════════════════════════════════
-def test_the_window_brings_no_crate_the_updaters_window_did_not():
+# What Tauri's tray feature adds to the lock file, and nothing else may:
+# the tray crate itself, and three that only a Linux build would compile.
+THE_TRAYS_CRATES = {("tray-icon", "0.25.1"), ("libappindicator", "0.9.0"), ("libappindicator-sys", "0.9.0"),
+                    ("libloading", "0.7.4")}
+
+
+def test_the_window_brings_no_crate_but_tauris_own_and_its_tray():
     manifest = app_crate("Cargo.toml")
     pinned = dict(re.findall(r'^(tauri(?:-build)?) = \{ version = "=(\d+\.\d+\.\d+)"', manifest, re.M))
     theirs = dict(re.findall(r'^(tauri(?:-build)?) = \{ version = "=(\d+\.\d+\.\d+)"',
                              repo("updater_rs", "app", "Cargo.toml"), re.M))
     assert pinned == theirs and set(pinned) == {"tauri", "tauri-build"}, "the versions the updater's window pinned"
-    assert 'default-features = false, features = ["wry", "custom-protocol"]' in manifest, "the window and nothing else"
+    assert 'default-features = false, features = ["wry", "custom-protocol", "tray-icon"]' in manifest, \
+        "the window and the tray icon, and nothing else"
+    assert "plugin" not in manifest, "a feature of Tauri's own, not a plugin crate"
     wanted = manifest[manifest.index("[dependencies]"):manifest.index("[profile.release]")]
     assert sorted(re.findall(r"^([\w-]+) = ", wanted, re.M)) == ["tauri", "tauri-build", "vispora-shell-core"]
 
@@ -352,7 +368,9 @@ def test_the_window_brings_no_crate_the_updaters_window_did_not():
         return found
 
     ours, updaters = outside(app_crate("Cargo.lock")), outside(repo("updater_rs", "app", "Cargo.lock"))
-    assert ours == updaters and len(ours) > 100, sorted(ours ^ updaters)
+    assert len(updaters) > 100 and updaters <= ours, sorted(updaters - ours)
+    assert ours - updaters == THE_TRAYS_CRATES, sorted(ours ^ updaters ^ THE_TRAYS_CRATES)
+    assert f"{len(ours)} outside crates" in repo("shell_rs", "README.md"), len(ours)
     assert "cargo build --release --locked --manifest-path shell_rs/app/Cargo.toml" in repo("shell_rs", "README.md")
 
 
@@ -386,13 +404,17 @@ def test_signing_out_does_not_skip_the_quit():
     main = app_crate("src", "main.rs")
     loop = main[main.index("let code = app.run_return("):main.index('let quit = shell.quit_and_wait("the window was closed");')]
     assert ("if let RunEvent::Exit = event {\n"
-            "            *over.lock().unwrap_or_else(|p| p.into_inner()) = true;\n"
             "            at_the_end.quit_and_wait(\"the window is gone\");\n"
             "        }") in loop
-    # A loop that is over is not told to end: Tauri would end the process on
-    # the spot, before the window's folder is taken away.
+    # When the shell is gone, the window is taken away, and the loop ends
+    # with its last window.  The loop is not told to end: the window would
+    # still be there, WebView2 would keep the window's folder, and the
+    # folder could not be removed (the trial's "Quit" from the tray sees
+    # that it is).  And told to end a loop that is over, Tauri ends the
+    # process on the spot.
     hook = main[main.index("*shell.exit_hook.lock()"):main.index("shell.start();")]
-    assert "if !*over {\n            handle.exit(code);\n        }" in hook and main.count("handle.exit(") == 1
+    assert "let _ = last_window.0.destroy();" in hook
+    assert ".exit(" not in main.replace("std::process::exit(", ""), "nothing tells the loop to end"
     tauri = registry_source("tauri", "src", "app.rs")
     if tauri:
         told = tauri[tauri.index("pub fn exit(&self, exit_code: i32) {"):]
@@ -481,8 +503,29 @@ def test_the_windows_page_cannot_reach_tauris_commands():
     assert "std::process::Command" not in main, "the window starts nothing itself"
     # WebView2 is asked for before a window is made, and a missing one is said in a plain message.
     run = main[main.index("fn run("):]
-    assert run.index("tauri::webview_version()?") < run.index("Shell::new(") < run.index("WebviewWindowBuilder::new(")
-    assert "Microsoft Edge WebView2" in main and "win::tell(APP_NAME" in main
+    assert run.index("tauri::webview_version().map_err(no_window)?") < run.index("Shell::new(") < run.index("WebviewWindowBuilder::new(")
+    assert "tell(trial.as_ref(), &trouble.words());" in main and "None => win::tell(APP_NAME, text)," in main
+
+
+def test_what_keeps_the_app_from_starting_is_said_in_words_of_its_own():
+    """A folder that cannot be made was reported as a missing WebView2, and
+    the person sent to install it.  Each kind of trouble has its own words
+    (core/src/trouble.rs, with a test of its own there)."""
+    main, trouble = app_crate("src", "main.rs"), rust("src", "trouble.rs")
+    run = main[main.index("fn run("):]
+    assert "-> Result<i32, Trouble> {" in run
+    assert "Shell::new(settings, win::platform()).map_err(Trouble::Shell)?" in run
+    assert run.count("Trouble::Folder {") == 2, "where the folder is made cannot be found, and it cannot be made"
+    assert "win::private_folder(&folder_in, open_to).map_err(|why| Trouble::Folder { place: folder_in.clone(), why })?" in run
+    for kind in ("Shell(String)", "Folder { place: String, why: String }", "Window(String)"):
+        assert kind in trouble, kind
+    said = trouble[:trouble.index("#[cfg(test)]")]
+    # Named where the window cannot be opened (twice), and where it is not to blame.
+    assert said.count("Microsoft Edge WebView2") == 3 and "nothing to do with Microsoft Edge WebView2" in said
+    assert "Microsoft Edge WebView2" not in main, "the words are in one place"
+    # In a trial the words go into a file: a box would sit on somebody's screen.
+    assert "Some(file) => {" in main and '"messages": self.messages_file,' in app_crate("try_it.py")
+    assert "says so in words of its own" in app_crate("try_it.py")
 
 
 def test_nothing_of_a_run_is_kept_in_the_windows_folder_and_nothing_found_there_is_used():
@@ -493,17 +536,15 @@ def test_nothing_of_a_run_is_kept_in_the_windows_folder_and_nothing_found_there_
     that is new at every start, closed to programs without the app's rights,
     and removed afterwards."""
     main, win = app_crate("src", "main.rs"), rust("src", "win.rs")
-    made = main[main.index("WebviewWindowBuilder::new("):main.index(".build()?;", main.index("WebviewWindowBuilder::new("))]
-    assert ".incognito(true)" in made and ".data_directory(PathBuf::from(&window_folder))" in made
+    made = main[main.index("WebviewWindowBuilder::new("):main.index(".map_err(no_window)?;", main.index("WebviewWindowBuilder::new("))]
+    assert ".incognito(true)" in made and ".data_directory(PathBuf::from(&own_folder.path))" in made
     assert made.count(".data_directory(") == 1 and '"webview"' not in main
     run = main[main.index("fn run("):]
-    assert "(win::administrators_folder()?, win::OpenTo::Administrators)" in run
-    assert "(folders.appdata_dir.clone(), win::OpenTo::ThisAccount)" in run
-    assert run.index("let window_folder = win::private_folder(&folder_in, open_to)?;") < run.index("WebviewWindowBuilder::new(")
-    # Removed when the run is over; and what a run that was ended from
-    # outside left behind, at the next start (by the one copy only).
-    assert run.index("let code = app.run_return(") < run.index("win::remove_private_folder(&window_folder)")
-    assert "if held.is_some() {\n        let left = win::remove_private_folders(&folder_in, None);" in run
+    assert "win::administrators_folder().map_err(" in run and "(place, win::OpenTo::Administrators)" in run
+    assert "unwrap_or_else(|| folders.appdata_dir.clone()), win::OpenTo::ThisAccount)" in run
+    assert run.index("let own_folder = win::private_folder(&folder_in, open_to)") < run.index("WebviewWindowBuilder::new(")
+    # Removed when the run is over.
+    assert run.index("let code = app.run_return(") < run.index("if !own_folder.remove() {")
     # The folder: a name nobody can guess, never one that is there already,
     # and nobody in it but the ones named and Windows itself.
     folder = win[win.index("pub fn private_folder("):win.index("/// Remove the window's folder of a run that is over.")]
@@ -524,6 +565,46 @@ def test_nothing_of_a_run_is_kept_in_the_windows_folder_and_nothing_found_there_
     # The trial looks into the folder for the secret, during a run and after it.
     trial = app_crate("try_it.py")
     assert "the run's secret is in no file of the window's folder" in trial and "the window's folder is gone after the run, and nothing of WebView2 is left anywhere else" in trial
+
+
+def test_a_start_never_takes_away_a_folder_that_is_in_use_and_never_keeps_the_window_waiting():
+    """Two people signed in at one PC each run a copy ("is a copy running"
+    is asked per session), and both copies' windows have their folders in
+    the same place.  A start removed every folder of the window's kind it
+    found there: the other copy's, under its running window, among them.
+    Now a run marks its folder for as long as it runs, and a folder whose
+    mark is held is not touched.
+
+    And the tidy-up asked Windows about every entry of the place before it
+    looked at its name (thousands, in Windows' own Temp folder), before the
+    window was made.  Now: the name first, and after the window is there."""
+    main, win = app_crate("src", "main.rs"), rust("src", "win.rs")
+    # The mark: made with the folder, held so that nobody else can open it.
+    folder = win[win.index("pub fn private_folder("):win.index("/// Remove the window's folder of a run that is over.")]
+    assert "match hold_mark(&path) {" in folder and "Ok(in_use) => return Ok(OwnFolder { path, in_use: Some(in_use) })," in folder
+    assert ".create_new(true).share_mode(nobody_else).open(format!(\"{folder}\\\\{IN_USE_MARK}\"))" in folder
+    assert "let nobody_else = 0;" in folder
+    # The tidy-up: the name first, then only what the listing already said.
+    tidy = win[win.index("pub fn remove_private_folders("):win.index("/// Is the window's folder `path` one that no run is using any more?")]
+    named = tidy.index("if !entry.file_name().to_string_lossy().starts_with(WINDOW_FOLDER_PREFIX) {\n            continue;")
+    assert named < tidy.index("entry.metadata()") < tidy.index("left_behind(&path, &found)")
+    assert "symlink_metadata" not in win[:win.index("#[cfg(test)]")], "a question to Windows for every entry of the place"
+    # What may be removed: the mark is there and nobody holds it; or there
+    # is no mark and the folder is too old to be one that is being made.
+    left = win[win.index("fn left_behind("):win.index("/// Take every setting for WebView2")]
+    assert ".read(true).share_mode(nobody_else).open(path.join(IN_USE_MARK))" in left
+    assert "Ok(_) => true," in left and "Err(_) => false," in left
+    assert "is_some_and(|age| age >= MARK_EXPECTED_WITHIN)" in left
+    # In the window's program: on a thread of its own, after the window is made.
+    run = main[main.index("fn run("):]
+    window_made = run.index(".map_err(no_window)?;", run.index("WebviewWindowBuilder::new("))
+    tidied = run.index("let tidied = win::remove_private_folders(&tidy_in);")
+    assert window_made < run.index("std::thread::spawn(move || {", window_made) < tidied < run.index("shell.start();")
+    assert run.count("remove_private_folders(") == 1
+    # The trial tries both for real.
+    trial = app_crate("try_it.py")
+    assert "its start left the first copy's folder alone" in trial and "this run's folder is marked as in use" in trial
+    assert "taken away at the next start, with %d other" in trial
 
 
 def test_where_the_shell_keeps_things_does_not_follow_the_environment():
@@ -607,7 +688,7 @@ def test_a_first_copy_is_looked_for_before_anything_asks_for_rights():
     # In main(): first copy, then everything else.
     body = main[main.index("fn main() {"):main.index("/// Open the window, start the backend")]
     begun = body.index("instance::begin(&win::session(names), ASKS_FOR_RIGHTS, &arguments)")
-    assert begun < body.index("paths::Paths::resolve(") < body.index("run(Settings::new(")
+    assert begun < body.index("paths::Paths::resolve(") < body.index("Settings::new(backend,") < body.index("run(settings,")
     assert "Begin::Shown | Begin::Running | Begin::Elevating => return," in body
     # In begin(): show the other, then rights, then the name.
     order = instance[instance.index("pub fn begin("):instance.index("#[cfg(test)]")]

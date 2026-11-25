@@ -579,9 +579,51 @@ pub fn administrators_folder() -> Result<String, String> {
 // (nothing of a run is written down for a later one), and its folder is new
 // at every start, under a name nobody can guess, made so that only
 // administrators can read or write it, and removed when the run is over.
+//
+// A run that is ended from outside cannot remove its folder, so a start
+// removes what earlier runs left behind.  It has to tell those from a
+// folder that is in use: "is a copy running" is asked per session of
+// Windows, so two people signed in at one PC each run a copy, and each
+// copy's start looks at the same place.  A run therefore marks its folder
+// (see IN_USE_MARK), and a folder whose mark is held is never touched.
 
 /// How the folders begin, so that what a run left behind is recognised.
 pub const WINDOW_FOLDER_PREFIX: &str = "Vispora-window-";
+/// The file in a window's folder that its run keeps open, for as long as
+/// it runs, in a way that lets nobody else open it.  A run that has ended,
+/// however it ended, holds it no more.
+pub const IN_USE_MARK: &str = "in-use";
+/// A folder without the mark is being made at this very moment (the folder
+/// comes first, its mark a moment later), or was left by a run that ended
+/// in that moment.  A start leaves it alone until it is this old.
+pub const MARK_EXPECTED_WITHIN: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The window's folder of one run, and what says that it is in use.
+#[derive(Debug)]
+pub struct OwnFolder {
+    pub path: String,
+    in_use: Option<std::fs::File>,
+}
+
+impl OwnFolder {
+    /// Take the folder away: the run is over.
+    pub fn remove(mut self) -> bool {
+        self.in_use.take();
+        remove_private_folder(&self.path)
+    }
+}
+
+/// What a start found among the window's folders (remove_private_folders).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Tidied {
+    /// How many entries of the folder above were looked at, by name alone.
+    pub entries: usize,
+    /// Folders that earlier runs left behind, and that are gone now.
+    pub removed: usize,
+    /// Folders of the window's kind that were left alone: in use by a copy
+    /// in another session, or too new to tell.
+    pub left: usize,
+}
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const TOKEN_USER: u32 = 1;
 
@@ -627,24 +669,44 @@ fn own_account() -> Result<String, String> {
     }
 }
 
-/// Make a new folder for the window in `parent`.  It did not exist before:
-/// a folder that is already there is never taken.
-pub fn private_folder(parent: &str, open_to: OpenTo) -> Result<String, String> {
-    let mut random = [0u8; 16];
-    Windows.random(&mut random)?;
-    let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    let path = format!("{parent}\\{WINDOW_FOLDER_PREFIX}{name}");
+/// Make a new folder for the window in `parent`, marked as in use.  It did
+/// not exist before: a folder that is already there is never taken.
+pub fn private_folder(parent: &str, open_to: OpenTo) -> Result<OwnFolder, String> {
     std::fs::create_dir_all(parent).map_err(|e| format!("{parent}: {e}"))?;
     let who = match open_to {
         OpenTo::Administrators => "BA".to_string(),
         OpenTo::ThisAccount => own_account().map_err(|why| format!("the account this runs under could not be read ({why})"))?,
     };
-    // Theirs, too: whoever owns a folder may change who gets into it.  So
-    // the owner is said here, and not left to what Windows would pick.  (A
-    // program without administrator rights cannot make a folder that is the
-    // administrators' own: Windows refuses.)
-    closed_folder(&path, &format!("O:{who}{}", open_only_to(&who)))?;
-    Ok(path)
+    let mut why = String::new();
+    // More than once only if the folder was taken away between being made
+    // and being marked.  A start in another session does not do that (see
+    // left_behind); if anything ever does, the folder was still empty, and
+    // another one is made.
+    for _ in 0..3 {
+        let mut random = [0u8; 16];
+        Windows.random(&mut random)?;
+        let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = format!("{parent}\\{WINDOW_FOLDER_PREFIX}{name}");
+        // Theirs, too: whoever owns a folder may change who gets into it.
+        // So the owner is said here, and not left to what Windows would
+        // pick.  (A program without administrator rights cannot make a
+        // folder that is the administrators' own: Windows refuses.)
+        closed_folder(&path, &format!("O:{who}{}", open_only_to(&who)))?;
+        match hold_mark(&path) {
+            Ok(in_use) => return Ok(OwnFolder { path, in_use: Some(in_use) }),
+            Err(e) => why = format!("{path}: it could not be marked as in use ({e})"),
+        }
+    }
+    Err(why)
+}
+
+/// Make the mark in a folder that was just made, and keep it open so that
+/// nobody else can open it.  (Not for the programs this one starts, either:
+/// Rust opens files so that they are not passed on.)
+fn hold_mark(folder: &str) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let nobody_else = 0;
+    std::fs::OpenOptions::new().read(true).write(true).create_new(true).share_mode(nobody_else).open(format!("{folder}\\{IN_USE_MARK}"))
 }
 
 /// Who gets into a folder that is open to `who` alone, the way Windows
@@ -679,7 +741,7 @@ fn closed_folder(path: &str, described: &str) -> Result<(), String> {
 /// Remove the window's folder of a run that is over.  WebView2's own
 /// programs let go of their files a moment after the window is gone, so
 /// this tries for a few seconds.
-pub fn remove_private_folder(path: &str) -> bool {
+fn remove_private_folder(path: &str) -> bool {
     for _ in 0..30 {
         match std::fs::remove_dir_all(path) {
             Ok(()) => return true,
@@ -692,22 +754,53 @@ pub fn remove_private_folder(path: &str) -> bool {
 
 /// Remove what earlier runs left behind in `parent` (a run that was ended
 /// from outside does not get to clean up).  Only real folders that begin as
-/// the window's folders begin; never `keep`; never anything that is a link
-/// to somewhere else.  How many were removed.
-pub fn remove_private_folders(parent: &str, keep: Option<&str>) -> usize {
+/// the window's folders begin; never one that is in use; never anything
+/// that is a link to somewhere else.
+///
+/// `parent` can hold thousands of files that are nothing of the app's
+/// (Windows' own folder for temporary files does).  So the name is looked
+/// at first, and nothing more is asked about an entry that does not begin
+/// as the window's folders begin; what is then asked is what the listing
+/// itself already said, at no further cost.
+pub fn remove_private_folders(parent: &str) -> Tidied {
     use std::os::windows::fs::MetadataExt as _;
-    let Ok(entries) = std::fs::read_dir(parent) else { return 0 };
-    let mut removed = 0;
+    let mut tidied = Tidied::default();
+    let Ok(entries) = std::fs::read_dir(parent) else { return tidied };
     for entry in entries.flatten() {
-        let (name, path) = (entry.file_name().to_string_lossy().into_owned(), entry.path());
-        let Ok(found) = std::fs::symlink_metadata(&path) else { continue };
-        let real_folder = found.is_dir() && found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0;
-        let kept = keep.is_some_and(|keep| keep.eq_ignore_ascii_case(&path.to_string_lossy()));
-        if name.starts_with(WINDOW_FOLDER_PREFIX) && real_folder && !kept && std::fs::remove_dir_all(&path).is_ok() {
-            removed += 1;
+        tidied.entries += 1;
+        if !entry.file_name().to_string_lossy().starts_with(WINDOW_FOLDER_PREFIX) {
+            continue;
+        }
+        let Ok(found) = entry.metadata() else { continue };
+        if !found.is_dir() || found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            continue;
+        }
+        let path = entry.path();
+        if left_behind(&path, &found) && std::fs::remove_dir_all(&path).is_ok() {
+            tidied.removed += 1;
+        } else {
+            tidied.left += 1;
         }
     }
-    removed
+    tidied
+}
+
+/// Is the window's folder `path` one that no run is using any more?
+fn left_behind(path: &std::path::Path, found: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let nobody_else = 0;
+    match std::fs::OpenOptions::new().read(true).share_mode(nobody_else).open(path.join(IN_USE_MARK)) {
+        // The mark is there and nobody holds it: its run is over.
+        Ok(_) => true,
+        // No mark: being made right now, or left in that moment.  Old
+        // enough, it is the second.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            found.created().ok().and_then(|made| made.elapsed().ok()).is_some_and(|age| age >= MARK_EXPECTED_WITHIN)
+        }
+        // The mark is held (a copy in another session runs in this folder),
+        // or cannot be opened at all: not this start's to remove.
+        Err(_) => false,
+    }
 }
 
 /// Take every setting for WebView2 out of this program's environment, and
@@ -800,32 +893,111 @@ mod tests {
     fn the_windows_folder_is_new_at_every_run_and_gone_after_it() {
         let parent = a_place("folders");
         let (first, second) = (private_folder(&parent, OpenTo::ThisAccount).unwrap(), private_folder(&parent, OpenTo::ThisAccount).unwrap());
-        assert_ne!(first, second, "a folder is never used twice");
-        for path in [&first, &second] {
-            let name = std::path::Path::new(path).file_name().unwrap().to_string_lossy().into_owned();
+        assert_ne!(first.path, second.path, "a folder is never used twice");
+        for folder in [&first, &second] {
+            let name = std::path::Path::new(&folder.path).file_name().unwrap().to_string_lossy().into_owned();
             assert!(name.starts_with(WINDOW_FOLDER_PREFIX) && name.len() == WINDOW_FOLDER_PREFIX.len() + 32, "{name}");
-            assert!(std::fs::read_dir(path).unwrap().next().is_none(), "it starts empty");
+            let inside: Vec<String> = std::fs::read_dir(&folder.path).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            assert_eq!(inside, [IN_USE_MARK], "it starts with its mark and nothing else");
         }
         // What a run wrote goes with the folder.
-        std::fs::create_dir_all(format!("{first}\\EBWebView\\Default")).unwrap();
-        std::fs::write(format!("{first}\\EBWebView\\Default\\Session Storage"), b"the secret").unwrap();
-        assert!(remove_private_folder(&first) && !std::path::Path::new(&first).exists());
-        assert!(remove_private_folder(&first), "one that is gone already is no error");
-        // What earlier runs left behind is removed at the next start: but
-        // not this run's own, not anything else in the folder above, and
-        // never through a link to somewhere else.
-        let (third, other, elsewhere) = (private_folder(&parent, OpenTo::ThisAccount).unwrap(), format!("{parent}\\Something-else"), a_place("elsewhere"));
+        let was = first.path.clone();
+        std::fs::create_dir_all(format!("{was}\\EBWebView\\Default")).unwrap();
+        std::fs::write(format!("{was}\\EBWebView\\Default\\Session Storage"), b"the secret").unwrap();
+        assert!(first.remove() && !std::path::Path::new(&was).exists());
+        assert!(remove_private_folder(&was), "one that is gone already is no error");
+        drop(second);
+        tidy(&parent);
+    }
+
+    /// A folder as a run that was ended from outside leaves it: made and
+    /// marked like any other, with something in it, and the mark let go of.
+    fn one_left_behind(parent: &str) -> String {
+        let folder = private_folder(parent, OpenTo::ThisAccount).unwrap();
+        std::fs::create_dir_all(format!("{}\\EBWebView\\Default", folder.path)).unwrap();
+        std::fs::write(format!("{}\\EBWebView\\Local State", folder.path), b"{}").unwrap();
+        let OwnFolder { path, in_use } = folder;
+        drop(in_use);
+        path
+    }
+
+    fn there(path: &str) -> bool {
+        std::path::Path::new(path).exists()
+    }
+
+    #[test]
+    fn a_start_removes_what_was_left_behind_and_never_a_folder_that_is_in_use() {
+        use std::os::windows::fs::{FileTimesExt as _, OpenOptionsExt as _};
+        let parent = a_place("tidying");
+        // Two people signed in at one PC: the other one's copy is running.
+        // Its window's folder is in the same place, with WebView2's files
+        // in it, opened the way WebView2 opens most of them: so that they
+        // could be deleted under it.
+        let theirs = private_folder(&parent, OpenTo::ThisAccount).unwrap();
+        std::fs::create_dir_all(format!("{}\\EBWebView\\Default", theirs.path)).unwrap();
+        let cookies = format!("{}\\EBWebView\\Default\\Cookies", theirs.path);
+        std::fs::write(&cookies, b"in use").unwrap();
+        let read_write_delete = 7;
+        let _open = std::fs::OpenOptions::new().read(true).share_mode(read_write_delete).open(&cookies).unwrap();
+        // What a run of this account left behind.
+        let left = one_left_behind(&parent);
+        // A folder without a mark: one that is being made at this moment
+        // looks like this, and so does one whose run ended in that moment.
+        // New, it is left alone; old, it is removed.
+        let (being_made, never_marked) = (format!("{parent}\\{WINDOW_FOLDER_PREFIX}being-made"), format!("{parent}\\{WINDOW_FOLDER_PREFIX}never-marked"));
+        for folder in [&being_made, &never_marked] {
+            std::fs::create_dir(folder).unwrap();
+            std::fs::write(format!("{folder}\\planted.js"), b"x").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - MARK_EXPECTED_WITHIN - std::time::Duration::from_secs(60);
+        let backup_semantics = 0x0200_0000;         // (what opening a folder takes)
+        let folder = std::fs::OpenOptions::new().write(true).custom_flags(backup_semantics).open(&never_marked).unwrap();
+        folder.set_times(std::fs::FileTimes::new().set_created(long_ago)).unwrap();
+        drop(folder);
+        // Not the window's, although it is in the same place; and a link
+        // that begins as the window's folders begin.
+        let (other, elsewhere) = (format!("{parent}\\Something-else"), a_place("elsewhere"));
         std::fs::create_dir(&other).unwrap();
+        std::fs::write(format!("{parent}\\{WINDOW_FOLDER_PREFIX}a-file"), b"not a folder").unwrap();
         std::fs::write(format!("{elsewhere}\\precious.txt"), b"keep me").unwrap();
         let link = format!("{parent}\\{WINDOW_FOLDER_PREFIX}link");
         let linked = std::process::Command::new("cmd.exe").args(["/d", "/c", "mklink", "/J", &link, &elsewhere]).output().unwrap();
         assert!(linked.status.success(), "{}", String::from_utf8_lossy(&linked.stderr));
-        assert_eq!(remove_private_folders(&parent, Some(&second)), 1, "the one left behind, and only that");
-        assert!(!std::path::Path::new(&third).exists() && std::path::Path::new(&second).exists() && std::path::Path::new(&other).exists());
-        assert!(std::path::Path::new(&format!("{elsewhere}\\precious.txt")).exists(), "a link was followed and what it points to removed");
+
+        let tidied = remove_private_folders(&parent);
+        assert_eq!(tidied, Tidied { entries: 7, removed: 2, left: 2 }, "the two that no run is using, and only those");
+        assert!(!there(&left) && !there(&never_marked));
+        assert!(there(&cookies) && there(&format!("{}\\{IN_USE_MARK}", theirs.path)), "a folder that is in use was emptied");
+        assert!(there(&format!("{being_made}\\planted.js")), "a folder that may be being made was removed");
+        assert!(there(&other) && there(&format!("{elsewhere}\\precious.txt")), "a link was followed and what it points to removed");
+        // The other copy quits: its folder goes with it.  The one that was
+        // too new to tell stays until it is old enough.
+        let was = theirs.path.clone();
+        drop(_open);
+        assert!(theirs.remove() && !there(&was));
+        assert_eq!(remove_private_folders(&parent), Tidied { entries: 4, removed: 0, left: 1 });
         let _ = std::fs::remove_dir(&link);
         tidy(&parent);
         tidy(&elsewhere);
+    }
+
+    #[test]
+    fn the_mark_is_held_so_that_nobody_else_can_open_it() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let parent = a_place("marked");
+        let folder = private_folder(&parent, OpenTo::ThisAccount).unwrap();
+        let mark = format!("{}\\{IN_USE_MARK}", folder.path);
+        for (reading, writing) in [(true, false), (true, true)] {
+            let refused = std::fs::OpenOptions::new().read(reading).write(writing).share_mode(7).open(&mark).unwrap_err();
+            assert_eq!(refused.raw_os_error(), Some(32), "the mark could be opened beside the run that holds it");
+        }
+        assert!(std::fs::remove_file(&mark).is_err(), "the mark could be taken away under the run that holds it");
+        // Let go of, it is an ordinary file again.
+        let OwnFolder { path, in_use } = folder;
+        drop(in_use);
+        assert!(std::fs::OpenOptions::new().read(true).share_mode(0).open(&mark).is_ok());
+        assert!(remove_private_folder(&path));
+        tidy(&parent);
     }
 
     #[test]
@@ -857,7 +1029,7 @@ mod tests {
         // in what Windows keeps about it.
         let account = own_account().unwrap();
         assert!(account.starts_with("S-1-5-") && account.len() > 12, "{account}");
-        let mine = private_folder(&parent, OpenTo::ThisAccount).unwrap();
+        let mine = private_folder(&parent, OpenTo::ThisAccount).unwrap().path;
         std::fs::write(format!("{mine}\\profile"), b"x").unwrap();
         // (icacls writes the list down the way Windows writes it, which is
         // the same in every language; the file is UTF-16)
@@ -892,7 +1064,9 @@ mod tests {
         // handed to Explorer is looked at, never the handing over itself)
         for not_a_link in ["", "calc.exe", "C:\\Windows\\System32\\calc.exe", "file:///C:/Windows/win.ini", "ms-settings:", "javascript:alert(1)",
                            "https://example.org/a b", "https://example.org/\" & calc.exe", "http://example.org/\r\nx", "vispora://localhost/",
-                           "HTTPS://EXAMPLE.ORG/", "https://example.org/x\\", "https://example.org/\u{e9}"] {
+                           "HTTPS://EXAMPLE.ORG/", "https://example.org/x\\", "https://example.org/\u{e9}",
+                           // (a quotation mark by itself, with no blank beside it)
+                           "https://example.org/\"x", "https://example.org/\",x", "https://example.org/\"", "\"https://example.org/\""] {
             assert_eq!(line_for_a_link("C:\\Windows\\explorer.exe", not_a_link), None, "{not_a_link}");
         }
         // What Explorer is started with: itself, and the link in quotation marks.

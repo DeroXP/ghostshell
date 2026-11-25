@@ -25,7 +25,7 @@ elevated = []
 
 [dependencies]
 vispora-shell-core = { path = "../core" }
-tauri = { version = "=2.12.7", default-features = false, features = ["wry", "custom-protocol"] }
+tauri = { version = "=2.12.7", default-features = false, features = ["wry", "custom-protocol", "tray-icon"] }
 
 [build-dependencies]
 tauri-build = { version = "=2.7.6", default-features = false, features = ["config-json"] }

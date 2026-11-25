@@ -34,6 +34,12 @@ With VISPORA_STAND_IN_SECRET=<file> it writes the run's secret there, as it
 was handed over: that is how a trial knows what to look for when it checks
 that the secret is nowhere it should not be.  (The file is the trial's own,
 in its throwaway folder; the real backend writes the secret nowhere.)
+
+One call is the stand-in's own and not the app's: POST /api/stand-in/game
+with {"name": "..."} makes the fake machine look as if that game were
+running ({"name": null}: as if it had ended).  That is how a trial sees the
+tray icon change, which on a real PC takes a real game.  It needs the
+run's secret like every other call.
 """
 import sandbox as m                                 # noqa: F401  (first: the fake machine)
 
@@ -86,6 +92,14 @@ def main():
             return answer
 
         A.app.after_request(note)
+    @A.app.route("/api/stand-in/game", methods=["POST"])
+    def a_game_runs_or_not():
+        from core import game_profiles
+        name = (A.request.get_json(silent=True) or {}).get("name") or None
+        game_profiles._engine["active_game"] = name
+        game_profiles._engine["active_pid"] = 4242 if name else None
+        return A.jsonify({"ok": True, "active_game": name})
+
     if "--die-with" in sys.argv:
         return int(_value("--die-with", "1"))
     time.sleep(float(_value("--slow-start", "0")))

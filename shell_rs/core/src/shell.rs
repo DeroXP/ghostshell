@@ -74,6 +74,13 @@ pub struct Settings {
     pub look_while_starting: Duration,
     pub look_when_ready: Duration,
     pub forward: forward::Limits,
+    /// How long a call of the shell's own may take (the tray's: what to
+    /// show, and what a menu entry asks for).
+    pub own_calls_within: Duration,
+    /// Where the shell's own exe is: what a person starts.  Handed to the
+    /// backend, which needs it where it names the app's exe (the entry that
+    /// starts the app at sign-in).  None where that is of no use (tests).
+    pub shell_exe: Option<String>,
 }
 
 impl Settings {
@@ -101,6 +108,8 @@ impl Settings {
             look_while_starting: Duration::from_millis(50),
             look_when_ready: Duration::from_millis(250),
             forward: forward::Limits::default(),
+            own_calls_within: Duration::from_secs(10),
+            shell_exe: None,
         }
     }
 }
@@ -411,6 +420,7 @@ impl Shell {
             ("token", self.token.as_str().into()),
             ("shell_pid", self.platform.own_pid().into()),
             ("shell_started", self.platform.own_start().into()),
+            ("shell_exe", self.settings.shell_exe.as_deref().map_or(Json::Null, Json::from)),
         ])
         .to_string();
         let started = self.platform.start(&self.settings.backend, &handoff);
@@ -510,6 +520,28 @@ impl Shell {
             return None;
         }
         Some(said["version"].as_str().unwrap_or("").to_string())
+    }
+
+    /// Ask the backend something on the shell's own behalf, with the run's
+    /// secret (the tray does: what to show, and what a menu entry asks
+    /// for).  Only a backend that is up is asked.  None when there is none,
+    /// or when it does not answer "200" in time.
+    pub fn ask_backend(&self, method: &str, path: &str) -> Option<Json> {
+        if self.phase() != Phase::Ready {
+            return None;
+        }
+        let mut ask = Request::new(method, path).with_header(token::HEADER, self.token.as_str());
+        if method != "GET" {
+            ask = ask.with_header("Content-Type", "application/json").with_body(b"{}".to_vec());
+        }
+        let limits = forward::Limits {
+            connect: Duration::from_millis(250),
+            silence: self.settings.own_calls_within,
+            whole: Some(self.settings.own_calls_within),
+            body: 64 * 1024,
+        };
+        let answer = forward::send(self.listening.port(), &ask, &limits).ok()?;
+        (answer.status == 200).then(|| answer.to_json())
     }
 
     /// End the backend now, without asking it.

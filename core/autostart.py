@@ -86,7 +86,26 @@ def _save_settings(d: dict):
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
+# Where the app's exe is, when it is not this process's own.
+#
+# The entry that starts the app at sign-in names the exe a person starts.
+# Started as it always was, that is this process, and nothing is set here.
+# Behind the shell (shell_rs/) this process is the app's backend and the
+# shell is what a person starts; the shell says where it is when it starts
+# the backend (app.py, _serve_for_the_shell), and that is what the entry has
+# to name.  No release starts the app that way yet.
+_app_exe: Optional[str] = None
+
+
+def use_app_exe(path: Optional[str]) -> None:
+    """The exe an entry is to name from now on; None for this process's own."""
+    global _app_exe
+    _app_exe = path or None
+
+
 def _current_exe_path() -> Optional[str]:
+    if _app_exe:
+        return _app_exe
     if getattr(sys, "frozen", False):
         return os.path.abspath(sys.executable)
     return None
@@ -254,6 +273,7 @@ def enable(delay_seconds: Optional[int] = None) -> dict:
     if not exe:
         return {"ok": False,
                 "err": "Autostart only works on the built .exe (run pyinstaller build.spec first)"}
+    # (behind the shell `exe` is the shell's, see use_app_exe)
     if not os.path.exists(exe):
         return {"ok": False, "err": f"Executable not found: {exe}"}
 

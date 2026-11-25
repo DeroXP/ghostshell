@@ -13,7 +13,7 @@ are as they were. The pieces:
 | --- | --- | --- |
 | `core/` | The shell without a window: which request is answered where, the backend's start and stop, quitting with a time limit, and whether this is the one copy | written, tested, tried against a stand-in backend |
 | `app/` | The window (Tauri, as for the updater), on the app's own page | written, tried for real against a stand-in backend |
-| the tray | The tray icon and its menu, and autostart pointing at the shell | not started |
+| the tray | The tray icon and its menu, and what the entry for starting at sign-in names | written, tried for real against a stand-in backend |
 | one file | `Vispora.exe` carrying the backend and unpacking it once per version | not started |
 
 ## How the two sides work together
@@ -109,13 +109,17 @@ next backend or given up on when the shell stops trying.
 
 What the backend does not do behind the shell: tell a second copy from the
 first, ask for administrator rights, open a window, show a tray icon. Those
-are the shell's (the next piece). Everything else a start does, it does.
+are the shell's. Everything else a start does, it does.
 
 ## The window
 
 `app/` is the window around `core/`: Tauri on WebView2, the versions the
-updater's window pinned, and no crate the updater's window did not already
-bring (a test compares the two lock files). Plain `cargo build`, as there.
+updater's window pinned, with Tauri's own tray feature switched on and
+nothing else added. Its lock file lists 422 outside crates: the 418 of the
+updater's window, in the same versions, and the 4 that the tray feature
+brings. Of those 4 one is compiled for Windows (`tray-icon`); the other
+three are for Linux and are only named. No Tauri plugin. A test compares the
+two lock files and knows the 4 by name. Plain `cargo build`, as there.
 
 * **The page is the app's own**, not changed. `static/js/app.js` was written
   for pywebview's window and asks it three things through
@@ -188,12 +192,30 @@ bring (a test compares the two lock files). Plain `cargo build`, as there.
   9.4 seconds in `EBWebView\Default\History`, with the address the window
   was opened at). It would also be writable by them before the next start,
   and what is planted there (a service worker for the app's own address,
-  for one) runs inside the app's page. A run that is ended from
-  outside cannot tidy up; the next start removes what it left (only folders
-  that begin as the window's folders begin, never through a link to
-  somewhere else).
+  for one) runs inside the app's page.
+* **A start takes away what earlier runs left behind, and never a folder
+  that is in use.** A run that is ended from outside cannot remove its
+  folder, so a start looks for such folders. It has to tell them from one
+  that is in use: "is a copy running" is asked per session of Windows, so
+  two people signed in at one PC (fast user switching, remote desktop) each
+  run a copy, and each copy's start looks at the same place. A run
+  therefore keeps one file in its folder open (`in-use`) for as long as it
+  runs, in a way that lets nobody else open it; a start removes a folder
+  only if that file is there and nobody holds it. A folder without the file
+  is being made at this moment (the folder comes first, the file a moment
+  later) and is left alone until it is ten minutes old. Only folders that
+  begin as the window's folders begin are looked at, never a link to
+  somewhere else. All of this is done once the window is there, on a
+  thread of its own, and by name first: the place holds thousands of files
+  that are nothing of the app's, and nothing is asked of Windows about
+  those. (In a trial: one earlier run's folder of 129 files taken away with
+  5,000 other files beside it, 20 ms, with the window on screen after 36 ms
+  as in every other run.)
 * **WebView2 is asked for before a window is made**, and a missing one is
-  said in a plain Windows message.
+  said in a plain Windows message. What else can keep the app from
+  starting has words of its own (`core/src/trouble.rs`): a folder for the
+  window that cannot be made is said as that, with where it was to be
+  made, and the person is not sent to install WebView2 for it.
 * **Closing the window from outside** (Alt+F4, the taskbar) quits the app:
   the process does not end before the backend has put the system back and
   ended.
@@ -219,6 +241,66 @@ bring (a test compares the two lock files). Plain `cargo build`, as there.
   socket, which only the backend is meant to get.
 * **`--from-autostart`** starts the window out of sight and is passed on to
   the backend, as today.
+* **How the window's loop ends.** When the backend has ended, the shell
+  takes its window away, and the loop ends with its last window. It does
+  not tell the loop to end: the window would still be there, WebView2 would
+  keep the window's folder, and the folder could not be removed (that is
+  how it was until a trial quit the app from the tray: the folder stayed,
+  and the quit waited three seconds for it).
+
+## The tray
+
+Today's tray (`app.py`, `_create_tray_icon`) is the measure, and
+`tests/test_tray_calls.py` holds the shell's against it: today's tray is
+built there for real, the shell's is made from what the app says, and the
+two are compared entry by entry.
+
+* **The same three pictures**, dot for dot: the app's mark in grey (Game
+  Mode is off), in colour (on), and brighter with a dot in the corner (a
+  game is running). The app draws them when it starts; the shell carries
+  what the app draws, written down once by `core/pictures/make.py`. A test
+  has the app draw them again at every run and compares.
+* **The same menu**, in the same order, with the same words and ticks:
+  Open Vispora, a status line that can only be read, Game Mode, Force
+  Normal Mode (only while a game runs), Crosshair, Refresh PC now, Clean
+  RAM now, Quit.
+* **The same clicks.** The left button, once or twice, brings the window
+  back; the right button opens the menu.
+* **The same actions.** "Open Vispora" and "Quit" are the shell's own: the
+  window is the shell's, and a quit from the tray goes the way every quit
+  goes (the backend puts the system back, then the shell ends). Every
+  other entry is carried out by the backend, as it always was: the shell
+  asks for it with a call (`/api/tray/...` in `app.py`), which does what
+  the entry of the same name does today and tells the person the same
+  thing afterwards. The calls need the run's secret like every other call.
+  Started as it always was, the app has its own tray and none of these
+  calls: they answer as a path that does not exist.
+* **Asked every three seconds**, as today's tray asks: one call on this PC
+  that starts no program. While there is no backend to ask (it is
+  starting), nothing is sent.
+
+Two things are different, and on purpose:
+
+* **The tooltip says what is so.** Today's tray writes its tooltip only
+  when the game changes, so "Vispora: game mode armed" shows in it only
+  after a game has ended; switch Game Mode on and it still says "Vispora".
+  The shell's tooltip follows the state. The words are today's.
+* **The icon is there before the backend is.** Until the backend has said
+  anything, the tray shows the grey mark and the menu of "Game Mode is
+  off"; "Open Vispora" and "Quit" can be clicked, the other entries can be
+  read and not clicked.
+
+And one that is not on purpose: in today's menu "Open Vispora" is in bold
+(it is what a click on the icon stands for). The menu Tauri makes has no
+bold entry.
+
+**Starting at sign-in.** The entry that starts the app at sign-in (a
+scheduled task) names the exe a person starts. Behind the shell that is the
+shell, not the backend, so the shell says where it is when it starts the
+backend, and `core/autostart.py` names that. Started as it always was, the
+entry names what it always named. This is written and tested as far as
+"what the entry would be"; no task is made by a test or a trial, and the
+task today's app makes is not touched.
 
 The exe is `VisporaShell.exe` for now. It gets the app's name in the
 one-file piece; until then no exe named after the app is ever started in a
@@ -228,7 +310,7 @@ trial, because the app itself is running on the PC the trials are made on.
 
 ```
 cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
-python shell_rs/app/try_it.py                  # 34 checks; the window is never shown
+python shell_rs/app/try_it.py                  # 71 checks; the window is never shown
 python shell_rs/app/try_it.py --time           # the times
 python shell_rs/app/try_it.py --picture x.png  # a picture of the window
 python shell_rs/app/try_it.py --show           # the window, to look at and click
@@ -258,22 +340,40 @@ at what another program on the PC could get at, with the real window:
   of WebView2 left anywhere else;
 * settings for WebView2 are planted in the trial's environment (a
   debugger's port, a profile folder) and must not be used;
-* a folder made to look like one an earlier run left behind must be removed
-  and not used;
+* a folder as a run that was ended from outside leaves it must be removed
+  and not used; one without the in-use file, made a moment ago, must be
+  left alone and not used;
+* a second copy is started that shares the place for the folders, as a
+  second person's copy does: its start must leave the first copy's folder
+  alone, and the first copy's page must go on working;
 * an empty frame, a frame that shows one of the app's own files, and a page
   from somewhere else in a frame are put into the page and must find
   nothing of what the window gives the app's page;
 * the page is sent to another port and another scheme under its own host
   name and must stay where it is;
 * the windows of the program are told that the session ends, as Windows
-  tells them, and the backend must have put the system back and ended
-  before the shell's process is gone; the folder that run has to leave
-  behind is then searched for the secret as well.
+  tells them, while the window is hidden in the tray, and the backend must
+  have put the system back and ended before the shell's process is gone;
+  the folder that run has to leave behind is then searched for the secret
+  as well;
+* where the window's folder cannot be made, the shell must not start and
+  must say so in words of its own.
+
+The tray is tried without a mouse, and for real. Its menu is read as
+Windows has it (the words, the ticks, what is greyed) and compared with
+today's; a click and a double click on the icon are sent as the messages
+Windows sends for them; an entry is chosen by the message Windows sends
+when one is chosen; a game is made to look as if it were running on the
+fake machine, to see the icon change. The menu itself is never put on the
+screen. One thing of a trial does show: for the seconds a run lasts there
+is a second "Vispora" icon in the notification area, the trial's.
 
 "Somewhere else" is this PC every time (127.0.0.1): nothing is asked of the
 internet, and no link is opened in a browser. A trial build takes scripts to
 run in its page from a folder the trial names; the build that ships has no
-such thing. The trial's folder for the window is closed to everybody but
+such thing; what the shell would say in a message box goes into a file
+in a trial, because a box would sit on the screen of whoever is at the PC.
+The trial's folder for the window is closed to everybody but
 the account the trial runs under, which keeps WebView2's own helper programs
 out as the shipping build's folder does: that WebView2 works in a closed
 folder is tried, that it works in one for administrators only is not.
@@ -283,6 +383,7 @@ folder is tried, that it works in one for administrators only is not.
 | File | What it does |
 | --- | --- |
 | `app/src/main.rs` | The window: first copy, WebView2, the page, the requests, the quit |
+| `app/src/tray.rs` | The tray icon: Tauri's, showing what `core/src/tray.rs` decides |
 | `app/build.rs`, `app/app.manifest`, `app/tauri.conf.json` | What the exe carries besides its code: icon, version (from `config.py`), a manifest that asks for no rights |
 | `app/try_it.py` | Runs the real window exe against a stand-in backend, out of the way |
 | `core/src/instance.rs` | Is this the one copy, and does it have the rights it needs: the order of a start |
@@ -291,22 +392,26 @@ folder is tried, that it works in one for administrators only is not.
 | `core/src/forward.rs` | Passing a call on to the backend and reading its answer |
 | `core/src/page.rs` | The page and its files, as the backend serves them |
 | `core/src/token.rs` | The run's secret |
+| `core/src/tray.rs`, `core/pictures/` | Which picture the tray shows, its tooltip and its menu, decided from what the backend says; the three pictures, and the script that has the app draw them |
+| `core/src/trouble.rs` | What the person is told when the app cannot start |
 | `core/src/platform.rs`, `core/src/win.rs` | The doors to the outside (starting a program, a free port, random numbers), and the real ones |
 | `core/src/bin/try.rs` | `vispora-shell-try`: the shell without a window, driven by lines of JSON. For trying and for the tests; never shipped |
 | `core/build.rs` | Reads the app's version from `config.py`, the one place it is written |
 | `try_it.py` | Runs the trial tool against a stand-in backend and takes the times |
 
 In the app: `app.py`, "Running behind the shell" (the hand-over, whom the
-backend answers, leaving with the shell), and `tests/shell_backend_stand_in.py`
-(the app on the fake machine, as a backend for trials).
+backend answers, leaving with the shell) and "The tray, behind the shell"
+(its calls); `core/autostart.py` (which exe the entry at sign-in names); and
+`tests/shell_backend_stand_in.py` (the app on the fake machine, as a backend
+for trials).
 
 ## No outside crates
 
 `core/` is the part of `Vispora.exe` that starts a program as administrator
 and decides which calls reach it. It uses no crates from outside this
 repository: its one dependency is `updater_rs/core`, for its JSON reader, and
-that has none either. A build downloads nothing. The window will bring Tauri
-with it, as the updater's window did, in a crate of its own.
+that has none either. A build of it downloads nothing. The window brings
+Tauri with it, as the updater's window did, in a crate of its own (`app/`).
 
 ## Build
 
@@ -357,11 +462,21 @@ it is told to start, and the only thing to tell it is the stand-in.
 
 ## What has not been done yet
 
-* **No tray icon.** A window that was hidden (Hide to Tray, or a start at
-  sign-in) is brought back by starting the app again. The tray needs calls
-  the backend does not have yet (its menu acts on the app directly today)
-  and its three icons; it is the next piece, with autostart pointing at the
-  shell's exe.
+* **The tray's menu has not been opened with a mouse, and no message of
+  the app's was seen.** The trial reads the menu as Windows has it and
+  chooses entries by message; it never puts the menu on the screen of the
+  PC it runs on. What an entry tells the person afterwards (a toast) is
+  the backend's, and on the fake machine it is caught, not shown. The
+  icon's picture and tooltip are not read from Windows either (Windows
+  does not say what an icon of another program shows): the trial reads the
+  shell's own account of them, and a test compares the three pictures'
+  files with what the app draws.
+* **The entry for starting at sign-in has never been made behind the
+  shell.** What it would be is tested. An entry that today's app made
+  names today's exe; once the shell is the app under the same name in the
+  same place, that is the shell. If the shell ever lives somewhere else,
+  an entry that is already there has to be made again: nothing does that
+  yet.
 * **The administrator prompt and a second start beside a copy that has
   administrator rights** have not been seen: the trials run without them.
   The event a second start rings is made so that a program without those
@@ -428,9 +543,7 @@ it is told to start, and the only thing to tell it is the stand-in.
 * The real backend has never been started by the shell. Its side of the
   arrangement is tested on the fake machine only, where the start-up work
   and a real quit's undoing do not happen.
-* Where the app's exe is, for the updater and for autostart: behind the
-  shell the backend's own exe is not `Vispora.exe` any more. The hand-over
-  will have to say it; nothing needs it before the one-file piece.
-* The graphics settings for the window (today the backend picks WebView2's
-  switches for the PC's graphics card before it opens its window) are the
-  window's piece.
+* Where the app's exe is, for the updater: behind the shell the backend's
+  own exe is not `Vispora.exe` any more. The hand-over says where the shell
+  is, and the entry at sign-in uses it; the updater does not yet, and
+  nothing needs it before the one-file piece.

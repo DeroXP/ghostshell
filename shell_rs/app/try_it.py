@@ -20,7 +20,14 @@ own is touched:
   * APPDATA, LOCALAPPDATA and USERPROFILE point into a temporary folder for
     it, so its log and the window's own folder land there;
   * the window is hidden for the checks, and for the times and the picture
-    it is drawn beyond the edge of the desktop and never takes the keyboard.
+    it is drawn beyond the edge of the desktop and never takes the keyboard;
+  * what the shell would say in a message box goes into a file instead: a
+    box would sit on the screen of whoever is at the PC, and wait.
+
+One thing of a trial does show: the tray icon.  For the seconds a run
+lasts there is a second "Vispora" icon in the notification area (where
+Windows keeps new icons: behind the arrow).  It is the trial's, on the fake
+machine; its menu is never opened by the trial.
 
 With --show the window is a real one in the middle of the screen, on the
 fake machine: what is clicked there changes nothing on this PC.  Quit it
@@ -33,6 +40,12 @@ must not be used; a page from somewhere else is put into a frame and must
 find nothing of the app's there; the page is sent somewhere else and must
 stay.  "Somewhere else" is this PC every time (127.0.0.1): nothing is asked
 of the internet, and no link is opened in a browser.
+
+The tray is tried without a mouse.  Its menu is read as Windows has it (the
+words, the ticks, what is greyed), a click and a double click on the icon
+are sent as the messages Windows sends for them, and an entry is chosen by
+the message Windows sends when one is chosen.  The menu itself is never put
+on the screen.
 
 Only the build made WITHOUT the `elevated` feature is run (the command
 above).  The build that ships asks for administrator rights when it starts;
@@ -64,6 +77,15 @@ WINDOW_TITLE = "Vispora"
 NO_WINDOW = 0x08000000
 WM_CLOSE = 0x0010
 WM_ENDSESSION = 0x0016
+WM_COMMAND = 0x0111                 # what a window is sent when an entry of its menu is chosen
+WM_LBUTTONUP, WM_LBUTTONDBLCLK = 0x0202, 0x0203
+TRAY_ICON_MESSAGE = 6002            # what the tray icon's window is sent for the mouse (the tray-icon crate's number)
+TRAY_WINDOW_CLASS = "tray_icon_app"
+MENU_BY_POSITION, MENU_GREYED, MENU_TICKED, MENU_LINE = 0x400, 0x1, 0x8, 0x800
+# The tray's menu while Game Mode is off, as today's app shows it (None: a
+# line).  tests/test_shell_rs.py holds this list against today's tray.
+TODAYS_MENU_WHEN_OFF = ["Open Vispora", None, "○  Game Mode: off", "Game Mode", "Crosshair", None,
+                        "Refresh PC now", "Clean RAM now", None, "Quit"]
 WINDOW_FOLDER = re.compile(r"^Vispora-window-[0-9a-f]{32}$")
 # How long after the page has its secret the window's folder is searched for
 # it.  A window that is not private writes it down twice: with the page's
@@ -138,41 +160,60 @@ class Elsewhere:
 class Run:
     """One start of the exe, with everything it is given."""
 
-    def __init__(self, root, window, planted=False):
+    def __init__(self, root, window, planted=False, beside=None, folder_in=None, plant=None):
+        """`beside`: another run whose folders this one shares, as a second
+        person's copy on the same PC shares the place the window's folders
+        are made in.  `folder_in`: where this run makes its window's folder,
+        in place of its data folder.  `plant`: called with the run before
+        the exe is started."""
         self.root = tempfile.mkdtemp(prefix="run-", dir=root)
         self.notes = os.path.join(self.root, "put-back.txt")
         self.calls_file = os.path.join(self.root, "calls.txt")
         self.secret_file = os.path.join(self.root, "secret.txt")
+        self.messages_file = os.path.join(self.root, "messages.txt")
         self.scripts = os.path.join(self.root, "scripts")
         os.makedirs(self.scripts)
         self.env = dict(os.environ)
         for var, folder in (("APPDATA", "Roaming"), ("LOCALAPPDATA", "Local"), ("USERPROFILE", "Home")):
-            self.env[var] = os.path.join(self.root, folder)
-            os.makedirs(self.env[var])
+            self.env[var] = beside.env[var] if beside else os.path.join(self.root, folder)
+            os.makedirs(self.env[var], exist_ok=True)
         self.data = os.path.join(self.env["APPDATA"], "Vispora")
         self.env["VISPORA_STAND_IN_NOTES"] = self.notes
         self.env["VISPORA_STAND_IN_CALLS"] = self.calls_file
         self.env["VISPORA_STAND_IN_SECRET"] = self.secret_file
-        self.env["VISPORA_SHELL_TRY"] = json.dumps({
-            "tag": "%d%d" % (os.getpid(), int(time.time() * 1000) % 10 ** 9),
+        told = {
+            "tag": "%d%d" % (os.getpid(), time.time_ns() % 10 ** 12),
             "window": window,
             "scripts": self.scripts,
+            "messages": self.messages_file,
             "backend": {"program": sys.executable, "args": ["-u", STAND_IN], "cwd": REPO},
-        })
-        self.debug_port = self.planted_profile = self.left_behind = None
+        }
+        if folder_in:
+            told["folder_in"] = folder_in
+        self.env["VISPORA_SHELL_TRY"] = json.dumps(told)
+        self.debug_port = self.planted_profile = self.left_behind = self.not_marked = None
         if planted:
             # What a program without rights could do before the app starts:
             # settings for WebView2 in the person's environment (a way in for
-            # a debugger, a profile of its choosing), and a folder made to
-            # look like one the window left behind.
+            # a debugger, a profile of its choosing), and folders made to
+            # look like the window's.
             self.debug_port = free_port()
             self.planted_profile = os.path.join(self.root, "planted-profile")
             self.env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--remote-debugging-port=%d" % self.debug_port
             self.env["WEBVIEW2_USER_DATA_FOLDER"] = self.planted_profile
+            # One as a run that was ended from outside leaves it: with its
+            # mark, which nobody holds any more.  And one without a mark,
+            # made a moment ago: a folder that is being made looks like that.
             self.left_behind = os.path.join(self.data, "Vispora-window-" + "0" * 32)
-            os.makedirs(os.path.join(self.left_behind, "EBWebView", "Default", "Service Worker"))
-            with open(os.path.join(self.left_behind, "EBWebView", "Default", "Service Worker", "planted.js"), "w") as f:
-                f.write("// what an earlier run left, or somebody put there")
+            self.not_marked = os.path.join(self.data, "Vispora-window-" + "1" * 32)
+            for folder in (self.left_behind, self.not_marked):
+                os.makedirs(os.path.join(folder, "EBWebView", "Default", "Service Worker"))
+                with open(os.path.join(folder, "EBWebView", "Default", "Service Worker", "planted.js"), "w") as f:
+                    f.write("// what an earlier run left, or somebody put there")
+            with open(os.path.join(self.left_behind, "in-use"), "w"):
+                pass
+        if plant:
+            plant(self)
         self.began = time.time()
         self.process = subprocess.Popen([EXE], env=self.env, cwd=self.root)
 
@@ -215,6 +256,79 @@ class Run:
     def window_folder(self):
         found = re.findall(r"the window's folder for this run: (.+)", self.log())
         return found[-1].strip() if found else None
+
+    def messages(self):
+        """What the shell would have said in a message box."""
+        try:
+            with open(self.messages_file, encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    def tidied(self):
+        """What each start that shares this run's folders found among the
+        window's old folders, oldest first: (entries looked at, milliseconds,
+        removed, left alone)."""
+        return [tuple(int(n) for n in found) for found in re.findall(
+            r"the window's old folders: (\d+) entries looked at in (\d+) ms, "
+            r"(\d+) left behind by earlier runs and removed, (\d+) in use and left alone", self.log())]
+
+    # ── the tray ──────────────────────────────────────────────────────
+    def tray_window(self):
+        """The window the tray icon's messages go to."""
+        return next((w for w in windows_of(self.process.pid) if class_of(w) == TRAY_WINDOW_CLASS), None)
+
+    def tray_said(self):
+        """What the shell says its tray shows, last: (the menu's number in
+        Windows, the look)."""
+        found = re.findall(r"tray look (\d+) (\{.*\})", self.log())
+        return (int(found[-1][0]), json.loads(found[-1][1])) if found else (0, {})
+
+    def tray_shows(self):
+        """The lines the shell wrote each time its tray changed."""
+        return re.findall(r'the tray shows: (\w+), "(.*)"', self.log())
+
+    def click_the_tray(self, double=False):
+        """What Windows sends the icon's window for a click with the left button."""
+        window = self.tray_window()
+        if window:
+            ctypes.windll.user32.PostMessageW(wintypes.HWND(window), TRAY_ICON_MESSAGE, 0,
+                                              WM_LBUTTONDBLCLK if double else WM_LBUTTONUP)
+        return bool(window)
+
+    def choose(self, words, within=20):
+        """Choose the entry of the tray's menu that reads `words`: what
+        Windows sends when it is clicked.  False if there is none to click,
+        or if the shell did not take it.
+
+        The shell makes its menu again whenever what it shows changes, and
+        an entry's number belongs to one making of the menu.  A choice that
+        arrives for a menu that has just been replaced names an entry that
+        is no more, and nothing happens: the shell's log says whether a
+        choice was taken, and one that was not is made again."""
+        ends = time.time() + within
+        while time.time() < ends:
+            number, look = self.tray_said()
+            entry = next((e for e in look.get("menu", []) if e["text"] == words and e["kind"] != "line"), None)
+            found = [(state, item) for text, state, item in menu_in_windows(number) if text == words]
+            if not entry or not found:
+                time.sleep(0.2)                     # (the menu is being made again)
+                continue
+            state, item = found[0]
+            if state & (MENU_GREYED | MENU_LINE):
+                return False
+            taken = {"open": "the tray's menu asked for the window", "quit": "quitting (Quit in the tray's menu)"}.get(
+                entry["id"], "the tray's menu: %s," % entry["id"])
+            before = self.log().count(taken)
+            ctypes.windll.user32.PostMessageW(wintypes.HWND(self.tray_window()), WM_COMMAND, item, 0)
+            if self.wait_for(lambda: self.log().count(taken) > before, 3):
+                return True
+            if self.process.poll() is not None:
+                return self.log().count(taken) > before
+        return False
+
+    def tray_calls(self, call):
+        return [c for c in self.calls() if c[3] == "/api/tray/" + call and c[2] == "POST" and c[1] == 200]
 
     def said(self, what):
         """Did a script in the page say `what`?  (It says things by asking
@@ -276,6 +390,49 @@ class Run:
                            creationflags=NO_WINDOW)
 
 
+def class_of(window):
+    name = ctypes.create_unicode_buffer(100)
+    ctypes.windll.user32.GetClassNameW(wintypes.HWND(window), name, 100)
+    return name.value
+
+
+def menu_in_windows(number):
+    """A menu as Windows has it: (words, state, the entry's own number) from
+    the top.  `number` is the menu's handle; Windows answers for a menu of
+    another program too."""
+    user32 = ctypes.windll.user32
+    user32.GetMenuItemCount.argtypes = [wintypes.HANDLE]
+    user32.GetMenuStringW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, ctypes.c_int, wintypes.UINT]
+    user32.GetMenuState.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.UINT]
+    user32.GetMenuItemID.argtypes, user32.GetMenuItemID.restype = [wintypes.HANDLE, ctypes.c_int], wintypes.UINT
+    rows = []
+    for at in range(max(user32.GetMenuItemCount(number), 0)):
+        words = ctypes.create_unicode_buffer(300)
+        user32.GetMenuStringW(number, at, words, 300, MENU_BY_POSITION)
+        rows.append((words.value, user32.GetMenuState(number, at, MENU_BY_POSITION), user32.GetMenuItemID(number, at)))
+    return rows
+
+
+def same_menu(in_windows, said):
+    """Is the menu Windows has the one the shell says it shows?"""
+    if len(in_windows) != len(said) or not said:
+        return False
+    for (words, state, _), entry in zip(in_windows, said):
+        if entry["kind"] == "line":
+            if not state & MENU_LINE:
+                return False
+            continue
+        if (words != entry["text"] or bool(state & MENU_GREYED) == entry["enabled"] or state & MENU_LINE
+                or bool(state & MENU_TICKED) != entry["ticked"]):
+            return False
+    return True
+
+
+def plain(text):
+    """`text` with every letter a console in any language can print."""
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
 def windows_of(pid):
     """Every top-level window of that process, shown or not."""
     user32 = ctypes.windll.user32
@@ -330,6 +487,23 @@ def own_account():
                          creationflags=NO_WINDOW).stdout
     found = re.search(r'"(S-1-5-[\d-]+)"', out)
     return found.group(1) if found else "?"
+
+
+def can_open(path):
+    """Can this file be opened at all, by a program that lets everybody
+    else read it, write it and delete it meanwhile?  Not while somebody
+    holds it open for itself alone."""
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                     wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    read, open_existing, invalid = 0x80000000, 3, wintypes.HANDLE(-1).value
+    shared_with_everybody = 7
+    handle = kernel32.CreateFileW(path, read, shared_with_everybody, None, open_existing, 0, None)
+    if handle == invalid:
+        return False
+    kernel32.CloseHandle(wintypes.HANDLE(handle))
+    return True
 
 
 def files_with(folder, secret, but=()):
@@ -439,19 +613,60 @@ def take_picture(hwnd, path):
 
 # ─── The checks ──────────────────────────────────────────────────────
 
+HIDE = "window.pywebview.api.close_to_tray();"
+A_GAME = """(function () {
+    window.pywebview.api.get_api_token().then(function (token) {
+        fetch('/api/stand-in/game', { method: 'POST', body: JSON.stringify({ name: %s }),
+            headers: { 'X-Vispora-Token': token, 'Content-Type': 'application/json' } });
+    });
+})();"""
+
+
+def first_screen(run):
+    return run.wait_for(lambda: [c for c in run.page_calls() if c[3] == "/api/dashboard"])
+
+
+def ended(run, within=60):
+    try:
+        return run.process.wait(within)
+    except subprocess.TimeoutExpired:
+        return "still running"
+
+
+class NoFurther(Exception):
+    """A check failed, and the trial was asked to stop at the first one."""
+
+
 def checks(root):
+    """Every check, one after the other.  With VISPORA_TRY_STOP_AT_FIRST set
+    in the environment, the trial ends at the first check that fails (for
+    when a build is broken on purpose, to see that the trial notices)."""
     results = []
+    stop_at_first = bool(os.environ.get("VISPORA_TRY_STOP_AT_FIRST"))
 
     def check(what, ok):
         results.append((what, bool(ok)))
-        print("  %s  %s" % ("ok    " if ok else "FAILED", what))
+        print("  %s  %s" % ("ok    " if ok else "FAILED", plain(what)))
+        if not ok and stop_at_first:
+            raise NoFurther()
 
+    try:
+        every_check(root, check)
+    except NoFurther:
+        print("  (stopped at the first check that failed)")
+    failed = [r for r in results if not r[1]]
+    print("\n%d checks, %d failed." % (len(results), len(failed)))
+    return not failed
+
+
+def every_check(root, check):
     elsewhere = Elsewhere()
     run = Run(root, "hidden", planted=True)
+    other = None
     try:
         # The page is the app's page, loaded in the real window: it asks the
         # backend for its first screen, with the secret from its address.
-        first = run.wait_for(lambda: [c for c in run.page_calls() if c[3] == "/api/dashboard"])
+        first = first_screen(run)
         has_the_secret = time.time()
         check("the window loaded the page, and the page got its first screen from the backend", first)
         calls = run.page_calls()
@@ -469,12 +684,19 @@ def checks(root):
               == set(ignored.group(1).strip().split(", ")))
         check("no debugger's way in was opened (port %d), no profile made where the planted setting said"
               % run.debug_port, not listening(run.debug_port) and not os.path.exists(run.planted_profile))
-        check("a folder made to look like one the window left behind was removed, not used",
-              not os.path.exists(run.left_behind) and "removed 1 folder(s) of the window" in log)
         folder = run.window_folder()
         check("the window has a folder of this run's own, and WebView2 is in it: %s" % (folder and os.path.basename(folder)),
               folder and os.path.isdir(os.path.join(folder, "EBWebView")) and os.path.dirname(folder) == run.data
-              and WINDOW_FOLDER.match(os.path.basename(folder)) and folder != run.left_behind)
+              and WINDOW_FOLDER.match(os.path.basename(folder)) and folder not in (run.left_behind, run.not_marked))
+        # The window's old folders are looked at once the window is there.
+        tidied = run.wait_for(run.tidied, 20)
+        check("a folder as a run that was ended from outside leaves it was removed, not used: %r" % (tidied,),
+              tidied and tidied[0][2] == 1 and not os.path.exists(run.left_behind))
+        check("one without a mark, made a moment ago, was left alone (it could be one that is being made), and not used",
+              tidied and tidied[0][3] == 2
+              and os.path.isfile(os.path.join(run.not_marked, "EBWebView", "Default", "Service Worker", "planted.js"))
+              and os.listdir(run.not_marked) == ["EBWebView"])
+        check("this run's folder is marked as in use: nobody else can open the mark", folder and not can_open(os.path.join(folder, "in-use")))
 
         gets_in = who_gets_in(folder, os.path.join(run.root, "who-gets-in.txt")) if folder else ""
         check("the folder is closed to everybody but the trial's own account and Windows itself: %s" % gets_in,
@@ -509,6 +731,28 @@ def checks(root):
         shown = run.wait_for(lambda: run.window(shown=True), within=10)
         check("and showed it", shown)
 
+        # Two people signed in at one PC each run a copy, and both copies'
+        # windows have their folders in the same place.  The second copy's
+        # start must not take the first one's folder away under it.
+        # (a file of the trial's own in the first copy's folder, named so
+        # that it is the first thing anybody clearing the folder would meet)
+        own_file = os.path.join(folder, "!a-file-of-the-trial.txt")
+        with open(own_file, "w") as f:
+            f.write("still here")
+        other = Run(root, "hidden", beside=run)
+        check("(a copy in another session, same place for the folders) its page came up", first_screen(other))
+        theirs = other.window_folder()
+        both = run.wait_for(lambda: len(run.tidied()) >= 2 and run.tidied(), 20)
+        check("its start left the first copy's folder alone, and the one that may be being made: %r" % (both and both[1],),
+              both and both[1][2] == 0 and both[1][3] == 3 and theirs != folder
+              and os.path.isdir(os.path.join(folder, "EBWebView")) and os.path.isdir(run.not_marked))
+        check("nothing in the first copy's folder was touched", os.path.isfile(own_file))
+        run.in_the_page("(function () {" + SAY + "say('still-here-beside-a-second-copy'); })();")
+        check("and the first copy's page goes on working", run.wait_for(lambda: run.said("still-here-beside-a-second-copy"), 20))
+        other.close_the_window()
+        check("the second copy quits and takes its own folder with it, and only that",
+              ended(other) == 0 and theirs and not os.path.exists(theirs) and os.path.isdir(os.path.join(folder, "EBWebView")))
+
         # Nothing of the run is written where another program can read it.
         secret = run.secret()
         time.sleep(max(0.0, has_the_secret + WRITTEN_DOWN_AFTER_S - time.time()))
@@ -521,10 +765,7 @@ def checks(root):
         # the (fake) system back and ends, and only then the shell.
         began = time.time()
         check("the window takes a close from outside", run.close_the_window())
-        try:
-            code = run.process.wait(60)
-        except subprocess.TimeoutExpired:
-            code = "still running"
+        code = ended(run)
         check("the shell ends by itself, exit code 0 (got %r)" % (code,), code == 0)
         check("the backend put the system back before it went: %r" % (run.put_back(),),
               run.put_back() == ["put back: user quit"])
@@ -533,35 +774,88 @@ def checks(root):
         log = run.log()
         check("the secret is in no line of the log", "#t=" not in log and "token" not in log.lower() and secret not in log)
         left = [os.path.relpath(where, run.root) for where, folders, _ in os.walk(run.root)
-                if "EBWebView" in folders or os.path.basename(where).startswith("Vispora-window-")]
+                if ("EBWebView" in folders or os.path.basename(where).startswith("Vispora-window-")) and where != run.not_marked]
         check("the window's folder is gone after the run, and nothing of WebView2 is left anywhere else: %r" % (left,),
               folder and not os.path.exists(folder) and not left)
         found, read, _ = files_with(run.root, secret, but=(run.secret_file,))
         check("and the secret is in no file the run left (%d files): %r" % (read, found), read > 0 and not found)
+        check("nothing was to be said in a message box", run.messages() == "")
     finally:
+        if other:
+            other.end()
         run.end()
         elsewhere.close()
 
-    # Signing out, shutting down, or Windows replacing the app's files: the
-    # window is told, and the process is ended as soon as it has answered.
-    # The quit has to be over by then.
+    # The tray: its icon, its menu as Windows has it, a click and a double
+    # click, and each entry.  Then Windows ends the session while the window
+    # is hidden in the tray: the quit must still be run.
     run = Run(root, "hidden")
     try:
-        check("(a second run) the page came up again", run.wait_for(lambda: [c for c in run.page_calls() if c[3] == "/api/dashboard"]))
+        check("(the tray's run) the page came up", first_screen(run))
         has_the_secret = time.time()
         again = run.window_folder()
         check("in another folder than the first run's", again and folder and again != folder and os.path.isdir(again))
         backend = run.backend_pid()
+        check("the tray icon is there", run.tray_window())
+        # Once the backend has said what is so, every entry can be clicked.
+        said = run.wait_for(lambda: [e for e in run.tray_said()[1].get("menu", []) if e["id"] == "game-mode" and e["enabled"]], 20)
+        number, look = run.tray_said()
+        in_windows = menu_in_windows(number)
+        check("its menu, as Windows has it, is today's menu: %r" % ([w or None for w, _, _ in in_windows],),
+              said and [None if state & MENU_LINE else words for words, state, _ in in_windows] == TODAYS_MENU_WHEN_OFF)
+        check("and is what the shell says it shows (ticks and greyed entries too); the status line can only be read",
+              same_menu(in_windows, look.get("menu", [])) and in_windows and in_windows[2][1] & MENU_GREYED
+              and not any(state & MENU_GREYED for words, state, _ in in_windows if words in ("Open Vispora", "Game Mode", "Quit")))
+        check("the icon is the grey one and its tooltip the app's name", run.tray_shows()[-1:] == [("idle", "Vispora")])
+
+        # The left button brings the window back; it does not open the menu.
+        check("the window is hidden to begin with", run.window(shown=True) is None)
+        check("a click on the tray icon is taken", run.click_the_tray())
+        check("and brings the window back",
+              run.wait_for(lambda: run.window(shown=True), 10) and "a click on the tray icon asked for the window" in run.log())
+        run.in_the_page(HIDE)
+        check("the page hides the window to the tray", run.wait_for(lambda: run.window(shown=True) is None, 10))
+        run.click_the_tray(double=True)
+        check("a double click brings it back as well",
+              run.wait_for(lambda: run.window(shown=True), 10) and "a double click on the tray icon asked for the window" in run.log())
+        run.in_the_page(HIDE)
+        run.wait_for(lambda: run.window(shown=True) is None, 10)
+        check("so does \"Open Vispora\" in the menu", run.choose("Open Vispora") and run.wait_for(lambda: run.window(shown=True), 10)
+              and "the tray's menu asked for the window" in run.log())
+
+        # The entries the backend carries out.
+        check("\"Game Mode\" is carried out by the backend", run.choose("Game Mode") and run.wait_for(lambda: run.tray_calls("game-mode"), 20))
+        armed = run.wait_for(lambda: run.tray_shows()[-1:] == [("armed", "Vispora: game mode armed")], 20)
+        number, look = run.tray_said()
+        in_windows = menu_in_windows(number)
+        check("the icon, the tooltip and the menu say that Game Mode is on, with a tick: %r" % (run.tray_shows()[-1:],),
+              armed and same_menu(in_windows, look["menu"]) and in_windows[2][0] == "●  Game Mode: armed"
+              and [state & MENU_TICKED for words, state, _ in in_windows if words == "Game Mode"] == [MENU_TICKED])
+        run.in_the_page(A_GAME % json.dumps("Trial Game"))
+        playing = run.wait_for(lambda: run.tray_shows()[-1:] == [("playing", "Vispora: playing Trial Game")], 20)
+        number, look = run.tray_said()
+        in_windows = menu_in_windows(number)
+        check("a game is running: the icon with the dot, the game's name in the tooltip and the menu, and \"Force Normal Mode\"",
+              playing and same_menu(in_windows, look["menu"])
+              and [words for words, _, _ in in_windows][2:5] == ["▶  Trial Game", "Game Mode", "Force Normal Mode"])
+        for words, call in (("Crosshair", "crosshair"), ("Refresh PC now", "refresh-pc"), ("Clean RAM now", "clean-ram"),
+                            ("Force Normal Mode", "force-normal")):
+            check("\"%s\" is carried out by the backend" % words, run.choose(words) and run.wait_for(lambda: run.tray_calls(call), 20))
+        check("the status line cannot be chosen", not run.choose("▶  Trial Game"))
+        calls = run.page_calls()
+        check("none of the tray's calls was refused (%d)" % len([c for c in calls if c[3].startswith("/api/tray/")]),
+              all(status == 200 for _, status, _, path in calls if path.startswith("/api/tray/")))
+
+        # Hidden in the tray, and Windows ends the session.
+        run.in_the_page(HIDE)
+        check("the window is hidden in the tray again", run.wait_for(lambda: run.window(shown=True) is None, 10))
         # (long enough for a window that is not private to have written the
         # secret down: this run's folder is looked into after the run)
         time.sleep(max(0.0, has_the_secret + WRITTEN_DOWN_AFTER_S - time.time()))
         began = time.time()
         told = run.end_the_session()                # what try_it.py sends: WM_ENDSESSION
-        check("the program's windows are told that the session ends (%d of them)" % told, told >= 2)
-        try:
-            code = run.process.wait(60)
-        except subprocess.TimeoutExpired:
-            code = "still running"
+        check("the program's windows are told that the session ends (%d of them)" % told, told >= 3)
+        code = ended(run)
         took = time.time() - began
         check("the backend's process was gone before the shell's", backend and not running(backend))
         check("the shell ended, exit code 0 (got %r)" % (code,), code == 0)
@@ -573,11 +867,44 @@ def checks(root):
         found, read, closed = files_with(again, run.secret()) if again and run.secret() else (["?"], 0, 0)
         check("the folder this run had to leave behind does not hold the secret "
               "(%d files read, %d could not be): %r" % (read, closed, found), read > 0 and not found)
+        check("and its mark is held by nobody any more: the next start will take the folder away",
+              can_open(os.path.join(again, "in-use")))
     finally:
         run.end()
-    failed = [r for r in results if not r[1]]
-    print("\n%d checks, %d failed." % (len(results), len(failed)))
-    return not failed
+
+    # "Quit" in the tray's menu goes the way every quit goes.
+    run = Run(root, "hidden")
+    try:
+        check("(a third run) the page came up", first_screen(run))
+        run.wait_for(lambda: [e for e in run.tray_said()[1].get("menu", []) if e["id"] == "game-mode" and e["enabled"]], 20)
+        folder, backend = run.window_folder(), run.backend_pid()
+        began = time.time()
+        check("\"Quit\" in the tray's menu is taken", run.choose("Quit"))
+        code = ended(run)
+        check("the shell ends, exit code 0 (got %r), in %.1f s" % (code, time.time() - began), code == 0)
+        check("the backend put the system back before it went, and is gone: %r" % (run.put_back(),),
+              run.put_back() == ["put back: user quit"] and backend and not running(backend))
+        check("and the window's folder with it", folder and not os.path.exists(folder))
+    finally:
+        run.end()
+
+    # The window's folder cannot be made: said in words of its own, not as
+    # a missing WebView2.  (Where it was to be made is a file here.)
+    in_the_way = os.path.join(root, "a-file-not-a-folder")
+    with open(in_the_way, "w"):
+        pass
+    run = Run(root, "hidden", folder_in=os.path.join(in_the_way, "inside"))
+    try:
+        code = ended(run, 30)
+        said = run.messages()
+        check("where the window's folder cannot be made, the shell does not start (exit code 1, got %r)" % (code,), code == 1)
+        check("and says so in words of its own: %r" % (said.split("\n")[0],),
+              said.startswith("Vispora could not make the folder its window keeps its files in")
+              and ("The folder is made in %s." % os.path.join(in_the_way, "inside")) in said
+              and "usually fixes this" not in said and "Nothing was changed on this PC." in said)
+        check("no backend was started for it", "backend started" not in run.log())
+    finally:
+        run.end()
 
 
 # ─── The times ───────────────────────────────────────────────────────
@@ -592,7 +919,7 @@ def times(root, runs=5):
             t["a window on screen"] = (time.time() - run.began) * 1000 if seen else float("nan")
             first = run.wait_for(run.page_calls)
             t["the page is loaded and makes its first call"] = first[0][0] * 1000 if first else float("nan")
-            screen = run.wait_for(lambda: [c for c in run.page_calls() if c[3] == "/api/dashboard"])
+            screen = first_screen(run)
             t["the first screen has its data (first page usable)"] = screen[0][0] * 1000 if screen else float("nan")
             time.sleep(1.0)                     # (let the page finish its first round of calls)
             began = time.time()
@@ -614,9 +941,47 @@ def times(root, runs=5):
             print("  %-56s %s" % (name, "yes, every time" if all(v == 0.0 for v in values) else "NOT every time"))
         else:
             print("  %-56s %9.0f   (%.0f to %.0f)" % (name, statistics.median(values), min(values), max(values)))
+
+    # What taking an earlier run's folder away costs a start, with a few
+    # thousand files beside it that are nothing of the app's (the place the
+    # app as it ships uses is Windows' own folder for temporary files).
+    beside = 5000
+    left = Run(root, "offscreen")
+    try:
+        first_screen(left)
+        time.sleep(WRITTEN_DOWN_AFTER_S / 4)    # (WebView2 has made its files)
+        left.end_the_session()                  # ended from outside: its folder stays
+        left.process.wait(60)
+    finally:
+        left.end()
+    time.sleep(3)
+
+    def many_files(run):
+        for n in range(beside):
+            with open(os.path.join(run.data, "tmp%05d.tmp" % n), "w") as f:
+                f.write("x")
+
+    folder = left.window_folder()
+    files = sum(len(names) for _, _, names in os.walk(folder)) if folder and os.path.isdir(folder) else 0
+    run = Run(root, "offscreen", beside=left, plant=many_files)
+    try:
+        seen = run.wait_for(lambda: run.window(shown=True))
+        on_screen = (time.time() - run.began) * 1000 if seen else float("nan")
+        tidied = run.wait_for(lambda: len(run.tidied()) >= 2 and run.tidied(), 30)
+        first_screen(run)
+    finally:
+        run.end()
+    if tidied and folder and not os.path.exists(folder):
+        entries, took, removed, _ = tidied[-1]
+        print("\n  One earlier run's folder (%d files) taken away at the next start, with %d other\n"
+              "  files beside it: %d ms for %d entries looked at and %d folder removed (the shell's\n"
+              "  clock).  It is done on a thread of its own once the window is there: the window was\n"
+              "  on screen after %.0f ms in that run." % (files, beside, took, entries, removed, on_screen))
+    else:
+        print("\n  The earlier run's folder was NOT taken away: %r" % (tidied,))
     print("\nThe window and the page are the real ones. The backend is the app on the fake machine:\n"
           "what depends on it (the first screen's data, the quit) is a trial's time, not a PC's.")
-    return True
+    return bool(tidied)
 
 
 # ─── To look at ──────────────────────────────────────────────────────
