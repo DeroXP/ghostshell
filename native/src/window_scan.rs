@@ -15,8 +15,7 @@
 
 use std::collections::HashSet;
 
-use serde_json::{json, Value};
-
+use crate::json::Json;
 use crate::procs;
 use crate::win32;
 
@@ -61,9 +60,9 @@ pub fn short_name(image: &str) -> String {
 
 /// `q: windowed_processes` - [{"pid", "name", "ws"}]: every process with a
 /// main window, its name as Get-Process prints it and its working set in bytes.
-pub fn windowed_processes() -> Result<Value, String> {
+pub fn windowed_processes() -> Result<Json, String> {
     let with_window = pids_with_a_main_window()?;
-    let rows: Vec<Value> = procs::snapshot()?
+    let rows = procs::snapshot()?
         .iter()
         .filter(|p| with_window.contains(&p.pid))
         .map(|p| {
@@ -76,10 +75,10 @@ pub fn windowed_processes() -> Result<Value, String> {
             } else {
                 short_name(&p.image)
             };
-            json!({ "pid": p.pid, "name": name, "ws": p.working_set })
+            Json::object([("pid", p.pid.into()), ("name", name.into()), ("ws", p.working_set.into())])
         })
         .collect();
-    Ok(Value::Array(rows))
+    Ok(Json::Array(rows))
 }
 
 #[cfg(test)]

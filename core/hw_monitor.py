@@ -320,7 +320,7 @@ def _gpu_from_native():
             "vram_pct": None}
     used, total = live.get("mem_used_bytes"), live.get("mem_total_bytes")
     if used is not None and total is not None:
-        used, total = used // 1048576, total // 1048576     # whole MiB, as nvidia-smi prints them
+        used, total = round(used / 1048576), round(total / 1048576)     # whole MiB, rounded as nvidia-smi prints them
         data["vram_pct"] = round(used / total * 100, 1) if total > 0 else 0
     return data
 

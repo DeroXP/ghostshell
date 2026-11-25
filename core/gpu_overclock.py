@@ -487,7 +487,13 @@ def _live_state_from_native():
     so an answer without it is not taken.
 
     A value the card does not report is 0 here, as it is from nvidia-smi
-    (which prints "[N/A]" for it)."""
+    (which prints "[N/A]" for it).
+
+    One reading can differ by a degree between the two ways.  The driver
+    reports the temperature in whole degrees, rounded, and that is what the
+    helper returns.  Current drivers make nvidia-smi print it with decimals
+    ("53.64"), which the nvidia-smi path below cuts off (53) where the driver
+    itself says 54.  On drivers that print whole degrees the two are equal."""
     live = native.gpu_live()
     if live is None or live.get("temp_c") is None:
         return None

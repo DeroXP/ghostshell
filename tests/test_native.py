@@ -355,7 +355,8 @@ def test_the_other_watchers_use_the_same_scan():
 # ═════════════════════════════════════════════════════════════════════
 LIVE = {"temp_c": 55, "gpu_util_pct": 64, "mem_util_pct": 10, "core_mhz": 3225, "mem_mhz": 16226,
         "core_max_mhz": 3090, "mem_max_mhz": 14001, "core_app_mhz": None, "mem_app_mhz": None, "power_mw": 147560,
-        "power_limit_mw": 300000, "fan_pct": 33, "mem_used_bytes": 10022 * MB + 4096, "mem_total_bytes": 16303 * MB}
+        "power_limit_mw": 300000, "fan_pct": 33, "mem_used_bytes": int(10021.64 * MB), "mem_total_bytes": 16303 * MB}
+# (10021.64 MiB in use: nvidia-smi prints that rounded, 10022, as measured against the real card)
 SMI = {"clocks.current.graphics": "3225", "clocks.current.memory": "16226", "temperature.gpu": "55.10",
        "power.draw": "147.56", "utilization.gpu": "64", "utilization.memory": "10", "fan.speed": "33",
        "power.limit": "300.00", "clocks.applications.graphics": "[N/A]", "clocks.applications.memory": "[N/A]",

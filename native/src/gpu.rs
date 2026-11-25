@@ -16,8 +16,7 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
-
+use crate::json::Json;
 use crate::win32;
 
 type Device = *mut c_void;
@@ -267,28 +266,28 @@ impl Reading {
         *self == Reading::default()
     }
 
-    pub fn to_json(&self) -> Value {
-        json!({
-            "temp_c": self.temp_c,
-            "gpu_util_pct": self.gpu_util_pct,
-            "mem_util_pct": self.mem_util_pct,
-            "core_mhz": self.core_mhz,
-            "mem_mhz": self.mem_mhz,
-            "core_max_mhz": self.core_max_mhz,
-            "mem_max_mhz": self.mem_max_mhz,
-            "core_app_mhz": self.core_app_mhz,
-            "mem_app_mhz": self.mem_app_mhz,
-            "power_mw": self.power_mw,
-            "power_limit_mw": self.power_limit_mw,
-            "fan_pct": self.fan_pct,
-            "mem_used_bytes": self.mem_used_bytes,
-            "mem_total_bytes": self.mem_total_bytes,
-        })
+    pub fn to_json(&self) -> Json {
+        Json::object([
+            ("temp_c", self.temp_c.into()),
+            ("gpu_util_pct", self.gpu_util_pct.into()),
+            ("mem_util_pct", self.mem_util_pct.into()),
+            ("core_mhz", self.core_mhz.into()),
+            ("mem_mhz", self.mem_mhz.into()),
+            ("core_max_mhz", self.core_max_mhz.into()),
+            ("mem_max_mhz", self.mem_max_mhz.into()),
+            ("core_app_mhz", self.core_app_mhz.into()),
+            ("mem_app_mhz", self.mem_app_mhz.into()),
+            ("power_mw", self.power_mw.into()),
+            ("power_limit_mw", self.power_limit_mw.into()),
+            ("fan_pct", self.fan_pct.into()),
+            ("mem_used_bytes", self.mem_used_bytes.into()),
+            ("mem_total_bytes", self.mem_total_bytes.into()),
+        ])
     }
 }
 
 /// `q: gpu_live` - the first NVIDIA card's readings.
-pub fn live() -> Result<Value, String> {
+pub fn live() -> Result<Json, String> {
     let mut state = STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = Instant::now();
     if let Some(until) = state.hold_until {
@@ -329,12 +328,12 @@ pub fn live() -> Result<Value, String> {
 
 /// `q: gpu_release` - let go of the NVIDIA library now and do not open it
 /// again for `hold_s` seconds (a driver installer is about to replace it).
-pub fn release(hold_s: u64) -> Value {
+pub fn release(hold_s: u64) -> Json {
     let mut state = STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let was_open = state.nvml.take().is_some();
     state.failed_at = None;
     state.hold_until = (hold_s > 0).then(|| Instant::now() + Duration::from_secs(hold_s.min(3600)));
-    json!({ "released": was_open, "hold_s": hold_s.min(3600) })
+    Json::object([("released", was_open.into()), ("hold_s", hold_s.min(3600).into())])
 }
 
 #[cfg(test)]
@@ -353,10 +352,10 @@ mod tests {
     fn a_reading_keeps_missing_values_as_null() {
         let r = Reading { temp_c: Some(55), power_mw: Some(147_560), ..Default::default() };
         let j = r.to_json();
-        assert_eq!(j["temp_c"], 55);
-        assert_eq!(j["power_mw"], 147_560);
+        assert_eq!(j["temp_c"].as_u64(), Some(55));
+        assert_eq!(j["power_mw"].as_u64(), Some(147_560));
         assert!(j["fan_pct"].is_null() && j["mem_used_bytes"].is_null());
-        assert_eq!(j.as_object().unwrap().len(), 14);
+        assert!(matches!(&j, Json::Object(pairs) if pairs.len() == 14));
         assert!(!r.is_empty() && Reading::default().is_empty());
     }
 
@@ -371,7 +370,7 @@ mod tests {
             }
         }
         let released = release(2);
-        assert_eq!(released["hold_s"], 2);
+        assert_eq!(released["hold_s"].as_u64(), Some(2));
         assert!(live().unwrap_err().contains("released"));
         release(0); // lift the hold again
     }

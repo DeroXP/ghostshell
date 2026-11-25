@@ -6,8 +6,7 @@
 //! works for protected processes too and costs about a millisecond, where
 //! asking each process in turn (psutil) cost the app a quarter of a core.
 
-use serde_json::{json, Value};
-
+use crate::json::Json;
 use crate::win32::{self, read};
 
 /// One process, as the snapshot describes it.
@@ -124,12 +123,18 @@ pub fn display_name(p: &Process) -> String {
 }
 
 /// `q: process_io` - [{"pid", "name", "other_bytes"}] for every process.
-pub fn process_io() -> Result<Value, String> {
-    let rows: Vec<Value> = snapshot()?
+pub fn process_io() -> Result<Json, String> {
+    let rows = snapshot()?
         .iter()
-        .map(|p| json!({ "pid": p.pid, "name": display_name(p), "other_bytes": p.other_bytes }))
+        .map(|p| {
+            Json::object([
+                ("pid", p.pid.into()),
+                ("name", display_name(p).into()),
+                ("other_bytes", p.other_bytes.into()),
+            ])
+        })
         .collect();
-    Ok(Value::Array(rows))
+    Ok(Json::Array(rows))
 }
 
 #[cfg(test)]
@@ -179,9 +184,9 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|r| r["pid"] == std::process::id())
+            .find(|r| r["pid"].as_u64() == Some(std::process::id() as u64))
             .expect("this process");
         assert!(me["name"].as_str().unwrap().ends_with(".exe"));
-        assert!(me["other_bytes"].is_u64());
+        assert!(me["other_bytes"].as_u64().is_some());
     }
 }
