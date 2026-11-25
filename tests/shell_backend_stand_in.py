@@ -47,6 +47,7 @@ backend that is up, and gives no usable answer, is asked.
 import sandbox as m                                 # noqa: F401  (first: the fake machine)
 
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -115,6 +116,36 @@ def main():
         else:
             m.NATIVE.pop("gpu_live", None)
         return A.jsonify({"ok": True, "card": says})
+
+    # The call that starts a graphics driver's installer.  Nothing of an
+    # install is ever run by a trial, not on the fake machine either: the
+    # app's own function is taken out of the call, which answers what a
+    # trial tells it to (that an installer was started, or that none was).
+    # At the moment the call arrives it looks whether a reader for the
+    # graphics card runs on this PC, and keeps what it found: the shell has
+    # to have ended its reader before it passes the call on.
+    install = {"starts": False, "readers_when_asked": []}
+
+    def readers_now():
+        listed = m.REAL_POPEN([os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32", "tasklist.exe"), "/fi",
+                               "imagename eq VisporaGpuReader.exe", "/fo", "csv", "/nh"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).communicate()[0]
+        return sorted(int(row.split('","')[1]) for row in listed.splitlines() if row.lower().startswith('"visporagpureader.exe"'))
+
+    def the_install_is_asked_for():
+        install["readers_when_asked"].append(readers_now())
+        if install["starts"]:
+            return A.jsonify({"ok": True, "msg": "NVIDIA installer launched. (A trial: nothing was started.)"})
+        return A.jsonify({"ok": False, "err": "Driver installer not downloaded yet"})
+
+    A.app.view_functions["api_driver_install"] = the_install_is_asked_for
+
+    @A.app.route("/api/stand-in/driver-install", methods=["POST"])
+    def an_install_starts_or_not():
+        told = A.request.get_json(force=True, silent=True) or {}
+        if "starts" in told:
+            install["starts"] = bool(told["starts"])
+        return A.jsonify({"ok": True, "starts": install["starts"], "readers_when_asked": install["readers_when_asked"]})
 
     whole = A.app.view_functions["api_tray_state"]
 

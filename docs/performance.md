@@ -565,57 +565,76 @@ the coldest of the seven things the plan lists as running all the time: it
 has run only while its page is open since 3.8.0. It went first because it
 is the smallest, not because it was slow.
 
-Measured with `python shell_rs/try_it.py --moved`: two shells, each with a
-backend on the fake machine, whose card gives every reading the same. One
-answers the sampler's calls itself, and asks its backend for the card's
-reading for every sample: the shell does not read the card itself
-([rust-port.md](rust-port.md), "Item 1, cut into pieces", says why). The
-other passes the calls on, and the backend's own sampler runs. Both sample
-for a minute, and then the same call is made 300 times in each (the middle
-value, and the slowest one in twenty). Processor time is counted in the
-processor's cycles, not in the ticks Windows charges by: work that comes
-in short bursts is charged wrongly by those.
+Measured with `python shell_rs/try_it.py --moved`: three shells, each with
+a backend on the fake machine, whose card gives every reading the same.
 
-| | In the backend, behind the shell | In the shell |
-| --- | --- | --- |
-| One reading of the card | 0.14 ms through the helper ("What the first native piece changes"); a started `nvidia-smi` without it | the same reading, asked of the backend: there after 0.84 ms (the slowest of 2,000: 1.7 ms), and **2.65 ms of the backend's processor time** |
-| The chart's data, a minute of it (`/api/perf/samples?seconds=60`) | 1.21 ms (1.37) | **0.14 ms** (0.16) |
-| The score (`/api/perf/score?seconds=30`) | 1.12 ms (1.26) | **0.011 ms** (0.014) |
-| `/api/perf/status` | 0.99 ms (1.19) | **0.003 ms** (0.005) |
-| Processor time while the sampler runs, of one core | the backend 0.07%, the shell 0.01% | the backend **1.32%**, the shell 0.24%: together 1.57% |
-| While the Monitor page is closed | nothing | nothing |
+* **With its reader**: the shell answers the sampler's calls itself, and
+  the card is read by the graphics card's own reader, a small program the
+  shell starts for it ([rust-port.md](rust-port.md), "Item 1, cut into
+  pieces", says why the shell's own process does not read the card). It
+  reads this PC's real card.
+* **Asking its backend**: the shell answers the calls itself and has no
+  reader, so every reading is a call to its backend. That is how it is
+  while a driver is being installed, on a PC whose card gives the reader
+  no reading, and in a shell whose pack carries no reader.
+* **Passed on**: the backend's own sampler runs.
 
-What is real in these numbers: the shell's sampling and its answers, and a
-call's way through the shell to a backend and back. What is a trial's: what
-the backend does for one reading of the card. On the fake machine it reads
-a table, which costs nothing; on a PC it asks the helper (the 0.14 ms
-above, five times a second: another 0.07% of one core in either column).
+Each samples for a minute, and then the same call is made 300 times in
+each (the middle value, and the slowest one in twenty). Processor time is
+counted in the processor's cycles, not in the ticks Windows charges by:
+work that comes in short bursts is charged wrongly by those.
 
-What it comes to, said plainly: **behind the shell the sampler costs more
-than it did in the backend.** The page's two calls every two seconds are
-answered in a tenth of a millisecond where they took two, and nobody waits
-for either. But each of the five samples a second is now a call to the
-backend, and answering a call costs the backend 2.65 ms of processor time
-(a thread, the request read in Python, Flask). That is about 1.5% of one
-core while the Monitor page is open, against about 0.15% for the backend's
-own sampler on a PC. Nothing runs while the page is closed, in either.
+| | In the backend, behind the shell | In the shell, asking its backend | In the shell, with its reader |
+| --- | --- | --- | --- |
+| One reading of the card | 0.14 ms through the helper ("What the first native piece changes"); a started `nvidia-smi` without it | the backend's reading, asked for: 0.87 ms (the slowest of 2,000: 1.7 ms), and 1.9 to 2.7 ms of the backend's processor time | **0.12 ms** (the slowest of 2,000: 1.2 ms) |
+| The chart's data, a minute of it (`/api/perf/samples?seconds=60`) | 1.12 ms (1.34) | 0.13 ms (0.16) | **0.13 ms** (0.15) |
+| The score (`/api/perf/score?seconds=30`) | 1.10 ms (1.32) | 0.011 ms (0.012) | **0.008 ms** (0.009) |
+| `/api/perf/status` | 0.92 ms (1.18) | 0.003 ms (0.004) | **0.003 ms** (0.005) |
+| Processor time while the sampler runs, of one core | the backend 0.06%, the shell 0.01%: 0.07% | the backend 0.94%, the shell 0.23%: 1.17% | the shell 0.04%, its reader 0.13%, the backend 0.01%: **0.18%** |
+| While the Monitor page is closed | nothing | nothing | nothing (the reader is ended ten seconds after the last reading) |
 
-Why it is taken all the same: the shell must not open the graphics
-driver's library, and the samples have to be the ones Python would have,
-also while a driver is installed. And the gain of this piece was never
-speed: it is that a module of the backend now runs in the shell with the
-same answers, which is what the six after it need to have been shown. The
-2.65 ms is also what every call of the page costs the backend, and so what
-each module that moves saves for its own calls.
+The reader itself:
 
-What takes the cost away is a reader for the card that is not the backend
-(the plan says what that would be, and that it is not decided). Until then
-the sampler can be left to the backend with `--all-to-backend`, which
-leaves everything to it.
+| | |
+| --- | --- |
+| From its program being started to its first reading | 40 ms (33 to 41 in seven starts): the process, and NVIDIA's library loaded and started in it |
+| Its process while it runs | 31 MB in memory, 23 MB of them its own: nearly all of it NVIDIA's library |
+| Its program | 0.29 MB; 0.14 MB of the download, squeezed in the pack |
+| While nobody wants a reading | no process |
+
+What is real in these numbers: the reader and its reading of this PC's
+card (an RTX 5070 Ti, driver 621.40), the shell's sampling and its
+answers, and a call's way through the shell to a backend and back. What is
+a trial's: what the backend does for one reading of the card. On the fake
+machine it reads a table, which costs nothing; on a PC it asks the helper
+(the 0.14 ms above, five times a second: another 0.07% of one core in the
+first two columns).
+
+What it comes to: with its reader, the sampler behind the shell costs
+about what the backend's own sampler costs on a PC (0.18% of one core
+against about 0.14%), where it cost eight times that while every reading
+was a call to the backend (the state of things between the first piece
+and this one). The page's two calls every two seconds are answered in a
+tenth of a millisecond where they took two. And none of it needs the
+backend: with the reader, the backend is not asked once in the minute.
+
+What the reader costs that the backend's sampler did not: a process start
+(40 ms) when the Monitor page is opened, 31 MB while it is open, and the
+middle column for as long as the reader is away. That is 900 seconds
+after a driver's install was started, and at all times on a PC whose card
+gives the helper no reading: there the shell pays the 1.17% while the
+Monitor page is open.
+
+The 1.9 to 2.7 ms of the backend's processor time for answering one call
+(a thread, the request read in Python, Flask) is also what every call of
+the page costs the backend, and so what each module that moves saves for
+its own calls.
 
 Not measured: anything with the real backend. Its answer to a call may
 cost more or less than the stand-in's (the same Flask and routes, on
-Python 3.14 here; a release is built with 3.12).
+Python 3.14 here; a release is built with 3.12). And the reader with
+administrator rights, started from the folder the pack is unpacked into
+on a person's PC.
 
 ## Measuring again
 

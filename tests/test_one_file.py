@@ -597,3 +597,71 @@ def test_the_trial_finds_the_pack_tool_where_the_core_is_built_and_says_when_it_
         os.environ.pop("CARGO_TARGET_DIR", None)
         if saved[4] is not None:
             os.environ["CARGO_TARGET_DIR"] = saved[4]
+
+
+# ═════════════════════════════════════════════════════════════════════
+# The graphics card's reader, carried in the pack
+# ═════════════════════════════════════════════════════════════════════
+def test_the_cards_reader_is_carried_in_the_pack_and_started_from_where_the_pack_is_unpacked():
+    """The shell starts a small program of its own for the graphics card's
+    readings (shell_rs/core/src/moved/card.rs says why it is a program of
+    its own).  The shell runs with administrator rights, and so does what
+    it starts: the reader is never started from beside the shell's exe,
+    which is in a folder any program can write to.  It is one more file of
+    the pack, and is started from the folder the pack was unpacked into,
+    which is the administrators' own, checked against the exe and held."""
+    app()
+    main, build, reader = S.app_crate("src", "main.rs"), S.app_crate("build.rs"), S.rust("src", "gpu_reader.rs")
+    # In the pack beside the app's own copy of the C runtime the reader
+    # needs (a Rust program asks Windows for VCRUNTIME140.dll, and Windows
+    # looks beside the program first).
+    assert 'pub const IN_THE_PACK: &str = "_internal\\\\VisporaGpuReader.exe";' in reader and 'pub const PROGRAM: &str = "VisporaGpuReader.exe";' in reader
+    manifest = S.rust("Cargo.toml")
+    assert '[[bin]]\nname = "VisporaGpuReader"\npath = "src/bin/gpu_reader.rs"' in manifest
+    # The exe: from the folder it has just made ready, where the pack has
+    # one, and in no other place.
+    hook = main[main.index("fn the_backend_made_ready("):main.index("/// Open the window, start the backend")]
+    started = 'if pack.has(gpu_reader::IN_THE_PACK) && shell.card_is_read_by(gpu_reader::OwnProgram::at(format!("{}\\\\{}", ready.folder, gpu_reader::IN_THE_PACK))) {'
+    assert hook.index("let ready = backend::make_ready(&pack, way, &places)?;") < hook.index(started)
+    assert main.count("OwnProgram::at(") == 1 and main.count("card_is_read_by(") == 1 and main.count("gpu_reader::") == 3
+    # Started with its two pipe ends and nothing else, in a job that ends with the shell.
+    assert "let (process, to_it, from_it) = win::start_with_pipes(&self.program)?;" in reader
+    assert "std::process" not in reader and "Command" not in reader, "the reader is started in another way as well"
+    win = S.rust("src", "win.rs")
+    start = win[win.index("pub fn start_with_pipes("):win.index("/// Open a link in the person's browser, by way of Explorer.")]
+    for part in ("let given = [its_input.0, its_output.0];", "PROC_THREAD_ATTRIBUTE_HANDLE_LIST, given.as_ptr() as *const c_void",
+                 "limits.basic.flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;", "EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_SUSPENDED",
+                 "startup.info.standard = [its_input.0, its_output.0, std::ptr::null_mut()];", "std::ptr::null(), folder_w.as_ptr(),"):
+        assert part in start, part
+    assert start.index("AssignProcessToJobObject(job.0, process.0)") < start.index("ResumeThread(thread.0);"), "it runs before it is in its job"
+    # (and a backend that is started at that moment does not get the pipe ends either)
+    assert win.count("let _one_at_a_time = STARTING.lock()") == 2
+    # The exe that ships is not built with a pack that has no reader.
+    assert 'let ships = std::env::var_os("CARGO_FEATURE_ELEVATED").is_some();' in build
+    assert "if ships && !vispora_shell_core::pack::Pack::read(&bytes).is_ok_and(|pack| pack.has(reader)) {" in build
+    # A folder's programs that are tried first, before it is taken away,
+    # are the ones at its top and the reader.
+    go = win[win.index("pub fn programs_let_go("):win.index("/// Remove what earlier runs left behind")]
+    assert "programs.chain(std::iter::once(folder.join(crate::gpu_reader::IN_THE_PACK)))" in go
+
+    reader_exe = S.built_tool("VisporaGpuReader.exe")
+    if not (S.TRY and reader_exe):
+        return
+    # The tool: a pack with the reader in it, and one without.
+    folder = a_made_up_backend("with-reader")
+    without, with_it = os.path.join(m.ROOT, "one-file", "without.pack"), os.path.join(m.ROOT, "one-file", "with-reader.pack")
+    code, said, complaint = pack_tool("--pack", folder, without, "lzms")
+    assert code == 0 and json.loads(said)["reader"] is False and json.loads(said)["files"] == 3, complaint
+    code, said, complaint = pack_tool("--pack", folder, with_it, "lzms", "--reader", reader_exe)
+    assert code == 0, complaint
+    says = json.loads(said)
+    assert (says["reader"], says["files"], says["bytes"]) == (True, 4, 23 + 99000 + os.path.getsize(reader_exe)), says
+    assert says["kept_as"] != json.loads(pack_tool("--pack-says", without)[1])["kept_as"], "the folder that stays has the same name with and without the reader"
+    assert sorted(os.listdir(os.path.join(folder, "_internal"))) == ["empty.txt", "python312.dll"], "the reader was put into the folder that was packed"
+    # A reader that is not there is said, and no pack is made.
+    nothing = os.path.join(m.ROOT, "one-file", "nothing.pack")
+    code, said, complaint = pack_tool("--pack", folder, nothing, "lzms", "--reader", os.path.join(m.ROOT, "one-file", "no-such-reader.exe"))
+    assert code == 1 and "is not there to be carried as _internal\\VisporaGpuReader.exe" in complaint and not os.path.exists(nothing), complaint
+    for wrong in (("--pack", folder, nothing, "lzms", "--reader"), ("--pack", folder, nothing, "lzms", "--with", reader_exe)):
+        assert pack_tool(*wrong)[0] != 0 and not os.path.exists(nothing), wrong
+

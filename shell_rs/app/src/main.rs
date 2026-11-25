@@ -30,6 +30,7 @@ use tauri::{RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use vispora_shell_core::http::Request;
 use vispora_shell_core::instance::{self, Begin, Held};
 use vispora_shell_core::json::Json;
+use vispora_shell_core::gpu_reader;
 use vispora_shell_core::moved;
 use vispora_shell_core::platform::{Command, Window};
 use vispora_shell_core::pack::Pack;
@@ -273,6 +274,13 @@ fn the_backend_made_ready(shell: &Arc<Shell>, carried: &'static [u8], places: ba
         let ready = backend::make_ready(&pack, way, &places)?;
         for line in &ready.said {
             shell.say(line);
+        }
+        // The graphics card's reader, where the pack carries one: started
+        // from the folder that was just made ready, which is checked and
+        // held like everything the shell starts with its rights, and from
+        // nowhere else (core/src/gpu_reader.rs).
+        if pack.has(gpu_reader::IN_THE_PACK) && shell.card_is_read_by(gpu_reader::OwnProgram::at(format!("{}\\{}", ready.folder, gpu_reader::IN_THE_PACK))) {
+            shell.say("the graphics card has a reader of its own in that folder: it is started while a reading is wanted");
         }
         shell.say(&format!("the background program was ready to be started {} ms after that began", began.elapsed().as_millis()));
         // Folders that stay and are not this pack's are taken away (all of

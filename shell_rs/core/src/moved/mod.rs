@@ -31,14 +31,16 @@
 //!   tools/measure/nvml_release.py).  A driver's installer has to replace
 //!   that file.  The shell lives for as long as the app does, so it does
 //!   not open the library at all: `Real` refuses every question about the
-//!   card, and the card's reading is asked of the backend (`Card`), which
-//!   reads the card the way it always did (its own copy of the library, or
-//!   nvidia-smi).  It is the reading the Python modules take themselves, so
-//!   a module that lives on it gives Python's answers at all times, also
-//!   while a driver is installed.
+//!   card.  The card is read by a small program of the shell's own, which
+//!   the shell starts while a reading is wanted and ends before a driver's
+//!   installer is started; and by the backend wherever that program is
+//!   away or has no reading (card.rs).  Either way it is the reading the
+//!   Python modules take themselves, so a module that lives on it gives
+//!   Python's answers at all times, also while a driver is installed.
 //!
 //! What has moved so far: the performance sampler (perf.rs).
 
+pub mod card;
 pub mod perf;
 
 use std::collections::HashMap;
@@ -46,6 +48,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::http::{Request, Response};
 use crate::json::Json;
+
+pub use card::{AskBackend, Card, FakeBackend, FakeReaders, FakeReading, From, Live, Reader, Readers, Say, HOLD_FOR_AN_INSTALL_S, IDLE_S, THE_BACKENDS_READING};
 
 /// The door to the machine, for everything that has moved: questions only.
 pub trait Readings: Send + Sync {
@@ -130,109 +134,6 @@ impl Readings for Fake {
     }
 }
 
-/// A made-up backend: asked, it says what it was told to say, whatever
-/// it is asked for, and keeps what it was asked.
-#[derive(Default)]
-pub struct FakeBackend {
-    says: Mutex<Option<Json>>,
-    asked: Mutex<Vec<String>>,
-}
-
-impl FakeBackend {
-    pub fn new() -> Arc<FakeBackend> {
-        Arc::new(FakeBackend::default())
-    }
-
-    /// From now on it says this (None: it does not answer).
-    pub fn says(&self, answer: Option<Json>) {
-        *self.says.lock().unwrap_or_else(|p| p.into_inner()) = answer;
-    }
-
-    /// What it was asked so far, in order.
-    pub fn asked(&self) -> Vec<String> {
-        self.asked.lock().unwrap_or_else(|p| p.into_inner()).clone()
-    }
-
-    /// The way to ask it (`Moved::asks_the_backend_with`).
-    pub fn asker(self: &Arc<Self>) -> AskBackend {
-        let backend = self.clone();
-        Arc::new(move |path: &str| {
-            backend.asked.lock().unwrap_or_else(|p| p.into_inner()).push(path.to_string());
-            backend.says.lock().unwrap_or_else(|p| p.into_inner()).clone()
-        })
-    }
-}
-
-// ═════════════════════════════════════════════════════════════════════
-// The graphics card: its reading is the backend's
-// ═════════════════════════════════════════════════════════════════════
-
-/// A way to ask the backend something with GET: its answer, or None where
-/// there is no backend to ask or it did not answer "200" in time.
-pub type AskBackend = Arc<dyn Fn(&str) -> Option<Json> + Send + Sync>;
-
-/// The backend's call that gives the card's reading as the app reads it
-/// (app.py, api_gpu_oc_live: `gpu_overclock.read_live_state()` and nothing
-/// else).  It is a call of the GPU overclock page, and it only reads: none
-/// of the overclock's own code has moved or is called from here.
-pub const THE_BACKENDS_READING: &str = "/api/gpu/oc/live";
-
-/// What the card says, in the app's own form: what
-/// `gpu_overclock.read_live_state()` gives, as far as what has moved uses it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Live {
-    pub core_mhz: i128,
-    pub mem_mhz: i128,
-    pub temp_c: i128,
-    pub power_w: f64,
-    pub gpu_util_pct: i128,
-    pub mem_util_pct: i128,
-    pub fan_pct: i128,
-}
-
-/// The card, for everything that has moved and reads it (see the top of
-/// this file for why the shell does not read it itself).
-pub struct Card {
-    door: Arc<dyn Readings>,
-    backend: Mutex<Option<AskBackend>>,
-}
-
-impl Card {
-    fn new(door: Arc<dyn Readings>) -> Card {
-        Card { door, backend: Mutex::new(None) }
-    }
-
-    pub fn now(&self) -> f64 {
-        self.door.now()
-    }
-
-    /// What the card says now: the backend's reading of it.  None where
-    /// there is no backend to ask (it is still starting, or gone), and
-    /// where it has no reading either (its answer says so: no NVIDIA card,
-    /// no driver, no nvidia-smi).
-    pub fn live(&self) -> Option<Live> {
-        let ask = self.backend.lock().unwrap_or_else(|p| p.into_inner()).clone()?;
-        let said = ask(THE_BACKENDS_READING)?;
-        if !said.get("ok").is_some_and(Json::truthy) {
-            return None;
-        }
-        // Each value as the Python modules read it off that answer:
-        // `int(s.get(name) or 0)`, and `float(s.get(name) or 0.0)` for the watts.
-        let number = |name: &str| match said.get(name) {
-            Some(Json::Int(whole)) => *whole as f64,
-            Some(Json::Float(number)) if number.is_finite() => *number,
-            Some(Json::Bool(true)) => 1.0,
-            _ => 0.0,
-        };
-        let whole = |name: &str| match said.get(name) {
-            Some(Json::Int(whole)) => *whole,
-            _ => number(name).trunc() as i128,
-        };
-        Some(Live { core_mhz: whole("core_mhz"), mem_mhz: whole("mem_mhz"), temp_c: whole("temp_c"), power_w: number("power_w"),
-                    gpu_util_pct: whole("gpu_util_pct"), mem_util_pct: whole("mem_util_pct"), fan_pct: whole("fan_pct") })
-    }
-}
-
 /// Everything that has moved, with the door it reads the machine through.
 pub struct Moved {
     pub card: Arc<Card>,
@@ -240,17 +141,31 @@ pub struct Moved {
 }
 
 impl Moved {
-    /// `threads`: may what has moved run threads of its own (the sampler's)?
-    /// Not where a test moves the clock by hand and takes every reading
-    /// itself (`perf::Sampler::step`).
+    /// `threads`: may what has moved run threads of its own (the sampler's,
+    /// and the one that looks after the card's reader)?  Not where a test
+    /// moves the clock by hand and does every round itself
+    /// (`perf::Sampler::step`, `Card::tend`).
     pub fn new(door: Arc<dyn Readings>, threads: bool) -> Arc<Moved> {
-        Arc::new(Moved { card: Arc::new(Card::new(door)), perf: perf::Sampler::new(threads) })
+        Arc::new(Moved { card: Arc::new(Card::new(door, threads)), perf: perf::Sampler::new(threads) })
     }
 
-    /// How the backend is asked for what the shell does not read itself
-    /// (the graphics card).
+    /// How the backend is asked for the graphics card's reading, where the
+    /// card's own reader is away or has none.
     pub fn asks_the_backend_with(&self, ask: AskBackend) {
-        *self.card.backend.lock().unwrap_or_else(|p| p.into_inner()) = Some(ask);
+        self.card.asks_the_backend_with(ask);
+    }
+
+    /// Is this the call that starts a graphics driver's installer?  It is
+    /// the backend's to answer, but the card's reader has to be gone before
+    /// the backend hears of it (`Card::around_a_driver_install`).
+    ///
+    /// The app starts an installer in one place, behind one call
+    /// (app.py, api_driver_install).  The path is held against the route
+    /// the way the web framework holds it, which reads a letter that is
+    /// written as "%" and two digits as that letter: a call that the
+    /// backend would take for this one is this one here too.
+    pub fn starts_a_driver_install(request: &Request) -> bool {
+        request.method == "POST" && as_the_backend_reads_a_path(request.path()) == THE_DRIVER_INSTALL
     }
 
     /// The shell's own answer to a call of the page, or None: the call is
@@ -261,6 +176,30 @@ impl Moved {
         }
         None
     }
+}
+
+/// The backend's call that starts a graphics driver's installer.
+pub const THE_DRIVER_INSTALL: &str = "/api/driver/install";
+
+/// A call's path with every "%" and two digits read as the letter they
+/// stand for, as the backend's web framework reads a path before it looks
+/// for the route.  (Letters that are not text become one that no route has.)
+fn as_the_backend_reads_a_path(path: &str) -> String {
+    let (bytes, mut out, mut at) = (path.as_bytes(), Vec::with_capacity(path.len()), 0);
+    while at < bytes.len() {
+        let hex = |byte: u8| (byte as char).to_digit(16);
+        match (bytes[at], bytes.get(at + 1).copied().and_then(hex), bytes.get(at + 2).copied().and_then(hex)) {
+            (b'%', Some(high), Some(low)) => {
+                out.push((high * 16 + low) as u8);
+                at += 3;
+            }
+            (byte, ..) => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -423,43 +362,24 @@ mod tests {
     }
 
     #[test]
-    fn the_cards_reading_is_the_backends_read_as_python_reads_it() {
-        let machine = Fake::new();
-        machine.at(1000.5);
-        let moved = Moved::new(machine.clone(), false);
-        // No backend to ask: no reading.  And the card is not asked through
-        // the door, whatever the made-up machine would say: the shell does
-        // not open the driver's library.
-        machine.answers("gpu_live", Some(Json::object([("temp_c", 61.into())])));
-        assert_eq!((moved.card.live(), moved.card.now()), (None, 1000.5));
-        assert!(machine.asked().is_empty(), "the card was asked through the shell's own door: {:?}", machine.asked());
-        // A backend to ask: its reading, asked for with its own call.
-        let says = Arc::new(Mutex::new(None::<Json>));
-        let (answer, asked) = (says.clone(), Arc::new(Mutex::new(Vec::new())));
-        let seen = asked.clone();
-        moved.asks_the_backend_with(Arc::new(move |path: &str| {
-            seen.lock().unwrap().push(path.to_string());
-            answer.lock().unwrap().clone()
-        }));
-        let backend_says = |text: Option<&str>| {
-            *says.lock().unwrap() = text.map(|text| Json::parse(text).unwrap());
-            moved.card.live()
-        };
-        let whole = r#"{"ok": true, "core_mhz": 2100, "mem_mhz": 9501, "temp_c": 61, "power_w": 215.44, "power_limit_w": 320.0, "gpu_util_pct": 97,
-                        "mem_util_pct": 40, "fan_pct": 55, "core_app_mhz": 2100, "mem_app_mhz": 9501, "core_max_mhz": 2200, "mem_max_mhz": 9800}"#;
-        assert_eq!(backend_says(Some(whole)), Some(Live { core_mhz: 2100, mem_mhz: 9501, temp_c: 61, power_w: 215.44, gpu_util_pct: 97, mem_util_pct: 40, fan_pct: 55 }));
-        assert_eq!(*asked.lock().unwrap(), [THE_BACKENDS_READING]);
-        // What is not there, nothing and false are 0, and true is 1; a
-        // number with a fraction is cut; whole watts are watts.
-        assert_eq!(backend_says(Some(r#"{"ok": true, "core_mhz": 1800.9, "temp_c": 70.0, "power_w": 100, "gpu_util_pct": null, "fan_pct": false, "mem_util_pct": true}"#)),
-                   Some(Live { core_mhz: 1800, mem_mhz: 0, temp_c: 70, power_w: 100.0, gpu_util_pct: 0, mem_util_pct: 1, fan_pct: 0 }));
-        assert_eq!(backend_says(Some(r#"{"ok": 1}"#)), Some(Live { core_mhz: 0, mem_mhz: 0, temp_c: 0, power_w: 0.0, gpu_util_pct: 0, mem_util_pct: 0, fan_pct: 0 }));
-        // The backend has no reading either, or says something else, or nothing.
-        for none in [Some(r#"{"ok": false, "err": "No NVIDIA GPU / nvidia-smi missing", "temp_c": 99}"#), Some(r#"{"temp_c": 99}"#), Some(r#"{"ok": 0, "temp_c": 9}"#),
-                     Some(r#"[1, 2]"#), Some(r#""warm""#), None] {
-            assert_eq!(backend_says(none), None, "{none:?}");
+    fn the_call_that_starts_a_drivers_installer_is_known_however_it_is_written() {
+        let is_it = |method: &str, target: &str| Moved::starts_a_driver_install(&Request::new(method, target));
+        for target in ["/api/driver/install", "/api/driver/install?x=1", "/api/driver/install?", "/api/driver/%69nstall", "/api/%64river/install",
+                       "/api%2Fdriver%2Finstall", "/%61%70%69/driver/install", "/api/driver/instal%6C?next=/api/other", "/api/driver/inst%61ll#x"] {
+            assert!(is_it("POST", target), "{target}");
         }
-        assert!(machine.asked().is_empty());
+        // (a method is passed on in capital letters, however it was written)
+        assert!(is_it("post", "/api/driver/install"));
+        // Another method does not start one (the backend answers it with
+        // words of its own), and neither does another path.
+        for (method, target) in [("GET", "/api/driver/install"), ("PUT", "/api/driver/install"), ("HEAD", "/api/driver/install"), ("OPTIONS", "/api/driver/install"),
+                                 ("POST", "/api/driver/install/"), ("POST", "/api/driver/Install"), ("POST", "/api/driver/installer"), ("POST", "/api/driver"),
+                                 ("POST", "/api/driver/status"), ("POST", "/api/driver/download"), ("POST", "/api/driver/install%"), ("POST", "/api/driver/install%2"),
+                                 ("POST", "/api/driver/%zznstall"), ("POST", "/api/perf/start"), ("POST", "/api/other?next=/api/driver/install"),
+                                 ("POST", "/api/driver/install%00"), ("POST", "/api/driver/inst%FFall")] {
+            assert!(!is_it(method, target), "{method} {target}");
+        }
+        assert_eq!(as_the_backend_reads_a_path("/a%20b/%C3%A9/%41%zz%4"), "/a b/\u{e9}/A%zz%4");
     }
 
     #[test]

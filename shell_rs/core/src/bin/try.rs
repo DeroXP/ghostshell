@@ -2,12 +2,17 @@
 //! or a script.
 //!
 //!     vispora-shell-try --backend <program> [--arg <argument>]... [--cwd <folder>]
-//!                       [--appdata <folder>] [--version <v>] [--readings real]
+//!                       [--appdata <folder>] [--version <v>] [--readings real] [--card-reader <program>]
 //!                       [--ready-within <seconds>] [--quit-within <seconds>] [--calls-wait <seconds>]
 //!
 //! With `--readings real` the shell answers the calls that have moved from
 //! the backend itself (src/moved/: they only read; the graphics card's
 //! reading is asked of the backend).  Without it every call is the backend's.
+//! With `--card-reader <program>` as well, the graphics card is read by
+//! that program (the reader that was built beside this tool:
+//! VisporaGpuReader.exe), started while a reading is wanted, and by the
+//! backend only where it is away or has none.  It reads this PC's card,
+//! and only reads.
 //!
 //! It starts the backend it is told to start (and only that: there is no
 //! default), then reads one JSON object per line from standard input and
@@ -62,6 +67,10 @@ fn state_of(shell: &Shell) -> Json {
     Json::object([
         ("phase", text_of(&shell.phase()).into()),
         ("backend_pid", shell.backend_pid().map_or(Json::Null, Into::into)),
+        ("card_reader_pid", shell.card_reader_pid().map_or(Json::Null, Into::into)),
+        ("card_readings_from", shell.card_readings_from().map_or(Json::Null, |from| Json::object([
+            ("reader", from.reader.into()), ("backend", from.backend.into()), ("nowhere", from.nowhere.into()),
+        ]))),
         ("port", (shell.port() as u32).into()),
         ("listen", shell.listening_handle().into()),
         ("starts", (shell.starts() as u32).into()),
@@ -87,6 +96,7 @@ fn settings_from(arguments: &[String]) -> Result<Settings, String> {
             // (looked at in main: the shell is given its door once it is made)
             "--readings" if value == "real" => {}
             "--readings" => return Err("--readings takes \"real\" and nothing else".to_string()),
+            "--card-reader" => {}
             "--ready-within" | "--quit-within" | "--calls-wait" => {
                 numbers.push((word.clone(), value.parse().map_err(|_| format!("{word} needs a number of seconds"))?))
             }
@@ -211,12 +221,19 @@ fn main() {
     }
     // Make a pack of a folder (the backend, built as a folder), and say
     // what a pack holds: how the exe's build gets what it carries.
-    if arguments.len() == 4 && arguments[0] == "--pack" {
+    //
+    //     --pack <folder> <pack> <way> [--reader <VisporaGpuReader.exe>]
+    //
+    // With --reader the pack also carries the graphics card's reader, which
+    // is built with this tool and not with the app.
+    let with_reader = arguments.len() == 6 && arguments[4] == "--reader";
+    if (arguments.len() == 4 || with_reader) && arguments[0] == "--pack" {
         let Some(way) = pack::Way::named(&arguments[3]) else {
             eprintln!("{} is no way to squeeze: plain, mszip, xpress-huff or lzms", arguments[3]);
             std::process::exit(2);
         };
-        let made = pack::make(&arguments[1], vispora_shell_core::APP_VERSION, "VisporaBackend.exe", way)
+        let more: Vec<(String, String)> = if with_reader { vec![(vispora_shell_core::gpu_reader::IN_THE_PACK.to_string(), arguments[5].clone())] } else { Vec::new() };
+        let made = pack::make_with(&arguments[1], vispora_shell_core::APP_VERSION, "VisporaBackend.exe", way, &more)
             .and_then(|bytes| std::fs::write(&arguments[2], &bytes).map_err(|e| format!("{}: {e}", arguments[2])));
         if let Err(why) = made {
             eprintln!("{why}");
@@ -234,6 +251,7 @@ fn main() {
                 ("bytes", (read.size() as u64).into()),
                 ("packed", (bytes.len() as u64).into()),
                 ("id", read.id.as_str().into()),
+                ("reader", read.has(vispora_shell_core::gpu_reader::IN_THE_PACK).into()),
                 ("kept_as", vispora_shell_core::backend::kept_name(&read).as_str().into()),
             ]))
         });
@@ -253,17 +271,28 @@ fn main() {
     //     {"do": "now", "time": 1000.0}                        what time it is
     //     {"do": "answers", "question": "gpu_live", "answer": {...}}   what the library says (null: nothing)
     //     {"do": "backend_says", "answer": {...}}   what the backend says the card says (null: it does not answer)
+    //     {"do": "reader", "says": {...}}  what the card's own reader says from now on: the helper's answer, or one
+    //                                     of "none" (it has no reading), "silent" (no answer in time), "garbled";
+    //                                     and "cannot_start": true | false
+    //     {"do": "install", "status": 200, "body": "..."}
+    //                                     the call that starts a driver's installer, with what the backend answers it
+    //     {"do": "tend"}                  what the thread that looks after the reader does in one round
     //     {"do": "step"}                  what the sampling thread does in one round
-    //     {"do": "asked"}                 what the library and the backend were asked so far
+    //     {"do": "asked"}                 what the library, the reader and the backend were asked so far
     //     {"do": "call", "method": "GET", "target": "/api/perf/score", "body": "..."}
     //         the shell's own answer ({"status", "body"}), or {"passed_on": true}
     //
     // Nothing of the PC is read: the machine is the table and the clock,
     // and the backend is what it is told to say.
-    if arguments == ["--moved"] {
-        let (machine, backend) = (moved::Fake::new(), moved::FakeBackend::new());
+    // (with --no-reader the made-up shell has no reader for the card, as a
+    // shell whose pack carries none: the card's reading is the backend's)
+    if arguments == ["--moved"] || arguments == ["--moved", "--no-reader"] {
+        let (machine, backend, readers) = (moved::Fake::new(), moved::FakeBackend::new(), moved::FakeReaders::new());
         let moved = Moved::new(machine.clone(), false);
         moved.asks_the_backend_with(backend.asker());
+        if arguments.len() == 1 {
+            moved.card.reads_with(Arc::new(readers.clone()));
+        }
         let out = std::io::stdout();
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
@@ -290,10 +319,49 @@ fn main() {
                         backend.says(asked.get("answer").filter(|answer| **answer != Json::Null).cloned());
                         Json::object([("ok", true.into())])
                     }
-                    Some("asked") => Json::object([
-                        ("library", Json::Array(machine.asked().into_iter().map(Into::into).collect())),
-                        ("backend", Json::Array(backend.asked().into_iter().map(Into::into).collect())),
-                    ]),
+                    Some("reader") => {
+                        if let Some(says) = asked.get("says") {
+                            readers.reads(match says.as_str() {
+                                Some("none") => moved::FakeReading::HasNone,
+                                Some("silent") => moved::FakeReading::IsSilent,
+                                Some("garbled") => moved::FakeReading::Garbles,
+                                _ => moved::FakeReading::Says(says.clone()),
+                            });
+                        }
+                        if let Some(cannot) = asked.get("cannot_start") {
+                            readers.cannot_start(cannot.truthy().then_some("a trial said so"));
+                        }
+                        Json::object([("ok", true.into())])
+                    }
+                    Some("install") => {
+                        let status = asked["status"].as_int().unwrap_or(200) as u16;
+                        let body = asked["body"].as_str().unwrap_or("").as_bytes().to_vec();
+                        let running = readers.clone();
+                        let mut heard_with = Vec::new();
+                        let answer = moved.card.around_a_driver_install(|| {
+                            // (what the backend would see at the moment it hears of the call)
+                            heard_with = running.running();
+                            vispora_shell_core::http::Response::new(status, "application/json", body)
+                        });
+                        Json::object([("status", (answer.status as u32).into()),
+                                      ("readers_when_the_backend_heard", Json::Array(heard_with.into_iter().map(Into::into).collect()))])
+                    }
+                    Some("tend") => Json::object([("still_one", moved.card.tend().into())]),
+                    Some("asked") => {
+                        let (reader, gave) = readers.asked();
+                        let from = moved.card.from();
+                        Json::object([
+                            ("from_the_reader", from.reader.into()),
+                            ("from_the_backend", from.backend.into()),
+                            ("from_nowhere", from.nowhere.into()),
+                            ("library", Json::Array(machine.asked().into_iter().map(Into::into).collect())),
+                            ("backend", Json::Array(backend.asked().into_iter().map(Into::into).collect())),
+                            ("reader", reader.into()),
+                            ("reader_gave", gave.into()),
+                            ("readers_started", readers.started().into()),
+                            ("readers_running", Json::Array(readers.running().into_iter().map(Into::into).collect())),
+                        ])
+                    }
                     Some("step") => {
                         moved.perf.step(&moved.card);
                         Json::object([("ok", true.into())])
@@ -350,6 +418,12 @@ fn main() {
     };
     if arguments.windows(2).any(|pair| pair[0] == "--readings" && pair[1] == "real") {
         shell.reads_with(Arc::new(moved::Real), true);
+    }
+    if let Some(program) = arguments.windows(2).find(|pair| pair[0] == "--card-reader").map(|pair| pair[1].clone()) {
+        if !shell.card_is_read_by(vispora_shell_core::gpu_reader::OwnProgram::at(program)) {
+            eprintln!("--card-reader needs --readings real: without it nothing in the shell wants a reading");
+            std::process::exit(2);
+        }
     }
     let out = std::io::stdout();
     let say = |value: Json| {

@@ -242,11 +242,11 @@ class Trial:
     """The shell's trial tool with the stand-in backend, and a conversation
     with it: one JSON line asked, one answered."""
 
-    def __init__(self, *backend_args, quit_within=None, notes=None):
+    def __init__(self, *backend_args, quit_within=None, notes=None, tool_args=()):
         command = [TRY, "--backend", sys.executable, "--arg", "-u", "--arg", STAND_IN, "--arg", "--backend"]
         for arg in backend_args:
             command += ["--arg", arg]
-        command += ["--appdata", config.APPDATA_DIR, "--ready-within", "90"]
+        command += ["--appdata", config.APPDATA_DIR, "--ready-within", "90", *tool_args]
         if quit_within is not None:
             command += ["--quit-within", str(quit_within)]
         env = dict(os.environ)

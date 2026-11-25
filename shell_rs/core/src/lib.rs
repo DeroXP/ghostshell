@@ -44,6 +44,7 @@ pub mod token;
 pub mod tray;
 pub mod trouble;
 pub mod win;
+pub mod gpu_reader;
 
 pub use vispora_updater_core::json;
 /// Where the app keeps its data (the folder the page shows, and the logs).
