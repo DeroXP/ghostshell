@@ -453,6 +453,37 @@ number PowerShell prints.
   tools/measure/live_sample.py 120` beside it.
 * **Quitting**, still. The steps are at the end of the section on quitting.
 
+## The shell (step 3), so far
+
+The shell's core exists (`shell_rs/core`); its window does not yet. So what
+can be timed is the shell without a window, with a backend that is **not
+the real one**: the app on the fake machine of the tests
+(`python shell_rs/try_it.py`, five runs, the middle value). Which of these
+numbers say something about a real PC and which do not:
+
+| | Today | The shell, in the trial | What the trial's number is worth |
+| --- | --- | --- | --- |
+| The shell's process is up | (does not exist) | 12 ms | Real: it is the shell's own exe. Without the window, which will add to it |
+| The page can be handed to a window | after the unpacking (0.3 to 2.9 s) and Python and Flask (0.5 s and more) | **14 ms** after the shell's process started | Real for the shell. It does not wait for the backend: the page is compiled in |
+| A window on screen | 1 s (1 to 5) after the first log line, by hand | not measured | There is no window yet. The next piece |
+| The backend answers | (the same process) | 0.8 s after the shell started it | A trial's. Python 3.14 from source on the fake machine: no unpacking, no start-up work. A real backend does more |
+| A call the page makes | straight to Flask | 0.8 ms through the shell and back (1.0 ms for the slowest in twenty) | Real for the way through the shell; the route asked is the cheapest one |
+| A call the shell answers itself | (goes to Flask) | under 0.05 ms | Real |
+| Quit, until both processes are gone | not measured (see Quitting) | 0.1 s | A trial's: on the fake machine a quit has nothing to undo. What is real: the fixed half second before the old exit is not waited behind the shell |
+
+What the shell changes about waiting, whatever the numbers turn out to be:
+
+* The page does not wait for Python any more. Its first calls do: they are
+  held until the backend answers, and then go through.
+* A quit takes the window away at once. What takes time afterwards (the
+  backend putting the system back) happens out of sight, and has a limit
+  of 30 seconds, after which the backend is ended and the next start puts
+  back what was left.
+
+Still to be measured, and by whom: a window on screen (the next piece, in
+its trial); the real backend's start behind the shell and a real quit (the
+owner's PC, once a build exists that they choose to run).
+
 ## Measuring again
 
 After each piece of the port, run the same scripts and put the new numbers

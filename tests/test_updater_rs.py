@@ -37,7 +37,12 @@ from core import updater as U                       # noqa: E402
 
 RS = os.path.join(m.REPO, "updater_rs")
 CORE = os.path.join(RS, "core")
-DECIDE = os.path.join(CORE, "target", "release", "vispora-updater-decide.exe")
+# (where cargo put it: the folder CARGO_TARGET_DIR names, when the build output
+# is kept out of the repository as README.md says, else the crate's own)
+DECIDE = next((path for path in (
+    os.path.join(os.environ.get("CARGO_TARGET_DIR") or CORE, "release", "vispora-updater-decide.exe"),
+    os.path.join(CORE, "target", "release", "vispora-updater-decide.exe"),
+) if os.path.isfile(path)), os.path.join(CORE, "target", "release", "vispora-updater-decide.exe"))
 
 
 def rust(*path):

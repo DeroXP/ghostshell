@@ -588,7 +588,12 @@ def test_main_ties_the_start_to_the_window_and_allows_it_at_once_in_browser_mode
     assert created < gated < started, "the handler must be added before pywebview starts"
     fallback = src[src.index("except ImportError:"):]
     assert "_crosshair_allow_start()" in fallback, "browser mode never sets DPI awareness: start at once"
-    assert src.count("allow_start") == 1, "nothing else may let the overlay open before the window"
+    # The same holds behind the shell (shell_rs/): the window is the shell's,
+    # in another process, and this one never has a window of pywebview's.
+    behind_shell = src[src.index("# No window and no tray here: they are the shell's."):
+                       src.index("    def show_window():")]
+    assert "_crosshair_allow_start()" in behind_shell and "_leave_with_the_shell()" in behind_shell
+    assert src.count("allow_start") == 2, "nothing else may let the overlay open before the window"
 
 
 # ── the tray item ─────────────────────────────────────────────────────

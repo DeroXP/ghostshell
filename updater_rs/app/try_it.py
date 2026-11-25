@@ -56,12 +56,22 @@ import zlib
 from ctypes import wintypes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TRIAL_EXE = os.path.join(HERE, "target", "release", "VisporaUpdater.exe")
+
+
+def built(crate, name):
+    """Where cargo put `name`: the folder CARGO_TARGET_DIR names, when the
+    build output is kept out of the repository (README.md), else the crate's
+    own target folder."""
+    outside = os.path.join(os.environ.get("CARGO_TARGET_DIR") or crate, "release", name)
+    return outside if os.path.isfile(outside) else os.path.join(crate, "target", "release", name)
+
+
+TRIAL_EXE = built(HERE, "VisporaUpdater.exe")
 # What is "installed" and what is "downloaded" has to be a real program,
 # because the updater starts the new one when it is done.  This one reads its
 # standard input, finds nothing there and ends: it opens no file and no
 # connection (see updater_rs/core/src/bin/decide.rs).
-STAND_IN = os.path.join(HERE, "..", "core", "target", "release", "vispora-updater-decide.exe")
+STAND_IN = built(os.path.join(HERE, "..", "core"), "vispora-updater-decide.exe")
 APP_NAME = "SandboxApp.exe"
 WINDOW_TITLE = "Vispora Updater"
 OLD_VERSION, NEW_VERSION = "1.0.0", "9.9.9"
@@ -416,11 +426,11 @@ def main(argv):
     for path, what in ((TRIAL_EXE, "the trial build (see the top of this file)"),
                        (STAND_IN, "updater_rs/core, built (cargo build --release)")):
         if not os.path.isfile(path):
-            refuse("%s is missing: it needs %s." % (os.path.relpath(path), what))
+            refuse("%s is missing: it needs %s." % (path, what))
     with open(TRIAL_EXE, "rb") as f:
         exe = f.read()
     if b'level="requireAdministrator"' in exe or b'level="asInvoker"' not in exe:
-        refuse("target/release/VisporaUpdater.exe is the build that ships (it asks for administrator "
+        refuse("VisporaUpdater.exe is the build that ships (it asks for administrator "
                "rights). Build it with --no-default-features first.")
     if stand_in_running():
         refuse("a program named %s is already running." % APP_NAME)

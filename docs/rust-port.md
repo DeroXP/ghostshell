@@ -140,8 +140,8 @@ What the practice run showed, for the shell:
 * A window can be tested without showing it: the updater's real exe is run
   against a made-up install by `updater_rs/app/try_it.py`.
 
-**Then the shell.** `Vispora.exe` becomes a Rust program (Tauri on WebView2)
-that:
+**Then the shell (its core is written; nothing ships yet).** `Vispora.exe`
+becomes a Rust program (Tauri on WebView2) that:
 
 * opens the window straight away and shows the same interface files;
 * owns the tray icon, the single-instance check, autostart, hide and show;
@@ -163,6 +163,40 @@ In between, the app is made of: the Rust shell (window, tray, start, quit,
 routing), the Python backend (every route not yet moved), and the step 1
 library, which the shell uses as an ordinary Rust crate and Python still loads
 as a DLL.
+
+Where the shell stands. It is cut into three pieces, each a pull request of
+its own. `main` stays releasable after each, because no release uses any of
+it before the last one is in and the owner says so; `build.spec` is not
+touched until then.
+
+1. **The core, without a window (written).** `shell_rs/core`: which request
+   is answered where, the backend's start and stop, quitting with a time
+   limit. The app can run as the shell's backend (`--backend`): without
+   window or tray, on a port the shell picks, leaving when the shell does.
+   Tested against a stand-in, and tried for real against the app on the
+   fake machine of the tests. No outside crates.
+2. **The window.** Tauri, as for the updater; the tray, telling a second
+   copy from the first, autostart; the shim for `window.pywebview.api`.
+3. **One file.** `Vispora.exe` carrying the backend, and unpacking it once
+   per version.
+
+Decided while writing the core (the reasons are in
+[shell_rs/README.md](../shell_rs/README.md)):
+
+* The backend listens on a port the shell picks, not on the fixed 5987. A
+  port that was taken or reserved used to leave the window blank.
+* The secret that tells the app's own page from a stranger is made by the
+  shell and handed to both sides. The backend gets it in its environment
+  and takes it out again at once.
+* A backend that ends with exit code 0 without having been asked takes the
+  shell with it: that is how the app leaves for an update. One that ends
+  any other way is started again, a few times.
+* Quitting has a limit of 30 seconds, after which a backend that has not
+  ended is ended. The window is out of sight from the first moment. How
+  long a real quit takes is still not measured
+  ([performance.md](performance.md)); the limit is meant to be far above
+  it and should be looked at again once it is.
+* If the shell dies, the backend notices, puts the system back and ends.
 
 Settled before this step starts (2026-11-24):
 
