@@ -109,34 +109,67 @@ A_CARD = {"temp_c": 61, "gpu_util_pct": 97, "mem_util_pct": 40, "core_mhz": 2100
           "mem_used_bytes": 5_000_000_000, "mem_total_bytes": 12_000_000_000}
 
 
-def processor_seconds(process):
-    """How much processor time a process has used so far, as Windows counts it."""
+def processor_seconds(pid):
+    """How much processor time the process `pid` has used so far.  Counted
+    in the processor's own cycles, which Windows keeps exactly, and not in
+    the time Windows charges at its clock's ticks: work that comes in short
+    bursts, as five small calls a second do, is charged wrongly by those.
+    (Asking takes the right to ask and nothing else.)"""
     import ctypes
     from ctypes import wintypes
-    times = [wintypes.FILETIME() for _ in range(4)]
     kernel32 = ctypes.WinDLL("kernel32")
-    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
-    if not kernel32.GetProcessTimes(int(process._handle), *[ctypes.byref(t) for t in times]):
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.QueryProcessCycleTime.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_uint64)]
+    kernel32.QueryThreadCycleTime.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_uint64)]
+    kernel32.GetCurrentThread.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    if processor_seconds.cycles_a_second is None:
+        # How many cycles a second of work is: this thread, kept busy for a while.
+        def mine():
+            cycles = ctypes.c_uint64(0)
+            kernel32.QueryThreadCycleTime(kernel32.GetCurrentThread(), ctypes.byref(cycles))
+            return cycles.value
+        rates = []
+        for _ in range(5):
+            began, cycles = time.perf_counter(), mine()
+            while time.perf_counter() - began < 0.1:
+                pass
+            rates.append((mine() - cycles) / (time.perf_counter() - began))
+        processor_seconds.cycles_a_second = max(rates)      # (the highest: the round nothing else took time from)
+    process = kernel32.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
+    if not process:
         return float("nan")
-    return sum((t.dwHighDateTime << 32 | t.dwLowDateTime) for t in times[2:]) / 1e7
+    try:
+        cycles = ctypes.c_uint64(0)
+        if not kernel32.QueryProcessCycleTime(process, ctypes.byref(cycles)):
+            return float("nan")
+        return cycles.value / processor_seconds.cycles_a_second
+    finally:
+        kernel32.CloseHandle(process)
+
+
+processor_seconds.cycles_a_second = None
 
 
 def moved(program, appdata):
     """The performance sampler, the first module that moved into the shell
     (shell_rs/core/src/moved/perf.rs), beside the same module in the backend.
 
-    Two shells, each with a backend on the fake machine.  One reads this
-    PC's graphics card itself and answers the sampler's calls itself; the
-    other passes them on, and the backend's sampler runs on the fake
-    machine, which is told to give every sample the same reading.  Both
-    sample for a minute, so that both hold the 300 samples a chart is made
-    of, and then the same calls are timed in both.
+    Two shells, each with a backend on the fake machine, whose card is told
+    to give every reading the same.  One answers the sampler's calls itself
+    and asks its backend for the card's reading for every sample (the shell
+    does not read the card itself: shell_rs/core/src/moved/mod.rs says
+    why); the other passes the calls on, and the backend's own sampler
+    runs.  Both sample for a minute, so that both hold the 300 samples a
+    chart is made of, and then the same calls are timed in both.
 
-    Real: the shell's reading of this PC's card (it only reads), its
-    sampling, its answers, and a call's way through the shell to a backend
-    and back.  A trial's: the backend's reading (the fake machine's table,
-    which costs nothing: on a PC it asks the native helper, 0.14 ms in
-    docs/performance.md, or starts nvidia-smi without it)."""
+    Real: the shell's sampling and its answers, and a call's way through
+    the shell to a backend and back (which is now also what one reading of
+    the card costs the shell).  A trial's: what the backend does for a
+    reading (the fake machine's table, which costs nothing: on a PC it asks
+    the native helper, 0.14 ms in docs/performance.md, or starts nvidia-smi
+    without it)."""
     def start(*more):
         return subprocess.Popen([program, "--backend", sys.executable, "--arg", "-u", "--arg", STAND_IN, "--arg", "--backend",
                                  "--appdata", appdata, *more],
@@ -156,30 +189,35 @@ def moved(program, appdata):
     shells = {"the shell answers it": start("--readings", "real"), "passed on to the backend": start()}
     try:
         asks = {name: asker(p) for name, p in shells.items()}
+        backends = {}
         for name, p in shells.items():
             json.loads(p.stdout.readline())
             assert asks[name](do="wait", **{"for": "ready"}, within=90)["phase"] == "ready"
+            backends[name] = asks[name](do="state")["backend_pid"]
+            assert asks[name](do="call", method="POST", target="/api/stand-in/card", token=True, body=json.dumps(A_CARD))["status"] == 200
         own, passed = asks["the shell answers it"], asks["passed on to the backend"]
-        one = own(do="reading", question="gpu_live", times=2000)
-        if not one["answer"] or one["answer"].get("temp_c") is None:
-            print("This PC's graphics card gives the shell no reading (no NVIDIA card, or no driver): the sampler's calls are\n"
-                  "the backend's on such a PC, and there is nothing of the shell's to time.")
-            return 0
-        print("One reading of this PC's card by the shell, in its own process: %.3f ms (the slowest of 2,000: %.2f ms)."
-              % (one["ms"], one["slowest_ms"]))
-        assert passed(do="call", method="POST", target="/api/stand-in/card", token=True, body=json.dumps(A_CARD))["status"] == 200
-        began = {name: (time.perf_counter(), processor_seconds(p)) for name, p in shells.items()}
+        one = own(do="card", times=2000)
+        assert one["reading"] and one["reading"]["temp_c"] == A_CARD["temp_c"], one
+        print("One reading of the card as the shell takes it (it asks its backend, which here reads the fake machine):\n"
+              "  %.3f ms (the slowest of 2,000: %.2f ms)." % (one["ms"], one["slowest_ms"]))
+        began = {name: (time.perf_counter(), processor_seconds(p.pid), processor_seconds(backends[name])) for name, p in shells.items()}
         for ask in asks.values():
             said = ask(do="call", method="POST", target="/api/perf/start", token=True, body='{"consumer": "trial"}')
             assert said["status"] == 200 and json.loads(said["body"])["ok"], said
         print("Both samplers run; a minute until each holds the 300 samples a chart is made of ...")
         time.sleep(62)
+        print("\nProcessor time used in that minute, as a share of one core (counted in the processor's cycles):\n")
+        print("  %-28s %-12s %-14s %s" % ("", "the shell", "its backend", "together"))
         for name, p in shells.items():
-            wall, used = time.perf_counter() - began[name][0], processor_seconds(p) - began[name][1]
+            wall = time.perf_counter() - began[name][0]
+            shell_used, backend_used = processor_seconds(p.pid) - began[name][1], processor_seconds(backends[name]) - began[name][2]
             held = json.loads(asks[name](do="call", method="GET", target="/api/perf/status", token=True)["body"])
-            print("  %-26s %d samples held; the shell's process used %.2f s of processor time in %.0f s (%.2f%% of one core)"
-                  % (name + ":", held["sample_count"], used, wall, 100 * used / wall))
-            assert held["sample_count"] == 300 and held["last"]["ok"], held
+            assert held["sample_count"] == 300 and held["last"]["ok"] and held["last"]["temp"] == A_CARD["temp_c"], held
+            print("  %-28s %-12s %-14s %.2f%%" % (name + ":", "%.2f%%" % (100 * shell_used / wall), "%.2f%%" % (100 * backend_used / wall),
+                                                 100 * (shell_used + backend_used) / wall))
+            if name == "the shell answers it":
+                print("  %-28s (the backend: %.2f ms of processor time for each of the %d readings it was asked for)"
+                      % ("", 1000 * backend_used / (wall / 0.2), round(wall / 0.2)))
         print("\nThe same call 300 times, the middle value in milliseconds (and the slowest one in twenty):\n")
         print("  %-40s %-28s %s" % ("", *shells))
         for target in ("/api/perf/samples?seconds=60", "/api/perf/score?seconds=30", "/api/perf/status"):
@@ -192,8 +230,8 @@ def moved(program, appdata):
         assert seen["phase"] == "ready"
         for ask in asks.values():
             ask(do="call", method="POST", target="/api/perf/stop", token=True, body='{"consumer": "trial"}')
-        print("\nReal: the shell's own reading, sampling and answers, and a call's way to a backend and back.\n"
-              "A trial's: what the backend's sampler reads (the fake machine's table; on a PC it asks the helper).")
+        print("\nReal: the shell's sampling and answers, and a call's way to a backend and back.\n"
+              "A trial's: what the backend does for one reading of the card (the fake machine's table; on a PC it asks the helper).")
         return 0
     finally:
         for p in shells.values():

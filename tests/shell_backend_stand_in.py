@@ -106,8 +106,9 @@ def main():
     @A.app.route("/api/stand-in/card", methods=["POST"])
     def the_card_says():
         # What the native helper says about the graphics card on the fake
-        # machine (nothing, unless a trial says so here): for timing the
-        # backend's own sampler with samples that hold something.
+        # machine (nothing, unless a trial says so here): what the backend's
+        # own sampler samples, and what the shell is told when it asks the
+        # backend for the card's reading (/api/gpu/oc/live).
         says = A.request.get_json(force=True, silent=True) or None
         if says:
             m.NATIVE["gpu_live"] = says

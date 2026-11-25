@@ -4,31 +4,31 @@
 //! This is core/perf_monitor.py, moved.  The Python module stays, and stays
 //! what answers when the app is started as it always was.  Here: the same
 //! five calls, the same answers (tests/test_moved_perf.py asks both the same
-//! things on the same made-up machine and compares), and one reading of
-//! the card for each sample, taken in the shell's own process.
+//! things on the same made-up machine and compares).
+//!
+//! Each sample is one reading of the card, and the reading is the
+//! backend's (`Card`, in mod.rs, says why the shell does not read the card
+//! itself).  It is the reading the Python sampler takes
+//! (`gpu_overclock.read_live_state()`), so the samples are the ones Python
+//! would have: also on a PC whose card answers only to nvidia-smi, also
+//! while a driver is installed, also while the driver does not answer.
+//! Without a backend to ask there is no reading, and a sample says so.
 //!
 //! It only reads.  Starting and stopping it starts and stops a thread of
 //! the shell's own and changes nothing on the PC.  It runs only while
 //! somebody wants it (the Monitor page says so, and says when it leaves).
 //!
-//! Where the shell does not take a call:
-//!
-//! * The card gives the shell no reading.  The Python module then asks
-//!   nvidia-smi, which the shell does not start.  Whether the card answers
-//!   is asked once, at the first call, and if it does not, every call of
-//!   the sampler's is the backend's for the rest of the run.  So there is
-//!   one sampler, in one place, and a PC whose card answers only to
-//!   nvidia-smi is served as it was.
-//! * A call that is not what the page sends: another method, a body that
-//!   is no JSON, or JSON that Python cannot use (it stops at those before
-//!   it touches the sampler, and says so in words of its own: those words
-//!   are the backend's to say).
+//! Where the shell does not take a call: it is not what the page sends.
+//! Another method, a body that is no JSON, JSON that Python cannot use (it
+//! stops at those before it touches the sampler, and says so in words of
+//! its own: those words are the backend's to say), or a number of seconds
+//! that Python may read and this program cannot (`PyInt::CannotTell`).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-use super::{py_round, query_int, Readings};
+use super::{py_round, query_int, Card, Live};
 use crate::http::{Request, Response};
 use crate::json::Json;
 
@@ -39,11 +39,6 @@ pub const KEPT: usize = 300;
 /// Below this much use, the card is doing nothing that a score could be
 /// made of.
 const IDLE_UTIL: i128 = 15;
-/// What the library says about the card, each a whole number or nothing.
-/// (core/native.py, _GPU_FIELDS: an answer is taken only if every one of
-/// them is.)
-const GPU_FIELDS: [&str; 14] = ["temp_c", "gpu_util_pct", "mem_util_pct", "core_mhz", "mem_mhz", "core_max_mhz", "mem_max_mhz", "core_app_mhz",
-                                "mem_app_mhz", "power_mw", "power_limit_mw", "fan_pct", "mem_used_bytes", "mem_total_bytes"];
 
 /// One reading of the card.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,44 +71,16 @@ impl Sample {
     }
 }
 
-/// What the card says now, as the app takes it (core/native.py, gpu_live,
-/// and core/gpu_overclock.py, _live_state_from_native): every value a whole
-/// number or nothing, and never without the temperature.  None for an
-/// answer that is not taken.
-fn card(door: &dyn Readings) -> Option<Vec<(&'static str, Option<i128>)>> {
-    let said = door.ask("gpu_live")?;
-    if !said.is_object() {
-        return None;
+/// A sample of what the card says at `ts` (None: there is no reading).
+fn sample_of(ts: f64, card: Option<Live>) -> Sample {
+    match card {
+        None => Sample { ts, ok: false, core: 0, mem: 0, temp: 0, power: 0.0, util: 0, memutil: 0, fan: 0 },
+        Some(card) => Sample { ts, ok: true, core: card.core_mhz, mem: card.mem_mhz, temp: card.temp_c, power: card.power_w, util: card.gpu_util_pct,
+                               memutil: card.mem_util_pct, fan: card.fan_pct },
     }
-    let mut values = Vec::with_capacity(GPU_FIELDS.len());
-    for name in GPU_FIELDS {
-        values.push((name, match said.get(name) {
-            None | Some(Json::Null) => None,
-            Some(Json::Int(whole)) => Some(*whole),
-            // (Python's int() of a number with a fraction cuts the fraction off)
-            Some(Json::Float(number)) if number.is_finite() => Some(number.trunc() as i128),
-            Some(_) => return None,
-        }));
-    }
-    values.iter().any(|(name, value)| *name == "temp_c" && value.is_some()).then_some(values)
-}
-
-/// A sample of what the card says at `ts` (None: it said nothing usable).
-fn sample_of(ts: f64, card: Option<Vec<(&'static str, Option<i128>)>>) -> Sample {
-    let Some(card) = card else {
-        return Sample { ts, ok: false, core: 0, mem: 0, temp: 0, power: 0.0, util: 0, memutil: 0, fan: 0 };
-    };
-    let value = |name: &str| card.iter().find(|(known, _)| *known == name).and_then(|(_, value)| *value);
-    let whole = |name: &str| value(name).unwrap_or(0);
-    // (the library counts milliwatts; the app shows watts with two places)
-    let watts = value("power_mw").map_or(0.0, |milliwatts| py_round(milliwatts as f64 / 1000.0, 2));
-    Sample { ts, ok: true, core: whole("core_mhz"), mem: whole("mem_mhz"), temp: whole("temp_c"), power: watts, util: whole("gpu_util_pct"),
-             memutil: whole("mem_util_pct"), fan: whole("fan_pct") }
 }
 
 struct State {
-    /// Is the card's reading the shell's to take?  Asked at the first call.
-    mine: Option<bool>,
     /// As the Python module keeps it: true from a start until the sampling
     /// thread has ended.
     running: bool,
@@ -186,7 +153,7 @@ fn consumer(said: &Json) -> Option<Json> {
 impl Sampler {
     pub fn new(threads: bool) -> Arc<Sampler> {
         Arc::new(Sampler {
-            state: Mutex::new(State { mine: None, running: false, thread: None, told_to_stop: false, starts: 0, consumers: Vec::new(), started_at: None,
+            state: Mutex::new(State { running: false, thread: None, told_to_stop: false, starts: 0, consumers: Vec::new(), started_at: None,
                                       samples: VecDeque::with_capacity(KEPT), last: None }),
             told: Condvar::new(),
             threads,
@@ -199,27 +166,17 @@ impl Sampler {
 
     /// The shell's answer to one of the sampler's calls, or None: the call
     /// is the backend's (see the top of this file).
-    pub fn answer(self: &Arc<Self>, door: &Arc<dyn Readings>, request: &Request) -> Option<Response> {
+    pub fn answer(self: &Arc<Self>, card: &Arc<Card>, request: &Request) -> Option<Response> {
         let (method, path, target) = (request.method.as_str(), request.path(), request.target.as_str());
         let answer = match (method, path) {
-            ("GET", "/api/perf/status") | ("GET", "/api/perf/samples") | ("GET", "/api/perf/score") => {
-                if !self.is_mine(door) {
-                    return None;
-                }
-                match path {
-                    "/api/perf/status" => self.status(),
-                    "/api/perf/samples" => self.chart(door.now(), query_int(target, "seconds", 60)),
-                    _ => self.score(door.now(), query_int(target, "seconds", 30)),
-                }
-            }
+            ("GET", "/api/perf/status") => self.status(),
+            ("GET", "/api/perf/samples") => self.chart(card.now(), query_int(target, "seconds", 60)?),
+            ("GET", "/api/perf/score") => self.score(card.now(), query_int(target, "seconds", 30)?),
             ("POST", "/api/perf/start") | ("POST", "/api/perf/stop") => {
                 let said = said(request)?;
                 let consumer = consumer(&said)?;
-                if !self.is_mine(door) {
-                    return None;
-                }
                 if path == "/api/perf/start" {
-                    self.start(door, consumer)
+                    self.start(card, consumer)
                 } else {
                     self.stop(consumer, said.get("force").is_some_and(Json::truthy))
                 }
@@ -229,18 +186,8 @@ impl Sampler {
         Some(Response::json(200, &answer))
     }
 
-    /// Does the card give the shell a reading?  Asked once.
-    fn is_mine(&self, door: &Arc<dyn Readings>) -> bool {
-        if let Some(mine) = self.state().mine {
-            return mine;
-        }
-        // (asked without the lock: the first reading loads the driver's library)
-        let answers = card(&**door).is_some();
-        *self.state().mine.get_or_insert(answers)
-    }
-
     /// Start sampling for `consumer`, if nobody has yet.
-    pub fn start(self: &Arc<Self>, door: &Arc<dyn Readings>, consumer: Json) -> Json {
+    pub fn start(self: &Arc<Self>, card: &Arc<Card>, consumer: Json) -> Json {
         let mut st = self.state();
         if !st.consumers.iter().any(|known| same_to_python(known, &consumer)) {
             st.consumers.push(consumer);
@@ -256,12 +203,12 @@ impl Sampler {
         st.thread = Some(this);
         st.told_to_stop = false;
         st.running = true;
-        st.started_at = Some(door.now());
+        st.started_at = Some(card.now());
         st.samples.clear();
         drop(st);
         if self.threads {
-            let (sampler, door) = (self.clone(), door.clone());
-            let started = std::thread::Builder::new().name("perf-sampler".to_string()).spawn(move || sampler.sample_until_told(&*door, this));
+            let (sampler, card) = (self.clone(), card.clone());
+            let started = std::thread::Builder::new().name("perf-sampler".to_string()).spawn(move || sampler.sample_until_told(&card, this));
             if started.is_err() {
                 // (no thread could be made: nothing samples, and that is said as "not running")
                 let mut st = self.state();
@@ -294,10 +241,11 @@ impl Sampler {
         Json::object([("ok", true.into()), ("stopped", true.into())])
     }
 
-    /// Take one sample.
-    fn sample(&self, door: &dyn Readings) {
-        let ts = door.now();
-        let sample = sample_of(ts, card(door));
+    /// Take one sample.  (The time is taken before the card is read, as
+    /// Python takes it; the card is read without the lock.)
+    fn sample(&self, card: &Card) {
+        let ts = card.now();
+        let sample = sample_of(ts, card.live());
         let mut st = self.state();
         if st.samples.len() == KEPT {
             st.samples.pop_front();
@@ -308,13 +256,13 @@ impl Sampler {
 
     /// The thread of the start `this`: a sample, a pause, until it is told
     /// to stop.
-    fn sample_until_told(&self, door: &dyn Readings, this: u64) {
+    fn sample_until_told(&self, card: &Card, this: u64) {
         let stays = |st: &State| st.thread == Some(this) && !st.told_to_stop;
         loop {
             if !stays(&self.state()) {
                 break;
             }
-            self.sample(door);
+            self.sample(card);
             let st = self.state();
             drop(self.told.wait_timeout_while(st, EVERY, |st| stays(st)).unwrap_or_else(|poisoned| poisoned.into_inner()));
         }
@@ -331,7 +279,7 @@ impl Sampler {
     /// if it is to go on, its end if it was told to stop.  For a sampler
     /// that runs no thread (`threads` false), where the clock and the card
     /// are a test's.
-    pub fn step(&self, door: &dyn Readings) {
+    pub fn step(&self, card: &Card) {
         let (alive, told) = {
             let st = self.state();
             (st.thread.is_some(), st.told_to_stop)
@@ -345,7 +293,7 @@ impl Sampler {
             st.told_to_stop = false;
             st.running = false;
         } else {
-            self.sample(door);
+            self.sample(card);
         }
     }
 
@@ -489,60 +437,73 @@ fn spread(values: &[i128]) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::Fake;
+    use super::super::{Fake, FakeBackend, Moved};
     use super::*;
 
+    /// What the backend says the card says (app.py, api_gpu_oc_live).
     fn reading(temp: i128, util: i128, core: i128) -> Json {
-        Json::object([("temp_c", Json::Int(temp)), ("gpu_util_pct", Json::Int(util)), ("mem_util_pct", 40.into()), ("core_mhz", Json::Int(core)),
-                      ("mem_mhz", 9501.into()), ("power_mw", 215_437.into()), ("fan_pct", 55.into())])
+        Json::object([("ok", true.into()), ("temp_c", Json::Int(temp)), ("gpu_util_pct", Json::Int(util)), ("mem_util_pct", 40.into()),
+                      ("core_mhz", Json::Int(core)), ("mem_mhz", 9501.into()), ("power_w", 215.44.into()), ("fan_pct", 55.into())])
     }
 
-    fn a_machine() -> (Arc<Fake>, Arc<dyn Readings>, Arc<Sampler>) {
-        let machine = Fake::new();
-        machine.answers("gpu_live", Some(reading(61, 97, 2100)));
+    /// A made-up machine (its clock), a made-up backend (the card's
+    /// reading), and a sampler that runs no thread.
+    fn a_machine() -> (Arc<Fake>, Arc<FakeBackend>, Arc<Card>, Arc<Sampler>) {
+        a_machine_with(false)
+    }
+
+    fn a_machine_with(threads: bool) -> (Arc<Fake>, Arc<FakeBackend>, Arc<Card>, Arc<Sampler>) {
+        let (machine, backend) = (Fake::new(), FakeBackend::new());
+        backend.says(Some(reading(61, 97, 2100)));
         machine.at(1000.0);
-        let door: Arc<dyn Readings> = machine.clone();
-        (machine, door, Sampler::new(false))
+        let moved = Moved::new(machine.clone(), threads);
+        moved.asks_the_backend_with(backend.asker());
+        (machine, backend, moved.card.clone(), moved.perf.clone())
     }
 
-    fn call(sampler: &Arc<Sampler>, door: &Arc<dyn Readings>, method: &str, target: &str, body: &str) -> Option<Json> {
-        let answer = sampler.answer(door, &Request::new(method, target).with_body(body))?;
+    fn call(sampler: &Arc<Sampler>, card: &Arc<Card>, method: &str, target: &str, body: &str) -> Option<Json> {
+        let answer = sampler.answer(card, &Request::new(method, target).with_body(body))?;
         assert_eq!((answer.status, answer.header("Content-Type")), (200, Some("application/json")));
         Some(answer.to_json())
     }
 
     #[test]
     fn a_reading_becomes_a_sample_as_the_app_makes_one() {
-        let (machine, door, _) = a_machine();
-        let taken = sample_of(5.0, card(&*door));
+        let (machine, backend, card, _) = a_machine();
+        let taken = sample_of(5.0, card.live());
         assert_eq!(taken, Sample { ts: 5.0, ok: true, core: 2100, mem: 9501, temp: 61, power: 215.44, util: 97, memutil: 40, fan: 55 });
-        // What the card does not say is 0, and a number with a fraction is cut.
-        machine.answers("gpu_live", Some(Json::object([("temp_c", 53.9.into()), ("fan_pct", Json::Null), ("power_mw", 1.into())])));
-        assert_eq!(sample_of(5.0, card(&*door)), Sample { ts: 5.0, ok: true, core: 0, mem: 0, temp: 53, power: 0.0, util: 0, memutil: 0, fan: 0 });
-        // Not taken: no temperature, a value that is no number (also one the
-        // sampler does not use), an answer that is no object, no answer.
+        // What the backend does not say is 0, and a number with a fraction is cut.
+        backend.says(Some(Json::object([("ok", true.into()), ("temp_c", 53.9.into()), ("fan_pct", Json::Null), ("power_w", 1.into())])));
+        assert_eq!(sample_of(5.0, card.live()), Sample { ts: 5.0, ok: true, core: 0, mem: 0, temp: 53, power: 1.0, util: 0, memutil: 0, fan: 0 });
+        // No reading: the backend says it has none, says something that is
+        // no reading, or does not answer.
         let nothing = Sample { ts: 5.0, ok: false, core: 0, mem: 0, temp: 0, power: 0.0, util: 0, memutil: 0, fan: 0 };
-        for not_one in [Some(Json::object([("gpu_util_pct", 97.into())])), Some(Json::object([("temp_c", Json::Null), ("core_mhz", 2100.into())])),
-                        Some(Json::object([("temp_c", 61.into()), ("mem_total_bytes", "a lot".into())])), Some(Json::object([("temp_c", true.into())])),
-                        Some(Json::object([("temp_c", f64::NAN.into())])), Some(Json::Array(Vec::new())), Some("warm".into()), None] {
-            machine.answers("gpu_live", not_one.clone());
-            assert_eq!(sample_of(5.0, card(&*door)), nothing, "{not_one:?}");
+        for not_one in [Some(Json::object([("ok", false.into()), ("err", "No NVIDIA GPU / nvidia-smi missing".into())])),
+                        Some(Json::object([("temp_c", 61.into()), ("core_mhz", 2100.into())])), Some(Json::Array(Vec::new())), Some("warm".into()), None] {
+            backend.says(not_one.clone());
+            assert_eq!(sample_of(5.0, card.live()), nothing, "{not_one:?}");
         }
+        // The card is asked of the backend and of nothing else: one call
+        // for each reading, and no question through the shell's own door.
+        assert_eq!(backend.asked(), vec![super::super::THE_BACKENDS_READING; 7]);
+        assert!(machine.asked().is_empty(), "{:?}", machine.asked());
     }
 
     #[test]
     fn it_starts_for_whoever_asks_and_stops_when_the_last_one_leaves() {
-        let (machine, door, sampler) = a_machine();
-        let post = |target: &str, body: &str| call(&sampler, &door, "POST", target, body).unwrap().to_string();
+        let (machine, backend, card, sampler) = a_machine();
+        let post = |target: &str, body: &str| call(&sampler, &card, "POST", target, body).unwrap().to_string();
         assert_eq!(post("/api/perf/start", r#"{"consumer": "hwmon-page"}"#), r#"{"ok":true,"consumers":["hwmon-page"]}"#);
+        assert!(backend.asked().is_empty(), "the card is read for a sample, and for nothing else");
         assert!(sampler.is_running());
         assert_eq!(post("/api/perf/start", r#"{"consumer": "hwmon-page"}"#), r#"{"ok":true,"msg":"already running","consumers":["hwmon-page"]}"#);
         assert_eq!(post("/api/perf/start", "{}"), r#"{"ok":true,"msg":"already running","consumers":["hwmon-page","manual"]}"#);
         for round in 0..3 {
             machine.at(1000.2 + round as f64 * 0.2);
-            sampler.step(&*door);
+            sampler.step(&card);
         }
         let status = sampler.status();
+        assert_eq!(backend.asked().len(), 3, "one reading for each sample");
         assert_eq!((status["sample_count"].as_int(), status["max_samples"].as_int(), status["interval_ms"].as_int()), (Some(3), Some(300), Some(200)));
         assert_eq!((status["running"].truthy(), &status["started_at"]), (true, &Json::Float(1000.0)));
         assert_eq!(status["last"].to_string(), r#"{"ts":1000.6,"ok":true,"core":2100,"mem":9501,"temp":61,"power":215.44,"util":97,"memutil":40,"fan":55}"#);
@@ -551,7 +512,7 @@ mod tests {
         assert_eq!(post("/api/perf/stop", r#"{"consumer": "manual"}"#), r#"{"ok":true,"still_running_for":["hwmon-page"]}"#);
         assert_eq!(post("/api/perf/stop", r#"{"consumer": "hwmon-page"}"#), r#"{"ok":true,"stopped":true}"#);
         assert!(sampler.is_running(), "it says it stopped before its thread has ended");
-        sampler.step(&*door);
+        sampler.step(&card);
         assert!(!sampler.is_running());
         assert_eq!(sampler.status()["sample_count"].as_int(), Some(3), "a sample was taken after it was told to stop");
         assert_eq!(post("/api/perf/stop", "{}"), r#"{"ok":true,"msg":"already stopped"}"#);
@@ -568,14 +529,14 @@ mod tests {
         // Told to stop and started again before its thread has ended: a new
         // one samples, and it is running all along.
         assert_eq!(post("/api/perf/start", r#"{"consumer": "again"}"#), r#"{"ok":true,"consumers":["again"]}"#);
-        sampler.step(&*door);
+        sampler.step(&card);
         assert!(sampler.is_running() && sampler.status()["sample_count"].as_int() == Some(1));
     }
 
     #[test]
     fn a_consumer_is_whatever_python_would_keep_for_one() {
-        let (_, door, sampler) = a_machine();
-        let post = |target: &str, body: &str| call(&sampler, &door, "POST", target, body).map(|said| said.to_string());
+        let (_, _, card, sampler) = a_machine();
+        let post = |target: &str, body: &str| call(&sampler, &card, "POST", target, body).map(|said| said.to_string());
         // A name is a text; but a number, a truth value and nothing at all
         // are kept as well, and 1, 1.0 and true are one and the same.
         assert_eq!(post("/api/perf/start", r#"{"consumer": 1}"#).unwrap(), r#"{"ok":true,"consumers":[1]}"#);
@@ -606,62 +567,90 @@ mod tests {
             let said = post("/api/perf/stop", &format!(r#"{{"consumer": "a", "force": {force}}}"#)).unwrap();
             assert_eq!(said.contains("\"stopped\":true"), stops, "force {force}: {said}");
             post("/api/perf/stop", r#"{"force": true}"#);
-            sampler.step(&*door);
+            sampler.step(&card);
         }
     }
 
     #[test]
     fn only_what_the_page_sends_is_taken() {
-        let (_, door, sampler) = a_machine();
+        let (_, backend, card, sampler) = a_machine();
         for (method, target) in [("POST", "/api/perf/status"), ("GET", "/api/perf/start"), ("GET", "/api/perf/stop"), ("PUT", "/api/perf/samples"),
                                  ("DELETE", "/api/perf/score"), ("HEAD", "/api/perf/status"), ("OPTIONS", "/api/perf/start"), ("GET", "/api/perf/"),
                                  ("GET", "/api/perf/status/"), ("GET", "/api/perf/other"), ("GET", "/api/perf")] {
-            assert_eq!(call(&sampler, &door, method, target, "{}"), None, "{method} {target}");
+            assert_eq!(call(&sampler, &card, method, target, "{}"), None, "{method} {target}");
         }
-        assert!(!sampler.is_running() && sampler.state().mine.is_none(), "a call that was not taken did something");
-        assert!(call(&sampler, &door, "GET", "/api/perf/status?x=1", "").is_some());
+        assert!(!sampler.is_running() && backend.asked().is_empty(), "a call that was not taken did something");
+        assert!(call(&sampler, &card, "GET", "/api/perf/status?x=1", "").is_some());
     }
 
     #[test]
-    fn a_card_that_gives_the_shell_no_reading_leaves_the_sampler_to_the_backend() {
-        // (Python then asks nvidia-smi, which the shell does not start)
-        let (machine, door, sampler) = a_machine();
-        machine.answers("gpu_live", None);
-        let all = [("GET", "/api/perf/status"), ("GET", "/api/perf/samples"), ("GET", "/api/perf/score"), ("POST", "/api/perf/start"), ("POST", "/api/perf/stop")];
-        for (method, target) in all {
-            assert_eq!(call(&sampler, &door, method, target, "{}"), None, "{method} {target}");
+    fn a_number_of_seconds_that_only_python_can_read_leaves_the_call_to_python() {
+        // (Python counts with as many digits as there are, and reads the
+        // digits of every script: what it answers then is not rebuilt here)
+        let (_, _, card, sampler) = a_machine();
+        let get = |target: &str| call(&sampler, &card, "GET", target, "");
+        let long = "9".repeat(60);
+        for seconds in [long.as_str(), "-99999999999999999999999999999999999999999", "%D9%A1%D9%A2", "12%C2%A0", "%EF%BC%91", "%FF", "%094", "4%0A"] {
+            for call in ["samples", "score"] {
+                assert_eq!(get(&format!("/api/perf/{call}?seconds={seconds}")), None, "{call} {seconds}");
+                assert_eq!(get(&format!("/api/perf/{call}?x=1&seconds={seconds}&y=2")), None, "{call} {seconds}");
+            }
+            // (the status does not read it)
+            assert!(get(&format!("/api/perf/status?seconds={seconds}")).is_some());
         }
-        assert_eq!(machine.asked(), ["gpu_live"], "it is asked once, at the first call");
-        // For the rest of the run, also when the card answers later: there
-        // is one sampler, and it is the backend's by now.
+        // What is plainly no number is the default, as it is to Python; and
+        // the first value named so is the one that counts.
+        assert_eq!(get("/api/perf/samples?seconds=abc").unwrap()["window_s"].as_int(), Some(60));
+        assert_eq!(get("/api/perf/score?seconds=1.5").unwrap()["samples_used"].as_int(), Some(0));
+        assert_eq!(get("/api/perf/samples?seconds=7&seconds=%D9%A1").unwrap()["window_s"].as_int(), Some(7));
+        assert_eq!(get("/api/perf/samples?seconds=%D9%A1&seconds=7"), None);
+        // As many digits as this program counts with are read.
+        let most = "9".repeat(38);
+        assert_eq!(get(&format!("/api/perf/samples?seconds={most}")).unwrap()["window_s"].to_string(), most);
+    }
+
+    #[test]
+    fn without_a_reading_a_sample_says_so_and_the_sampler_stays_the_shells() {
+        // The backend has no reading (no NVIDIA card: Python's own sampler
+        // then makes the same samples), or there is no backend to ask.
+        for none in [Some(Json::object([("ok", false.into()), ("err", "No NVIDIA GPU / nvidia-smi missing".into())])), None] {
+            let (_, backend, card, sampler) = a_machine();
+            backend.says(none.clone());
+            for (method, target) in [("GET", "/api/perf/status"), ("GET", "/api/perf/samples"), ("GET", "/api/perf/score"), ("POST", "/api/perf/start")] {
+                assert!(call(&sampler, &card, method, target, "{}").is_some(), "{method} {target}");
+            }
+            sampler.step(&card);
+            assert_eq!(sampler.status()["last"].to_string(), r#"{"ts":1000.0,"ok":false,"core":0,"mem":0,"temp":0,"power":0.0,"util":0,"memutil":0,"fan":0}"#);
+            // The reading comes back: so do the samples.
+            backend.says(Some(reading(61, 97, 2100)));
+            sampler.step(&card);
+            assert_eq!(sampler.status()["last"].to_string(), r#"{"ts":1000.0,"ok":true,"core":2100,"mem":9501,"temp":61,"power":215.44,"util":97,"memutil":40,"fan":55}"#);
+            assert_eq!(sampler.status()["sample_count"].as_int(), Some(2));
+        }
+        // A sampler that was never told how to ask the backend.
+        let machine = Fake::new();
         machine.answers("gpu_live", Some(reading(61, 97, 2100)));
-        for (method, target) in all {
-            assert_eq!(call(&sampler, &door, method, target, "{}"), None);
-        }
-        assert!(!sampler.is_running());
-        // And the other way round: a card that answered at the first call
-        // and stops answering gives samples that say so.
-        let (machine, door, sampler) = a_machine();
-        call(&sampler, &door, "POST", "/api/perf/start", "{}").unwrap();
-        machine.answers("gpu_live", None);
-        sampler.step(&*door);
-        assert_eq!(sampler.status()["last"].to_string(), r#"{"ts":1000.0,"ok":false,"core":0,"mem":0,"temp":0,"power":0.0,"util":0,"memutil":0,"fan":0}"#);
+        let moved = Moved::new(machine.clone(), false);
+        moved.perf.start(&moved.card, "x".into());
+        moved.perf.step(&moved.card);
+        assert_eq!(moved.perf.status()["last"]["ok"], Json::Bool(false));
+        assert!(machine.asked().is_empty(), "the card was asked through the shell's own door: {:?}", machine.asked());
     }
 
     #[test]
     fn the_chart_and_the_score_are_of_the_last_seconds_asked_for() {
-        let (machine, door, sampler) = a_machine();
-        sampler.start(&door, "test".into());
+        let (machine, backend, card, sampler) = a_machine();
+        sampler.start(&card, "test".into());
         // 400 samples, a fifth of a second apart: 300 are kept.
         for round in 0..400 {
             machine.at(1000.0 + round as f64 * 0.2);
-            machine.answers("gpu_live", Some(reading(60 + (round % 3), 90 + (round % 5), 2100 + (round % 2) * 10)));
-            sampler.step(&*door);
+            backend.says(Some(reading(60 + (round % 3), 90 + (round % 5), 2100 + (round % 2) * 10)));
+            sampler.step(&card);
         }
         let now = 1000.0 + 399.0 * 0.2;
         machine.at(now);
         assert_eq!(sampler.status()["sample_count"].as_int(), Some(300));
-        let get = |target: &str| call(&sampler, &door, "GET", target, "").unwrap();
+        let get = |target: &str| call(&sampler, &card, "GET", target, "").unwrap();
         let chart = get("/api/perf/samples");
         assert_eq!((chart["count"].as_int(), chart["window_s"].as_int()), (Some(300), Some(60)));
         for list in ["ts", "core", "mem", "temp", "power", "util", "fan"] {
@@ -685,10 +674,10 @@ mod tests {
         let few = get("/api/perf/score?seconds=1");
         assert_eq!(few.to_string(), "{\"score\":null,\"verdict\":\"no-data\",\"reason\":\"need \\u226510 samples, have 6\",\"subs\":{},\"samples_used\":6,\
                                      \"last_util\":94,\"last_temp\":60,\"avg_util\":92.3,\"max_util\":94,\"idle_threshold\":15}");
-        machine.answers("gpu_live", Some(reading(40, 3, 300)));
+        backend.says(Some(reading(40, 3, 300)));
         for round in 400..560 {
             machine.at(1000.0 + round as f64 * 0.2);
-            sampler.step(&*door);
+            sampler.step(&card);
         }
         machine.at(1000.0 + 559.0 * 0.2);
         let idle = get("/api/perf/score");
@@ -697,8 +686,8 @@ mod tests {
         // A card whose clock and use jump about, and that warms up by 30 degrees.
         for round in 560..720 {
             machine.at(1000.0 + round as f64 * 0.2);
-            machine.answers("gpu_live", Some(reading(50 + (round - 560) / 5, if round % 2 == 0 { 99 } else { 20 }, 1500 + (round % 4) * 250)));
-            sampler.step(&*door);
+            backend.says(Some(reading(50 + (round - 560) / 5, if round % 2 == 0 { 99 } else { 20 }, 1500 + (round % 4) * 250)));
+            sampler.step(&card);
         }
         machine.at(1000.0 + 719.0 * 0.2);
         let shaky = get("/api/perf/score");
@@ -709,12 +698,12 @@ mod tests {
     fn the_score_at_its_edges() {
         // Twelve samples, each (temperature, use, clock), and the score of them.
         let scored = |cards: Vec<(i128, i128, i128)>| {
-            let (machine, door, sampler) = a_machine();
-            sampler.start(&door, "edges".into());
+            let (machine, backend, card, sampler) = a_machine();
+            sampler.start(&card, "edges".into());
             for (round, (temp, util, core)) in cards.iter().enumerate() {
                 machine.at(100.0 + round as f64 * 0.25);
-                machine.answers("gpu_live", Some(reading(*temp, *util, *core)));
-                sampler.step(&*door);
+                backend.says(Some(reading(*temp, *util, *core)));
+                sampler.step(&card);
             }
             sampler.score(100.0 + cards.len() as f64 * 0.25, 60)
         };
@@ -758,12 +747,8 @@ mod tests {
 
     #[test]
     fn with_threads_it_samples_by_itself_until_it_is_told_to_stop() {
-        let machine = Fake::new();
-        machine.answers("gpu_live", Some(reading(61, 97, 2100)));
-        machine.at(1000.0);
-        let door: Arc<dyn Readings> = machine.clone();
-        let sampler = Sampler::new(true);
-        assert!(sampler.answer(&door, &Request::new("POST", "/api/perf/start").with_body("{}")).is_some());
+        let (_, backend, card, sampler) = a_machine_with(true);
+        assert!(sampler.answer(&card, &Request::new("POST", "/api/perf/start").with_body("{}")).is_some());
         let waited = std::time::Instant::now();
         while sampler.status()["sample_count"].as_int() < Some(3) && waited.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(20));
@@ -778,8 +763,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert!(!sampler.is_running() && told.elapsed() < Duration::from_millis(150), "it took {:?} to stop", told.elapsed());
-        let taken = sampler.status()["sample_count"].as_int();
+        let (taken, asked) = (sampler.status()["sample_count"].as_int(), backend.asked().len());
+        assert_eq!(Some(asked as i128), taken, "one reading of the backend's for each sample");
         std::thread::sleep(Duration::from_millis(450));
-        assert_eq!(sampler.status()["sample_count"].as_int(), taken);
+        assert_eq!((sampler.status()["sample_count"].as_int(), backend.asked().len()), (taken, asked), "it went on after it was told to stop");
     }
 }

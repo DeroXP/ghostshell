@@ -927,7 +927,8 @@ pub enum ToRemove {
     /// One of this program's making that nobody holds.  While this is kept,
     /// nobody can come to hold it either.
     Ours(std::fs::File),
-    /// Somebody holds it (hold_own_folder): a copy of the app is using it.
+    /// Some program holds the folder open (as a copy of the app does that
+    /// runs from it: hold_own_folder).  Which program, Windows does not say.
     InUse,
     /// Not of this program's making (or a link, or a file): never touched.
     NotOurs,
