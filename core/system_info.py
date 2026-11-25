@@ -1,10 +1,41 @@
-"""System information detection for the dashboard."""
+"""System information detection for the dashboard.
+
+This is what the first screen waits for.  Every part of it is one WMI query
+(and the NVIDIA card's name).  Each used to start a PowerShell: seven of them
+and an nvidia-smi, 4.4 seconds on the owner's PC with nothing else running.
+With the native helper (core/native.py) the same queries are asked inside
+the app; without it, PowerShell answers as before (_cim).
+"""
 import json
 import platform
 import os
+from core import native
 from core.utils import run_ps, run_cmd, get_logger, detect_drive_type
 
 log = get_logger("sysinfo")
+
+
+def _cim(wql: str, powershell: str, namespace: str = "root\\cimv2"):
+    """The rows of one WMI query, as a list of dicts: from the native helper
+    (`wql`), else from PowerShell (`powershell`, the pipeline this code has
+    always run, printing JSON).  None when neither gave any row.
+
+    Both read the same WMI class, so the rows and their order are the same;
+    PowerShell prints one row as a bare object, which is made a list here."""
+    rows = native.wmi(namespace, wql)
+    if rows:
+        return rows
+    r = run_ps(powershell)
+    if r["ok"] and r["out"]:
+        try:
+            d = json.loads(r["out"])
+        except Exception:
+            return None
+        if isinstance(d, dict):
+            return [d]
+        if isinstance(d, list) and d and all(isinstance(x, dict) for x in d):
+            return d
+    return None
 
 
 def get_system_info() -> dict:
@@ -22,12 +53,13 @@ def get_system_info() -> dict:
 
 
 def _get_os_info() -> dict:
-    r = run_ps(
+    rows = _cim(
+        "SELECT Caption,Version,BuildNumber,OSArchitecture FROM Win32_OperatingSystem",
         "Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber,OSArchitecture | ConvertTo-Json"
     )
-    if r["ok"] and r["out"]:
+    if rows and len(rows) == 1:
         try:
-            d = json.loads(r["out"])
+            d = rows[0]
             return {
                 "name": d.get("Caption", "Windows"),
                 "version": d.get("Version", ""),
@@ -45,14 +77,13 @@ def _get_os_info() -> dict:
 
 
 def _get_cpu_info() -> dict:
-    r = run_ps(
+    rows = _cim(
+        "SELECT Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,CurrentClockSpeed FROM Win32_Processor",
         "Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,CurrentClockSpeed | ConvertTo-Json"
     )
-    if r["ok"] and r["out"]:
+    if rows:
         try:
-            d = json.loads(r["out"])
-            if isinstance(d, list):
-                d = d[0]
+            d = rows[0]
             return {
                 "name": d.get("Name", "Unknown").strip(),
                 "cores": d.get("NumberOfCores", 0),
@@ -66,7 +97,24 @@ def _get_cpu_info() -> dict:
             "threads": os.cpu_count() or 0, "max_clock": 0, "cur_clock": 0}
 
 
+def _nvidia_card():
+    """The first NVIDIA card as (name, driver version, memory in MiB), from
+    the driver's own library through the native helper; None when the helper
+    is not there, there is no such card, or the driver leaves one of the three
+    out (nvidia-smi is asked then, as before).
+
+    The memory is in whole MiB, rounded, which is what nvidia-smi prints for
+    memory.total."""
+    card = native.gpu_identity()
+    if not card or not card.get("driver_version") or card.get("mem_total_bytes") is None:
+        return None
+    return card["name"], card["driver_version"], round(card["mem_total_bytes"] / 1048576)
+
+
 def _get_gpu_info() -> dict:
+    card = _nvidia_card()
+    if card:
+        return {"name": card[0], "driver": card[1], "vram_gb": round(card[2] / 1024, 1), "status": "OK"}
     # Try nvidia-smi first — most reliable for NVIDIA
     r2 = run_cmd(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader,nounits"])
     if r2["ok"] and r2["out"]:
@@ -86,14 +134,12 @@ def _get_gpu_info() -> dict:
             }
 
     # Fallback: WMI — but filter out virtual/basic adapters
-    r = run_ps(
+    d = _cim(
+        "SELECT Name,DriverVersion,AdapterRAM,Status FROM Win32_VideoController",
         "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,AdapterRAM,Status | ConvertTo-Json"
     )
-    if r["ok"] and r["out"]:
+    if d:
         try:
-            d = json.loads(r["out"])
-            if not isinstance(d, list):
-                d = [d]
             # Filter: prefer real GPU over virtual/basic display
             skip_names = ["virtual", "basic", "meta", "microsoft", "remote", "vmware", "hyper-v", "parsec"]
             real_gpu = None
@@ -145,16 +191,14 @@ def _detect_gpus() -> list:
     Skips the obvious virtual / remote-display adapters so a Parsec or
     RDP session doesn't get mistaken for the real GPU."""
     out: list = []
-    r = run_ps(
+    d = _cim(
+        "SELECT Name,DriverVersion,AdapterRAM,PNPDeviceID,Status FROM Win32_VideoController",
         "Get-CimInstance Win32_VideoController "
         "| Select-Object Name,DriverVersion,AdapterRAM,PNPDeviceID,Status "
         "| ConvertTo-Json -Compress"
     )
-    if r["ok"] and r["out"]:
+    if d:
         try:
-            d = json.loads(r["out"])
-            if not isinstance(d, list):
-                d = [d]
             skip = ("virtual", "basic display", "basic render", "meta",
                     "remote", "vmware", "hyper-v", "parsec", "citrix",
                     "ddm", "aspeed", "matrox", "idd")
@@ -182,6 +226,10 @@ def _detect_gpus() -> list:
     # If nvidia-smi reports a card WMI missed (rare, but happens when the
     # NVIDIA adapter is in a weird power state), make sure it's listed.
     if not any(g["vendor"] == "NVIDIA" for g in out):
+        card = _nvidia_card()
+        if card:
+            out.append({"name": card[0], "vendor": "NVIDIA", "vram_gb": round(card[2] / 1024, 1), "driver": ""})
+            return out
         nv = run_cmd(["nvidia-smi", "--query-gpu=name,memory.total",
                       "--format=csv,noheader,nounits"])
         if nv["ok"] and nv["out"]:
@@ -197,17 +245,15 @@ def _detect_gpus() -> list:
 
 
 def _get_ram_info() -> dict:
-    r = run_ps(
+    d = _cim(
+        "SELECT Capacity,Speed,ConfiguredClockSpeed FROM Win32_PhysicalMemory",
         "Get-CimInstance Win32_PhysicalMemory | Select-Object Capacity,Speed,ConfiguredClockSpeed | ConvertTo-Json"
     )
     total = 0
     speed = 0
     sticks = 0
-    if r["ok"] and r["out"]:
+    if d:
         try:
-            d = json.loads(r["out"])
-            if not isinstance(d, list):
-                d = [d]
             sticks = len(d)
             for stick in d:
                 total += stick.get("Capacity", 0)
@@ -219,13 +265,14 @@ def _get_ram_info() -> dict:
     total_gb = round(total / (1024 ** 3), 1) if total else 0
 
     # Current usage
-    r2 = run_ps(
+    rows2 = _cim(
+        "SELECT TotalVisibleMemorySize,FreePhysicalMemory FROM Win32_OperatingSystem",
         "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | ConvertTo-Json"
     )
     used_pct = 0
-    if r2["ok"] and r2["out"]:
+    if rows2 and len(rows2) == 1:
         try:
-            d2 = json.loads(r2["out"])
+            d2 = rows2[0]
             t = d2.get("TotalVisibleMemorySize", 1)
             f = d2.get("FreePhysicalMemory", 0)
             used_pct = round((1 - f / t) * 100) if t else 0
@@ -237,15 +284,13 @@ def _get_ram_info() -> dict:
 
 def _get_storage_info() -> dict:
     drive_type = detect_drive_type()
-    r = run_ps(
+    d = _cim(
+        "SELECT DeviceID,Size,FreeSpace FROM Win32_LogicalDisk WHERE DriveType=3",
         "Get-CimInstance Win32_LogicalDisk -Filter \"DriveType=3\" | Select-Object DeviceID,Size,FreeSpace | ConvertTo-Json"
     )
     drives = []
-    if r["ok"] and r["out"]:
+    if d:
         try:
-            d = json.loads(r["out"])
-            if not isinstance(d, list):
-                d = [d]
             for drv in d:
                 total = drv.get("Size", 0) or 0
                 free = drv.get("FreeSpace", 0) or 0
@@ -262,16 +307,18 @@ def _get_storage_info() -> dict:
 
 def _get_network_info() -> dict:
     # Current DNS
-    r = run_ps(
-        "Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {$_.ServerAddresses} | Select-Object InterfaceAlias,ServerAddresses | ConvertTo-Json"
+    # (The helper reads the class Get-DnsClientServerAddress is a wrapper
+    # for; address family 2 is IPv4.  Adapters without a DNS server are
+    # skipped by the loop below, as the Where-Object did.)
+    d = _cim(
+        "SELECT InterfaceAlias,ServerAddresses FROM MSFT_DNSClientServerAddress WHERE AddressFamily=2",
+        "Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {$_.ServerAddresses} | Select-Object InterfaceAlias,ServerAddresses | ConvertTo-Json",
+        namespace="root\\StandardCimv2"
     )
     dns_servers = []
     adapter = ""
-    if r["ok"] and r["out"]:
+    if d:
         try:
-            d = json.loads(r["out"])
-            if not isinstance(d, list):
-                d = [d]
             for item in d:
                 addrs = item.get("ServerAddresses", [])
                 if addrs:

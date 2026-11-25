@@ -55,8 +55,39 @@ if _missing:
 # loudly rather than fail.
 _native_dll = os.path.join(base_path, 'native', 'target', 'release', 'vispora_native.dll')
 _native_binaries = [(_native_dll, '.')] if os.path.isfile(_native_dll) else []
+
+
+def _native_helper_version_wanted():
+    """The helper version core/native.py asks for (its ABI number)."""
+    import re
+    with open(os.path.join(base_path, 'core', 'native.py'), encoding='utf-8') as f:
+        return int(re.search(r'^ABI = (\d+)', f.read(), re.M).group(1))
+
+
+def _native_helper_version_built():
+    """The version the built DLL says it is.  Loading it runs nothing but that
+    one function."""
+    import ctypes
+    lib = ctypes.WinDLL(_native_dll)
+    lib.vispora_native_abi.restype = ctypes.c_uint32
+    return int(lib.vispora_native_abi())
+
+
 if _native_binaries:
-    print(f"build.spec: native helper bundled ({os.path.getsize(_native_dll) // 1024} KB)")
+    # A DLL from before the last change to native/ is refused by the app at
+    # run time, and the build would then be the slow one without anybody
+    # noticing.  That is always a forgotten rebuild, so it stops the build.
+    _wanted, _built = _native_helper_version_wanted(), _native_helper_version_built()
+    if _built != _wanted:
+        raise SystemExit(f"build.spec: the built native helper is version {_built}, the app needs version {_wanted}. "
+                         "Rebuild it first: cargo build --release --manifest-path native/Cargo.toml")
+    _native_sources = [os.path.join(base_path, 'native', 'Cargo.toml')] + [
+        os.path.join(base_path, 'native', 'src', f) for f in os.listdir(os.path.join(base_path, 'native', 'src'))
+        if f != 'main.rs']      # (main.rs is the command-line tool, not part of the DLL)
+    if max(os.path.getmtime(p) for p in _native_sources) > os.path.getmtime(_native_dll):
+        print("build.spec: WARNING - native/ has changed since the native helper was built.  "
+              "Rebuild it first: cargo build --release --manifest-path native/Cargo.toml")
+    print(f"build.spec: native helper bundled (version {_built}, {os.path.getsize(_native_dll) // 1024} KB)")
 else:
     print("build.spec: WARNING - native helper NOT FOUND: this build will start PowerShell and nvidia-smi "
           "for every reading.  Run: cargo build --release --manifest-path native/Cargo.toml")

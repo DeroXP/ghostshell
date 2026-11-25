@@ -465,25 +465,39 @@ def _capture_baseline() -> dict:
     baseline = {}
 
     # Win32PrioritySeparation
-    r = run_cmd(["reg","query",r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl","/v","Win32PrioritySeparation"])
-    if r["ok"] and "0x" in r["out"]:
-        baseline["priority_sep"] = r["out"].split("0x")[-1].strip().split()[0]
+    value = _reg_number_hex(r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl", "Win32PrioritySeparation")
+    if value is not None:
+        baseline["priority_sep"] = value
 
     # SystemResponsiveness
-    r = run_cmd(["reg","query",r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile","/v","SystemResponsiveness"])
-    if r["ok"] and "0x" in r["out"]:
-        baseline["sys_responsiveness"] = r["out"].split("0x")[-1].strip().split()[0]
+    value = _reg_number_hex(r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", "SystemResponsiveness")
+    if value is not None:
+        baseline["sys_responsiveness"] = value
 
     # NetworkThrottlingIndex
-    r = run_cmd(["reg","query",r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile","/v","NetworkThrottlingIndex"])
-    if r["ok"] and "0x" in r["out"]:
-        baseline["net_throttle"] = r["out"].split("0x")[-1].strip().split()[0]
+    value = _reg_number_hex(r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile", "NetworkThrottlingIndex")
+    if value is not None:
+        baseline["net_throttle"] = value
 
     # CPU idle
     baseline["cpu_idle_disabled"] = _cpu_idle_disabled()
     baseline["idle_probe"] = "qh"        # this baseline's idle state is a real reading
 
     return baseline
+
+
+def _reg_number_hex(key: str, value: str):
+    """A registry number as the hex digits `reg query` prints after "0x"
+    ("26" for 38), or None when the value is not there, cannot be read or is
+    not a number.  Read directly: this used to start reg.exe and pick the
+    digits out of what it printed, three times at every game start."""
+    current = reg_originals.read_value(key, value)
+    if not current or current.get("type") not in ("REG_DWORD", "REG_QWORD"):
+        return None
+    try:
+        return format(int(current["data"]), "x")
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _cpu_idle_disabled() -> bool:
@@ -804,16 +818,11 @@ def _apply_registry_tweaks(recheck: bool = False) -> None:
 
 
 # ── power plan ───────────────────────────────────────────────────────
-_HEX8 = re.compile(r"0x[0-9a-fA-F]{8}")
-
-
 def _power_limit(scheme: str, setting: str):
     """The largest value Windows accepts for this processor setting on this
     PC, or None if that cannot be read.  (/qh lists, for a range setting:
     minimum, maximum, increment, then the AC and DC values.)"""
-    r = run_cmd(["powercfg", "/qh", scheme, _PROC_SUB, setting])
-    found = _HEX8.findall(r.get("out") or "") if r.get("ok") else []
-    return int(found[-4], 16) if len(found) >= 5 else None
+    return reg_originals.power_limit(scheme, _PROC_SUB, setting)
 
 
 _PARKING_CAP_KEY = (rf"HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\{_PROC_SUB}"
@@ -1250,6 +1259,9 @@ def _load_target_restore() -> dict:
 
 def _active_power_guid() -> str:
     """GUID of the currently-active Windows power scheme, or '' if unknown."""
+    plan = native.power_scheme()
+    if plan:
+        return plan["guid"]
     r = run_cmd(["powercfg", "/getactivescheme"], timeout=6)
     if not r.get("ok"):
         return ""
@@ -1708,9 +1720,8 @@ def _verify_normal_state(baseline: dict):
     # user's choice, not a leftover of game mode: "restoring" it reverted
     # them at the next start whenever no game had been played since.
     prio = r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl"
-    r = run_cmd(["reg","query",r"HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl","/v","Win32PrioritySeparation"])
-    if r["ok"] and "0x" in r["out"]:
-        current = r["out"].split("0x")[-1].strip().split()[0].lower()
+    current = _reg_number_hex(prio, "Win32PrioritySeparation")
+    if current is not None:
         expected = baseline.get("priority_sep", "2").lower()
         if current == "28" and expected != "28" and not (
                 reg_originals.on_record(prio, "Win32PrioritySeparation")
@@ -2781,6 +2792,21 @@ def get_active_game_info() -> dict | None:
         "oc_core":  int(_engine.get("active_oc_core", 0) or 0),
         "oc_mem":   int(_engine.get("active_oc_mem",  0) or 0),
     }
+
+
+def unless_in_a_game(fn) -> bool:
+    """Call fn() unless a game session is on.  True when it was called.
+
+    The session lock is held for the check and the call, so a game cannot
+    start in between.  app.py enters efficiency mode through this once
+    start-up is over: a session keeps the app responsive from the moment it
+    starts and enters efficiency mode itself when the game closes, and a
+    late "start-up is over" must not undo the first of those."""
+    with _session_lock:
+        if _engine.get("gaming_mode"):
+            return False
+        fn()
+        return True
 
 
 # ─── v3.3 — Multi-game tracking ───────────────────────────────────────

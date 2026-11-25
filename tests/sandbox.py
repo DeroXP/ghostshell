@@ -901,11 +901,19 @@ _utils.run_cmd, _utils.run_ps = run_cmd, run_ps     # before anything does `from
 # app sees when the helper is not installed - so unless a test fills NATIVE,
 # everything is asked the old way (PowerShell, nvidia-smi, ping) and the fakes
 # below answer.  NATIVE_CALLS lists every question asked: (question, arguments).
+#
+# The helper's ACTIONS (they free memory: trim_working_sets,
+# purge_standby_list) have their own door, native.act, and their own fake:
+# NATIVE_ACTS maps an action to what it reports (or to a callable), and
+# NATIVE_ACTED lists every action asked for.  No test can make the real
+# library do anything.
 from core import native as _native                  # noqa: E402
 
-real_native_call, real_native_open = _native.call, _native._open
+real_native_call, real_native_open, real_native_act = _native.call, _native._open, _native.act
 NATIVE: dict = {}
 NATIVE_CALLS: list = []
+NATIVE_ACTS: dict = {}
+NATIVE_ACTED: list = []
 
 
 def _native_call(query, /, **args):
@@ -914,8 +922,38 @@ def _native_call(query, /, **args):
     return answer(**args) if callable(answer) else answer
 
 
+def _native_act(action, /, **args):
+    NATIVE_ACTED.append((action, dict(args)))
+    answer = NATIVE_ACTS.get(action)
+    return answer(**args) if callable(answer) else answer
+
+
 _native.call = _native_call
+_native.act = _native_act
 _native.available = lambda: bool(NATIVE)
+
+
+def native_machine() -> None:
+    """Have the native helper answer its power-plan and service questions
+    from this same fake machine: the plans powercfg reads and writes (PLAN),
+    the services sc reads.  A test that calls this and one that does not see
+    the same machine through two doors, which is how "the helper gives the
+    same answer" is checked."""
+    def power_setting(scheme="current", sub="", setting=""):
+        plan = PLAN["active"] if scheme == "current" else scheme.lower()
+        if plan not in PLAN["schemes"]:
+            return None                     # (the helper answers an error; the app sees None)
+        ac, dc = cell(plan, setting)
+        return {"scheme": plan, "ac": ac, "dc": dc, "min": 0, "max": _limit(setting.lower()), "increment": 1}
+
+    def service_state(name=""):
+        if svc_get(name) is None:
+            return {"installed": False, "state": None}
+        return {"installed": True, "state": 4 if name.lower() in RUNNING else 1}
+
+    NATIVE["power_scheme"] = lambda: {"guid": PLAN["active"], "schemes": sorted(PLAN["schemes"])}
+    NATIVE["power_setting"] = power_setting
+    NATIVE["service_state"] = service_state
 
 from core import reg_originals, sys_state           # noqa: E402
 from core import process_tuning as _pt              # noqa: E402
@@ -1957,10 +1995,11 @@ def _wipe_app_data() -> None:
 def fresh(plan: str = USERPLAN) -> None:
     """A clean machine and a clean app: nothing tweaked, nothing on record."""
     for box in (STORE, _KEY_CASE, REG_FAIL, SC_FAIL, RUNNING, TASKS, TASK_FAIL, TASK_NO_FLAG, BCD, BCD_FAIL, TCP,
-                STACK, FEATURES, DISM_3010, FSUTIL, DEF, PNP, COUNTS, GPU, ALIVE, POWER_LIMITS, K.snapshots, NATIVE):
+                STACK, FEATURES, DISM_3010, FSUTIL, DEF, PNP, COUNTS, GPU, ALIVE, POWER_LIMITS, K.snapshots, NATIVE,
+                NATIVE_ACTS):
         box.clear()
     for log_ in (WRITES, DELETES, PTOUCH, CMDS, PSC, CMD_HOOKS, PS_HOOKS, SPI, TIMER, K.calls, PRIV, CPU_TIMES,
-                 NATIVE_CALLS):
+                 NATIVE_CALLS, NATIVE_ACTED):
         del log_[:]
     for flag in (BCD_OK, DISM_OK, FSUTIL_OK, DEF_OK, STACK_OK, TCP_OK, DUPLICATE_OK, HIBERNATE, DRS_OK, DRS_SAVE_OK):
         flag[0] = True
@@ -1983,7 +2022,7 @@ def fresh(plan: str = USERPLAN) -> None:
 
 
 def clear_logs() -> None:
-    for log_ in (WRITES, DELETES, PTOUCH, CMDS, PSC, NATIVE_CALLS):
+    for log_ in (WRITES, DELETES, PTOUCH, CMDS, PSC, NATIVE_CALLS, NATIVE_ACTED):
         del log_[:]
 
 

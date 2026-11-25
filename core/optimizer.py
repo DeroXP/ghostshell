@@ -300,11 +300,7 @@ def _own_power_plans() -> set:
 
 def active_power_plan() -> str:
     """GUID of the active power plan, or "" if it cannot be read."""
-    r = run_cmd(["powercfg", "/getactivescheme"])
-    for part in (r.get("out") or "").split():
-        if len(part) == 36 and part.count("-") == 4:
-            return part
-    return ""
+    return reg_originals.active_scheme()
 
 
 def _read_power_baseline() -> str:

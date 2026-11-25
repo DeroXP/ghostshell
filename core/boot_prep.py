@@ -9,8 +9,8 @@ import os
 import time
 import threading
 from config import APPDATA_DIR
-from core import reg_originals
-from core.utils import run_ps, run_cmd, get_logger, atomic_write_json
+from core import native, reg_originals
+from core.utils import run_ps, run_cmd, get_logger, atomic_write_json, is_admin
 
 log = get_logger("boot_prep")
 
@@ -55,6 +55,18 @@ def _step(name: str, fn):
 
 def _flush_working_sets() -> bool:
     """Trim working sets of all processes — frees RAM without killing anything."""
+    # The native helper makes the same Windows call for every process, inside
+    # the app.  Without it, PowerShell compiles and runs the C# below, as it
+    # did at every start.
+    done = native.trim_working_sets()
+    if done is not None:
+        log.debug(f"  working sets trimmed: {done['trimmed']} of {done['processes']} processes")
+        if done["reached_services"] or not is_admin():
+            return True
+        # Elevated, and yet the helper could not switch on the privilege that
+        # reaches Windows' services: it trimmed fewer processes than the old
+        # way does.  Not expected; the old way runs as well, so nothing is lost.
+        log.info("  working sets: the native helper could not reach the services, PowerShell trims as before")
     r = run_ps("""
 try {
     Add-Type -TypeDefinition @'
@@ -75,6 +87,10 @@ def _clear_standby_list() -> bool:
     """Drop the standby memory list so games get fresh allocations."""
     # The purge needs SeProfileSingleProcessPrivilege (13), which an elevated
     # token holds switched off: without switching it on this always failed.
+    # (The native helper switches it on for its own thread only, makes the
+    # call and lets go again; the PowerShell below is the way without it.)
+    if native.purge_standby_list():
+        return True
     r = run_ps("""
 try {
     Add-Type -TypeDefinition @'
@@ -96,6 +112,11 @@ def _reg(key: str, val: str, data: str, vtype: str = "REG_DWORD") -> bool:
     # was there before.  These used to be written at every launch with no
     # record at all.
     reg_originals.remember(key, val, data, vtype)
+    if reg_originals.reads_as(key, val, data, vtype):
+        # Already what this step writes, as at every start after the first:
+        # nothing to change, so no reg.exe is started for it (eight of them
+        # were, at every launch).
+        return True
     ok = run_cmd(["reg", "add", key, "/v", val, "/t", vtype, "/d", data, "/f"])["ok"]
     if not ok:
         log.warning(f"  reg write failed: {key}\\{val} = {data}")

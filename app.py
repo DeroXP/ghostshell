@@ -147,6 +147,7 @@ def api_dashboard():
     info = system_info.get_system_info()
     info["admin"] = is_admin()
     info["module_status"] = _module_status
+    _first_screen_served.set()      # (start-up counts as over once the first screen has its data)
     return jsonify(info)
 
 
@@ -3495,6 +3496,56 @@ def _set_efficiency_mode():
         log.warning(f"Could not set efficiency mode: {e}")
 
 
+# ── efficiency mode, once start-up is over ───────────────────────────
+# A start that somebody is waiting for does its work at normal speed first:
+# the first screen's data, the start-up preparation, the dependency check.
+# The app used to put itself in efficiency mode (below normal priority, slow
+# cores) as the very first thing, and then did all of that throttled; the
+# first screen had its data a median 14 seconds after the start
+# (docs/performance.md).  A start at sign-in still throttles itself at once:
+# nobody is waiting for it, and it must not compete with Windows starting up.
+_first_screen_served = threading.Event()
+_STARTUP_EFFICIENCY_CAP_S = 60.0        # efficiency mode by then, whatever is still running
+_STARTUP_EFFICIENCY_POLL_S = 0.5
+
+
+def _startup_work_done() -> bool:
+    """Have the things a start does at once finished: the first screen's
+    data, the start-up preparation and the dependency check?  Never raises."""
+    try:
+        from core import dependencies
+        return bool(_first_screen_served.is_set()
+                    and boot_prep.get_status().get("done")
+                    and dependencies.boot_check_done())
+    except Exception as e:
+        log.debug(f"could not tell whether start-up is over: {e}")
+        return True
+
+
+def _efficiency_mode_after_startup(cap_s: float = None, poll_s: float = None) -> str:
+    """Wait for start-up to be over (at most `cap_s`), then enter efficiency
+    mode, unless a game is running by then: game mode keeps the app
+    responsive during a game and enters efficiency mode itself when the game
+    closes.  Returns what it did: "efficiency" or "left to game mode"."""
+    cap_s = _STARTUP_EFFICIENCY_CAP_S if cap_s is None else cap_s
+    poll_s = _STARTUP_EFFICIENCY_POLL_S if poll_s is None else poll_s
+    started = time.monotonic()
+    while time.monotonic() - started < cap_s and not _startup_work_done():
+        time.sleep(poll_s)
+    waited = time.monotonic() - started
+    try:
+        entered = game_profiles.unless_in_a_game(_set_efficiency_mode)
+    except Exception as e:
+        log.debug(f"could not ask game mode before entering efficiency mode: {e}")
+        _set_efficiency_mode()
+        entered = True
+    if entered:
+        log.info(f"Start-up over after {waited:.1f}s: now in efficiency mode")
+        return "efficiency"
+    log.info(f"Start-up over after {waited:.1f}s: a game is running, so game mode decides about efficiency mode")
+    return "left to game mode"
+
+
 def _set_responsive_mode():
     """Drop efficiency throttling — set Normal priority + clear EcoQoS.
     Called when Vispora needs to keep up with real work: a game is
@@ -4034,8 +4085,13 @@ def main():
     except Exception as e:
         log.warning(f"Post-install state check failed: {e}")
 
-    # Set efficiency mode so Vispora itself is lightweight
-    _set_efficiency_mode()
+    # Efficiency mode, so Vispora itself is lightweight: at once after a
+    # start at sign-in (nobody is waiting, and Windows is still starting up).
+    # When somebody opened the app and is waiting for its window, it comes
+    # after the start-up work (further down, once the recovery steps that
+    # must run alone are over; see _efficiency_mode_after_startup).
+    if from_autostart:
+        _set_efficiency_mode()
 
     # v3.1 fix — restore microphone access if it was killed by an earlier
     # Vispora version's bulk privacy tweak.  Idempotent + safe: only ever
@@ -4106,14 +4162,18 @@ def main():
     except Exception as e:
         log.debug(f"Adaptive Tuning orphan check failed: {e}")
 
-    # v3.1 — start the network-burst sampler so the Network tab has data
-    # ready when the user opens it, and so the burst-alert system is
-    # always armed during gameplay.
-    try:
-        net_monitor.start()
-        log.info("net_monitor sampler started")
-    except Exception as e:
-        log.debug(f"net_monitor start failed: {e}")
+    # The network sampler is NOT started here any more.  It starts when the
+    # Network page first asks for its figures and stops when nobody has asked
+    # for half a minute (core/net_monitor.py).  It used to run from this
+    # point until the app quit, a quarter of a processor core on the owner's
+    # PC, whether or not that page was ever opened; its burst alert is only
+    # ever shown on that page.
+
+    # A start somebody is waiting for: efficiency mode once the start-up work
+    # is over, not before it (a start at sign-in entered it above).
+    if not from_autostart:
+        threading.Thread(target=_efficiency_mode_after_startup, daemon=True,
+                         name="efficiency-after-startup").start()
 
     # v3.1 — Background Pauser orphan recovery.  If a previous run crashed
     # mid-game, any browser / AI app we suspended is still frozen.  Resume

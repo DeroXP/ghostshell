@@ -4,6 +4,11 @@ Measured on 2026-11-24, before any of the app moved to Rust. This is the
 baseline the port is steered by: [rust-port.md](rust-port.md) is the order that
 follows from it, and [native/](../native/README.md) is the first piece.
 
+Each step of the port adds a section with the same things measured again:
+[the first piece](#what-the-first-native-piece-changes) (the readings taken
+all the time) and [the second](#what-the-second-piece-changes) (the readings a
+start waits for).
+
 Nothing here is an estimate from reading the code. Where something could not
 be measured it says so.
 
@@ -299,6 +304,155 @@ Two differences are known and deliberate:
 * **A few protected system processes have a name** in the helper's list
   ("Secure System") where psutil had none.
 
+## What the second piece changes
+
+Step 2 of [the order](rust-port.md): the readings a start waits for now go
+through the native helper, and two things that needed no Rust were fixed with
+it. Measured the same day, the same ways.
+
+### The first screen
+
+Run for real on this PC (`real_reads.py`), the system information the first
+screen waits for:
+
+| | Before | With the helper |
+| --- | --- | --- |
+| Programs started | 8 (7 PowerShell, 1 `nvidia-smi`) | 0 |
+| Time | **3.6 s** | **0.1 s** |
+
+(The 4.4 seconds further up was taken while a game was running. This time
+the PC was idle: the graphics card at 0% and 34 degrees.)
+
+The data is the same. Read both ways one after the other on this PC, every
+field agreed: Windows, the processor, the card and its driver, the memory
+sticks, both drives and their type, the adapter and its DNS servers. Only the
+two figures that move between two looks (memory in use, free disk space) were
+left out of the comparison.
+
+What one of its answers costs (`helper_cost.py`): a WMI query 7 to 20 ms, the
+card's name and driver 0.01 ms. The slowest PowerShell call it replaces took
+1.25 s.
+
+### A start
+
+Counted in the sandbox. The fake PC begins as one the app has never run on, so
+`count_starts.py` now makes the start twice: the first start on a PC, and a
+later start, which is every start after that.
+
+Programs started by **a later start**:
+
+| | Before (3.8.1) | Now, without the helper | Now, with the helper |
+| --- | --- | --- | --- |
+| Before the window opens | 16 | 6 | **3** |
+| Background tasks | 33 | 25 | **8** |
+| The first screen's data | 8 | 8 | **0** |
+| All of it | 57 | 39 | **11** |
+
+And by the **first start on a PC** (one-time repairs, values written for the
+first time, the power plan switched):
+
+| | Before (3.8.1) | Now, without the helper | Now, with the helper |
+| --- | --- | --- | --- |
+| Before the window opens | 28 | 24 | 20 |
+| Background tasks | 40 | 40 | 23 |
+| The first screen's data | 8 | 8 | 0 |
+| All of it | 76 | 72 | 43 |
+
+The middle column is the part that needed no Rust: the app wrote 17 registry
+values again at every launch (nine for the Game Bar handlers before the window
+opened, eight in the start-up preparation), a `reg` start each. They are read
+first now, directly, and written only when one is missing or different.
+
+What a later start still starts, with the helper:
+
+* before the window: one `nvidia-smi` (the overclock page's capability check,
+  left where it is until the overclock module moves) and two FFmpeg probes;
+* in the background: `ipconfig /flushdns`, and on the sandbox's PC, which has
+  nothing installed, four more FFmpeg probes and three `winget` calls to
+  install what is missing. On a PC that has FFmpeg, a probe that finds it is
+  now remembered for the rest of the run, and those four are none.
+
+### The start-up preparation's two memory steps
+
+Each started PowerShell and compiled a small C# program in it, at every start.
+They are the helper's two actions now, kept apart from its questions (see
+[native/README.md](../native/README.md)).
+
+| | The old way | The helper |
+| --- | --- | --- |
+| Trimming one scratch process (`memory_step_cost.py`) | 223 ms: PowerShell, the compile, the call | 0.03 ms |
+
+That is one process, started by the script for the purpose. Neither way was
+run over every process here, and the standby list was not cleared: on a PC in
+use both would be felt. So what the two steps take in a real start with the
+helper is **not measured**. The old way's figure for the whole preparation is
+the one from the log further up, a median 3.3 seconds.
+
+### A game starting, and quitting during one
+
+Counted in the sandbox with the helper answering:
+
+| | Before | Now |
+| --- | --- | --- |
+| A game starting | 57 programs | **33** |
+| Quit during a game | 24 | **16** |
+
+The 24 and 8 that went were all reads: the active power plan asked for again
+and again, single power settings, three registry values. What is left writes
+something (`powercfg` setting a value, `reg add`), and moves with game mode
+itself in step 4. One power-setting read costs 0.6 ms through the helper,
+against a `powercfg` start of 16 ms.
+
+### The two fixes that needed no Rust
+
+**Efficiency mode after the start-up work.** A start somebody is waiting for
+now does the first screen, the start-up preparation and the dependency check
+at normal priority, and enters efficiency mode when all three are done (or
+after 60 seconds, whichever comes first). A start at sign-in still throttles
+itself at once, as before. What this does to the median 14 seconds is **not
+measured**: it needs a real start. The log says when it happened: "Start-up
+over after N s: now in efficiency mode".
+
+**The network monitor only while its page reads it.** It ran from the first
+second of every start: the thread that was 26% of a core on the installed
+3.7.0, and 3.5 ms every second (`helper_cost.py`) once the first piece made it
+one call. Now it starts when the Network page first asks and stops 30 seconds
+after the last request. At idle, with the page closed, it does nothing.
+
+With both pieces, an idle minute adds up to: the temperature ceiling at 0.1 ms
+a second and the game monitor at 3.5 ms every three seconds. About a tenth of
+a percent of one core, and no program started. As before that is arithmetic
+from the parts, not a measurement of the running app.
+
+### The same answers
+
+`native/check_parity.py` now makes 56 checks on this PC, and all 56 agree. The
+26 that are new with this piece:
+
+* the card's name, driver version and memory as `nvidia-smi` prints them;
+* the first screen's five WMI classes row for row and in the same order, the
+  DNS servers per adapter, and the drive type decided by the same disk;
+* seven services (running, stopped, and not installed) as `sc query` has them;
+* the active power plan and the list of plans as `powercfg` prints them, and
+  seven processor settings on each plan as `powercfg /qh` does: values,
+  limits, hidden settings, and the ones that do not exist;
+* trimming a scratch process through the helper leaves it as the old
+  PowerShell leaves another: 310 MB down to under 1 MB, both still running.
+
+One existing answer changed: a WMI property that is an unsigned 32-bit number
+(a graphics adapter's memory) came back negative above 2 GB, and is now the
+number PowerShell prints.
+
+### What is still not measured
+
+* **A real start.** Everything above is the parts: counted in the sandbox, or
+  timed one by one. How long a real start takes now, from the click to a
+  screen with data, needs the owner to start a build that has this in it:
+  `python tools/measure/log_timeline.py` reads it from the log afterwards.
+* **The running app**, as after the first piece: `python
+  tools/measure/live_sample.py 120` beside it.
+* **Quitting**, still. The steps are at the end of the section on quitting.
+
 ## Measuring again
 
 After each piece of the port, run the same scripts and put the new numbers
@@ -309,6 +463,7 @@ python tools/measure/count_starts.py            (about 4 minutes)
 python tools/measure/count_starts.py --helper
 python tools/measure/process_cost.py
 python tools/measure/helper_cost.py             (needs the helper built)
+python tools/measure/memory_step_cost.py        (needs the helper built)
 python tools/measure/real_reads.py
 python tools/measure/real_reads.py --helper
 python tools/measure/log_timeline.py
@@ -316,4 +471,6 @@ python tools/measure/live_sample.py 120         (with the app running)
 python native/check_parity.py                   (needs the helper built)
 ```
 
-None of them changes anything on the PC, and none needs the app to be closed.
+None of them changes a setting on the PC, and none needs the app to be
+closed. Two of them start scratch processes of their own and trim those
+(`memory_step_cost.py`, `check_parity.py`); nothing else is touched.

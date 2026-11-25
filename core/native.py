@@ -22,8 +22,13 @@ its full path.  There is deliberately no setting or environment variable for
 it: the app runs elevated, and a path anyone could set would be a way to run
 their code as administrator.
 
-The questions (the "q" of a call) and their answers are listed in
-native/README.md.
+Almost everything here is a QUESTION: it reads the machine and changes
+nothing (call()).  Two things are ACTIONS, which free memory at start-up
+(act(), at the end of this file).  The library keeps the two apart behind
+separate exported functions, and so does this module.
+
+The questions (the "q" of a call), the actions (the "do") and their answers
+are listed in native/README.md.
 """
 from __future__ import annotations
 
@@ -37,10 +42,11 @@ from core.utils import get_logger
 
 log = get_logger("native")
 
-ABI = 1                     # must equal ABI in native/src/lib.rs; a library of another version is not used
+ABI = 2                     # must equal ABI in native/src/lib.rs; a library of another version is not used
 DLL_NAME = "vispora_native.dll"
 _FIRST_BUFFER = 64 * 1024
 _MAX_BUFFER = 16 * 1024 * 1024
+_ACTION_BUFFER = 8192       # an action is asked once, with room to spare (the library refuses less than 4096)
 _GIVE_UP_AFTER = 5          # calls in a row that crashed inside the library
 
 _lock = threading.Lock()
@@ -72,6 +78,9 @@ def _open(path: str):
         lib.vispora_native_call.argtypes = [ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32]
         lib.vispora_native_call.restype = ctypes.c_int32
         found = int(lib.vispora_native_abi())
+        if found == ABI:
+            lib.vispora_native_act.argtypes = lib.vispora_native_call.argtypes
+            lib.vispora_native_act.restype = ctypes.c_int32
     except Exception as e:
         return None, f"could not be loaded: {e}"
     if found != ABI:
@@ -118,21 +127,40 @@ def call(query: str, /, **args):
     """Ask the helper one question, e.g. call("ping", target="1.1.1.1").
     Returns its answer (whatever JSON value that question answers with), or
     None when the helper is not there or could not answer.  Never raises."""
+    return _exchange("vispora_native_call", query, {**args, "q": query}, again=True)
+
+
+def act(action: str, /, **args):
+    """Have the helper carry out one of its actions (see the end of this
+    file).  Returns what it reports, or None when the helper is not there or
+    did not do it.  Never raises.  Asked exactly once: an action is never
+    repeated because its answer did not fit."""
+    return _exchange("vispora_native_act", action, {**args, "do": action}, again=False)
+
+
+def _exchange(export: str, query: str, request: dict, again: bool):
+    """Send one request through one of the library's two doors and read the
+    answer.  `again`: may the request be sent again with a larger buffer when
+    the answer did not fit (questions: yes; actions: never)."""
     try:
         lib = _load()
         if lib is None:
             return None
-        request = json.dumps({**args, "q": query}, separators=(",", ":")).encode("utf-8")
-        size = _state["buffer"]
+        send = getattr(lib, export)
+        request = json.dumps(request, separators=(",", ":")).encode("utf-8")
+        size = _state["buffer"] if again else _ACTION_BUFFER
         raw = None
-        for _ in range(4):
+        for _ in range(4 if again else 1):
             buf = ctypes.create_string_buffer(size)
-            n = int(lib.vispora_native_call(request, len(request), buf, size))
+            n = int(send(request, len(request), buf, size))
             if n > 0:
                 raw = buf.raw[:n]
                 break
             if n == 0:                                      # the library gave up without an answer
                 _complain(query, "no answer")
+                return None
+            if not again:
+                _complain(query, "the answer did not fit")
                 return None
             size = max(size * 2, -n + 1024)                 # too small: -n bytes are needed
             if size > _MAX_BUFFER:
@@ -228,6 +256,23 @@ def gpu_live():
         return None
 
 
+def gpu_identity():
+    """What the first NVIDIA card is: {"name", "driver_version",
+    "mem_total_bytes"} (the last two None where the driver does not say), as
+    `nvidia-smi --query-gpu=name,driver_version,memory.total` prints them.
+    None when there is no NVIDIA card or driver."""
+    d = call("gpu_identity")
+    if not isinstance(d, dict) or not isinstance(d.get("name"), str) or not d["name"].strip():
+        return None
+    driver = d.get("driver_version")
+    try:
+        return {"name": d["name"].strip(), "driver_version": driver.strip() if isinstance(driver, str) else None,
+                "mem_total_bytes": _opt_int(d.get("mem_total_bytes"))}
+    except (TypeError, ValueError):
+        _complain("gpu_identity", "an answer of the wrong shape")
+        return None
+
+
 def gpu_release(hold_s: int = 0) -> bool:
     """Let go of the NVIDIA library and do not open it again for `hold_s`
     seconds (a driver installer is about to replace the file); gpu_live()
@@ -295,3 +340,94 @@ def wmi(namespace: str, query: str):
     if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
         return None
     return rows
+
+
+def service_state(name: str):
+    """Is a Windows service installed, and what is it doing?  {"installed":
+    bool, "running": bool}, what `sc query <name>` tells.  None when the
+    helper is not there or the service manager would not say."""
+    if not isinstance(name, str) or not name.strip():
+        return None
+    d = call("service_state", name=name)
+    if not isinstance(d, dict) or not isinstance(d.get("installed"), bool):
+        return None
+    try:
+        state = _opt_int(d.get("state"))
+    except (TypeError, ValueError):
+        return None
+    if d["installed"] and state is None:
+        return None
+    return {"installed": d["installed"], "running": d["installed"] and state == 4}
+
+
+def _is_guid(text) -> bool:
+    return (isinstance(text, str) and len(text) == 36 and text.count("-") == 4
+            and all(c in "0123456789abcdefABCDEF-" for c in text))
+
+
+def power_scheme():
+    """The power plans: {"guid": the active plan, "schemes": [every plan]},
+    GUIDs in lower case, as `powercfg /getactivescheme` and `powercfg /list`
+    print them.  None when the helper is not there or Windows would not say."""
+    d = call("power_scheme")
+    if not isinstance(d, dict) or not _is_guid(d.get("guid")):
+        return None
+    schemes = d.get("schemes")
+    if not isinstance(schemes, list) or not all(_is_guid(g) for g in schemes):
+        return None
+    return {"guid": d["guid"].lower(), "schemes": [g.lower() for g in schemes]}
+
+
+def power_setting(scheme: str, sub: str, setting: str):
+    """One setting of one power plan: {"ac", "dc", "max"}.  ac and dc are the
+    two current values `powercfg /qh` prints; max is the largest value Windows
+    accepts for it, None for a setting that is a list of choices.
+
+    `scheme` is a plan's GUID or "current"; `sub` and `setting` are GUIDs (the
+    caller turns powercfg's aliases into GUIDs first).  None when the helper is
+    not there, when anything is not a GUID, or when the plan or the setting
+    does not exist - which is when powercfg prints an error."""
+    current = isinstance(scheme, str) and scheme.strip().lower() in ("current", "scheme_current")
+    if not (current or _is_guid(scheme)) or not _is_guid(sub) or not _is_guid(setting):
+        return None
+    d = call("power_setting", scheme="current" if current else scheme, sub=sub, setting=setting)
+    if not isinstance(d, dict):
+        return None
+    try:
+        return {"ac": _int(d["ac"]), "dc": _int(d["dc"]), "max": _opt_int(d.get("max"))}
+    except (KeyError, TypeError, ValueError):
+        _complain("power_setting", "an answer of the wrong shape")
+        return None
+
+
+# ═════════════════════════════════════════════════════════════════════
+# The actions.  The only two things the helper does that change anything:
+# both free memory, neither changes a setting, and nothing has to be put
+# back afterwards.  They go through act(), never call().
+# ═════════════════════════════════════════════════════════════════════
+def trim_working_sets():
+    """Ask Windows to trim the working set of every process (the memory each
+    keeps in RAM; it comes back as the process uses it).  {"processes": n,
+    "trimmed": m, "reached_services": bool} when it was done, None when the
+    helper is not there or did not do it.
+
+    reached_services: the helper had the debug privilege while it opened the
+    processes, which is what lets an elevated program reach Windows' own
+    services (the PowerShell this replaces always had it).  False without
+    administrator rights."""
+    d = act("trim_working_sets")
+    if not isinstance(d, dict):
+        return None
+    try:
+        return {"processes": _int(d["processes"]), "trimmed": _int(d["trimmed"]),
+                "reached_services": d.get("debug_privilege") is True}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def purge_standby_list() -> bool:
+    """Drop Windows' standby memory list (cached file pages nobody is using).
+    True when it was done; False when the helper is not there or Windows
+    refused (it needs administrator rights)."""
+    d = act("purge_standby_list")
+    return isinstance(d, dict) and d.get("purged") is True

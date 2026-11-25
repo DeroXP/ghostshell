@@ -36,6 +36,7 @@ import urllib.request
 from typing import Optional
 
 from config import APPDATA_DIR
+from core import native
 from core.utils import get_logger, run_ps, atomic_write_json
 
 log = get_logger("driver_updater")
@@ -239,6 +240,11 @@ _state_lock = threading.Lock()
 # ═══════════════════════════════════════════════════════════════════════════
 def _detect_nvidia() -> Optional[dict]:
     """Use nvidia-smi to read GPU model + currently installed driver version."""
+    # The driver's own library gives the same two through the native helper
+    # (core/native.py); nvidia-smi is run where the helper is not there.
+    card = native.gpu_identity()
+    if card and card.get("driver_version"):
+        return {"vendor": "nvidia", "model": card["name"], "current_version": card["driver_version"]}
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
@@ -263,6 +269,16 @@ def _detect_nvidia() -> Optional[dict]:
 
 
 def _detect_amd() -> Optional[dict]:
+    # The same WMI class through the native helper, picking the first Radeon
+    # or AMD adapter as the PowerShell filter below does (-like ignores case).
+    adapters = native.wmi("root\\cimv2", "SELECT Name,DriverVersion FROM Win32_VideoController")
+    if adapters:
+        for adapter in adapters:
+            name = str(adapter.get("Name") or "")
+            if "radeon" in name.lower() or "amd" in name.lower():
+                return {"vendor": "amd", "model": name.strip(),
+                        "current_version": str(adapter.get("DriverVersion") or "").strip()}
+        return None
     r = run_ps(
         "Get-CimInstance Win32_VideoController | "
         "Where-Object { ($_.Name -like '*Radeon*') -or ($_.Name -like '*AMD*') } | "

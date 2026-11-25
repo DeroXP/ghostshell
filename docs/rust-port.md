@@ -17,17 +17,17 @@ The shape, as agreed:
 
 | What hurts | How much | Fixed by |
 | --- | --- | --- |
-| The network monitor's loop over every process | 26 to 28% of a core, always | Step 1 (done here) |
-| A program started for every reading | 80 a minute idle, about 250 in a game on 3.7.0 | Step 1 (done here) |
-| The Monitor page's loop | 9 programs and 3.3 s a pass | Step 1 (done here) |
-| The first screen waiting on 8 program starts | 4.4 s alone, a median 14 s in real starts | Step 2 |
-| 68 programs started during a start, in a process that throttled itself | 9 PowerShell and 4 `tasklist` among them | Step 2, then step 4 |
+| The network monitor's loop over every process | 26 to 28% of a core, always | Step 1 (done); step 2 stops it while nobody looks (done) |
+| A program started for every reading | 80 a minute idle, about 250 in a game on 3.7.0 | Step 1 (done) |
+| The Monitor page's loop | 9 programs and 3.3 s a pass | Step 1 (done) |
+| The first screen waiting on 8 program starts | 4.4 s alone, a median 14 s in real starts | Step 2 (done) |
+| 68 programs started during a start, in a process that throttled itself | 9 PowerShell and 4 `tasklist` among them | Step 2 (done for the readings), then step 4 |
 | Unpacking 204 files at every start | 0.3 to 2.9 s, and again deleted at exit | Step 3 |
 | Python and Flask loading before anything shows | 0.5 s and more | Step 3 |
-| A game starting: 58 programs | mostly `powercfg` and `reg` | Step 4 |
+| A game starting: 58 programs | mostly `powercfg` and `reg` | Step 2 took the reads (33 left); step 4 takes the writes |
 | Quit | not measured yet | Step 3 owns it; measure first |
 
-## Step 1. The hot readings (this change)
+## Step 1. The hot readings (done, in 3.8.1)
 
 A small Rust library, `native/`, loaded into the Python app, answers the
 questions that were asked all the time: which processes have a window, every
@@ -48,30 +48,54 @@ downloads nothing. That is worth keeping for as long as it is loaded into the
 elevated Python app. The shell in step 3 is another matter: Tauri brings a
 few hundred crates with it, and choosing it is choosing that.
 
-## Step 2. The start-up readings
+## Step 2. The start-up readings (done)
 
-Same library, same pattern, no change of shape. The things a start waits for:
+Same library, same pattern, no change of shape. What a start waits for, and
+what became of it:
 
-1. **System information** (the first screen): seven PowerShell calls become
-   seven WMI queries through the `wmi` question the library already has. This
-   is the 4.4 seconds.
-2. **Boot prep's two memory steps**: each compiles C# inside PowerShell at
-   every start. They become two direct calls. These are the first native calls
-   that change something (they trim memory), so they go in a separate, clearly
-   named part of the library, not among the read-only questions.
-3. **The dependency check**: `tasklist`, `sc query` and `winget` probes become
-   a look at the process list the library already has and a service query.
-4. **Registry reads and power-plan reads**: 20 `reg` and several `powercfg`
-   starts before the window opens become direct calls.
+1. **System information** (the first screen): seven PowerShell calls and an
+   `nvidia-smi` became seven WMI queries through the `wmi` question the
+   library already had, and one new question for the card's name. Measured on
+   this PC: 3.6 seconds and 8 programs before, 0.1 seconds and none after,
+   with the same data on the screen.
+2. **Boot prep's two memory steps**: each compiled C# inside PowerShell at
+   every start. They are two direct calls now. These are the first native
+   calls that change something (they free memory), so they are the library's
+   two **actions**: in a file of their own, behind an exported function of
+   their own, which no question can reach.
+3. **The dependency check**: `tasklist` and `sc query` became a look at the
+   process list the library already had and a new service question, and the
+   PowerShell that looks for LibreHardwareMonitor's sensors became a WMI
+   query. `winget` is only run to install something that is missing, and
+   stays.
+4. **Registry and power-plan reads**: registry values are read directly
+   (Python's own registry calls, no Rust needed), and the power plan through
+   two new questions. The values a start used to write again at every launch
+   (17 `reg` starts) are now read first and written only when they differ.
 
-Two things in this step need no Rust at all and are worth doing with it:
+The two things that needed no Rust:
 
-* Do the start-up work first and enter efficiency mode after it, not before.
-* Run the network monitor only while something uses it (its page is open, or a
-  game is running), not from the first second of every start.
+* **Efficiency mode after the start-up work, not before it**, when somebody
+  opened the app and is waiting for it. A start at sign-in still throttles
+  itself at once.
+* **The network monitor only while its page reads it.** It starts with the
+  page's first request and stops half a minute after the last. A running game
+  does not keep it going, as this document first proposed: its only reader is
+  that page, and a burst that is already under way shows there a few seconds
+  after the page is opened.
 
-Measure again after this step. If the first screen is still slow, the rest is
-the window itself, which is step 3.
+What it bought, counted in the sandbox for a start on a PC the app has run on
+before: programs started before the window opens 16 to 3, by the start-up
+tasks 33 to 8, for the first screen 8 to 0. A game starting 57 to 33, a quit
+during a game 24 to 16. The numbers and how they were taken are in
+[performance.md](performance.md).
+
+Not moved in this step, on purpose: the one `nvidia-smi` the overclock page's
+capability check runs before the window opens. It belongs to the GPU overclock
+module, which moves last.
+
+If the first screen is still slow after this step, the rest is the window
+itself and the unpacking before it, which is step 3.
 
 ## Step 3. The Rust shell
 
@@ -107,13 +131,22 @@ routing), the Python backend (every route not yet moved), and the step 1
 library, which the shell uses as an ordinary Rust crate and Python still loads
 as a DLL.
 
-Decisions this step needs from the owner before it starts:
+Settled before this step starts (2026-11-24):
 
-* The install becomes a folder, not a single file. The updater, the autostart
-  task and the "where am I installed" record all learn that.
+* The shell is Tauri. Its versions are pinned and the lock file is committed.
+  `native/` itself stays free of outside crates.
+* The download stays one file named `Vispora.exe` if that can be done: the
+  GitHub release asset, the standalone updater (it swaps one exe) and the
+  local update folder all depend on it. One way: the shell carries the
+  backend and unpacks it once per version, into a folder only administrators
+  can write to, where today it is unpacked at every start. If a single file
+  turns out not to work, that is the owner's decision, and the step stops
+  there until it is made.
 * The shell keeps the name `Vispora.exe`, so firewall rules, the autostart
   task and shortcuts keep working.
-* A new exe starts with no reputation at virus scanners and SmartScreen.
+
+Still to be said out loud before it ships: a new exe starts with no reputation
+at virus scanners and SmartScreen.
 
 ## Step 4. The backend, one module at a time
 
@@ -172,4 +205,5 @@ hot the code is and how much depends on it.
   PowerShell as the fallback; later steps keep the Python route reachable
   until a release has run on the Rust one.
 * **Anything that changes the system is kept apart from anything that only
-  reads it**, in separate modules, as it is in step 1.
+  reads it**: in separate modules, and in the library behind a separate
+  exported function, as the two memory actions of step 2 are.

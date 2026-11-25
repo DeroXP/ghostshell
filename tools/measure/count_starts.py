@@ -16,6 +16,14 @@ in the tests), to show what it takes away.  The fake machine answers at once,
 so the loops tick at the rate they are written for: the per-minute numbers are
 what the code asks for, and a real PC, where every start takes time, gets
 slightly fewer.  Takes about four minutes with the default 60-second windows.
+
+The start is counted twice.  The fake machine begins as a PC the app has never
+run on, so the first pass includes what only a first start does (one-time
+repairs, registry values written for the first time, the user's power plan
+switched).  The second pass, "a later start", is every start after that.  It
+is made in the same process: what the app keeps in files and in the registry
+carries over as it would, and the few things it only remembers while it runs
+are reset by hand (see later_start).
 """
 import collections
 import io
@@ -124,10 +132,46 @@ if HELPER:
         "cpu_clock": {"mhz": 3700},
         "cpu_times": _cpu_times,
         "ping": {"ok": True, "ms": 11},
-        "wmi": lambda namespace, query: ([{"Name": "CPU Package", "SensorType": "Temperature", "Value": 52.0}]
-                                         if "librehardwaremonitor" in namespace.lower() else []),
         "process_io": [],
     })
+
+    # The start-up questions (step 2): what WMI says about this fake PC, the
+    # card's name, and the power plans and services of the same fake machine
+    # that powercfg and sc read (m.native_machine).
+    _GIB = 1024 ** 3
+    _WMI = {
+        "win32_operatingsystem": [{"Caption": "Microsoft Windows 11 Home", "Version": "10.0.26300",
+                                   "BuildNumber": "26300", "OSArchitecture": "64-bit",
+                                   "TotalVisibleMemorySize": 66_900_000, "FreePhysicalMemory": 40_140_000}],
+        "win32_processor": [{"Name": "Intel(R) Core(TM) Ultra 9 285K", "NumberOfCores": 24,
+                             "NumberOfLogicalProcessors": 24, "MaxClockSpeed": 3700, "CurrentClockSpeed": 3700}],
+        "win32_physicalmemory": [{"Capacity": 32 * _GIB, "Speed": 6000, "ConfiguredClockSpeed": 5600}] * 2,
+        "win32_logicaldisk": [{"DeviceID": "C:", "Size": 1999 * _GIB, "FreeSpace": 512 * _GIB}],
+        "win32_videocontroller": [{"Name": "NVIDIA GeForce RTX 5070 Ti", "DriverVersion": "32.0.15.2140",
+                                   "AdapterRAM": 4293918720, "PNPDeviceID": "PCI\\VEN_10DE&DEV_2C05",
+                                   "Status": "OK"}],
+        "msft_dnsclientserveraddress": [{"InterfaceAlias": "Ethernet", "ServerAddresses": ["1.1.1.1", "1.0.0.1"]}],
+        "msft_physicaldisk": [{"MediaType": 4, "BusType": 17}],
+    }
+
+    def _wmi(namespace="", query=""):
+        words = query.split()
+        cls = words[words.index("FROM") + 1].lower() if "FROM" in words else ""
+        if cls in _WMI:
+            return _WMI[cls]
+        if cls == "sensor" and "librehardwaremonitor" in namespace.lower():
+            return [{"Name": "CPU Package", "SensorType": "Temperature", "Value": 52.0}]
+        return []           # (LibreHardwareMonitor's namespace list included: it is not installed here)
+
+    m.native_machine()
+    m.NATIVE.update({
+        "wmi": _wmi,
+        "gpu_identity": {"name": _SMI["name"], "driver_version": _SMI["driver_version"],
+                         "mem_total_bytes": int(_SMI["memory.total"]) * 1048576},
+    })
+    # The two memory steps of the start-up preparation: the helper's actions.
+    m.NATIVE_ACTS.update({"trim_working_sets": {"processes": 300, "trimmed": 250, "debug_privilege": True},
+                          "purge_standby_list": {"purged": True}})
 
 
 class CountingPopen:
@@ -223,51 +267,75 @@ def settle(seconds=1.0, quiet=0.6, cap=None):
             break
 
 
-# ── 1. start-up, before the window ────────────────────────────────────
-PHASE[0] = "1 start-up, before the window opens"
-step("post-install state", updater.check_post_install_state)
-step("mic restore", privacy.restore_microphone_access)
-step("store restore", privacy.restore_store_updates)
-step("game bar block", debloater.block_gamebar_protocols)
-step("adaptive recover", adaptive_tuning.recover_interrupted_session)
-step("game mode boot restore", game_profiles.check_and_restore_on_boot)
-step("adaptive orphan", adaptive_tuning.clear_runtime_if_orphaned)
-step("pauser orphans", background_pauser.recover_orphans)
-step("tournament stale", tournament_mode.recover_if_stale)
-step("webview gpu args", capabilities.webview2_gpu_args)
-step("capabilities", capabilities.get)
-settle()
-
-# ── 2. start-up, background tasks ─────────────────────────────────────
-PHASE[0] = "2 start-up, background tasks"
-step("autostart migrate", autostart.migrate_from_legacy_runkey)
-step("update check", updater.check_update_background)
-done = threading.Event()
-step("boot prep", lambda: boot_prep.prep_for_gaming_async(on_done=lambda d: done.set()))
-done.wait(20)
-step("saved overclock", gpu_overclock.apply_saved_profile_on_startup)
-step("saved overclock done", gpu_overclock.mark_startup_apply_done)
-step("driver check", driver_updater.check_in_background)
-step("competitive latency", competitive_latency.apply_on_boot)
-step("startup manager", startup_manager.run_on_boot)
-step("idle mode", idle_mode.run_on_boot)
-step("hidhide cleanup", hidhide_cleanup.run_once)
-step("dependency check", dependencies.check_on_boot)
-step("community games", community.merge_into_known_games_async)
-step("clip settings", clipper.get_settings)
-step("find ffmpeg", clipper._find_ffmpeg)
-step("auto recover", auto_recover.recover_legacy_bad_tweaks)
-step("install info", updater.write_install_info)
-step("updater bootstrap", updater.ensure_updater_up_to_date_async)
-settle(6.0, 1.5)
-
-# ── 3. the first screen ───────────────────────────────────────────────
-PHASE[0] = "3 first screen (dashboard data)"
 client = A.app.test_client()
 HDR = {"Host": f"127.0.0.1:{A.config.APP_PORT}", A._API_TOKEN_HEADER: A._API_TOKEN}
-for route in ("/api/dashboard", "/api/notifier/status", "/api/boot-prep/status"):
-    step(route, lambda r=route: client.get(r, headers=HDR))
-settle()
+
+
+def start_up(which: str) -> None:
+    """Everything a start does, in main()'s order: before the window, the
+    background tasks, the first screen's data.  `which` names the pass."""
+    # ── 1. start-up, before the window ────────────────────────────────
+    PHASE[0] = f"1{which} start-up, before the window opens"
+    step("post-install state", updater.check_post_install_state)
+    step("mic restore", privacy.restore_microphone_access)
+    step("store restore", privacy.restore_store_updates)
+    step("game bar block", debloater.block_gamebar_protocols)
+    step("adaptive recover", adaptive_tuning.recover_interrupted_session)
+    step("game mode boot restore", game_profiles.check_and_restore_on_boot)
+    step("adaptive orphan", adaptive_tuning.clear_runtime_if_orphaned)
+    step("pauser orphans", background_pauser.recover_orphans)
+    step("tournament stale", tournament_mode.recover_if_stale)
+    step("webview gpu args", capabilities.webview2_gpu_args)
+    step("capabilities", capabilities.get)
+    settle()
+
+    # ── 2. start-up, background tasks ─────────────────────────────────
+    PHASE[0] = f"2{which} start-up, background tasks"
+    step("autostart migrate", autostart.migrate_from_legacy_runkey)
+    step("update check", updater.check_update_background)
+    done = threading.Event()
+    step("boot prep", lambda: boot_prep.prep_for_gaming_async(on_done=lambda d: done.set()))
+    done.wait(20)
+    step("saved overclock", gpu_overclock.apply_saved_profile_on_startup)
+    step("saved overclock done", gpu_overclock.mark_startup_apply_done)
+    step("driver check", driver_updater.detect_gpu)     # (what check_in_background's first check asks the machine)
+    step("competitive latency", competitive_latency.apply_on_boot)
+    step("startup manager", startup_manager.run_on_boot)
+    step("idle mode", idle_mode.run_on_boot)
+    step("hidhide cleanup", hidhide_cleanup.run_once)
+    step("dependency check", dependencies.check_on_boot)
+    step("community games", community.merge_into_known_games_async)
+    step("clip settings", clipper.get_settings)
+    step("find ffmpeg", clipper._find_ffmpeg)
+    step("auto recover", auto_recover.recover_legacy_bad_tweaks)
+    step("install info", updater.write_install_info)
+    step("updater bootstrap", updater.ensure_updater_up_to_date_async)
+    settle(6.0, 1.5)
+
+    # ── 3. the first screen ───────────────────────────────────────────
+    PHASE[0] = f"3{which} first screen (dashboard data)"
+    for route in ("/api/dashboard", "/api/notifier/status", "/api/boot-prep/status"):
+        step(route, lambda r=route: client.get(r, headers=HDR))
+    settle()
+
+
+def later_start() -> None:
+    """Make the next start_up() a start of the app on a PC it has run on
+    before.  Files and the registry carry over by themselves; this resets what
+    the app only remembers while it runs, which a new process would not have:
+    the start-up preparation's "done", the capability check's answer, and an
+    FFmpeg found on PATH."""
+    PHASE[0] = "(between two starts)"
+    settle(2.0, 1.0)
+    boot_prep._state.update(running=False, done=False, steps=[], started_at=0, finished_at=0)
+    capabilities._cache = None
+    if hasattr(dependencies, "_ffmpeg_on_path"):
+        dependencies._ffmpeg_on_path = None
+
+
+start_up(" FIRST start on this PC:")
+later_start()
+start_up(" a LATER start:")
 
 # ── 4. one idle minute: monitors on, no game ──────────────────────────
 PHASE[0] = "(warm-up)"
@@ -343,7 +411,7 @@ for phase, program, caller, _t, thread in EVENTS:
 report = {"native_helper": HELPER, "python": sys.version.split()[0], "idle_window_s": IDLE_S, "game_window_s": GAME_S,
           "game_mode_came_on": game_started, "monitor_starts_per_pass": samples, "phases": {}}
 for phase, d in by_phase.items():
-    scale = 60.0 / IDLE_S if phase.startswith(("4", "5")) else (60.0 / GAME_S if phase.startswith("9") else 1.0)
+    scale = 60.0 / IDLE_S if phase.startswith(("4 ", "5 ")) else (60.0 / GAME_S if phase.startswith("9 ") else 1.0)
     report["phases"][phase] = {
         "process_starts": round(d["total"] * scale, 1),
         "by_program": {k: round(v * scale, 1) for k, v in d["by_program"].most_common()},

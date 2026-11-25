@@ -57,8 +57,10 @@ pyinstaller updater_helper.spec --noconfirm   # dist/VisporaUpdater.exe
 
 The first line builds `native/target/release/vispora_native.dll`, a small Rust
 library that answers the app's most frequent questions (which processes have a
-window, the graphics card's readings, and so on) without starting a program
-for each. `build.spec` bundles it when it is there and warns when it is not. A
+window, the graphics card's readings, what the first screen shows, and so on)
+without starting a program for each. Run it again after every change under
+`native/`. `build.spec` bundles the library when it is there and warns when it
+is not; a library left over from before such a change stops the build. A
 build without it works the same, only slower: the app then asks PowerShell and
 `nvidia-smi` as before. See [native/README.md](native/README.md).
 
@@ -101,8 +103,9 @@ the file with `import sandbox as m`, before any app import.
 
 One test is the exception to "nothing on the PC is read": on a PC where the
 native helper has been built, `tests/test_native.py` asks the real library a
-few read-only questions (the process list, the processor's clock). The Rust
-side has tests of its own: `cargo test --release --manifest-path native/Cargo.toml`.
+few read-only questions (the process list, the processor's clock, the active
+power plan) and has it trim that test's own memory. The Rust side has tests of
+its own: `cargo test --release --manifest-path native/Cargo.toml`.
 
 ## Layout
 
@@ -112,13 +115,13 @@ side has tests of its own: `cargo test --release --manifest-path native/Cargo.to
 | `config.py` | Names, paths and the static tweak lists |
 | `update_sources.py` | Where releases are published (GitHub, the update server) and how each answer is read |
 | `core/` | One module per feature |
-| `native/` | The native helper: a Rust library for the app's hottest readings (see `native/README.md`) |
+| `native/` | The native helper: a Rust library for the readings the app takes all the time and the ones a start waits for (see `native/README.md`) |
 | `static/`, `templates/` | The UI (plain JS/CSS, no build step) |
 | `updater/` | The standalone updater app (its own Flask + pywebview window) |
 | `tests/` | The test suite and the fake machine it runs on (see [Test](#test)) |
 | `cloud/` | Optional FastAPI licensing / trial backend (see `cloud/README.md`) |
 | `docs/` | Where the app's time goes (`performance.md`) and the order of the move to Rust (`rust-port.md`) |
-| `tools/measure/` | The scripts behind `docs/performance.md`; none of them changes anything on the PC |
+| `tools/measure/` | The scripts behind `docs/performance.md`; none of them changes a setting on the PC |
 
 ## Data
 

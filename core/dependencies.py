@@ -52,6 +52,7 @@ import urllib.request
 from typing import Optional, Callable
 
 from config import APPDATA_DIR
+from core import native
 from core.utils import get_logger
 
 log = get_logger("dependencies")
@@ -185,6 +186,11 @@ def get_progress() -> dict:
 
 def _service_query(name: str) -> dict:
     """Returns {installed, running, name}.  Empty/falsy when not present."""
+    # The service manager is asked directly through the native helper; sc.exe
+    # (which asks it the same thing) only where the helper is not there.
+    state = native.service_state(name)
+    if state is not None:
+        return {"installed": state["installed"], "running": state["running"], "name": name}
     try:
         r = subprocess.run(
             ["sc", "query", name],
@@ -227,6 +233,12 @@ def _lhm_wmi_namespace_present() -> bool:
     """True if the LHM WMI provider has been registered (i.e. LHM has
     been launched at least once after install).  The CPU temp reader
     in hw_monitor.py queries this namespace."""
+    # The same WMI query through the native helper, where it is there: the
+    # namespaces listed under LibreHardwareMonitor's, of which the PowerShell
+    # below prints the first.
+    rows = native.wmi("root\\LibreHardwareMonitor", "SELECT Name FROM __NAMESPACE")
+    if rows is not None:
+        return bool(rows)
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -244,6 +256,11 @@ def _lhm_wmi_namespace_present() -> bool:
 def _lhm_process_running() -> bool:
     """Cheap process-list check.  We use this to decide whether the
     boot-time auto-launch should fire."""
+    # The native helper's process list (one system call) where it is there;
+    # tasklist.exe otherwise.
+    processes = native.process_io()
+    if processes is not None:
+        return any(p["name"].lower() == "librehardwaremonitor.exe" for p in processes)
     try:
         r = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq LibreHardwareMonitor.exe", "/FO", "CSV", "/NH"],
@@ -732,11 +749,19 @@ def _winget_path() -> Optional[str]:
 
 # ─── FFmpeg (clipper + screenshotter) ────────────────────────────────
 FFMPEG_PACKAGE_ID = "Gyan.FFmpeg.Essentials"   # ~80 MB essentials build
+_ffmpeg_on_path: Optional[dict] = None          # what _detect_ffmpeg found on PATH, once it has (see there)
 
 def _detect_ffmpeg() -> dict:
     """Returns {installed, path, version}.  Looks at PATH first
     (typical winget install adds itself), then standard install dirs."""
     # 1. Try PATH lookup
+    # An FFmpeg found on PATH is remembered for the rest of the run: a start
+    # asked five times over (the capability check, the dependency check, the
+    # clipper), running `ffmpeg -version` each time.  "Not found" is not
+    # remembered, so an install is seen at once.
+    global _ffmpeg_on_path
+    if _ffmpeg_on_path is not None:
+        return dict(_ffmpeg_on_path)
     try:
         r = subprocess.run(
             ["ffmpeg", "-version"],
@@ -747,8 +772,9 @@ def _detect_ffmpeg() -> dict:
         if r.returncode == 0 and "ffmpeg version" in (r.stdout or "").lower():
             # Extract version string
             first = (r.stdout.splitlines() or [""])[0]
-            return {"installed": True, "path": "ffmpeg",
-                    "version_line": first[:80]}
+            _ffmpeg_on_path = {"installed": True, "path": "ffmpeg",
+                               "version_line": first[:80]}
+            return dict(_ffmpeg_on_path)
     except Exception: pass
     # 2. Known winget install paths
     pf = os.environ.get("ProgramFiles", r"C:\Program Files")
@@ -1185,6 +1211,11 @@ CROSSHAIR_DEPS = ("presentmon1", "presentmon2")
 # install batches never run at once.
 _boot_check_done = threading.Event()
 _crosshair_install_lock = threading.Lock()
+
+
+def boot_check_done() -> bool:
+    """Is the start-up check over (and with it any install it started)?"""
+    return _boot_check_done.is_set()
 
 
 def _crosshair_on() -> bool:

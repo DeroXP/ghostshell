@@ -66,11 +66,15 @@ type FnKindU32 = unsafe extern "C" fn(Device, u32, *mut u32) -> Status;
 type FnUtilization = unsafe extern "C" fn(Device, *mut Utilization) -> Status;
 type FnMemoryV1 = unsafe extern "C" fn(Device, *mut MemoryV1) -> Status;
 type FnMemoryV2 = unsafe extern "C" fn(Device, *mut MemoryV2) -> Status;
+type FnDeviceText = unsafe extern "C" fn(Device, *mut u8, u32) -> Status;
+type FnSystemText = unsafe extern "C" fn(*mut u8, u32) -> Status;
 
 struct Nvml {
     module: win32::Handle,
     device: Device,
     shutdown: FnVoid,
+    name: Option<FnDeviceText>,
+    driver_version: Option<FnSystemText>,
     temperature: Option<FnKindU32>,
     utilization: Option<FnUtilization>,
     clock: Option<FnKindU32>,
@@ -170,6 +174,8 @@ fn open() -> Result<Nvml, String> {
             module,
             device,
             shutdown,
+            name: export(module, "nvmlDeviceGetName\0"),
+            driver_version: export(module, "nvmlSystemGetDriverVersion\0"),
             temperature: export(module, "nvmlDeviceGetTemperature\0"),
             utilization: export(module, "nvmlDeviceGetUtilizationRates\0"),
             clock: export(module, "nvmlDeviceGetClockInfo\0"),
@@ -217,6 +223,23 @@ impl Nvml {
         let mut m = MemoryV1::default();
         // SAFETY: as above.
         (unsafe { self.memory_v1?(self.device, &mut m) } == NVML_SUCCESS).then_some((m.used, m.total))
+    }
+
+    /// The card's model name ("NVIDIA GeForce RTX 5070 Ti"), as nvidia-smi's
+    /// `name` prints it.
+    fn name(&self) -> Option<String> {
+        let mut buf = [0u8; 96]; // NVML_DEVICE_NAME_V2_BUFFER_SIZE
+        // SAFETY: `f` came from this library with this signature; the buffer is `len` bytes.
+        let status = unsafe { self.name?(self.device, buf.as_mut_ptr(), buf.len() as u32) };
+        (status == NVML_SUCCESS).then(|| c_text(&buf))
+    }
+
+    /// The installed driver's version ("621.40"), nvidia-smi's `driver_version`.
+    fn driver_version(&self) -> Option<String> {
+        let mut buf = [0u8; 80]; // NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE
+        // SAFETY: as above.
+        let status = unsafe { self.driver_version?(buf.as_mut_ptr(), buf.len() as u32) };
+        (status == NVML_SUCCESS).then(|| c_text(&buf))
     }
 
     fn read(&self) -> Reading {
@@ -286,10 +309,15 @@ impl Reading {
     }
 }
 
-/// `q: gpu_live` - the first NVIDIA card's readings.
-pub fn live() -> Result<Json, String> {
-    let mut state = STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = Instant::now();
+/// The text in a NUL-terminated C buffer.
+fn c_text(buf: &[u8]) -> String {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).trim().to_string()
+}
+
+/// Make sure the library is open, unless it is being held off or failed to
+/// open a moment ago.
+fn ensure_open(state: &mut State, now: Instant) -> Result<(), String> {
     if let Some(until) = state.hold_until {
         if now < until {
             return Err("the NVIDIA library is released for a driver install".into());
@@ -314,6 +342,29 @@ pub fn live() -> Result<Json, String> {
             }
         }
     }
+    Ok(())
+}
+
+/// `q: gpu_identity` - what the first NVIDIA card is: its name, the driver's
+/// version and its memory.  What `nvidia-smi --query-gpu=name,driver_version,
+/// memory.total` prints, read once at start-up for the first screen.
+pub fn identity() -> Result<Json, String> {
+    let mut state = STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    ensure_open(&mut state, Instant::now())?;
+    let nvml = state.nvml.as_ref().ok_or("the NVIDIA library is not open")?;
+    let name = nvml.name().filter(|n| !n.is_empty()).ok_or("the NVIDIA driver did not name the card")?;
+    Ok(Json::object([
+        ("name", name.into()),
+        ("driver_version", nvml.driver_version().into()),
+        ("mem_total_bytes", nvml.memory().map(|m| m.1).into()),
+    ]))
+}
+
+/// `q: gpu_live` - the first NVIDIA card's readings.
+pub fn live() -> Result<Json, String> {
+    let mut state = STATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    ensure_open(&mut state, now)?;
     let reading = state.nvml.as_ref().map(Nvml::read).unwrap_or_default();
     if reading.is_empty() {
         // The driver was replaced or reset under the loaded library.  Let go
@@ -369,9 +420,27 @@ mod tests {
                 Err(why) => assert!(why.len() > 5),
             }
         }
+        // The card's name and driver, on a PC that has one.
+        match identity() {
+            Ok(v) => {
+                assert!(v["name"].as_str().unwrap().len() > 3, "{v}");
+                assert!(v["driver_version"].as_str().map_or(true, |d| d.contains('.')), "{v}");
+                assert!(v["mem_total_bytes"].as_u64().map_or(true, |b| b > 100 << 20), "{v}");
+            }
+            Err(why) => assert!(why.len() > 5),
+        }
         let released = release(2);
         assert_eq!(released["hold_s"].as_u64(), Some(2));
         assert!(live().unwrap_err().contains("released"));
+        assert!(identity().unwrap_err().contains("released"));
         release(0); // lift the hold again
+    }
+
+    #[test]
+    fn text_from_the_driver_stops_at_the_first_nul() {
+        assert_eq!(c_text(b"NVIDIA GeForce RTX 5070 Ti\0junk"), "NVIDIA GeForce RTX 5070 Ti");
+        assert_eq!(c_text(b"621.40 \0"), "621.40");
+        assert_eq!(c_text(b"\0"), "");
+        assert_eq!(c_text(b"no terminator"), "no terminator");
     }
 }
