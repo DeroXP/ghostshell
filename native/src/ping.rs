@@ -6,8 +6,7 @@
 use std::ffi::c_void;
 use std::net::Ipv4Addr;
 
-use serde_json::{json, Value};
-
+use crate::json::Json;
 use crate::win32::{self, read};
 
 const PAYLOAD: [u8; 32] = *b"vispora-native ping payload 0123";
@@ -36,7 +35,7 @@ fn parse_reply(replies: u32, buf: &[u8]) -> (bool, u32) {
 /// `q: ping` - {"ok": true, "ms": n} when the address answered within the
 /// timeout, {"ok": false} when it did not (or answered with an error such as
 /// "destination unreachable", which ping.exe prints without a time).
-pub fn ping(target: &str, timeout_ms: u32) -> Result<Value, String> {
+pub fn ping(target: &str, timeout_ms: u32) -> Result<Json, String> {
     let address: Ipv4Addr = target.trim().parse().map_err(|_| format!("not an IPv4 address: {target}"))?;
     // SAFETY: plain call; the handle is closed below on every path.
     let handle = unsafe { win32::IcmpCreateFile() };
@@ -64,8 +63,8 @@ pub fn ping(target: &str, timeout_ms: u32) -> Result<Value, String> {
     // SAFETY: `reply` owns `reply_bytes` initialised bytes.
     let raw = unsafe { std::slice::from_raw_parts(reply.as_ptr() as *const u8, reply_bytes) };
     Ok(match parse_reply(replies, raw) {
-        (true, ms) => json!({ "ok": true, "ms": ms }),
-        (false, _) => json!({ "ok": false }),
+        (true, ms) => Json::object([("ok", true.into()), ("ms", ms.into())]),
+        (false, _) => Json::object([("ok", false.into())]),
     })
 }
 
@@ -100,7 +99,7 @@ mod tests {
     #[test]
     fn this_machine_answers_itself() {
         let a = ping("127.0.0.1", 1000).unwrap();
-        assert_eq!(a["ok"], true, "{a}");
+        assert_eq!(a["ok"], Json::Bool(true), "{a}");
         assert!(a["ms"].as_u64().unwrap() < 1000);
     }
 }

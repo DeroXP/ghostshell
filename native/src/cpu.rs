@@ -6,8 +6,7 @@
 //! fails outright where the performance-counter library is damaged).  Both
 //! numbers come straight from the kernel here.
 
-use serde_json::{json, Value};
-
+use crate::json::Json;
 use crate::win32::{self, read};
 
 /// PROCESSOR_POWER_INFORMATION: six ULONGs per processor.
@@ -22,7 +21,7 @@ const MAX_PROCESSORS: usize = 1024;
 
 /// `q: cpu_clock` - {"mhz", "max_mhz", "processors"}: the first processor's
 /// current clock, which is what Win32_Processor.CurrentClockSpeed reports.
-pub fn clock() -> Result<Value, String> {
+pub fn clock() -> Result<Json, String> {
     let mut buf = vec![0u32; MAX_PROCESSORS * POWER_INFO_SIZE / 4];
     let bytes = buf.len() * 4;
     // SAFETY: the buffer is `bytes` long and writable; no input buffer is used.
@@ -44,7 +43,7 @@ pub fn clock() -> Result<Value, String> {
     if mhz == 0 {
         return Err("Windows reported no processor clock".into());
     }
-    Ok(json!({ "mhz": mhz, "max_mhz": max_mhz, "processors": processors }))
+    Ok(Json::object([("mhz", mhz.into()), ("max_mhz", max_mhz.into()), ("processors", processors.into())]))
 }
 
 /// (current MHz of the first processor, its maximum MHz, how many processors
@@ -89,7 +88,7 @@ fn parse_times(raw: &[u8]) -> Times {
 /// `q: cpu_times` - {"total", "idle", "dpc", "interrupt", "processors"}.
 /// Two answers a moment apart give "% DPC Time" and "% Interrupt Time":
 /// (dpc2 - dpc1) / (total2 - total1) x 100.
-pub fn times() -> Result<Value, String> {
+pub fn times() -> Result<Json, String> {
     let mut buf = vec![0u64; MAX_PROCESSORS * PERF_INFO_SIZE / 8];
     let bytes = buf.len() * 8;
     let mut written: u32 = 0;
@@ -112,9 +111,13 @@ pub fn times() -> Result<Value, String> {
     if t.processors == 0 || t.total == 0 {
         return Err("Windows reported no processor times".into());
     }
-    Ok(json!({
-        "total": t.total, "idle": t.idle, "dpc": t.dpc, "interrupt": t.interrupt, "processors": t.processors,
-    }))
+    Ok(Json::object([
+        ("total", t.total.into()),
+        ("idle", t.idle.into()),
+        ("dpc", t.dpc.into()),
+        ("interrupt", t.interrupt.into()),
+        ("processors", t.processors.into()),
+    ]))
 }
 
 #[cfg(test)]

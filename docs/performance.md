@@ -243,10 +243,61 @@ Counted the same way, with the native helper answering:
 And the network monitor's loop over every process becomes one call that
 returns all of them.
 
-These are counts from the sandbox with a stand-in for the helper. How long the
-real library takes per answer, and what the running app's processor use drops
-to, can only be measured on a build that contains it. The pull request that
-added the helper says where that stands.
+Those are counts, from the sandbox with a stand-in for the helper. What one
+answer costs was then measured with the real library on this PC
+(`tools/measure/helper_cost.py`, 200 answers each):
+
+| Question | The old way, per answer | The helper, per answer |
+| --- | --- | --- |
+| The graphics card's readings | `nvidia-smi`: 62 ms and a process | 0.14 ms |
+| Processes with a window | PowerShell: 327 ms, 406 ms of processor time | 8 ms |
+| Every process's I/O counters | psutil's loop: about 270 ms a pass in the running app (26% of a core at one pass a second) | 9 ms |
+| Processor clock | PowerShell: 1,305 ms | 0.01 ms |
+| DPC and interrupt time | PowerShell: 370 ms, and no answer on this PC | 0.1 ms |
+| Ping | `ping.exe`: 30 ms | 0.2 ms plus the echo itself |
+| A WMI query | PowerShell: 250 to 1,300 ms | 6 to 14 ms |
+
+The 8 and 9 ms are Windows' own call for the whole process list (5 to 8 ms
+here); it is the call Task Manager makes.
+
+One whole pass of the Monitor page, run for real (`real_reads.py --helper`):
+
+| | Before | With the helper |
+| --- | --- | --- |
+| Programs started | 9 | 0 |
+| Time | 3.3 s | 0.32 s |
+| GPU temperature | none (the blank tile) | read |
+| DPC time | none on this PC | read |
+
+Of the 0.32 seconds, 0.28 is the last of the four temperature sources, which
+fails slowly on this PC. Where the first one answers (LibreHardwareMonitor,
+inside the app) the other three are not asked.
+
+Adding up the measured parts for an idle minute with the helper (the
+temperature ceiling at 0.14 ms a second, the network monitor at 9 ms a second,
+the game monitor at 8 ms every three seconds) gives about 1% of one core,
+where the same three cost a quarter of a core plus 80 program starts. That sum
+is arithmetic, not a measurement: the real figure needs a build with the helper
+running for a while, watched with `live_sample.py`.
+
+### The same answers
+
+`native/check_parity.py` asks the real library every question and holds the
+answer against PowerShell, `nvidia-smi`, `ping` and psutil on the same PC: 30
+of 30 checks agree. The same 11 processes with a window, by id and name, with
+the same memory figures; all 316 processes' counters between psutil's reading
+before and after; the card's limits, maximum clocks and memory total exactly;
+the processor's clock exactly; four WMI classes row for row.
+
+Two differences are known and deliberate:
+
+* **The GPU temperature can read one degree higher.** The driver reports
+  whole degrees, rounded, and that is what the helper returns. Current drivers
+  make `nvidia-smi` print decimals (`53.64`), which the old code cuts off (53)
+  where the driver itself says 54. On drivers that print whole degrees the two
+  are the same.
+* **A few protected system processes have a name** in the helper's list
+  ("Secure System") where psutil had none.
 
 ## Measuring again
 
@@ -257,9 +308,12 @@ beside these:
 python tools/measure/count_starts.py            (about 4 minutes)
 python tools/measure/count_starts.py --helper
 python tools/measure/process_cost.py
+python tools/measure/helper_cost.py             (needs the helper built)
 python tools/measure/real_reads.py
+python tools/measure/real_reads.py --helper
 python tools/measure/log_timeline.py
 python tools/measure/live_sample.py 120         (with the app running)
+python native/check_parity.py                   (needs the helper built)
 ```
 
 None of them changes anything on the PC, and none needs the app to be closed.

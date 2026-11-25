@@ -6,8 +6,9 @@ Why it exists: on the owner's PC the running app was measured starting about
 250 nvidia-smi processes a minute during a game and a PowerShell every three
 seconds while idle, and one thread spent a quarter of a processor core reading
 each process's I/O counters one process at a time (docs/performance.md has the
-numbers).  One call into this library answers the same question in well under
-a millisecond.
+numbers).  One call into this library answers the same question in a fraction
+of a millisecond (the card's readings) to nine milliseconds (the whole process
+list), and starts nothing.
 
 It is optional on purpose.  Every function here returns None when the library
 is not there (a build without it, a source checkout that never ran cargo), is

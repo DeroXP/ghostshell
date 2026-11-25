@@ -39,7 +39,14 @@ every caller keeps its old way as the fallback.
 
 What it buys, counted in the sandbox: programs started per idle minute 80 to
 0, in a game 70 to 7, on the Monitor page 9 a pass to 0, and the per-process
-loop becomes one call.
+loop becomes one call. Measured with the real library: a GPU reading 62 ms to
+0.14 ms, the per-process reading 270 ms to 9 ms, a Monitor pass 3.3 s to
+0.32 s.
+
+The library uses no crates from outside the repository, so building it
+downloads nothing. That is worth keeping for as long as it is loaded into the
+elevated Python app. The shell in step 3 is another matter: Tauri brings a
+few hundred crates with it, and choosing it is choosing that.
 
 ## Step 2. The start-up readings
 

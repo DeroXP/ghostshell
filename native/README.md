@@ -52,23 +52,27 @@ environment variable for the path, because the app runs elevated.
 
 ## Building
 
-Needs Rust (stable) with the MSVC toolchain.
+Needs Rust (stable) with the MSVC toolchain, and nothing else: the build is a
+few seconds and needs no network.
 
 ```
 cargo build --release --manifest-path native/Cargo.toml
 cargo test  --release --manifest-path native/Cargo.toml
 ```
 
+The tests ask the real machine (the process list, WMI, the graphics card if
+there is one, a ping to this PC itself); all of it read-only.
+
 This makes `native/target/release/vispora_native.dll` (the library) and
-`vispora-native.exe` (the same answers from a terminal, for checking by hand:
-`vispora-native gpu_live`).
+`vispora-native-ask.exe` (the same answers from a terminal, for checking by
+hand: `vispora-native-ask gpu_live`).
 
 Build it before `pyinstaller build.spec`. The spec bundles the library when it
 is there and prints a warning when it is not.
 
 ## Adding a question
 
-1. Write it in its own file under `src/`, returning `Result<serde_json::Value, String>`,
+1. Write it in its own file under `src/`, returning `Result<Json, String>`,
    and add it to `dispatch` in `src/lib.rs`.
 2. Add a function for it to `core/native.py` that checks the shape of the
    answer and returns `None` for anything else.
@@ -78,10 +82,29 @@ is there and prints a warning when it is not.
 4. If an existing answer changes shape, raise `ABI` in `src/lib.rs` and in
    `core/native.py` together. A test checks that they match.
 
-## Crates used
+## Checking it against the old way
 
-* `serde_json` for the JSON.
-* `wmi` for the WMI question (it brings Microsoft's `windows` crate with it).
+```
+python native/check_parity.py
+```
 
-Everything else calls Windows directly through the declarations in
-`src/win32.rs`.
+asks the built library every question on this PC and holds each answer against
+PowerShell, `nvidia-smi`, `ping` and psutil. It only reads the machine. Run it
+after changing a question, and on any PC whose hardware is different enough to
+matter (another GPU vendor, no LibreHardwareMonitor).
+
+`python tools/measure/helper_cost.py` times one answer of each kind.
+
+## No outside code
+
+The crate has no dependencies: `cargo build` downloads nothing and works
+offline. The library is loaded into a program that runs as administrator, so
+everything in it is either written in this folder or part of Windows:
+
+* Windows functions are declared by hand in `src/win32.rs`;
+* the JSON it reads and writes is `src/json.rs`;
+* WMI is called through COM directly in `src/wmi_query.rs`;
+* NVIDIA's `nvml.dll`, which the driver installs, is loaded from System32 only.
+
+Keep it that way unless there is a strong reason: a dependency here is code
+that runs elevated on every user's PC.
