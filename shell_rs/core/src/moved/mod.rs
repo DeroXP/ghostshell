@@ -57,7 +57,15 @@ pub trait Readings: Send + Sync {
     /// (native/README.md lists them), or None where it has no answer.
     fn ask(&self, question: &str) -> Option<Json>;
     /// The time, in seconds since 1970: what Python's `time.time()` gives.
+    /// It is the PC's own clock, which a person or Windows can set forward
+    /// or back at any moment: for telling when something happened, never
+    /// for how long something lasts.
     fn now(&self) -> f64;
+    /// Seconds on a clock that only goes forward, and is set by nobody: for
+    /// how long something lasts (how long a reader has been idle, how long
+    /// it has to stay away).  It begins somewhere; only the difference
+    /// between two readings of it says anything.
+    fn steady(&self) -> f64;
 }
 
 /// The real machine.
@@ -88,13 +96,22 @@ impl Readings for Real {
     fn now(&self) -> f64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |since| since.as_secs_f64())
     }
+
+    fn steady(&self) -> f64 {
+        static BEGAN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        BEGAN.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+    }
 }
 
-/// A made-up machine: it answers from a table, and its clock is set by hand.
+/// A made-up machine: it answers from a table, and its two clocks are set
+/// by hand.
 #[derive(Default)]
 pub struct Fake {
     answers: Mutex<HashMap<String, Json>>,
+    /// The PC's own clock.
     clock: Mutex<f64>,
+    /// The clock that does not jump.
+    steady: Mutex<f64>,
     asked: Mutex<Vec<String>>,
 }
 
@@ -112,8 +129,15 @@ impl Fake {
         };
     }
 
-    /// What time it is from now on.
+    /// What time it is from now on, on both clocks: time has gone by.
     pub fn at(&self, time: f64) {
+        *self.clock.lock().unwrap_or_else(|p| p.into_inner()) = time;
+        *self.steady.lock().unwrap_or_else(|p| p.into_inner()) = time;
+    }
+
+    /// The PC's own clock is set to another time (by the person, or by
+    /// Windows): no time has gone by.
+    pub fn the_pcs_clock_is_set_to(&self, time: f64) {
         *self.clock.lock().unwrap_or_else(|p| p.into_inner()) = time;
     }
 
@@ -131,6 +155,10 @@ impl Readings for Fake {
 
     fn now(&self) -> f64 {
         *self.clock.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn steady(&self) -> f64 {
+        *self.steady.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -425,6 +453,24 @@ mod tests {
         assert_eq!(Real.ask("purge_standby_list"), None);
         assert_eq!(Real.ask("trim_working_sets"), None);
         assert!(Real.now() > 1_700_000_000.0);
+        // The clock that does not jump goes forward, and is not the PC's own.
+        let (first, wall) = (Real.steady(), Real.now());
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let second = Real.steady();
+        assert!((0.02..5.0).contains(&(second - first)) && first < 1_000_000.0 && wall - first > 1_000_000_000.0, "{first} {second}");
+    }
+
+    #[test]
+    fn the_made_up_machine_has_a_clock_of_the_pcs_and_one_that_does_not_jump() {
+        let machine = Fake::new();
+        machine.at(1000.0);
+        assert_eq!((machine.now(), machine.steady()), (1000.0, 1000.0));
+        machine.the_pcs_clock_is_set_to(99_999.0);
+        assert_eq!((machine.now(), machine.steady()), (99_999.0, 1000.0));
+        machine.the_pcs_clock_is_set_to(5.0);
+        assert_eq!((machine.now(), machine.steady()), (5.0, 1000.0));
+        machine.at(1000.5);
+        assert_eq!((machine.now(), machine.steady()), (1000.5, 1000.5));
     }
 
     #[link(name = "kernel32")]

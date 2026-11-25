@@ -406,11 +406,18 @@ module stands on was laid down with the least else in the way:
   * **Before a driver's install it is gone.** The install begins with one
     call of the page (`POST /api/driver/install`), which goes through the
     shell. The shell ends the reader, waits until Windows says it is gone,
-    and only then passes the call on. If the backend answers that it
-    started the installer, no reader is started for 900 seconds, which is
-    how long the backend keeps off its own copy of the library. If it
-    answers anything else, things are as they were, and the next reading
-    starts a reader again.
+    and only then passes the call on. While such a call is on its way no
+    reader is started, however many are on their way at once. If the
+    backend answers that it started the installer, no reader is started
+    for 900 seconds from that answer, which is how long the backend keeps
+    off its own copy of the library. If it answers anything else, the call
+    leaves nothing behind, and the next reading starts a reader again.
+  * **Its times are counted on a clock that does not jump.** How long it
+    has been idle, how long it stays away, how long a pause lasts: on
+    Windows' own count of time gone by, as the helper counts its hold, and
+    not on the PC's clock, which a person or Windows can set forward or
+    back in the middle of an install. (A reading is stamped with the PC's
+    clock, as Python stamps it.)
   * **Where it is away or has no reading, the reading is the backend's**
     (`GET /api/gpu/oc/live`, which is `gpu_overclock.read_live_state()`
     and nothing else, asked with the run's secret as the shell asks for
@@ -450,10 +457,23 @@ module stands on was laid down with the least else in the way:
     write to, and a file under its name can be exchanged while the app
     runs: so the reader is not the shell's exe started with a word, and
     is never started by a path beside it. It is one more file of the pack
-    (`_internal\VisporaGpuReader.exe`, beside the app's own copy of the C
-    runtime it needs), unpacked with the backend into the administrators'
-    folder, checked against the exe and held like every file there. The
-    download is still the one `Vispora.exe`; it grows by 0.1 MB.
+    (`_internal\VisporaGpuReader.exe`), unpacked with the backend into the
+    administrators' folder, checked against the exe and held like every
+    file there. The download is still the one `Vispora.exe`; it grows by
+    0.1 MB.
+  * **The one library it needs that is not Windows' own is beside it, or
+    it is not started.** A Rust program asks Windows for
+    `VCRUNTIME140.dll` when it starts, and Windows looks beside the
+    program first, then in its own folder, then along the PATH. The app
+    carries its own copy in `_internal`, which is why the reader is put
+    there. So that this holds and is not luck: the exe that ships is not
+    built with a pack that has the reader and not that file, and a shell
+    whose pack lacks it does not start the reader. The other way would
+    have been to build the reader so that it needs no such library. That
+    takes either a made-up empty library put in the way of the real one
+    for every program of the core, or a second build command for the
+    reader alone, which is easy to forget and would need this check all
+    the same.
 * **What the shell takes, and what it passes on.** The shell answers a
   moved call only where it gives the answer Python gives. Anything else of
   the same path is passed on, so the backend answers it as before: another
@@ -507,6 +527,12 @@ here:
   * On a PC whose card answers the helper not at all (only
     `nvidia-smi` does), the same question is there at all times, not
     only during an install.
+* **The clean install's script.** `POST /api/gpu/clean-install` writes a
+  script that the person runs by hand later, and that script removes
+  NVIDIA's drivers. Today's app does not let go of the library for it,
+  and neither the backend nor the shell can know when the script is run:
+  a reader may be running then, as the backend's helper may be. Seen in
+  the reading of this piece; not solved.
 * **Today's app keeps the library too.** The same measurement, through the
   app's own helper: asked to let go, it shuts the library down and frees
   it, and both copies of the file (`System32` and the driver's own folder)

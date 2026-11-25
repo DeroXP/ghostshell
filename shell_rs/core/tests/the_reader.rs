@@ -28,6 +28,32 @@ fn alone() -> std::sync::MutexGuard<'static, ()> {
     ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Everything a program writes until its output ends.  With a limit: if
+/// something else holds the other end of its pipe (this program itself, or
+/// a program that inherited it), the output never ends, and a test that
+/// waited for it would hang and say nothing.
+fn all_it_says(from_it: std::fs::File) -> String {
+    let (said, hears) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut from_it, mut all) = (from_it, String::new());
+        let _ = from_it.read_to_string(&mut all);
+        let _ = said.send(all);
+    });
+    hears.recv_timeout(Duration::from_secs(15)).expect("its output did not end within 15 s of its end: something else holds the other end of its pipe")
+}
+
+/// One line of what a program writes, with the same limit.
+fn a_line_of(from_it: &std::sync::Arc<std::sync::Mutex<std::io::BufReader<std::fs::File>>>) -> String {
+    let (said, hears) = std::sync::mpsc::channel();
+    let from_it = from_it.clone();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = from_it.lock().unwrap().read_line(&mut line);
+        let _ = said.send(line);
+    });
+    hears.recv_timeout(Duration::from_secs(15)).expect("no line within 15 s")
+}
+
 fn of_windows(program: &str) -> String {
     format!("{}\\System32\\{program}", win::windows_folder().unwrap())
 }
@@ -157,7 +183,7 @@ fn the_program_gets_its_two_pipe_ends_and_nothing_else_of_this_programs() {
     // moment this program lets go of it.
     let listening = win::platform().listen().unwrap();
     let port = listening.port();
-    let (program, to_it, mut from_it) = win::start_with_pipes(&of_windows("sort.exe")).unwrap();
+    let (program, to_it, from_it) = win::start_with_pipes(&of_windows("sort.exe")).unwrap();
     drop(listening);
     assert!(!program.is_gone());
     assert!(!knocks(port), "a program started with pipes inherited the shell's listening socket");
@@ -168,9 +194,7 @@ fn the_program_gets_its_two_pipe_ends_and_nothing_else_of_this_programs() {
     let mut to_it = to_it;
     to_it.write_all(b"b\r\na\r\n").unwrap();
     drop(to_it);
-    let mut sorted = String::new();
-    from_it.read_to_string(&mut sorted).unwrap();
-    assert_eq!(sorted, "a\r\nb\r\n");
+    assert_eq!(all_it_says(from_it), "a\r\nb\r\n");
     let began = Instant::now();
     while !program.is_gone() && began.elapsed() < Duration::from_secs(5) {
         std::thread::sleep(Duration::from_millis(10));
@@ -185,11 +209,10 @@ fn a_program_with_pipes_starts_in_its_own_folder_and_not_in_this_programs() {
     // (the folder a program is started in is one of the places Windows
     // looks for the libraries it asks for: the reader's is the folder its
     // pack was unpacked into, never the one the shell happens to be in)
-    let (program, mut to_it, mut from_it) = win::start_with_pipes(&of_windows("cmd.exe")).unwrap();
+    let (program, mut to_it, from_it) = win::start_with_pipes(&of_windows("cmd.exe")).unwrap();
     to_it.write_all(b"cd\r\nexit\r\n").unwrap();
     drop(to_it);
-    let mut said = String::new();
-    from_it.read_to_string(&mut said).unwrap();
+    let said = all_it_says(from_it);
     let (said, its_own, mine) = (said.to_lowercase(), of_windows("").trim_end_matches('\\').to_lowercase(), std::env::current_dir().unwrap().to_string_lossy().to_lowercase());
     assert!(said.lines().any(|line| line.trim() == its_own), "not started in {its_own}:\n{said}");
     assert!(mine != its_own && !said.contains(&mine), "started in this program's folder ({mine}):\n{said}");
@@ -200,14 +223,13 @@ fn a_program_with_pipes_starts_in_its_own_folder_and_not_in_this_programs() {
 fn the_reader_ends_by_itself_when_its_input_ends_and_takes_nothing_from_its_input() {
     let _alone = alone();
     let (program, mut to_it, from_it) = win::start_with_pipes(READER).unwrap();
-    let mut from_it = std::io::BufReader::new(from_it);
+    let from_it = std::sync::Arc::new(std::sync::Mutex::new(std::io::BufReader::new(from_it)));
     // Whatever a line holds, the answer is the card's reading (or that
     // there is none): never anything the line asked for.
     let mut answers = Vec::new();
     for line in ["", "{\"q\":\"abi\"}", "{\"do\":\"purge_standby_list\"}", "{\"q\":\"gpu_release\",\"hold_s\":3600}", "C:\\Windows\\System32\\nvml.dll"] {
         to_it.write_all(format!("{line}\n").as_bytes()).unwrap();
-        let mut answer = String::new();
-        from_it.read_line(&mut answer).unwrap();
+        let answer = a_line_of(&from_it);
         let said = vispora_shell_core::json::Json::parse(answer.trim_end()).unwrap_or_else(|why| panic!("{answer:?}: {why}"));
         assert!(said.get("abi").is_none() && said["data"].get("abi").is_none() && said["data"].get("released").is_none(), "{line:?} was listened to: {answer}");
         answers.push(match said.get("ok") {
@@ -224,9 +246,27 @@ fn the_reader_ends_by_itself_when_its_input_ends_and_takes_nothing_from_its_inpu
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(program.is_gone(), "the reader's input ended and the reader did not");
-    let mut rest = String::new();
-    from_it.read_to_string(&mut rest).unwrap();
-    assert_eq!(rest, "", "it said something nobody asked for");
+    assert_eq!(a_line_of(&from_it), "", "it said something nobody asked for");
+}
+
+#[test]
+fn a_program_that_was_ended_is_gone_when_the_ending_says_so() {
+    let _alone = alone();
+    // "Seen to be gone" is what the call for a driver's install waits for
+    // before it is passed on: the ending waits until Windows says that the
+    // process is no more.  A reader that has read the card, so that it has
+    // the driver's library to let go of; asked the moment the ending comes
+    // back; a number of times, since an ending that did not wait would
+    // only be caught now and then.
+    for round in 0..25 {
+        let (program, mut to_it, from_it) = win::start_with_pipes(READER).unwrap();
+        let from_it = std::sync::Arc::new(std::sync::Mutex::new(std::io::BufReader::new(from_it)));
+        to_it.write_all(b"\n").unwrap();
+        assert!(!a_line_of(&from_it).is_empty(), "round {round}: the reader did not answer");
+        assert!(!program.is_gone(), "round {round}");
+        assert!(program.end(GONE_WITHIN), "round {round}: it was not seen to go");
+        assert!(program.is_gone(), "round {round}: the ending said that it is gone, and Windows says that it is not");
+    }
 }
 
 #[test]

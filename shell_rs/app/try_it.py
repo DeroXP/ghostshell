@@ -601,11 +601,13 @@ def own_account():
     return found.group(1) if found else "?"
 
 
-def made_up_backend(root, name, more=b"", reader=False):
+def made_up_backend(root, name, more=b"", reader=False, runtime=True):
     """A small folder that stands for a backend, and the pack of it: (the
     pack's file, what the pack tool says about it, the folder).  With
     `reader` the pack also carries the graphics card's reader, as it was
-    built beside the pack tool."""
+    built beside the pack tool, and the folder has the C runtime the reader
+    needs beside it, as the app's own folder has (this PC's copy of it;
+    not with `runtime` False)."""
     folder = os.path.join(root, "made-up-" + name, "VisporaBackend")
     os.makedirs(os.path.join(folder, "_internal", "certifi"))
     for path, holds in (("VisporaBackend.exe", b"MZ not really a program" + more),
@@ -615,6 +617,9 @@ def made_up_backend(root, name, more=b"", reader=False):
                         (os.path.join("_internal", "noise.bin"), os.urandom(5000))):
         with open(os.path.join(folder, path), "wb") as f:
             f.write(holds)
+    if reader and runtime:
+        shutil.copyfile(os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "System32", "vcruntime140.dll"),
+                        os.path.join(folder, "_internal", "VCRUNTIME140.dll"))
     pack = os.path.join(root, "made-up-" + name, "backend.pack")
     made = subprocess.run([PACK_TOOL, "--pack", folder, pack, "lzms"] + (["--reader", READER] if reader else []), capture_output=True, text=True,
                           creationflags=NO_WINDOW)
@@ -871,6 +876,33 @@ def image_of(pid):
         kernel32.CloseHandle(process)
 
 
+def libraries_of(pid, name):
+    """The files of the libraries named `name` that are loaded in the
+    process `pid`, as Windows has them.  (A read.)"""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.K32EnumProcessModules.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.HMODULE), wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.K32GetModuleFileNameExW.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    process = kernel32.OpenProcess(0x0410, False, pid)             # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+    if not process:
+        return []
+    try:
+        modules, needed = (wintypes.HMODULE * 2048)(), wintypes.DWORD(0)
+        if not kernel32.K32EnumProcessModules(process, modules, ctypes.sizeof(modules), ctypes.byref(needed)):
+            return []
+        found = []
+        for module in modules[:needed.value // ctypes.sizeof(wintypes.HMODULE)]:
+            file = ctypes.create_unicode_buffer(1024)
+            kernel32.K32GetModuleFileNameExW(process, module, file, 1024)
+            if os.path.basename(file.value).lower() == name.lower():
+                found.append(file.value)
+        return found
+    finally:
+        kernel32.CloseHandle(process)
+
+
 def readers_of(run):
     """The process numbers of the readers this run's shell has started, in order (its log)."""
     return [int(pid) for pid in re.findall(r"the graphics card's reader was started \(pid (\d+)\)", run.log())]
@@ -886,8 +918,8 @@ def the_cards_reader(root, check):
     only reads.  Nothing is installed or started: the stand-in backend only
     says that an installer was, or was not."""
     pack, says, source = made_up_backend(root, "with-reader", reader=True)
-    check("a pack was made that carries the graphics card's reader: %r" % ({k: says.get(k) for k in ("files", "reader")},),
-          says.get("files") == 6 and says.get("reader") is True)
+    check("a pack was made that carries the graphics card's reader, and the C runtime it needs beside it: %r" % ({k: says.get(k) for k in ("files", "reader")},),
+          says.get("files") == 7 and says.get("reader") is True)
     its_card = {"temp_c": 71, "gpu_util_pct": 50, "mem_util_pct": 20, "core_mhz": 1800, "mem_mhz": 7000, "power_mw": 123450, "fan_pct": 60}
     library = THE_DRIVERS_LIBRARY
 
@@ -921,6 +953,8 @@ def the_cards_reader(root, check):
             return
         check("the page wants the sampler: a reader runs, and its program is the one in the unpacked folder: %s" % os.path.basename(image_of(pid or 0)),
               pid and running(pid) and os.path.normcase(image_of(pid)) == os.path.normcase(reader_exe))
+        check("the C runtime in the reader's process is the copy beside it in that folder, not one from elsewhere on the PC: %s" % (libraries_of(pid or 0, "vcruntime140.dll"),),
+              pid and [os.path.normcase(found) for found in libraries_of(pid, "vcruntime140.dll")] == [os.path.normcase(os.path.join(folder, "_internal", "VCRUNTIME140.dll"))])
         check("the graphics driver's library is in the reader's process, and not in the shell's", pid and holds(pid, library) and not holds(shell_pid, library))
         check("the samples are the reader's (this PC's card), and the backend is not asked for the card: %r" % (last,),
               last and last[0] == "true" and last[2] == "true" and asked_for_the_card(run) == 0)
@@ -967,6 +1001,24 @@ def the_cards_reader(root, check):
               % (quit_by_its_window(run),),
               again and again != pid and not running(again) and run.process.returncode == 0 and folder and not os.path.exists(folder)
               and ("the graphics card's reader was ended (pid %d): the app quits" % again) in run.log())
+    finally:
+        run.end()
+
+    # A pack whose reader does not have its C runtime beside it: the reader
+    # is not started (Windows would give it a copy from somewhere else),
+    # and the card's reading is the backend's.
+    bare, bare_says, _ = made_up_backend(root, "reader-without-runtime", reader=True, runtime=False)
+    run = Run(root, "hidden", pack=bare, keep=False)
+    try:
+        up = first_screen(run)
+        the_page_calls(run, "POST", "/api/stand-in/card", its_card)
+        the_page_calls(run, "POST", "/api/perf/start", {"consumer": "trial"})
+        time.sleep(1.5)
+        last = the_page_calls(run, "GET", "/api/perf/status", tell=THE_LAST_SAMPLE)
+        check("a pack with the reader and without its C runtime: no reader is started, the log says why, and the samples are the backend's: %r" % (last,),
+              up and bare_says.get("reader") is True and bare_says.get("files") == 6 and readers_of(run) == []
+              and "not the C runtime it needs beside it: the reader is not started" in run.log() and last and last[2:] == ["true", "71"])
+        quit_by_its_window(run)
     finally:
         run.end()
 

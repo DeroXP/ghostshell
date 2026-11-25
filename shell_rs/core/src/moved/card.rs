@@ -33,6 +33,11 @@
 //! _live_state_from_native).  So whichever of the two a reading comes from,
 //! it is the reading Python would have taken.
 //!
+//! How long a reader has been idle, how long it has to stay away, and how
+//! long a pause lasts is counted on a clock that does not jump (the door's
+//! `steady`), as the helper counts its own hold: the PC's own clock can be
+//! set forward or back in the middle of a driver's install.
+//!
 //! Nothing here starts a program or calls Windows: a reader is reached
 //! through `Readers`, which has a real side (src/gpu_reader.rs) and a
 //! made-up one (`FakeReaders`).
@@ -138,7 +143,11 @@ struct State {
     reader: Option<Arc<dyn Reader>>,
     /// It has answered once (which limit its next answer has).
     answered: bool,
-    /// A driver's installer was started: no reader until then.
+    /// Calls for a driver's install that are on their way to the backend
+    /// and not answered yet: no reader while there is one.
+    installs: u32,
+    /// A driver's installer was started: no reader until then (on the
+    /// clock that does not jump, as the next two).
     away_until: Option<f64>,
     /// A reader gave no reading: none is started until then.
     pause_until: Option<f64>,
@@ -168,7 +177,7 @@ pub struct Card {
 
 impl Card {
     pub(super) fn new(door: Arc<dyn Readings>, threads: bool) -> Card {
-        let state = State { from: From::default(), backend: None, readers: None, say: None, reader: None, answered: false, away_until: None, pause_until: None,
+        let state = State { from: From::default(), backend: None, readers: None, say: None, reader: None, answered: false, installs: 0, away_until: None, pause_until: None,
                             next_pause: PAUSE_S, last_wanted: 0.0, watched: false, closed: false };
         Card { inner: Arc::new(Inner { door, threads, state: Mutex::new(state) }) }
     }
@@ -177,8 +186,15 @@ impl Card {
         self.inner.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The time, on the PC's own clock: for what a reading is stamped with.
     pub fn now(&self) -> f64 {
         self.inner.door.now()
+    }
+
+    /// Seconds on the clock that does not jump: for everything here that
+    /// lasts a while.
+    fn steady(&self) -> f64 {
+        self.inner.door.steady()
     }
 
     /// How the backend is asked.
@@ -218,7 +234,7 @@ impl Card {
     /// backend where it may not, or gave nothing.  None where neither has
     /// a reading.
     pub fn live(&self) -> Option<Live> {
-        let now = self.now();
+        let now = self.steady();
         if let Some((reader, within)) = self.the_reader(now) {
             let read = match reader.read(within) {
                 Ok(Some(said)) => taken(&said).ok_or_else(|| "its answer is not a reading".to_string()),
@@ -254,7 +270,8 @@ impl Card {
         let found = {
             let mut st = self.state();
             st.last_wanted = now;
-            if st.closed || st.away_until.is_some_and(|until| now < until) || st.pause_until.is_some_and(|until| now < until) {
+            let away = st.installs > 0 || st.away_until.is_some_and(|until| now < until);
+            if st.closed || away || st.pause_until.is_some_and(|until| now < until) {
                 return None;
             }
             (st.away_until, st.pause_until) = (None, None);
@@ -321,7 +338,7 @@ impl Card {
     /// still a reader to look after?  (Called once a second by the thread
     /// that looks after it; by hand where there is no such thread.)
     pub fn tend(&self) -> bool {
-        let now = self.now();
+        let now = self.steady();
         let idle = {
             let mut st = self.state();
             if st.reader.is_some() && now - st.last_wanted < IDLE_S {
@@ -340,17 +357,18 @@ impl Card {
 
     /// Around the call that starts a graphics driver's installer
     /// (`pass_on` hands it to the backend).  The reader is ended, and seen
-    /// to be gone, before the backend hears of the call.  If the backend
-    /// then says that an installer was started, no reader is started for
-    /// `HOLD_FOR_AN_INSTALL_S`; if it says anything else, things are as
-    /// they were before the call, and a reader may be started at the next
-    /// reading.
+    /// to be gone, before the backend hears of the call, and none is
+    /// started while the call is on its way: however many such calls are
+    /// on their way at once.  If the backend then says that an installer
+    /// was started, no reader is started for `HOLD_FOR_AN_INSTALL_S` from
+    /// its answer on; if it says anything else, this call leaves nothing
+    /// behind, and a reader may be started at the next reading (unless an
+    /// installer that was started before still has its time to run).
     pub fn around_a_driver_install(&self, pass_on: impl FnOnce() -> Response) -> Response {
-        let until = self.now() + HOLD_FOR_AN_INSTALL_S;
-        let (reader, before) = {
+        let reader = {
             let mut st = self.state();
-            let before = st.away_until.replace(until);
-            (st.reader.take(), before)
+            st.installs += 1;
+            st.reader.take()
         };
         match &reader {
             Some(reader) if reader.end() => self.say(&format!("a graphics driver's installer may be about to start: the graphics card's reader was ended first (pid {}), \
@@ -363,18 +381,20 @@ impl Card {
         // (the backend lets go of its own copy only once it knows that it
         // starts the installer, and says so with "ok")
         let started = answer.status == 200 && answer.to_json().get("ok").is_some_and(Json::truthy);
+        {
+            // (counted from the answer: the backend let go before it answered)
+            let until = self.steady() + HOLD_FOR_AN_INSTALL_S;
+            let mut st = self.state();
+            st.installs -= 1;
+            if started {
+                // (later than the time of any installer that was started before)
+                st.away_until = Some(until);
+            }
+        }
         if started {
             self.say(&format!("a graphics driver's installer was started: no reader for the graphics card for {HOLD_FOR_AN_INSTALL_S:.0} s, the backend is asked meanwhile"));
-        } else {
-            let mut st = self.state();
-            // (unless another such call came meanwhile and set its own)
-            if st.away_until == Some(until) {
-                st.away_until = before;
-            }
-            drop(st);
-            if reader.is_some() {
-                self.say("no graphics driver's installer was started: the graphics card's reader may be started again");
-            }
+        } else if reader.is_some() {
+            self.say("no graphics driver's installer was started: the graphics card's reader may be started again");
         }
         answer
     }
@@ -954,6 +974,112 @@ mod tests {
         assert_eq!(rig.readers.running().len(), 0);
         rig.machine.at(3400.0);
         assert_eq!(rig.card.live(), of_the_reader(61));
+    }
+
+    #[test]
+    fn calls_for_an_install_that_overlap_and_start_nothing_leave_nothing_behind() {
+        // Two calls, the second begun while the first is on its way, and
+        // the first answered first.  Neither starts an installer.
+        let rig = Rig::new();
+        assert_eq!(rig.card.live(), of_the_reader(61));
+        let (first_may_end, ended) = (Arc::new(std::sync::Barrier::new(2)), Arc::new(std::sync::Barrier::new(2)));
+        let first = {
+            let (card, may_end, ended) = (rig.card.clone(), first_may_end.clone(), ended.clone());
+            std::thread::spawn(move || {
+                card.around_a_driver_install(|| {
+                    may_end.wait();
+                    an_answer(r#"{"ok": false, "err": "Driver installer not downloaded yet"}"#)
+                });
+                ended.wait();
+            })
+        };
+        // (the first is on its way: the reader is gone, and none is started)
+        while !rig.readers.running().is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        rig.machine.at(1001.0);
+        assert_eq!(rig.card.live(), of_the_backend());
+        rig.card.around_a_driver_install(|| {
+            first_may_end.wait();
+            ended.wait();
+            // (the first has been answered; this one is still on its way)
+            assert_eq!(rig.card.live(), of_the_backend());
+            assert_eq!(rig.readers.started(), 1, "a reader was started while a call for an install was on its way");
+            an_answer(r#"{"ok": false, "err": "An install is already in progress"}"#)
+        });
+        first.join().unwrap();
+        // Both answered, neither started one: the next reading has a reader.
+        rig.machine.at(1001.2);
+        assert_eq!(rig.card.live(), of_the_reader(61), "the reader stayed away though no installer was started");
+        assert_eq!(rig.readers.started(), 2);
+        // The same with one of the two starting an installer: 900 seconds
+        // from its answer, whichever of the two is answered last.
+        for the_first_starts_it in [true, false] {
+            let rig = Rig::new();
+            let (yes, no) = (r#"{"ok": true}"#, r#"{"ok": false}"#);
+            let (first_may_end, ended) = (Arc::new(std::sync::Barrier::new(2)), Arc::new(std::sync::Barrier::new(2)));
+            let first = {
+                let (card, may_end, ended) = (rig.card.clone(), first_may_end.clone(), ended.clone());
+                std::thread::spawn(move || {
+                    card.around_a_driver_install(|| {
+                        may_end.wait();
+                        an_answer(if the_first_starts_it { yes } else { no })
+                    });
+                    ended.wait();
+                })
+            };
+            rig.card.around_a_driver_install(|| {
+                first_may_end.wait();
+                ended.wait();
+                an_answer(if the_first_starts_it { no } else { yes })
+            });
+            first.join().unwrap();
+            rig.machine.at(1899.0);
+            assert_eq!(rig.card.live(), of_the_backend(), "the first starts it: {the_first_starts_it}");
+            rig.machine.at(1900.0);
+            assert_eq!(rig.card.live(), of_the_reader(61), "the first starts it: {the_first_starts_it}");
+        }
+    }
+
+    #[test]
+    fn how_long_things_last_is_not_counted_on_the_pcs_own_clock() {
+        // An installer was started, and the PC's clock is set forward by a
+        // day: the reader stays away for its 900 seconds all the same.
+        let rig = Rig::new();
+        // (the PC's clock says something else than the clock that counts,
+        // as it does on any PC: the one began in 1970, the other at a start)
+        rig.machine.the_pcs_clock_is_set_to(1000.0 + 500_000.0);
+        rig.card.around_a_driver_install(|| an_answer(r#"{"ok": true}"#));
+        rig.machine.the_pcs_clock_is_set_to(1000.0 + 586_400.0);
+        assert_eq!(rig.card.live(), of_the_backend(), "a reader was started early because the PC's clock was set forward");
+        assert_eq!(rig.readers.started(), 0);
+        // ... and set back by a day: it does not stay away for a day.
+        rig.machine.the_pcs_clock_is_set_to(1000.0 - 86_400.0);
+        rig.machine.at(1900.0);
+        assert_eq!(rig.card.live(), of_the_reader(61));
+        // An idle reader is ended after ten seconds that went by, whatever
+        // the PC's clock says: not early because it was set forward, and
+        // not never because it was set back.
+        rig.machine.the_pcs_clock_is_set_to(1900.0 + 3600.0);
+        assert!(rig.card.tend(), "a reader was ended as idle because the PC's clock was set forward");
+        rig.machine.at(1909.5);
+        rig.machine.the_pcs_clock_is_set_to(100.0);
+        assert!(rig.card.tend());
+        rig.machine.at(1910.0);
+        rig.machine.the_pcs_clock_is_set_to(100.0);
+        assert!(!rig.card.tend(), "an idle reader stayed because the PC's clock was set back");
+        assert!(rig.readers.running().is_empty());
+        // And the pause after a reader gave nothing.
+        rig.readers.reads(FakeReading::HasNone);
+        assert_eq!(rig.card.live(), of_the_backend());
+        rig.readers.reads(FakeReading::Says(helper(61)));
+        rig.machine.the_pcs_clock_is_set_to(1_000_000.0);
+        assert_eq!(rig.card.live(), of_the_backend(), "a reader was tried again early because the PC's clock was set forward");
+        rig.machine.at(1940.0);
+        rig.machine.the_pcs_clock_is_set_to(0.0);
+        assert_eq!(rig.card.live(), of_the_reader(61));
+        // What a reading is stamped with is the PC's own clock, as it was.
+        assert_eq!(rig.card.now(), 0.0);
     }
 
     #[test]

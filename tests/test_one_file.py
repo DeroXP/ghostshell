@@ -602,6 +602,49 @@ def test_the_trial_finds_the_pack_tool_where_the_core_is_built_and_says_when_it_
 # ═════════════════════════════════════════════════════════════════════
 # The graphics card's reader, carried in the pack
 # ═════════════════════════════════════════════════════════════════════
+# Libraries that are part of Windows itself, and are found in Windows' own
+# folder whatever a program has beside it.
+WINDOWS_OWN = {"kernel32.dll", "ntdll.dll", "kernelbase.dll", "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "userenv.dll", "ws2_32.dll",
+               "user32.dll", "shell32.dll", "ole32.dll", "oleaut32.dll", "cabinet.dll", "secur32.dll", "crypt32.dll", "ucrtbase.dll",
+               "powrprof.dll", "iphlpapi.dll"}
+
+
+def libraries_asked_for(exe):
+    """The libraries a program asks Windows for when it starts, and the
+    ones it asks for later by a list of its own: as its file says."""
+    import struct
+    with open(exe, "rb") as f:
+        data = f.read()
+    at = struct.unpack_from("<I", data, 0x3C)[0]
+    assert data[at:at + 4] == b"PE\0\0", "not a program"
+    sections, optional_size = struct.unpack_from("<H", data, at + 6)[0], struct.unpack_from("<H", data, at + 20)[0]
+    optional = at + 24
+    lists = optional + (112 if struct.unpack_from("<H", data, optional)[0] == 0x20B else 96)
+    table = [struct.unpack_from("<8sIIII", data, optional + optional_size + 40 * n) for n in range(sections)]
+
+    def in_the_file(address):
+        for _name, size, begins, kept, where in table:
+            if begins <= address < begins + max(size, kept):
+                return address - begins + where
+        raise AssertionError(f"{address:#x} is in no part of the file")
+
+    def name_at(address):
+        begins = in_the_file(address)
+        return data[begins:data.index(b"\0", begins)].decode("ascii")
+
+    names = []
+    # (list 1: asked for at the start; list 13: asked for when first used)
+    for which, each, name_field in ((1, 20, 12), (13, 32, 4)):
+        address = struct.unpack_from("<I", data, lists + 8 * which)[0]
+        if not address:
+            continue
+        entry = in_the_file(address)
+        while any(data[entry:entry + each]):
+            names.append(name_at(struct.unpack_from("<I", data, entry + name_field)[0]))
+            entry += each
+    return names
+
+
 def test_the_cards_reader_is_carried_in_the_pack_and_started_from_where_the_pack_is_unpacked():
     """The shell starts a small program of its own for the graphics card's
     readings (shell_rs/core/src/moved/card.rs says why it is a program of
@@ -621,9 +664,12 @@ def test_the_cards_reader_is_carried_in_the_pack_and_started_from_where_the_pack
     # The exe: from the folder it has just made ready, where the pack has
     # one, and in no other place.
     hook = main[main.index("fn the_backend_made_ready("):main.index("/// Open the window, start the backend")]
-    started = 'if pack.has(gpu_reader::IN_THE_PACK) && shell.card_is_read_by(gpu_reader::OwnProgram::at(format!("{}\\\\{}", ready.folder, gpu_reader::IN_THE_PACK))) {'
+    started = ('} else if pack.has(gpu_reader::IN_THE_PACK) && shell.card_is_read_by(gpu_reader::OwnProgram::at(format!("{}\\\\{}", ready.folder, '
+               'gpu_reader::IN_THE_PACK))) {')
+    # ... and only with the C runtime it needs beside it (below).
+    assert hook.index("if pack.has(gpu_reader::IN_THE_PACK) && !pack.has(gpu_reader::ITS_C_RUNTIME) {") < hook.index(started)
     assert hook.index("let ready = backend::make_ready(&pack, way, &places)?;") < hook.index(started)
-    assert main.count("OwnProgram::at(") == 1 and main.count("card_is_read_by(") == 1 and main.count("gpu_reader::") == 3
+    assert main.count("OwnProgram::at(") == 1 and main.count("card_is_read_by(") == 1 and main.count("gpu_reader::") == 5
     # Started with its two pipe ends and nothing else, in a job that ends with the shell.
     assert "let (process, to_it, from_it) = win::start_with_pipes(&self.program)?;" in reader
     assert "std::process" not in reader and "Command" not in reader, "the reader is started in another way as well"
@@ -636,9 +682,12 @@ def test_the_cards_reader_is_carried_in_the_pack_and_started_from_where_the_pack
     assert start.index("AssignProcessToJobObject(job.0, process.0)") < start.index("ResumeThread(thread.0);"), "it runs before it is in its job"
     # (and a backend that is started at that moment does not get the pipe ends either)
     assert win.count("let _one_at_a_time = STARTING.lock()") == 2
-    # The exe that ships is not built with a pack that has no reader.
+    # The exe that ships is not built with a pack that has no reader, or
+    # one whose reader does not have its C runtime beside it.
     assert 'let ships = std::env::var_os("CARGO_FEATURE_ELEVATED").is_some();' in build
-    assert "if ships && !vispora_shell_core::pack::Pack::read(&bytes).is_ok_and(|pack| pack.has(reader)) {" in build
+    assert "let has = |path: &str| vispora_shell_core::pack::Pack::read(&bytes).is_ok_and(|pack| pack.has(path));" in build
+    assert "if ships && !has(reader) {" in build and "if ships && !has(runtime) {" in build
+    assert 'pub const ITS_C_RUNTIME: &str = "_internal\\\\VCRUNTIME140.dll";' in reader
     # A folder's programs that are tried first, before it is taken away,
     # are the ones at its top and the reader.
     go = win[win.index("pub fn programs_let_go("):win.index("/// Remove what earlier runs left behind")]
@@ -647,6 +696,14 @@ def test_the_cards_reader_is_carried_in_the_pack_and_started_from_where_the_pack
     reader_exe = S.built_tool("VisporaGpuReader.exe")
     if not (S.TRY and reader_exe):
         return
+    # What the reader's program asks Windows for when it starts: libraries
+    # of Windows' own, and one that is not, which is the one the app carries
+    # beside it.  (A second one would have to be carried and held too.)
+    asked_for = libraries_asked_for(reader_exe)
+    assert len(asked_for) >= 3 and "KERNEL32.dll".lower() in [name.lower() for name in asked_for], asked_for
+    not_windows_own = [name for name in asked_for if not name.lower().startswith(("api-ms-win-", "ext-ms-")) and name.lower() not in WINDOWS_OWN]
+    assert [name.lower() for name in not_windows_own] == ["vcruntime140.dll"], \
+        f"the reader asks Windows for {not_windows_own}: what is not Windows' own has to be beside it in the pack (gpu_reader.rs, ITS_C_RUNTIME)"
     # The tool: a pack with the reader in it, and one without.
     folder = a_made_up_backend("with-reader")
     without, with_it = os.path.join(m.ROOT, "one-file", "without.pack"), os.path.join(m.ROOT, "one-file", "with-reader.pack")

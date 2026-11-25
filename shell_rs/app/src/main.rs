@@ -279,7 +279,12 @@ fn the_backend_made_ready(shell: &Arc<Shell>, carried: &'static [u8], places: ba
         // from the folder that was just made ready, which is checked and
         // held like everything the shell starts with its rights, and from
         // nowhere else (core/src/gpu_reader.rs).
-        if pack.has(gpu_reader::IN_THE_PACK) && shell.card_is_read_by(gpu_reader::OwnProgram::at(format!("{}\\{}", ready.folder, gpu_reader::IN_THE_PACK))) {
+        // And only with the C runtime it needs beside it: without the
+        // app's own copy there, Windows would give it one from somewhere
+        // else.  (The exe that ships is not built with such a pack.)
+        if pack.has(gpu_reader::IN_THE_PACK) && !pack.has(gpu_reader::ITS_C_RUNTIME) {
+            shell.say("the pack carries a reader for the graphics card and not the C runtime it needs beside it: the reader is not started, and the backend is asked for the card");
+        } else if pack.has(gpu_reader::IN_THE_PACK) && shell.card_is_read_by(gpu_reader::OwnProgram::at(format!("{}\\{}", ready.folder, gpu_reader::IN_THE_PACK))) {
             shell.say("the graphics card has a reader of its own in that folder: it is started while a reading is wanted");
         }
         shell.say(&format!("the background program was ready to be started {} ms after that began", began.elapsed().as_millis()));
@@ -347,9 +352,11 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
         shell.say(&format!("settings for WebView2 were in the environment and were not used: {}", ignored.join(", ")));
     }
     // What has moved from the backend is answered by the shell itself
-    // (core/src/moved/: it only reads, and the graphics card's reading is
-    // asked of the backend).  The backend's own routes are as they were,
-    // and answer whatever the shell does not take.
+    // (core/src/moved/: it only reads; the graphics card is read by a
+    // small program of its own, which is given to the shell once the pack
+    // is unpacked, and by the backend where that one is away).  The
+    // backend's own routes are as they were, and answer whatever the shell
+    // does not take.
     if all_to_backend {
         shell.say("every call is the backend's: the shell answers nothing of what has moved itself");
     } else {
