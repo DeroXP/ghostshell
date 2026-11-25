@@ -156,9 +156,10 @@ working, so `app.js` is not touched.
 
 Python is no longer packed as one self-unpacking exe. The shell carries the
 backend as a folder of files and unpacks it itself, into a folder only
-administrators can write to: at every start, or once per version (piece 4
-below; which of the two is the owner's choice). The window is on screen
-before Python has finished loading, and before the unpacking is done.
+administrators can write to: once per version, into a folder that stays
+(the owner's choice; piece 4 below has the other way, which a build can
+still be made for). The window is on screen before Python has finished
+loading, and before the unpacking is done.
 
 In between, the app is made of: the Rust shell (window, tray, start, quit,
 routing), the Python backend (every route not yet moved), and the step 1
@@ -192,19 +193,24 @@ touched until then.
    that an ordinary start of today's app does not have. The entry that
    starts the app at sign-in names the shell when the app runs behind it.
    Tried for real against the app on the fake machine, without a mouse.
-4. **One file (written; the owner chooses between two ways).** The shell's
+4. **One file (written; the owner chose to keep the backend unpacked).** The shell's
    exe carries the app: built as a folder (`backend.spec`), squeezed into
    one piece and compiled into the exe, and unpacked by the shell before it
    starts it. It is unpacked only into a folder the shell made itself in
    that run, or one it has checked and holds: the administrators' own,
    closed to everybody else, and holding exactly the files the exe carries.
-   One switch says how it is kept: (a) unpacked at every start and taken
-   away at the quit, so nothing stays on the PC, which is the default until
-   the owner has chosen; or (b) unpacked once per version into a folder
-   that stays, and checked at later starts. Measured with the real
-   backend's files (57 MB in 206 files, in a trial that starts a stand-in
-   in their place): (a) costs 94 ms at every start, (b) 108 ms once and
-   11 ms at later starts, and leaves 57 MB on the PC. Either way the
+   One switch says how it is kept, and the owner chose on 2026-11-25:
+   (b), unpacked once per version into a folder that stays
+   (`C:\ProgramData\Vispora-backend-kept-<version>-...`) and checked at
+   later starts. That is what the build that ships does. (a), unpacked at
+   every start and taken away at the quit so that nothing stays on the PC,
+   is what a build made with `--features unpack-at-every-start` does.
+   Measured with the real backend's files (57 MB in 206 files, in a trial
+   that starts a stand-in in their place): (b) costs 108 ms once and 11 ms
+   at later starts, and leaves 57 MB on the PC, also after `Vispora.exe`
+   is deleted ("What stays on the PC" in
+   [shell_rs/README.md](../shell_rs/README.md) says how to take them
+   away); (a) costs 94 ms at every start. Either way the
    download is one file of 32.8 MB where today's is 28.2 MB, and the window
    is on screen after 36 ms without waiting for the unpacking. An update is
    for the shell's exe. The build that ships was built once with the real
@@ -215,32 +221,47 @@ administrator rights, and the one-file exe was never started. Before a
 release, on a real PC, in this order (stop at the first thing that is not
 as described, and keep `%APPDATA%\Vispora\shell.log` and `vispora.log`):
 
-1. Decide between (a) and (b) above. (b) is built with
-   `--features keep-backend`.
-2. Quit the installed Vispora. Build the one file (the three commands under
-   "One file" in [shell_rs/README.md](../shell_rs/README.md)), and put it
+1. Quit the installed Vispora. Build the one file (the three commands under
+   "One file" in [shell_rs/README.md](../shell_rs/README.md); nothing has
+   to be said for how the backend is kept: a build keeps it), and put it
    somewhere else than the installed copy, under the name `Vispora.exe`.
-3. Start it by hand. Expected: Windows' prompt for administrator rights,
+2. Start it by hand. Expected: Windows' prompt for administrator rights,
    then the window at once, then the first screen filling in. `shell.log`
-   says where the backend was unpacked and how long it took.
-4. While it runs, look at the folder it named (in `C:\Windows\Temp` for
-   (a), in `C:\ProgramData` for (b)): an ordinary, not elevated, Explorer
-   window or terminal must be refused when it tries to open it.
-5. Use the app as usual for a while: Game Mode on and off, the tray's
+   has one line about the unpacking: "the background program was unpacked
+   into C:\ProgramData\Vispora-backend-kept-<version>-<16 letters>, to
+   stay: 206 files, ... bytes, ... ms".
+3. Look in `C:\ProgramData` while it runs: that one folder is there, with
+   about 57 MB in it. An ordinary, not elevated, Explorer window or
+   terminal must be refused when it tries to open it, and it must not let
+   itself be renamed or deleted while the app runs. In `C:\Windows\Temp`
+   there is one `Vispora-window-...` folder, closed in the same way, and
+   no `Vispora-backend-run-...` folder.
+4. Use the app as usual for a while: Game Mode on and off, the tray's
    menu with the mouse, "Clean now" on the cleaner page (the app must go
    on working afterwards), a link from the Drivers page (the browser must
    not run elevated).
-6. Quit from the tray. Expected: both processes gone within a few
-   seconds, the settings put back, and for (a) the folder gone.
+5. Quit from the tray. Expected: both processes gone within a few
+   seconds, the settings put back, the window's folder gone from
+   `C:\Windows\Temp`, and the folder in `C:\ProgramData` still there.
+6. Start it again. `shell.log` must now say that the folder was found and
+   checked, not unpacked: "the background program is in
+   C:\ProgramData\Vispora-backend-kept-... from an earlier start, and is
+   what the exe carries: 206 files, ... bytes, checked in ... ms". No line
+   about unpacking for this start, and no second folder.
 7. Start it a second time while it runs: the first copy's window must come
    to the front, with no prompt.
 8. Switch "start at sign-in" on, sign out and in: the app must come up in
    the tray, without a prompt.
-9. For (b): start it again and read in `shell.log` that the folder was
-   found and checked, not unpacked.
+9. Quit it and take the folder away by hand, as "What stays on the PC" in
+   [shell_rs/README.md](../shell_rs/README.md) says. The next start must
+   unpack it again and say so in `shell.log`, as at step 2.
 10. An update: only once a second one-file build with a higher version
-    exists. The updater must swap the one exe and start it again, and
-    nothing of the version before may be left in the two places of step 4.
+    exists. The updater must swap the one exe and start it again. The new
+    version's first start unpacks a folder of its own and takes the old
+    version's away (`shell.log`: "folders of the background program from
+    other versions: 1 taken away, ..."), so that one folder is left in
+    `C:\ProgramData`, and nothing of either version in `C:\Windows\Temp`
+    once the app has quit.
 
 Decided while writing the core (the reasons are in
 [shell_rs/README.md](../shell_rs/README.md)):

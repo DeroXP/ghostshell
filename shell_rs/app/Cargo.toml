@@ -23,12 +23,15 @@ default = ["elevated"]
 # stand-in backend and names of its own (see try_it.py).
 elevated = []
 # Which of the two ways the backend is kept on the PC (../core/src/backend.rs).
-# Without this feature it is unpacked at every start into a folder for that
-# run, and taken away at the quit: nothing stays on the PC.  With it, it is
-# unpacked once per version into a folder that stays, and checked and used
-# again at later starts.  The choice is the owner's; until they have made
-# it, builds are made without.
-keep-backend = []
+# The owner chose (2026-11-25): it is unpacked once per version into a
+# folder that stays (ProgramData\Vispora-backend-kept-<version>-...), and
+# checked and used again at later starts.  That is what a build does that
+# is told nothing, the build that ships among them.
+# With this feature a build goes the other way: the backend is unpacked at
+# every start into a folder for that run and taken away at the quit, so
+# that nothing stays on the PC.  Both ways are built and tested; a trial
+# says which one it wants through its own setting, whatever the build.
+unpack-at-every-start = []
 
 [dependencies]
 vispora-shell-core = { path = "../core" }
