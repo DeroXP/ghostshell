@@ -105,6 +105,36 @@ pub struct Live {
     pub fan_pct: i128,
 }
 
+/// What the card's reader says: the helper's answer as the app takes it
+/// (core/native.py, gpu_live), each of its values a whole number, or
+/// nothing where the card does not say it.  The temperature is always
+/// there: an answer without one is not taken.  (`Live` is the same answer
+/// with nought wherever the card says nothing, which is how the sampler
+/// and the overclock's page read it; the hardware monitor keeps "nothing"
+/// apart from nought, and reads the card's memory as well.)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    values: [Option<i128>; GPU_FIELDS.len()],
+}
+
+impl Reading {
+    /// The value the helper names `name`, or None where the card does not
+    /// say it (and for a name the helper does not have).
+    pub fn value(&self, name: &str) -> Option<i128> {
+        GPU_FIELDS.iter().position(|known| *known == name).and_then(|at| self.values[at])
+    }
+
+    /// The reading in the app's own form (core/gpu_overclock.py,
+    /// _live_state_from_native).
+    pub fn live(&self) -> Live {
+        let whole = |name: &str| self.value(name).unwrap_or(0);
+        // (the library counts milliwatts; the app shows watts with two places)
+        let watts = self.value("power_mw").map_or(0.0, |milliwatts| py_round(milliwatts as f64 / 1000.0, 2));
+        Live { core_mhz: whole("core_mhz"), mem_mhz: whole("mem_mhz"), temp_c: whole("temp_c"), power_w: watts, gpu_util_pct: whole("gpu_util_pct"),
+               mem_util_pct: whole("mem_util_pct"), fan_pct: whole("fan_pct") }
+    }
+}
+
 /// A reader that is running.
 pub trait Reader: Send + Sync {
     /// What the helper says of the card now, in its own form: its answer
@@ -234,25 +264,8 @@ impl Card {
     /// backend where it may not, or gave nothing.  None where neither has
     /// a reading.
     pub fn live(&self) -> Option<Live> {
-        let now = self.steady();
-        if let Some((reader, within)) = self.the_reader(now) {
-            let read = match reader.read(within) {
-                Ok(Some(said)) => taken(&said).ok_or_else(|| "its answer is not a reading".to_string()),
-                Ok(None) => Err("it has no reading of a card".to_string()),
-                Err(why) => Err(why),
-            };
-            match read {
-                Ok(live) => {
-                    let mut st = self.state();
-                    if st.reader.as_ref().is_some_and(|running| Arc::ptr_eq(running, &reader)) {
-                        st.answered = true;
-                        st.next_pause = PAUSE_S;
-                    }
-                    st.from.reader += 1;
-                    return Some(live);
-                }
-                Err(why) => self.gave_nothing(&reader, now, &why),
-            }
+        if let Some(reading) = self.from_the_reader() {
+            return Some(reading.live());
         }
         let live = self.the_backends();
         let mut st = self.state();
@@ -261,6 +274,35 @@ impl Card {
             None => st.from.nowhere += 1,
         }
         live
+    }
+
+    /// What the card's own reader says now: all of it.  None where the
+    /// reader may not be asked or gave nothing.  The backend is not asked
+    /// here: who wants more of the backend than its reading of the card
+    /// (the hardware monitor does) asks it for that.
+    pub fn from_the_reader(&self) -> Option<Reading> {
+        let now = self.steady();
+        let (reader, within) = self.the_reader(now)?;
+        let read = match reader.read(within) {
+            Ok(Some(said)) => taken(&said).ok_or_else(|| "its answer is not a reading".to_string()),
+            Ok(None) => Err("it has no reading of a card".to_string()),
+            Err(why) => Err(why),
+        };
+        match read {
+            Ok(reading) => {
+                let mut st = self.state();
+                if st.reader.as_ref().is_some_and(|running| Arc::ptr_eq(running, &reader)) {
+                    st.answered = true;
+                    st.next_pause = PAUSE_S;
+                }
+                st.from.reader += 1;
+                Some(reading)
+            }
+            Err(why) => {
+                self.gave_nothing(&reader, now, &why);
+                None
+            }
+        }
     }
 
     /// The reader to ask now, started if need be, and how long its answer
@@ -452,36 +494,38 @@ impl State {
 /// gpu_live, and core/gpu_overclock.py, _live_state_from_native): every
 /// value a whole number or nothing, and never without the temperature.
 /// None for an answer that Python does not take (it then asks nvidia-smi).
-fn taken(said: &Json) -> Option<Live> {
+fn taken(said: &Json) -> Option<Reading> {
     // (an answer that is no object has none of the values, and so no temperature)
-    let mut values = Vec::with_capacity(GPU_FIELDS.len());
-    for name in GPU_FIELDS {
-        values.push((name, match said.get(name) {
+    let mut values = [None; GPU_FIELDS.len()];
+    for (at, name) in GPU_FIELDS.iter().enumerate() {
+        values[at] = match said.get(name) {
             None | Some(Json::Null) => None,
             Some(Json::Int(whole)) => Some(*whole),
             // (Python's int() of a number with a fraction cuts the fraction off)
             Some(Json::Float(number)) if number.is_finite() => Some(number.trunc() as i128),
             Some(_) => return None,
-        }));
+        };
     }
-    let value = |name: &str| values.iter().find(|(known, _)| *known == name).and_then(|(_, value)| *value);
-    let whole = |name: &str| value(name).unwrap_or(0);
-    value("temp_c")?;
-    // (the library counts milliwatts; the app shows watts with two places)
-    let watts = value("power_mw").map_or(0.0, |milliwatts| py_round(milliwatts as f64 / 1000.0, 2));
-    Some(Live { core_mhz: whole("core_mhz"), mem_mhz: whole("mem_mhz"), temp_c: whole("temp_c"), power_w: watts, gpu_util_pct: whole("gpu_util_pct"),
-                mem_util_pct: whole("mem_util_pct"), fan_pct: whole("fan_pct") })
+    let reading = Reading { values };
+    reading.value("temp_c")?;
+    Some(reading)
 }
 
 // ═════════════════════════════════════════════════════════════════════
 // The made-up sides
 // ═════════════════════════════════════════════════════════════════════
 
-/// A made-up backend: asked, it says what it was told to say, whatever
-/// it is asked for, and keeps what it was asked.
+/// A made-up backend: asked, it says what it was told to say, and keeps
+/// what it was asked.
 #[derive(Default)]
 pub struct FakeBackend {
+    /// What it says, whatever it is asked for ...
     says: Mutex<Option<Json>>,
+    /// ... but for these calls, which have an answer of their own
+    /// (None: it does not answer them).
+    says_to: Mutex<Vec<(String, Option<Json>)>>,
+    /// Or somebody else answers for it, asked at the moment it is asked.
+    answered_by: Mutex<Option<AskBackend>>,
     asked: Mutex<Vec<String>>,
 }
 
@@ -495,9 +539,29 @@ impl FakeBackend {
         *self.says.lock().unwrap_or_else(|p| p.into_inner()) = answer;
     }
 
+    /// From now on it says this to the call `path`, whatever it says to
+    /// the others.
+    pub fn says_to(&self, path: &str, answer: Option<Json>) {
+        let mut says_to = self.says_to.lock().unwrap_or_else(|p| p.into_inner());
+        says_to.retain(|(known, _)| known != path);
+        says_to.push((path.to_string(), answer));
+    }
+
+    /// From now on somebody else answers for it: asked with the call at the
+    /// moment the backend is asked.
+    pub fn is_answered_by(&self, somebody: AskBackend) {
+        *self.answered_by.lock().unwrap_or_else(|p| p.into_inner()) = Some(somebody);
+    }
+
     /// What it was asked so far, in order.
     pub fn asked(&self) -> Vec<String> {
         self.asked.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// What it says to the call `path` now, as it was told.
+    pub fn says_now(&self, path: &str) -> Option<Json> {
+        let of_its_own = self.says_to.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(known, _)| known == path).map(|(_, answer)| answer.clone());
+        of_its_own.unwrap_or_else(|| self.says.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
     /// The way to ask it (`Card::asks_the_backend_with`).
@@ -505,7 +569,11 @@ impl FakeBackend {
         let backend = self.clone();
         Arc::new(move |path: &str| {
             backend.asked.lock().unwrap_or_else(|p| p.into_inner()).push(path.to_string());
-            backend.says.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            let somebody = backend.answered_by.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            match somebody {
+                Some(somebody) => somebody(path),
+                None => backend.says_now(path),
+            }
         })
     }
 }
@@ -745,9 +813,15 @@ mod tests {
     fn the_helpers_answer_is_read_as_python_reads_it() {
         // What the card does not say is 0, a number with a fraction is cut,
         // and watts are milliwatts with two places, rounded as Python rounds.
-        let whole = |pairs: &str| taken(&Json::parse(pairs).unwrap());
+        let whole = |pairs: &str| taken(&Json::parse(pairs).unwrap()).map(|reading| reading.live());
         assert_eq!(whole(r#"{"temp_c": 53.9, "fan_pct": null, "power_mw": 1}"#),
                    Some(Live { core_mhz: 0, mem_mhz: 0, temp_c: 53, power_w: 0.0, gpu_util_pct: 0, mem_util_pct: 0, fan_pct: 0 }));
+        // The reading itself keeps "the card does not say" apart from
+        // nought, and has the card's memory too (the hardware monitor
+        // reads those).
+        let said = taken(&Json::parse(r#"{"temp_c": 53.9, "fan_pct": null, "gpu_util_pct": 0, "mem_used_bytes": 5000000000, "mem_total_bytes": 1.2e10}"#).unwrap()).unwrap();
+        assert_eq!((said.value("temp_c"), said.value("fan_pct"), said.value("gpu_util_pct"), said.value("core_mhz")), (Some(53), None, Some(0), None));
+        assert_eq!((said.value("mem_used_bytes"), said.value("mem_total_bytes"), said.value("no_such_value")), (Some(5_000_000_000), Some(12_000_000_000), None));
         for (milliwatts, watts) in [(215_435, 215.44), (2675, 2.67), (1005, 1.0), (15, 0.01), (5, 0.01), (4, 0.0), (999_999_995, 999_999.99)] {
             assert_eq!(whole(&format!(r#"{{"temp_c": 60, "power_mw": {milliwatts}}}"#)).unwrap().power_w, watts, "{milliwatts}");
         }

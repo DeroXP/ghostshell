@@ -19,7 +19,10 @@
 //!   to the native library by its name, and the time.  Nothing that changes
 //!   the machine can be reached through that door: the library's actions
 //!   are behind another function of its own, which is named nowhere in the
-//!   shell (tests/test_moved_perf.py holds that).
+//!   shell (tests/test_moved_perf.py holds that).  Two questions take
+//!   words of their own, and the door holds each to what it may be asked:
+//!   WMI is asked to tell rows and nothing else, and an echo request goes to
+//!   an address that is written as four numbers and to nothing else.
 //! * **A real side and a made-up side, from the first handler.**  `Real`
 //!   asks the library that is compiled into the shell (native/, the same
 //!   code the Python app loads as a DLL).  `Fake` answers from a table and
@@ -38,9 +41,11 @@
 //!   Python modules take themselves, so a module that lives on it gives
 //!   Python's answers at all times, also while a driver is installed.
 //!
-//! What has moved so far: the performance sampler (perf.rs).
+//! What has moved so far: the performance sampler (perf.rs) and the
+//! hardware monitor (hw.rs).
 
 pub mod card;
+pub mod hw;
 pub mod perf;
 
 use std::collections::HashMap;
@@ -49,13 +54,17 @@ use std::sync::{Arc, Mutex};
 use crate::http::{Request, Response};
 use crate::json::Json;
 
-pub use card::{AskBackend, Card, FakeBackend, FakeReaders, FakeReading, From, Live, Reader, Readers, Say, HOLD_FOR_AN_INSTALL_S, IDLE_S, THE_BACKENDS_READING};
+pub use card::{AskBackend, Card, FakeBackend, FakeReaders, FakeReading, From, Live, Reader, Readers, Reading, Say, HOLD_FOR_AN_INSTALL_S, IDLE_S, THE_BACKENDS_READING};
 
 /// The door to the machine, for everything that has moved: questions only.
 pub trait Readings: Send + Sync {
     /// What the native library answers to the question named `question`
     /// (native/README.md lists them), or None where it has no answer.
     fn ask(&self, question: &str) -> Option<Json>;
+    /// The same for one of the two questions that take words of their own:
+    /// "wmi" (a `namespace` and a `query`) and "ping" (a `target` and a
+    /// `timeout_ms`).
+    fn ask_with(&self, question: &str, with: &[(&str, Json)]) -> Option<Json>;
     /// The time, in seconds since 1970: what Python's `time.time()` gives.
     /// It is the PC's own clock, which a person or Windows can set forward
     /// or back at any moment: for telling when something happened, never
@@ -66,6 +75,9 @@ pub trait Readings: Send + Sync {
     /// it has to stay away).  It begins somewhere; only the difference
     /// between two readings of it says anything.
     fn steady(&self) -> f64;
+    /// Let this many seconds go by (a reading that is the difference
+    /// between two readings needs some time between them).
+    fn wait(&self, seconds: f64);
 }
 
 /// The real machine.
@@ -73,6 +85,10 @@ pub struct Real;
 
 impl Readings for Real {
     fn ask(&self, question: &str) -> Option<Json> {
+        self.ask_with(question, &[])
+    }
+
+    fn ask_with(&self, question: &str, with: &[(&str, Json)]) -> Option<Json> {
         // (a question's name, written in this crate: never text of the page's)
         if question.is_empty() || !question.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_') {
             return None;
@@ -83,10 +99,30 @@ impl Readings for Real {
         if question.starts_with("gpu_") {
             return None;
         }
+        // Two questions take words of their own, and only these words;
+        // every other question is its name and nothing beside it.
+        let text = |name: &str| with.iter().find(|(known, _)| *known == name).and_then(|(_, value)| value.as_str());
+        let may = match question {
+            // WMI is asked to tell rows (the library itself runs nothing
+            // that does not begin with SELECT either).
+            "wmi" => with.len() == 2 && text("namespace").is_some() && text("query").is_some_and(|query| query.starts_with("SELECT ")),
+            // One echo request, to an address written as four numbers: no
+            // name is looked up, and nothing else is sent anywhere.
+            "ping" => {
+                with.len() == 2 && text("target").is_some_and(plain_ipv4)
+                    && with.iter().any(|(name, value)| *name == "timeout_ms" && matches!(value, Json::Int(1..=10_000)))
+            }
+            _ => with.is_empty(),
+        };
+        if !may {
+            return None;
+        }
+        let mut request = vec![("q".to_string(), Json::from(question))];
+        request.extend(with.iter().map(|(name, value)| (name.to_string(), value.clone())));
         // `answer` is the library's door for questions.  Its other door,
         // for the two things that change the machine, is not used here or
         // anywhere in the shell.
-        let said = Json::parse(&vispora_native::answer(&format!("{{\"q\":\"{question}\"}}"))).ok()?;
+        let said = Json::parse(&vispora_native::answer(&Json::Object(request).to_string())).ok()?;
         match said.get("ok") {
             Some(Json::Bool(true)) => said.get("data").cloned(),
             _ => None,
@@ -101,6 +137,12 @@ impl Readings for Real {
         static BEGAN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         BEGAN.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
     }
+
+    fn wait(&self, seconds: f64) {
+        if seconds > 0.0 && seconds.is_finite() {
+            std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+        }
+    }
 }
 
 /// A made-up machine: it answers from a table, and its two clocks are set
@@ -108,11 +150,27 @@ impl Readings for Real {
 #[derive(Default)]
 pub struct Fake {
     answers: Mutex<HashMap<String, Json>>,
+    /// What counts up as time goes by: for a question, by how much each of
+    /// the whole numbers in its answer grows in a second.
+    growing: Mutex<HashMap<String, Json>>,
     /// The PC's own clock.
     clock: Mutex<f64>,
     /// The clock that does not jump.
     steady: Mutex<f64>,
     asked: Mutex<Vec<String>>,
+    /// How long was waited so far, in all.
+    waited: Mutex<f64>,
+}
+
+/// What a question is kept under in the made-up machine's table: its name,
+/// and the words that go with it in the order of their names.
+fn kept_as(question: &str, with: &[(&str, Json)]) -> String {
+    if with.is_empty() {
+        return question.to_string();
+    }
+    let mut with: Vec<(String, Json)> = with.iter().map(|(name, value)| (name.to_string(), value.clone())).collect();
+    with.sort_by(|a, b| a.0.cmp(&b.0));
+    format!("{question} {}", Json::Object(with))
 }
 
 impl Fake {
@@ -122,17 +180,58 @@ impl Fake {
 
     /// What the library answers to `question` from now on (None: nothing).
     pub fn answers(&self, question: &str, answer: Option<Json>) {
+        self.answers_with(question, &[], answer);
+    }
+
+    /// The same for a question that is asked with words of its own: what
+    /// it answers when it is asked with exactly these.
+    pub fn answers_with(&self, question: &str, with: &[(&str, Json)], answer: Option<Json>) {
         let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
         match answer {
-            Some(answer) => answers.insert(question.to_string(), answer),
-            None => answers.remove(question),
+            Some(answer) => answers.insert(kept_as(question, with), answer),
+            None => answers.remove(&kept_as(question, with)),
         };
+    }
+
+    /// From now on the whole numbers in the answer to `question` count up
+    /// as time goes by: each by what `each_second` says under its name
+    /// (None: they stand still again).  As a processor's times do.
+    pub fn grows(&self, question: &str, each_second: Option<Json>) {
+        let mut growing = self.growing.lock().unwrap_or_else(|p| p.into_inner());
+        match each_second {
+            Some(each_second) => growing.insert(question.to_string(), each_second),
+            None => growing.remove(question),
+        };
+    }
+
+    /// This much time has gone by: what counts up has counted.
+    fn has_gone_by(&self, seconds: f64) {
+        if seconds.is_nan() || seconds <= 0.0 {
+            return;
+        }
+        let growing = self.growing.lock().unwrap_or_else(|p| p.into_inner());
+        let mut answers = self.answers.lock().unwrap_or_else(|p| p.into_inner());
+        for (question, each_second) in growing.iter() {
+            let (Some(Json::Object(now)), Json::Object(rates)) = (answers.get_mut(question), each_second) else { continue };
+            for (name, value) in now.iter_mut() {
+                if let (Json::Int(whole), Some((_, Json::Int(rate)))) = (&mut *value, rates.iter().find(|(known, _)| known == name)) {
+                    *whole += (*rate as f64 * seconds).round() as i128;
+                }
+            }
+        }
     }
 
     /// What time it is from now on, on both clocks: time has gone by.
     pub fn at(&self, time: f64) {
+        let before = self.steady();
+        self.has_gone_by(time - before);
         *self.clock.lock().unwrap_or_else(|p| p.into_inner()) = time;
         *self.steady.lock().unwrap_or_else(|p| p.into_inner()) = time;
+    }
+
+    /// How long was waited so far, in all.
+    pub fn waited(&self) -> f64 {
+        *self.waited.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// The PC's own clock is set to another time (by the person, or by
@@ -149,8 +248,14 @@ impl Fake {
 
 impl Readings for Fake {
     fn ask(&self, question: &str) -> Option<Json> {
-        self.asked.lock().unwrap_or_else(|p| p.into_inner()).push(question.to_string());
-        self.answers.lock().unwrap_or_else(|p| p.into_inner()).get(question).cloned()
+        self.ask_with(question, &[])
+    }
+
+    fn ask_with(&self, question: &str, with: &[(&str, Json)]) -> Option<Json> {
+        let kept = kept_as(question, with);
+        let answer = self.answers.lock().unwrap_or_else(|p| p.into_inner()).get(&kept).cloned();
+        self.asked.lock().unwrap_or_else(|p| p.into_inner()).push(kept);
+        answer
     }
 
     fn now(&self) -> f64 {
@@ -160,27 +265,48 @@ impl Readings for Fake {
     fn steady(&self) -> f64 {
         *self.steady.lock().unwrap_or_else(|p| p.into_inner())
     }
+
+    /// (nobody waits: the made-up time goes by at once, on both clocks)
+    fn wait(&self, seconds: f64) {
+        if seconds.is_nan() || seconds <= 0.0 {
+            return;
+        }
+        self.has_gone_by(seconds);
+        *self.clock.lock().unwrap_or_else(|p| p.into_inner()) += seconds;
+        *self.steady.lock().unwrap_or_else(|p| p.into_inner()) += seconds;
+        *self.waited.lock().unwrap_or_else(|p| p.into_inner()) += seconds;
+    }
 }
 
 /// Everything that has moved, with the door it reads the machine through.
 pub struct Moved {
     pub card: Arc<Card>,
     pub perf: Arc<perf::Sampler>,
+    pub hw: Arc<hw::Monitor>,
 }
 
 impl Moved {
     /// `threads`: may what has moved run threads of its own (the sampler's,
-    /// and the one that looks after the card's reader)?  Not where a test
-    /// moves the clock by hand and does every round itself
-    /// (`perf::Sampler::step`, `Card::tend`).
+    /// the monitor's, and the one that looks after the card's reader)?  Not
+    /// where a test moves the clock by hand and does every round itself
+    /// (`perf::Sampler::step`, `hw::Monitor::step`, `Card::tend`).
     pub fn new(door: Arc<dyn Readings>, threads: bool) -> Arc<Moved> {
-        Arc::new(Moved { card: Arc::new(Card::new(door, threads)), perf: perf::Sampler::new(threads) })
+        Arc::new(Moved { card: Arc::new(Card::new(door.clone(), threads)), perf: perf::Sampler::new(threads), hw: hw::Monitor::new(door, threads) })
     }
 
-    /// How the backend is asked for the graphics card's reading, where the
-    /// card's own reader is away or has none.
+    /// How the backend is asked: for the graphics card's reading, where the
+    /// card's own reader is away or has none; and for a part of the
+    /// hardware monitor's reading, where Python would start a program to
+    /// take it.
     pub fn asks_the_backend_with(&self, ask: AskBackend) {
-        self.card.asks_the_backend_with(ask);
+        self.card.asks_the_backend_with(ask.clone());
+        self.hw.asks_the_backend_with(ask);
+    }
+
+    /// The shell quits: what has moved stops, and reads nothing any more.
+    pub fn close(&self) {
+        self.hw.close();
+        self.card.close();
     }
 
     /// Is this the call that starts a graphics driver's installer?  It is
@@ -201,6 +327,13 @@ impl Moved {
     pub fn answer(&self, request: &Request) -> Option<Response> {
         if request.path().starts_with("/api/perf/") {
             return self.perf.answer(&self.card, request);
+        }
+        // (the monitor's calls are known however they are written: one that
+        // the backend would take for a start must not be passed on to it
+        // as something else, or its own monitor would run beside this one)
+        let path = as_the_backend_reads_a_path(request.path());
+        if path.starts_with("/api/monitor/") {
+            return self.hw.answer(&self.card, request, &path);
         }
         None
     }
@@ -261,6 +394,106 @@ fn unquoted(text: &str) -> String {
         at += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A text for a call's query, written so that Flask reads it back as it
+/// is: everything but plain letters, digits and four marks as "%" and two
+/// digits.
+pub fn quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Is this an IPv4 address written plainly: four numbers of one to three
+/// digits, none above 255, none with a nought before it, with dots between
+/// and nothing around?  (What Python takes for an IPv4 address and the
+/// native library reads as one: core/native.py, _is_ipv4; native/src/ping.rs.
+/// Python takes a few more ways of writing one, which the library then
+/// does not read; for those, and for a name, it starts ping.exe.)
+pub fn plain_ipv4(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('.').collect();
+    parts.len() == 4 && parts.iter().all(|part| {
+        (1..=3).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit()) && (part.len() == 1 || !part.starts_with('0'))
+            && part.parse::<u16>().is_ok_and(|number| number <= 255)
+    })
+}
+
+/// What the body of a POST says to a route that reads it with
+/// `request.get_json(force=True) or {}` and then takes values out of it
+/// with `.get`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Said {
+    /// This object (an empty one for a body that says nothing: `null`, `0`,
+    /// `""`, `[]`, `{}`).
+    Says(Json),
+    /// Python stops before the route does anything: the body is no JSON,
+    /// or it is something and not an object.
+    PythonStops,
+    /// Python may well read it, and this program cannot: it is not plain
+    /// UTF-8 (Python reads JSON in UTF-16 and UTF-32 too, which it knows by
+    /// a zero among the first bytes, and lets halves of a character pair
+    /// through), or it is nested deeper than this program reads.
+    CannotTell,
+}
+
+/// See `Said`.
+pub fn said_by(body: &[u8]) -> Said {
+    // (Python takes the mark off that some programs put before UTF-8)
+    let (body, marked) = match body.strip_prefix(b"\xEF\xBB\xBF") {
+        Some(rest) => (rest, true),
+        None => (body, false),
+    };
+    let another_encoding = !marked
+        && match body {
+            [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..] => true,
+            [a, b, _, _, ..] => *a == 0 || *b == 0,
+            [a, b] => *a == 0 || *b == 0,
+            _ => false,
+        };
+    if another_encoding {
+        return Said::CannotTell;
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        // Python stops at what is not UTF-8, but for one thing: it lets
+        // halves of a character pair through, written as UTF-8 writes
+        // characters.  This program cannot hold those.
+        return if utf8_with_halves(body) { Said::CannotTell } else { Said::PythonStops };
+    };
+    match Json::parse(text) {
+        Ok(said @ Json::Object(_)) => Said::Says(said),
+        Ok(other) if !other.truthy() => Said::Says(Json::Object(Vec::new())),
+        Ok(_) => Said::PythonStops,
+        Err(why) if why == TOO_DEEP => Said::CannotTell,
+        Err(_) => Said::PythonStops,
+    }
+}
+
+/// What the reader of JSON says of a text that is nested deeper than it reads.
+const TOO_DEEP: &str = "nested too deeply";
+
+/// Would these bytes be UTF-8 if halves of a character pair (written
+/// 0xED, 0xA0 to 0xBF, and one more) were let through, as Python's
+/// "surrogatepass" lets them through?
+fn utf8_with_halves(bytes: &[u8]) -> bool {
+    let mut other = bytes.to_vec();
+    let mut at = 0;
+    while at + 2 < other.len() {
+        if other[at] == 0xED && (0xA0..=0xBF).contains(&other[at + 1]) && (0x80..=0xBF).contains(&other[at + 2]) {
+            // (a character of the same length that UTF-8 does allow)
+            other[at..at + 3].copy_from_slice(&[0xEE, 0x80, 0x80]);
+            at += 3;
+        } else {
+            at += 1;
+        }
+    }
+    std::str::from_utf8(&other).is_ok()
 }
 
 /// What Python's `int(text)` makes of a text.
@@ -458,6 +691,59 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         let second = Real.steady();
         assert!((0.02..5.0).contains(&(second - first)) && first < 1_000_000.0 && wall - first > 1_000_000_000.0, "{first} {second}");
+    }
+
+    #[test]
+    fn the_real_door_asks_wmi_for_rows_and_pings_a_plain_address_and_nothing_else() {
+        let wmi = |namespace: &str, query: &str| Real.ask_with("wmi", &[("namespace", namespace.into()), ("query", query.into())]);
+        let rows = wmi("root\\cimv2", "SELECT NumberOfLogicalProcessors FROM Win32_ComputerSystem").unwrap();
+        assert!(rows.as_array().is_some_and(|rows| rows.len() == 1), "{rows}");
+        // (a namespace that is not there: no rows, as the app reads it)
+        assert_eq!(wmi("root\\NoSuchNamespaceHere", "SELECT Name FROM Sensor"), Some(Json::Array(vec![])));
+        // Only a question that begins with SELECT, with nothing else beside it.
+        for query in ["select Name FROM Win32_Process", " SELECT Name FROM Win32_Process", "DELETE FROM Win32_Process", "", "SELECT"] {
+            assert_eq!(wmi("root\\cimv2", query), None, "{query:?}");
+        }
+        assert_eq!(Real.ask_with("wmi", &[("namespace", "root\\cimv2".into()), ("query", "SELECT Name FROM Win32_Processor".into()), ("x", 1.into())]), None);
+        assert_eq!(Real.ask_with("wmi", &[("query", "SELECT Name FROM Win32_Processor".into())]), None);
+        assert_eq!(Real.ask_with("wmi", &[("namespace", 5.into()), ("query", "SELECT Name FROM Win32_Processor".into())]), None);
+        // An echo request to this PC itself (it does not leave the PC).
+        let ping = |target: Json, timeout: Json| Real.ask_with("ping", &[("target", target), ("timeout_ms", timeout)]);
+        let said = ping("127.0.0.1".into(), Json::Int(500)).unwrap();
+        assert_eq!(said["ok"], Json::Bool(true), "{said}");
+        // Never to a name, to an address written another way, or with a
+        // limit of its own choosing; and nothing is sent then.
+        for target in ["localhost", "127.0.0.01", " 127.0.0.1", "127.0.0.1 ", "127.0.0", "127.0.0.1.5", "256.0.0.1", "", "\u{661}27.0.0.1"] {
+            assert_eq!(ping(target.into(), Json::Int(500)), None, "{target:?}");
+        }
+        for timeout in [Json::Int(0), Json::Int(10_001), Json::Float(500.0), "500".into(), Json::Null] {
+            assert_eq!(ping("127.0.0.1".into(), timeout.clone()), None, "{timeout}");
+        }
+        assert_eq!(Real.ask_with("ping", &[("target", "127.0.0.1".into())]), None);
+        // Words beside any other question: not asked.
+        assert_eq!(Real.ask_with("cpu_times", &[("x", 1.into())]), None);
+        assert_eq!(Real.ask_with("abi", &[("q", "purge_standby_list".into())]), None);
+        // The two that the hardware monitor reads, which take no words.
+        assert!(Real.ask("memory").unwrap()["load_pct"].as_int().is_some_and(|load| (1..=100).contains(&load)));
+        assert!(Real.ask("dpc_rate").unwrap()["per_second"].as_int().is_some());
+        assert!(plain_ipv4("1.1.1.1") && plain_ipv4("255.0.10.0") && !plain_ipv4("01.1.1.1") && !plain_ipv4("1.1.1") && !plain_ipv4("1..1.1"));
+    }
+
+    #[test]
+    fn a_body_is_read_as_the_backends_route_reads_it() {
+        let says = |body: &[u8]| said_by(body);
+        assert_eq!(says(b"{\"a\": 1}"), Said::Says(Json::parse("{\"a\": 1}").unwrap()));
+        for nothing in [&b"null"[..], b"0", b"\"\"", b"[]", b"{}", b"false", b" {} ", b"\xEF\xBB\xBF{}"] {
+            assert_eq!(says(nothing), Said::Says(Json::Object(Vec::new())), "{nothing:?}");
+        }
+        for stops in [&b""[..], b"x", b"[1]", b"\"a\"", b"5", b"true", b"{", b"\xff", b"{\"a\": \"\xc3\"}", b"\xEF\xBB\xBF\xEF\xBB\xBF{}"] {
+            assert_eq!(says(stops), Said::PythonStops, "{stops:?}");
+        }
+        let deep = format!("{}{}", "[".repeat(80), "]".repeat(80));
+        for cannot in [deep.as_bytes(), b"\xff\xfe{\0}\0", b"\xfe\xff\0{\0}", b"{\0}\0", b"\0{\0}", b"{\0", b"\0{", b"{\"a\": \"\xed\xa0\x80\"}"] {
+            assert_eq!(says(cannot), Said::CannotTell, "{cannot:?}");
+        }
+        assert_eq!(quoted("a b&c=d/\u{f6}~-._"), "a%20b%26c%3Dd%2F%C3%B6~-._");
     }
 
     #[test]

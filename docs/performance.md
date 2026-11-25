@@ -636,6 +636,56 @@ Python 3.14 here; a release is built with 3.12). And the reader with
 administrator rights, started from the folder the pack is unpacked into
 on a person's PC.
 
+### The hardware monitor (the second module)
+
+The Monitor page's tiles: the processor, the card, the memory, DPC time
+and a ping, once a second from the first visit to that page until its Stop
+button or the quit: the page does not stop it when it is left (`core/hw_monitor.py`,
+now also `shell_rs/core/src/moved/hw.rs`). Before step 1 one pass started
+nine programs and took 3.3 s ("The Monitor page", above); since 3.8.1 the
+helper takes every reading on this PC, and no program is started.
+
+Measured with `python shell_rs/try_it.py --monitor`, on this PC, both at
+the same time for a minute, each with its echo requests to 127.0.0.1
+(four runs; the snapshot's time was taken in the last two):
+
+* **the shell**: the trial tool with the card's reader beside it, its
+  monitor started by the page's call; the backend is the stand-in, asked
+  for a part of a pass only where this PC leaves the shell without a
+  reading (it was asked none);
+* **the backend's own**: `core/hw_monitor.py` in a Python process of its
+  own, with the app's native helper as a source checkout builds it.
+
+| | The backend's own | The shell |
+| --- | --- | --- |
+| Processor time while it runs, of one core | 3.07% to 3.27% | 2.94% to 3.12%, and its card's reader 0.06%, its backend 0.01% |
+| Programs started in a minute | 0 | 0 (it cannot start one) |
+| One pass, the middle of 20 taken one a second (the slowest) | 269 to 483 ms (460 to 697) | 258 to 508 ms (477 to 715) |
+| The page's call for the snapshot, a minute of readings, 300 times (the slowest in twenty) | 0.94 to 0.96 ms (1.09 to 1.12), answered by the backend through the shell | **0.036 to 0.080 ms** (0.039 to 0.081) |
+| Before the first visit to the Monitor page, and after its Stop button | nothing | nothing (the reader is ended ten seconds after the last reading) |
+
+The readings themselves agree: the same clock, card temperature and clock,
+memory of the card, standby list (to the megabyte), ping; the load and
+the DPC shares a few tenths apart (each pass covers its own second).
+
+What it comes to: on this PC the monitor costs the shell what it costs
+the backend. Nearly all of a pass is WMI: no source on this PC has a
+processor temperature, and the four questions for one take about 75, 75,
+110 and 300 ms (the last is the thermal zone's counter), asked at every
+pass by both, as Python asks them. Most of that work is done in WMI's own
+process, which neither number counts. The page's call every three seconds
+is answered in under a twentieth of the time, and the monitor no longer needs
+the backend, which is what item 1's last step needs. Making it cheaper
+means asking for a temperature less often where none was found, which
+changes when a newly installed LibreHardwareMonitor is seen
+([rust-port.md](rust-port.md), piece 2).
+
+Not measured: with administrator rights; on a PC where
+LibreHardwareMonitor answers (one question instead of four); the parts the
+shell asks of a real backend (what a part costs there is the function's
+own cost and a call's, 1.9 to 2.7 ms of the backend's processor time:
+"The performance sampler", above).
+
 ## Measuring again
 
 After each piece of the port, run the same scripts and put the new numbers
@@ -653,6 +703,7 @@ python tools/measure/log_timeline.py
 python tools/measure/live_sample.py 120         (with the app running)
 python native/check_parity.py                   (needs the helper built)
 python shell_rs/try_it.py --moved               (what has moved into the shell; needs the shell's core built)
+python shell_rs/try_it.py --monitor             (the hardware monitor, the shell's beside the backend's own)
 ```
 
 None of them changes a setting on the PC, and none needs the app to be

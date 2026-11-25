@@ -750,7 +750,7 @@ def test_what_has_moved_can_only_read_the_machine():
     the backend, it asks through a way the shell hands it: it opens no
     connection of its own.)"""
     sources = moved_sources()
-    assert set(sources) == {"card.rs", "mod.rs", "perf.rs"}, "a new module has moved: this test and the plan in docs/rust-port.md have to know it"
+    assert set(sources) == {"card.rs", "hw.rs", "mod.rs", "perf.rs"}, "a new module has moved: this test and the plan in docs/rust-port.md have to know it"
     everything = {os.path.join(where, name): open(os.path.join(where, name), encoding="utf-8").read()
                   for crate in (S.CORE, os.path.join(os.path.dirname(S.CORE), "app")) for where, _, names in os.walk(os.path.join(crate, "src"))
                   for name in names if name.endswith(".rs")}
@@ -770,12 +770,18 @@ def test_what_has_moved_can_only_read_the_machine():
     real = door[door.index("impl Readings for Real {"):door.index("/// A made-up machine")]
     assert "!question.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_')" in real, "a question is a name, never a request's text"
     # The helper is asked in one place, through its door for questions: a
-    # question by its name, with nothing beside it.
+    # question by its name, with nothing beside it but for two questions,
+    # each held to what it may be asked: WMI to tell rows, and an echo
+    # request to an address written as four numbers.
     assert real.count("vispora_native::answer(") == 1 and real.count("vispora_native::") == 1
-    assert 'vispora_native::answer(&format!("{{\\"q\\":\\"{question}\\"}}"))' in real
-    # The door is all there is: a question, the time, and a clock that does not jump.
+    assert "vispora_native::answer(&Json::Object(request).to_string())" in real
+    assert ('"wmi" => with.len() == 2 && text("namespace").is_some() && text("query").is_some_and(|query| query.starts_with("SELECT ")),' in real
+            and 'with.len() == 2 && text("target").is_some_and(plain_ipv4)' in real and "_ => with.is_empty()," in real)
+    assert real.index("if !may {\n            return None;\n        }") < real.index("vispora_native::answer(")
+    # The door is all there is: a question, the time, a clock that does not
+    # jump, and letting time go by.
     trait = door[door.index("pub trait Readings: Send + Sync {"):door.index("/// The real machine.")]
-    assert re.findall(r"fn (\w+)\(", trait) == ["ask", "now", "steady"]
+    assert re.findall(r"fn (\w+)\(", trait) == ["ask", "ask_with", "now", "steady", "wait"]
     for name, text in sources.items():
         code = text[:text.index("#[cfg(test)]")]
         for word in ("std::process", "Command::new", "std::fs", "File::", "extern \"system\"", "unsafe", "crate::win", "crate::platform", "std::env",
@@ -816,7 +822,7 @@ def test_the_shell_takes_the_samplers_calls_and_no_others():
     assert "_ => return None," in taken, "what is not one of them is the backend's"
     door = moved_sources()["mod.rs"]
     answer = door[door.index("pub fn answer(&self, request: &Request) -> Option<Response> {"):door.index("// What a route of the backend reads off a call")]
-    assert re.findall(r'starts_with\("([^"]+)"\)', answer) == ["/api/perf/"] and "        }\n        None\n    }\n" in answer
+    assert re.findall(r'starts_with\("([^"]+)"\)', answer) == ["/api/perf/", "/api/monitor/"] and "        }\n        None\n    }\n" in answer
     # The router asks what every call is asked first, and only then what has moved.
     router = S.rust("src", "router.rs")
     handle = router[router.index("pub fn handle(self: &Arc<Self>, request: &Request) -> Response {"):router.index("/// Why a call is not from the app's own page")]
@@ -965,15 +971,17 @@ def test_the_backends_reading_of_the_card_is_what_its_sampler_reads():
     card_rs = sources["card.rs"]
     assert 'pub const THE_BACKENDS_READING: &str = "/api/gpu/oc/live";' in card_rs
     code = "".join(text[:text.index("#[cfg(test)]")] for text in sources.values())
-    assert code.count('"/api/') == 2 + code.count('"/api/perf/'), "the shell names another call of the backend's as well"
+    assert code.count('"/api/') == 2 + code.count('"/api/perf/') + code.count('"/api/monitor/'), "the shell names another call of the backend's as well"
     assert 'pub const THE_DRIVER_INSTALL: &str = "/api/driver/install";' in sources["mod.rs"]
     backends = card_rs[card_rs.index("fn the_backends(&self) -> Option<Live> {"):card_rs.index("impl State {")]
     assert "let said = ask(THE_BACKENDS_READING)?;" in backends and card_rs.count("ask(THE_BACKENDS_READING)") == 1
     # The card is read in two places and no third: the reader, where one may
     # be asked, and the backend.  Never through the door to the shell's own
     # library, which is used for the time and nothing else.
-    live = card_rs[card_rs.index("pub fn live(&self) -> Option<Live> {"):card_rs.index("/// The reader to ask now, started if need be")]
-    assert live.index("self.the_reader(now)") < live.index("reader.read(within)") < live.index("let live = self.the_backends();")
+    live = card_rs[card_rs.index("pub fn live(&self) -> Option<Live> {"):card_rs.index("/// What the card's own reader says now: all of it.")]
+    assert live.index("if let Some(reading) = self.from_the_reader() {") < live.index("let live = self.the_backends();")
+    reader = card_rs[card_rs.index("pub fn from_the_reader(&self) -> Option<Reading> {"):card_rs.index("/// The reader to ask now, started if need be")]
+    assert reader.index("self.the_reader(now)?") < reader.index("reader.read(within)") and "the_backends" not in reader
     code = card_rs[:card_rs.index("#[cfg(test)]")]
     assert code.count("door.") == 2 and "self.inner.door.now()" in code and "self.inner.door.steady()" in code, "the card asks the shell's own door for something"
     # How long a reader is idle, away or paused is counted on the clock

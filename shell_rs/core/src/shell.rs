@@ -245,11 +245,13 @@ impl Shell {
         let shell = Arc::downgrade(self);
         moved.asks_the_backend_with(Arc::new(move |path: &str| shell.upgrade()?.ask_backend("GET", path)));
         let shell = Arc::downgrade(self);
-        moved.card.says_with(Arc::new(move |line: &str| {
+        let say: crate::moved::Say = Arc::new(move |line: &str| {
             if let Some(shell) = shell.upgrade() {
                 shell.say(line);
             }
-        }));
+        });
+        moved.card.says_with(say.clone());
+        moved.hw.says_with(say);
         *self.moved.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(moved.clone());
         moved
     }
@@ -694,7 +696,7 @@ impl Shell {
         // a folder for one run is taken away after the quit.
         let moved = self.moved.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         if let Some(moved) = moved {
-            moved.card.close();
+            moved.close();
         }
         // Out of sight first: to the person at the PC, that is the quit.
         if let Some(window) = self.window() {

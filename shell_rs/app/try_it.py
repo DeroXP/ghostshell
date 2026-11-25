@@ -1036,6 +1036,81 @@ def the_cards_reader(root, check):
         run.end()
 
 
+# What the page shows of the hardware monitor's snapshot, in words without
+# a blank (a missing reading is an empty word).
+THE_SNAPSHOT = ("said.running, said.latest.cpu_load, said.latest.cpu_clock, said.latest.ram_pct, said.latest.ram_standby_mb, said.latest.dpc_rate, "
+                "said.latest.net_ping_ms, said.latest.gpu_temp, said.history.cpu_load.length, (said.latest.cpu_temp_source || 'none').replace(/ /g, '_')")
+
+
+def a_number(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def the_hardware_monitor(root, check):
+    """The hardware monitor: its start, stop and snapshot are answered by the
+    shell, which reads this PC through its own door (the processor's times
+    and clock, the memory and the standby list, DPCs a second, WMI for a
+    temperature, and one echo request a second to this PC itself), and the
+    graphics card through its backend (the stand-in's fake machine).
+
+    It only reads.  The standby list is read and not emptied, and the only
+    echo requests go to 127.0.0.1: the trial names that target, where the
+    page names none (and the app would ping 1.1.1.1)."""
+    its_card = {"temp_c": 66, "gpu_util_pct": 50, "mem_util_pct": 20, "core_mhz": 1800, "mem_mhz": 7000, "power_mw": 123450, "fan_pct": 60}
+
+    def the_monitors(run, part=True):
+        return [c[3] for c in run.calls() if c[3].startswith("/api/monitor/") and c[3].startswith("/api/monitor/part") == part]
+
+    run = Run(root, "hidden")
+    try:
+        up = first_screen(run)
+        pid = run.process.pid
+        the_page_calls(run, "POST", "/api/stand-in/card", its_card)
+        started = the_page_calls(run, "POST", "/api/monitor/start", {"ping_target": "127.0.0.1"})
+        time.sleep(3.3)
+        snap = the_page_calls(run, "GET", "/api/monitor/snapshot", tell=THE_SNAPSHOT)
+        check("the hardware monitor's start and snapshot are answered by the shell, which read this PC (load, clock, memory, standby list, DPCs a second): %r"
+              % (snap,), up and started == ["true"] and snap and snap[0] == "true" and all(a_number(v) is not None for v in snap[1:6]) and int(snap[8]) >= 3)
+        check("the echo request went to this PC itself and came back (%r ms); none of the monitor's calls reached the backend: %r"
+              % (snap and snap[6], the_monitors(run, part=False)), snap and (a_number(snap[6]) or 0) >= 1 and the_monitors(run, part=False) == [])
+        parts = the_monitors(run)
+        check("the card is the backend's part of each pass (66 degrees on its fake machine, not this PC's card): %r, asked %d times"
+              % (snap and snap[7], len(parts)), snap and snap[7] == "66" and set(parts) == {"/api/monitor/part?name=gpu"} and 3 <= len(parts) <= int(snap[8]) + 1)
+        # A name for a target: the shell looks nothing up and sends nothing;
+        # the backend is asked for that part, with that name (its ping.exe is
+        # a fake one, which says nothing).
+        stopped = the_page_calls(run, "POST", "/api/monitor/stop")
+        the_page_calls(run, "POST", "/api/monitor/start", {"ping_target": "localhost"})
+        time.sleep(2.3)
+        named = the_page_calls(run, "GET", "/api/monitor/snapshot", tell=THE_SNAPSHOT)
+        pings = [part for part in the_monitors(run) if "name=ping" in part]
+        check("for a target that is a name, the backend is asked, with that name, and the page is told what it found (nothing): %r, %r"
+              % (sorted(set(pings)), named and named[6]), stopped == ["true"] and pings and set(pings) == {"/api/monitor/part?name=ping&target=localhost"}
+              and named and named[0] == "true" and named[6] == "")
+        # The backend is ended, and the shell starts it again: the monitor
+        # is the shell's, and goes on.
+        first = run.backend_pid()
+        subprocess.run(["taskkill", "/PID", str(first), "/F"], capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        again = run.wait_for(lambda: run.backend_pid() not in (None, first) and run.backend_pid(), 60)
+        time.sleep(2.5)
+        later = the_page_calls(run, "GET", "/api/monitor/snapshot", tell=THE_SNAPSHOT)
+        check("a backend that was ended and started again (pid %r, then %r) changes nothing of it: still running, %r readings kept, and still no call of the "
+              "monitor's reached a backend" % (first, again, later and later[8]),
+              again and later and later[0] == "true" and named and int(later[8]) > int(named[8]) and the_monitors(run, part=False) == [])
+        the_page_calls(run, "POST", "/api/monitor/stop")
+        time.sleep(1.2)
+        asked = len(the_monitors(run))
+        time.sleep(2.0)
+        check("once it is stopped, the backend is asked nothing more (%d parts in all)" % asked, len(the_monitors(run)) == asked)
+        check("the shell's process never held the graphics driver's library", not holds(pid, THE_DRIVERS_LIBRARY) and holds(pid, "kernel32.dll"))
+        check("the shell quits as ever with a monitor that ran (exit code %r)" % (quit_by_its_window(run),), run.process.returncode == 0)
+    finally:
+        run.end()
+
+
 def moved(root, check):
     """What has moved from the backend into the shell: the performance
     sampler's calls are answered by the shell and do not reach the backend.
@@ -1118,10 +1193,21 @@ def moved(root, check):
               and "every call is the backend's" in run.log())
         check("the backend's own sampler is as it was, and the shell does not ask for the card: %r" % (told,),
               done and told and told[0] == "running" and told[2] in ("no-reading", "nothing") and asked_for_the_card(run) == 0)
+        # The hardware monitor: its calls reach the backend, whose own
+        # monitor runs (on the stand-in's fake machine), and the shell's does not.
+        started = the_page_calls(run, "POST", "/api/monitor/start", {"ping_target": "127.0.0.1"})
+        time.sleep(1.5)
+        snap = the_page_calls(run, "GET", "/api/monitor/snapshot", tell="said.running")
+        stopped = the_page_calls(run, "POST", "/api/monitor/stop")
+        reached = [c[3] for c in run.calls() if c[3].startswith("/api/monitor/")]
+        check("... and the hardware monitor's too: the backend's own monitor runs, and the shell asks it for no part: %r" % (reached,),
+              started == ["true"] and snap == ["true"] and stopped == ["true"]
+              and reached == ["/api/monitor/start", "/api/monitor/snapshot", "/api/monitor/stop"])
         quit_by_its_window(run)
     finally:
         run.end()
 
+    the_hardware_monitor(root, check)
     the_cards_reader(root, check)
 
 

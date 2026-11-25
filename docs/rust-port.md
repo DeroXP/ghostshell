@@ -344,9 +344,12 @@ not alike any more. Since steps 1 and 2 only three of them run all the
 time: the game monitor (a scan every three seconds), the temperature
 ceiling (the card's temperature every second) and the popup watchdog (every
 visible window every second). Idle Mode is off unless a person switches it
-on. The network monitor, the hardware monitor and the performance sampler
-run only while their page is open. And they differ in what they do: three
-only read the PC, four change it.
+on. The network monitor and the performance sampler run only while their
+page is open; the hardware monitor from the first visit to its page until
+its Stop button or the quit (found with piece 2: the page starts it and
+does not stop it when it is left, so that its tiles are current when the
+page comes back). And they differ in what they do: three only read the
+PC, four change it.
 
 Item 1 is cut by that, and what only reads goes first. One module to a pull
 request, in this order:
@@ -355,7 +358,7 @@ request, in this order:
 | --- | --- | --- | --- | --- |
 | 1 | The performance sampler (`core/perf_monitor.py`) | the graphics card, five times a second, while the Monitor page is open | nothing | **moved**: `shell_rs/core/src/moved/perf.rs` |
 | | The graphics card's own reader (not a module of the backend: what pieces 1, 2 and 5 read the card with) | the card, while something in the shell wants its readings | nothing | **written**: `VisporaGpuReader`, a small program the shell starts and ends (below). The backend's reading where it is away or has none |
-| 2 | The hardware monitor (`core/hw_monitor.py`) | processor, card, memory, DPC time, ping: once a second while the Monitor page is open | nothing | its benchmark writes a file, and its list of programs starts PowerShell: both stay in Python until they have a reading of their own |
+| 2 | The hardware monitor (`core/hw_monitor.py`) | processor, card, memory, DPC time, ping: once a second from the first visit to the Monitor page until its Stop button or the quit | nothing | **moved**: its loop and its start, stop and snapshot, `shell_rs/core/src/moved/hw.rs`. Its benchmark (it writes a file) and its list of programs (PowerShell) stay the backend's (below) |
 | 3 | The network monitor (`core/net_monitor.py`) | bytes per program and per network card, once a second while the Network page is open | nothing in its loop | pausing a program is process tuning (item 3 of the plan) and stays; which game is running is the game monitor's to say, and is asked of the backend until piece 7 |
 | 4 | The popup watchdog (`core/popup_killer.py`) | every visible window, once a second, always | closes Windows' own "get an app to open this link" windows | the first piece that changes something: looking and closing are kept apart, and the closing is never run against a PC by a test or a trial |
 | 5 | The temperature ceiling (`core/temp_ceiling.py`) | the card's temperature, once a second, always | when it trips: resets the overclock | the reset is GPU overclock's and stays in Python: the shell watches and decides, and asks the backend to carry it out |
@@ -547,6 +550,175 @@ here:
   something in the backend reads the card (the temperature ceiling, until
   piece 5): the reader takes the shell's part of it away, not the
   backend's.
+
+### Piece 2: the hardware monitor
+
+`core/hw_monitor.py`, the Monitor page's tiles and sparklines: the
+processor (temperature, load, clock), the graphics card (temperature,
+load, clock, memory), the memory (in use, the standby list), the time
+spent in DPCs and interrupts and DPCs a second, and a ping, once a
+second, a minute of each kept. In the shell:
+`shell_rs/core/src/moved/hw.rs`. It runs from the first visit to the
+Monitor page until the page's Stop button or the quit: the page starts it
+when it opens and does not stop it when it is left (`static/js/app.js`,
+"Hardware Monitor auto-runs"), in today's app as behind the shell. Behind
+the shell that keeps the card's reader running too (it is asked once a
+second), until the monitor is stopped.
+
+* **What moves, and what stays.** The loop and the three calls that
+  belong to it move: `POST /api/monitor/start`, `POST /api/monitor/stop`,
+  `GET /api/monitor/snapshot`. Two calls of the module's stay the
+  backend's, behind the shell too: the list of programs
+  (`GET /api/monitor/processes`, one PowerShell `Get-Process`) and the
+  benchmark (`POST /api/monitor/benchmark`, three PowerShell scripts, one
+  of which writes 50 MB to a file in the temporary folder and deletes it,
+  and a ping). Neither is a reading that is taken all the time: each is
+  one button, pressed once. They move when a reading of their own is
+  written for them, with the pages that only read (item 2), and the
+  benchmark's file is a change to the PC, kept apart from what reads.
+* **Where each reading comes from: where Python reads it.**
+  * The processor's load and its time in DPCs and interrupts: the
+    helper's `cpu_times` (Python reads the load through a call of its own
+    to the same Windows function, and the two shares through the helper).
+    The first pass, with nothing to compare with, reads twice a quarter
+    of a second apart, as Python does; so does a pass after more than ten
+    seconds without one (for the shares, as in Python).
+  * Its clock: the helper's `cpu_clock`.
+  * Its temperature: WMI through the helper, the four places Python asks
+    in Python's order (LibreHardwareMonitor, OpenHardwareMonitor, the
+    ACPI zone, the thermal zone's counter), the same questions word for
+    word.
+  * The memory in use and the standby list, and DPCs a second: two new
+    questions of the helper's, `memory` and `dpc_rate` (`native/src/
+    memory.rs`), which make the calls Python makes itself through ctypes
+    (`GlobalMemoryStatusEx`, `GetSystemInfo`, `NtQuerySystemInformation`
+    classes 80 and 23). Measured side by side on this PC: the same
+    standby list to the megabyte, the same DPC rate. They only read.
+  * The graphics card: its own reader (`Card::from_the_reader`, all of
+    the helper's answer, the card's memory included), never the shell's
+    own door; then LibreHardwareMonitor for what the card does not say,
+    as Python does.
+  * The ping: one echo request through the helper (below).
+* **Where Python would start a program, the backend is asked for that
+  part.** The shell starts none: not PowerShell, not `nvidia-smi`, not
+  `ping.exe` (nothing in `moved/` can start a program, and a test holds
+  that). Python starts one where its helper has no answer: PowerShell
+  for the load, the clock, a temperature, the standby list or the DPC
+  counters when those give nothing; `nvidia-smi` for a card the helper
+  cannot read; `ping.exe` for a name or an address written another way.
+  In each of those places the shell asks its backend for that part of
+  the pass, `GET /api/monitor/part?name=cpu|gpu|ram|dpc|ping` (and
+  `&target=` for the ping), a call that is there only behind the shell.
+  The backend takes the part with the very function its own loop would
+  have used (`_sample_cpu()`, `_sample_gpu()`, ...), so the page is shown
+  Python's answer, and the program is the backend's to start, as it is
+  today. The same where Python would read a value in a way of its own
+  that the shell does not copy (a sensor's value written as text, a name
+  that is a list). The card's part is asked where the reader is away (a
+  driver's install) or has no reading (no NVIDIA card, a card that
+  answers only to `nvidia-smi`), and in a shell whose pack carries no
+  reader. If the backend's function raises, its own loop would have
+  thrown the pass away; the shell does the same. With no backend to ask,
+  that reading is nothing for that pass.
+* **One of each.** The backend's own monitor is started by its start call
+  and by nothing else. Behind the shell that call reaches the backend
+  only where Python stops before it starts anything (a body that is no
+  JSON, or JSON that is something and no object): those are passed on,
+  and the backend says no in its own words. A body that Python might read
+  and the shell cannot is refused by the shell, not passed on (below).
+  The calls are known however their path is written (`%73tart`,
+  `/api%2Fmonitor%2Fstop`), as the backend's web framework reads a path.
+  The shell takes the calls from the moment it is made, before its
+  backend is started and before a page is shown; told to leave everything
+  to the backend (`--all-to-backend`), it takes none of them and asks for
+  no part, and the backend's own monitor runs as it does today. What the
+  monitor keeps (its minute of readings, what a pass compares with) is in
+  the shell: a backend that is ended and started again changes nothing
+  of it (tried in the window). An ordinary start of today's app has no
+  shell and no part call (it answers as a path that does not exist).
+* **It only reads.** The standby list is read, never emptied (emptying it
+  is one of the helper's two actions, behind its other door, which the
+  shell names nowhere). Starting and stopping the monitor starts and
+  stops a thread of the shell's own.
+* **The ping target comes from the page's start call** (`ping_target`;
+  the page sends none, so it is `1.1.1.1`, as in Python). The shell sends
+  one echo request a second, 32 bytes of the helper's own, with half a
+  second for the answer, to that target, and only if the target is a
+  text that is an IPv4 address written plainly: four numbers of one to
+  three digits, none above 255, none with a nought before it, nothing
+  around them. It looks no name up and sends nothing anywhere else. For
+  any other text Python starts `ping.exe`, and the shell asks the backend
+  for that part, with that text. A target that is no text (a number, a
+  list, `null`) gets no ping, from Python or from the shell. What the
+  shell refuses (answers 400 and does not pass on, so that nothing is
+  started anywhere): a start whose body is JSON in UTF-16 or UTF-32, has
+  half of a character pair in it (escaped, or written as UTF-8 writes
+  characters, which Python lets through), or is nested deeper than the
+  shell reads (64 levels). No page sends any of these.
+* **The same answers**, proven before anything is removed:
+  `tests/test_moved_hw.py` asks the Python module (its routes, its loop
+  run a round at a time) and the shell's (in the trial tool) the same
+  things on the same made-up machine, and compares every answer, the
+  snapshot after every pass included, a whole number where Python has one
+  and a fraction where Python has that: 441 answers, among them the
+  snapshot after each of 286 passes, and 31 calls passed on and 7
+  refused. The machine is the processor's times counting up, its clock,
+  the memory, the DPC rate, WMI's rows for each of the four questions,
+  the echo requests, the card, and what PowerShell, `nvidia-smi` and
+  `ping.exe` print; Python's own calls to Windows read the same machine.
+  Among the scripts: no LibreHardwareMonitor, no OpenHardwareMonitor, no
+  ACPI zone, a thermal zone of the placeholder kind, WMI that gives no
+  answer, a counter that gives nothing (and PowerShell that gives nothing
+  either), a card that answers only to `nvidia-smi`, no NVIDIA card
+  (LibreHardwareMonitor's sensors of an AMD card), no card at all, a
+  reader that is silent, that garbles, that is away for an install, a
+  pass that raises in Python, the PC's clock set back and forward, and
+  eighteen kinds of ping target. In every pass in which Python's own
+  loop started a program, the shell asked its backend, and the page got
+  Python's answer.
+* **Tried for real, and measured.** `python shell_rs/app/try_it.py
+  --moved`: the real window against the stand-in backend; the monitor
+  reads this PC through the shell's own door (load, clock, memory, the
+  standby list, DPCs a second, WMI, one echo request a second to
+  127.0.0.1, which the trial names as the target), the card through the
+  backend's part (the stand-in's fake machine); a target that is a name
+  goes to the backend with that name; the backend is ended and started
+  again and the monitor goes on; once stopped, the backend is asked
+  nothing more; told to leave everything to the backend, the backend's
+  own monitor runs and no part is asked. `python shell_rs/try_it.py
+  --monitor`: the numbers, in [performance.md](performance.md).
+
+What is left open by this piece:
+
+* **Four questions for a temperature on a PC that has none.** On this PC
+  no source has one, and the four questions are asked at every pass, by
+  Python and by the shell alike: they take about half of a pass (the
+  thermal zone's counter alone about 300 ms) and nearly all of the 3% of
+  a core the monitor uses while it runs (which is, once the page was
+  visited, until the Stop button or the quit). Asking a source that
+  gave nothing less often would change when a LibreHardwareMonitor that
+  is installed while the app runs is seen. Not changed here.
+* **The backend's part keeps a previous reading of its own.** For the
+  processor's load and the two shares, the backend's functions compare
+  with their own reading before. The shell asks for those parts only
+  where its own reading of the processor's times gave nothing, and then
+  the backend's gives nothing too (the same Windows call), so the answer
+  is PowerShell's, as in Python. A made-up machine could make the two
+  differ (processor times that ran, then stood still between two parts);
+  a running PC's processor times do not stand still.
+* **What was never run by anybody**: the monitor with administrator
+  rights; beside the real backend (its part call has answered only the
+  stand-in, on the fake machine, and the trial's ping on a fake
+  `ping.exe`); the part call answered by a backend that really starts
+  PowerShell, `nvidia-smi` or `ping.exe` (the same-answers test runs the
+  real functions with those programs made up); the card's part during a
+  real driver's install; an echo request from the shell to anything but
+  127.0.0.1 (the app's own target, 1.1.1.1, was pinged only by the
+  measuring of Python's helper before this piece); a PC where WMI's
+  LibreHardwareMonitor namespace is there (this PC has none, so the
+  temperature was never read for real by either); and the two new
+  questions of the helper's in the released app (they are not asked by
+  Python).
 
 ## What goes last
 

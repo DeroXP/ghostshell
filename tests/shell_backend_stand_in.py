@@ -30,6 +30,8 @@ each time it puts the (fake) system back, with the reason: that is how a test
 sees that a backend restored before it went.  With VISPORA_STAND_IN_CALLS=<file>
 it writes a line for every call it answers (the time, the status, the
 method and the path): that is how a trial sees what the window's page asked.
+(For the call a shell makes for a part of the hardware monitor's pass, the
+path is written with its query: which part, and for the ping, to whom.)
 With VISPORA_STAND_IN_SECRET=<file> it writes the run's secret there, as it
 was handed over: that is how a trial knows what to look for when it checks
 that the secret is nowhere it should not be.  (The file is the trial's own,
@@ -91,8 +93,9 @@ def main():
     calls = os.environ.get("VISPORA_STAND_IN_CALLS")
     if calls:
         def note(answer):
+            path = A.request.full_path.rstrip("?") if A.request.path == "/api/monitor/part" else A.request.path
             with open(calls, "a", encoding="utf-8") as f:
-                f.write(f"{time.time():.3f} {answer.status_code} {A.request.method} {A.request.path}\n")
+                f.write(f"{time.time():.3f} {answer.status_code} {A.request.method} {path}\n")
             return answer
 
         A.app.after_request(note)
