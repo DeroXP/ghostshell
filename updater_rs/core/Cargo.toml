@@ -1,0 +1,36 @@
+[package]
+name = "vispora-updater-core"
+version = "2.0.0"
+edition = "2021"
+description = "Everything Vispora's standalone updater does, without its window: where to look for a build, the download and its SHA-256 check, backup, swap and rollback"
+license = "MIT"
+publish = false
+
+[lib]
+name = "vispora_updater_core"
+# (The indented examples in the comments are command lines and tables, not Rust.)
+doctest = false
+
+# The same decisions from a terminal, as JSON: what a list of GitHub releases
+# offers a channel, how two versions compare.  It reads its input, prints an
+# answer and touches nothing; tests/test_updater_rs.py holds its answers
+# against update_sources.py.
+[[bin]]
+name = "vispora-updater-decide"
+path = "src/bin/decide.rs"
+
+# No dependencies, on purpose.  This is the code that downloads a program,
+# decides whether to trust it, and puts it in the place of the app's exe, and
+# it runs as administrator.  It is built from this folder and from Windows
+# itself; a build never downloads anything.  The window around it
+# (updater_rs/app) is the only part that uses outside crates.
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+# The pipeline is wrapped in catch_unwind so that an unexpected error is shown
+# in the window (lib.rs); that needs unwinding.
+panic = "unwind"

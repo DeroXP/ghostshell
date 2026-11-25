@@ -27,3 +27,7 @@ dist-*/
 # The native helper (Rust): build output.  The DLL is built before a release
 # (cargo build --release --manifest-path native/Cargo.toml) and bundled by build.spec.
 native/target/
+
+# The Rust updater (updater_rs/): build output of its two crates.
+updater_rs/core/target/
+updater_rs/app/target/
