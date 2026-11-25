@@ -40,7 +40,11 @@ fn no_backup_means_the_old_exe_is_left_alone() {
     assert_eq!(rig.error(), "could not back up the old exe: No space left on device");
 }
 
-/// A disk on which the copy of the new exe into place waits until it is let go.
+/// A disk on which the copy of the new exe into place waits until it is let
+/// go.  Not for ever: a test that goes wrong before it lets go must end in a
+/// failed check, not in a test run that never ends.
+const HELD_AT_MOST: Duration = Duration::from_secs(20);
+
 struct SlowSwap {
     in_swap: (Mutex<bool>, Condvar),
     release: (Mutex<bool>, Condvar),
@@ -54,10 +58,8 @@ impl SlowSwap {
             if to == target && from.ends_with(".part") {
                 *mine.in_swap.0.lock().unwrap() = true;
                 mine.in_swap.1.notify_all();
-                let mut released = mine.release.0.lock().unwrap();
-                while !*released {
-                    released = mine.release.1.wait(released).unwrap();
-                }
+                let released = mine.release.0.lock().unwrap();
+                let _ = mine.release.1.wait_timeout_while(released, HELD_AT_MOST, |let_go| !*let_go).unwrap();
             }
             None
         }));
@@ -80,6 +82,7 @@ fn the_close_button_mid_swap_waits_for_the_swap() {
     let rig = Rig::update();
     rig.net.publish("stable", "3.6.1", &new(), None, SERVER);
     let gate = SlowSwap::install(&rig);
+    let _at_the_end = LetGoAtTheEnd(gate.clone());
     // (exit code, was the pipeline still running, was there an exe at the target)
     let exits: Arc<Mutex<Vec<(i32, bool, bool)>>> = Arc::default();
     let (seen, updater, target) = (exits.clone(), Arc::downgrade(&rig.updater), rig.target.clone());
@@ -110,6 +113,7 @@ fn closing_the_window_mid_swap_waits_for_the_swap() {
     let rig = Rig::update();
     rig.net.publish("stable", "3.6.1", &new(), None, SERVER);
     let gate = SlowSwap::install(&rig);
+    let _at_the_end = LetGoAtTheEnd(gate.clone());
     assert_eq!(rig.updater.start_install(), Ok(()));
     assert!(gate.wait_until_in_swap(10));
     let released_at: Arc<Mutex<Option<Instant>>> = Arc::default();

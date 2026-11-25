@@ -1,0 +1,553 @@
+//! The backend's start and stop, and quitting.
+//!
+//! The backend is the Python app, started as a program of its own with
+//! `--backend` and a hand-over in its environment: the port to listen on,
+//! the run's secret, and the shell's process id (app.py, "Running behind the
+//! shell").  From then on:
+//!
+//! * It is **starting** until it answers `/api/shell/hello` with the version
+//!   this shell was built with.  Calls from the page that have to be passed
+//!   on wait for that, up to a limit (router.rs).
+//! * It is **ready** until its process ends.  If it ends on its own with exit
+//!   code 0, it left because it meant to (an update is being installed) and
+//!   the shell goes too.  If it ends any other way, it is started again, a
+//!   few times; after that the shell says so and stops trying.
+//! * **Quitting**, however it was asked for and however often: the window is
+//!   taken out of sight at once, the backend is told to put the system back
+//!   and go (`/api/window/quit`, the call the page always made), and the
+//!   shell waits for its process to end.  Not for ever: after the limit the
+//!   backend is ended.  Only then is the shell **gone**, and only then does
+//!   its process exit.
+//!
+//! Nothing waits without a limit, and whoever asks for the quit, or waits for
+//! it, waits for the same one.
+
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use crate::forward;
+use crate::http::Request;
+use crate::json::Json;
+use crate::platform::{Child, Command, Platform, Window};
+use crate::token::{self, Token};
+
+/// What the shell is told when it is made.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    /// How the backend is started.
+    pub backend: Command,
+    /// The build this shell belongs to.  A backend that says another version
+    /// is not this shell's backend.
+    pub version: String,
+    /// The folder the app keeps its data in (shown in the page).
+    pub appdata_dir: String,
+    /// Where the page lives, as its own requests name it.
+    pub origin: String,
+    /// How long a backend may take to answer for the first time.
+    pub ready_within: Duration,
+    /// How long a call from the page waits for a backend that is not up yet.
+    pub calls_wait: Duration,
+    /// How long a backend that has been up may take to put the system back
+    /// and end, once it is told to quit.
+    pub quit_within: Duration,
+    /// The same for a backend that never came up: it has little to put back.
+    pub quit_unready_within: Duration,
+    /// How often a backend that stopped is started again within
+    /// `restarts_within`, and how long the shell waits before each.
+    pub restarts: usize,
+    pub restarts_within: Duration,
+    pub restart_pause: Duration,
+    /// How often a backend is looked at: while it starts, and once it is up.
+    pub look_while_starting: Duration,
+    pub look_when_ready: Duration,
+    pub forward: forward::Limits,
+}
+
+impl Settings {
+    pub fn new(backend: Command, appdata_dir: &str) -> Settings {
+        Settings {
+            backend,
+            version: crate::APP_VERSION.to_string(),
+            appdata_dir: appdata_dir.to_string(),
+            origin: "http://vispora.localhost".to_string(),
+            // Python, Flask and the app's modules load in a second or two;
+            // a cold disk and a virus scanner can make that many.
+            ready_within: Duration::from_secs(90),
+            calls_wait: Duration::from_secs(30),
+            // Quitting undoes game mode, hands the graphics card back and
+            // waits for FFmpeg and PresentMon to stop.  Nobody has timed it
+            // on a real PC yet (docs/performance.md); half a minute is
+            // meant to be far more than it takes.  A backend that is ended
+            // at the limit has not put everything back: the next start does.
+            quit_within: Duration::from_secs(30),
+            quit_unready_within: Duration::from_secs(5),
+            restarts: 3,
+            restarts_within: Duration::from_secs(5 * 60),
+            restart_pause: Duration::from_secs(1),
+            look_while_starting: Duration::from_millis(50),
+            look_when_ready: Duration::from_millis(250),
+            forward: forward::Limits::default(),
+        }
+    }
+}
+
+/// Where the shell is with its backend.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Phase {
+    /// A backend has been started (or is about to be) and does not answer yet.
+    Starting,
+    Ready,
+    /// The backend is gone and is not started again: why, in words for the
+    /// person at the PC.
+    Down(String),
+    Quitting,
+    Gone,
+}
+
+struct State {
+    phase: Phase,
+    port: u16,
+    child: Option<Box<dyn Child>>,
+    /// Has a backend been up in this run?
+    was_ready: bool,
+    /// When backends were started.
+    starts: Vec<Instant>,
+    /// How long the last start took until the backend answered.
+    ready_took: Option<Duration>,
+    quit_took: Option<Duration>,
+    exit_code: i32,
+    history: Vec<String>,
+}
+
+type ExitHook = Arc<dyn Fn(i32) + Send + Sync>;
+type LogHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+pub struct Shell {
+    pub settings: Settings,
+    token: Token,
+    platform: Box<dyn Platform>,
+    state: Mutex<State>,
+    /// Rung whenever `state.phase` changes, for everybody who waits for one.
+    changed: Condvar,
+    /// The window, once there is one.
+    pub window: Mutex<Option<Arc<dyn Window>>>,
+    /// Ends the process, once the shell is gone.
+    pub exit_hook: Mutex<Option<ExitHook>>,
+    /// Takes every line the shell has to say (the app writes them to its log).
+    pub log_hook: Mutex<Option<LogHook>>,
+}
+
+/// How a backend that was being watched stopped being watched.
+enum Watched {
+    /// The shell is quitting: the end of the backend is the quit's business.
+    Quitting,
+    /// It ended on its own, cleanly, after having been up.
+    Left,
+    /// It is another build than this shell.
+    Wrong(String),
+    /// It ended, or never came up.
+    Stopped(String),
+}
+
+impl Shell {
+    pub fn new(settings: Settings, platform: Box<dyn Platform>) -> Result<Arc<Shell>, String> {
+        let token = Token::random(|bytes| platform.random(bytes))?;
+        Ok(Arc::new(Shell {
+            settings,
+            token,
+            platform,
+            state: Mutex::new(State {
+                phase: Phase::Starting,
+                port: 0,
+                child: None,
+                was_ready: false,
+                starts: Vec::new(),
+                ready_took: None,
+                quit_took: None,
+                exit_code: 0,
+                history: Vec::new(),
+            }),
+            changed: Condvar::new(),
+            window: Mutex::new(None),
+            exit_hook: Mutex::new(None),
+            log_hook: Mutex::new(None),
+        }))
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn window(&self) -> Option<Arc<dyn Window>> {
+        self.window.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    /// The run's secret.
+    pub fn token(&self) -> &Token {
+        &self.token
+    }
+
+    /// What the window's address ends in, so that the page has the secret:
+    /// `#t=...`.  A fragment is never sent anywhere; the page takes it out of
+    /// its address bar when it has read it (static/js/app.js).
+    pub fn fragment(&self) -> String {
+        format!("#t={}", self.token.as_str())
+    }
+
+    pub fn phase(&self) -> Phase {
+        self.state().phase.clone()
+    }
+
+    /// The backend's process id, while there is one.
+    pub fn backend_pid(&self) -> Option<u32> {
+        self.state().child.as_ref().map(|child| child.id())
+    }
+
+    pub fn starts(&self) -> usize {
+        self.state().starts.len()
+    }
+
+    /// How long the last start took until the backend answered, and how long
+    /// quitting took.
+    pub fn timings(&self) -> (Option<Duration>, Option<Duration>) {
+        let st = self.state();
+        (st.ready_took, st.quit_took)
+    }
+
+    /// What the shell has said so far, oldest first.
+    pub fn history(&self) -> Vec<String> {
+        self.state().history.clone()
+    }
+
+    pub(crate) fn say(&self, line: &str) {
+        {
+            let mut st = self.state();
+            if st.history.len() < 500 {
+                st.history.push(line.to_string());
+            }
+        }
+        let hook = self.log_hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        if let Some(hook) = hook {
+            hook(line);
+        }
+    }
+
+    /// Wait until `wanted` says yes to the phase, at most `at_most`.  The
+    /// phase it ended on.
+    pub fn wait_for(&self, at_most: Duration, wanted: impl Fn(&Phase) -> bool) -> Phase {
+        let give_up = Instant::now() + at_most;
+        let mut st = self.state();
+        loop {
+            if wanted(&st.phase) {
+                return st.phase.clone();
+            }
+            let left = give_up.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return st.phase.clone();
+            }
+            st = self.changed.wait_timeout(st, left).unwrap_or_else(|poisoned| poisoned.into_inner()).0;
+        }
+    }
+
+    /// The port of a backend that is up, for a call that has to be passed
+    /// on.  Waits for one that is starting; says why not otherwise.
+    pub(crate) fn port_when_ready(&self) -> Result<u16, (u16, String)> {
+        let give_up = Instant::now() + self.settings.calls_wait;
+        let mut st = self.state();
+        loop {
+            match &st.phase {
+                Phase::Ready => return Ok(st.port),
+                Phase::Down(why) => return Err((503, why.clone())),
+                Phase::Quitting | Phase::Gone => return Err((503, "Vispora is closing.".to_string())),
+                Phase::Starting => {}
+            }
+            let left = give_up.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err((503, "Vispora is still starting. Try again in a moment.".to_string()));
+            }
+            st = self.changed.wait_timeout(st, left).unwrap_or_else(|poisoned| poisoned.into_inner()).0;
+        }
+    }
+
+    // ─── Starting, and staying up ────────────────────────────────────
+
+    /// Start the backend, and keep it: on a thread of its own, until the
+    /// shell quits or gives up.
+    pub fn start(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        let made = std::thread::Builder::new().name("shell-backend".into()).spawn(move || me.keep());
+        if let Err(e) = made {
+            self.give_up(format!("Vispora could not start its background program ({e}). Close it and open it again."));
+        }
+    }
+
+    fn keep(self: &Arc<Self>) {
+        loop {
+            match self.start_backend() {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(why) => {
+                    self.say(&format!("the backend could not be started: {why}"));
+                    self.give_up(format!("Vispora could not start its background program ({why}). Close it and open it again."));
+                    return;
+                }
+            }
+            let stopped = match self.watch() {
+                Watched::Quitting => return,
+                Watched::Left => {
+                    self.say("the backend ended on its own (exit code 0): the shell goes too");
+                    self.quit("the backend left");
+                    return;
+                }
+                Watched::Wrong(why) => {
+                    self.say(&why);
+                    self.give_up("Vispora's files do not belong together. Download Vispora again.".to_string());
+                    return;
+                }
+                Watched::Stopped(what) => what,
+            };
+            let recent = {
+                let st = self.state();
+                st.starts.iter().filter(|at| at.elapsed() <= self.settings.restarts_within).count()
+            };
+            if recent > self.settings.restarts {
+                self.say(&format!("the backend stopped ({stopped}) for the {recent}. time in a row: not started again"));
+                self.give_up("Vispora's background program keeps stopping. Close Vispora and open it again.".to_string());
+                return;
+            }
+            self.say(&format!("the backend stopped ({stopped}): starting it again"));
+            // A moment first, so that a backend that dies at once is not
+            // started in a tight circle.  (A quit ends the wait.)
+            if matches!(self.wait_for(self.settings.restart_pause, |phase| matches!(phase, Phase::Quitting | Phase::Gone)),
+                        Phase::Quitting | Phase::Gone) {
+                return;
+            }
+        }
+    }
+
+    /// The backend will not be started again.
+    fn give_up(&self, why: String) {
+        let mut st = self.state();
+        if !matches!(st.phase, Phase::Quitting | Phase::Gone) {
+            st.phase = Phase::Down(why);
+            self.changed.notify_all();
+        }
+    }
+
+    /// Start one backend.  False when the shell is quitting and none is
+    /// wanted any more.
+    fn start_backend(&self) -> Result<bool, String> {
+        if matches!(self.state().phase, Phase::Quitting | Phase::Gone) {
+            return Ok(false);
+        }
+        let port = self.platform.free_port()?;
+        let handoff = Json::object([
+            ("port", (port as u32).into()),
+            ("token", self.token.as_str().into()),
+            ("shell_pid", self.platform.own_pid().into()),
+        ])
+        .to_string();
+        let mut child = self.platform.start(&self.settings.backend, &handoff)?;
+        let pid = child.id();
+        let mut st = self.state();
+        if matches!(st.phase, Phase::Quitting | Phase::Gone) {
+            // The quit came while it was being started, and has not seen it.
+            drop(st);
+            child.kill();
+            return Ok(false);
+        }
+        st.phase = Phase::Starting;
+        st.port = port;
+        st.child = Some(child);
+        st.starts.push(Instant::now());
+        st.ready_took = None;
+        self.changed.notify_all();
+        drop(st);
+        self.say(&format!("backend started (pid {pid}, port {port})"));
+        Ok(true)
+    }
+
+    /// Look at the backend until it stops, or until the shell quits.
+    fn watch(&self) -> Watched {
+        let started = Instant::now();
+        let mut ready = false;
+        loop {
+            let port = {
+                let mut st = self.state();
+                if matches!(st.phase, Phase::Quitting | Phase::Gone) {
+                    return Watched::Quitting;
+                }
+                if let Some(code) = st.child.as_mut().and_then(|child| child.exit_code()) {
+                    st.child = None;
+                    if ready {
+                        st.phase = Phase::Starting;
+                        self.changed.notify_all();
+                    }
+                    return if ready && code == 0 { Watched::Left } else { Watched::Stopped(format!("exit code {code}")) };
+                }
+                st.port
+            };
+            if !ready {
+                match self.hello(port) {
+                    Some(version) if version == self.settings.version => {
+                        let mut st = self.state();
+                        if matches!(st.phase, Phase::Quitting | Phase::Gone) {
+                            return Watched::Quitting;
+                        }
+                        st.phase = Phase::Ready;
+                        st.was_ready = true;
+                        st.ready_took = Some(started.elapsed());
+                        self.changed.notify_all();
+                        drop(st);
+                        ready = true;
+                        self.say(&format!("backend ready after {} ms", started.elapsed().as_millis()));
+                    }
+                    Some(other) => {
+                        self.end_backend();
+                        return Watched::Wrong(format!(
+                            "the backend is version {other:?} and the shell is {:?}: not this shell's backend",
+                            self.settings.version
+                        ));
+                    }
+                    None if started.elapsed() > self.settings.ready_within => {
+                        self.end_backend();
+                        return Watched::Stopped(format!("it did not answer within {} s", self.settings.ready_within.as_secs()));
+                    }
+                    None => {}
+                }
+            }
+            std::thread::sleep(if ready { self.settings.look_when_ready } else { self.settings.look_while_starting });
+        }
+    }
+
+    /// Ask the backend whether it is up.  Its version when it is.
+    fn hello(&self, port: u16) -> Option<String> {
+        let ask = Request::new("GET", "/api/shell/hello").with_header(token::HEADER, self.token.as_str());
+        // (a port nobody listens on yet is found out at once on this PC's own address)
+        let limits = forward::Limits { connect: Duration::from_millis(100), silence: Duration::from_secs(5), body: 64 * 1024 };
+        let answer = forward::send(port, &ask, &limits).ok()?;
+        let said = answer.to_json();
+        if answer.status != 200 || !said["ok"].truthy() {
+            return None;
+        }
+        Some(said["version"].as_str().unwrap_or("").to_string())
+    }
+
+    /// End the backend now, without asking it.
+    fn end_backend(&self) {
+        let child = self.state().child.take();
+        if let Some(mut child) = child {
+            child.kill();
+        }
+    }
+
+    // ─── Quitting ────────────────────────────────────────────────────
+
+    /// Begin to quit, and come back at once.  However many ask, and whoever
+    /// asks first, there is one quit.
+    pub fn quit(self: &Arc<Self>, reason: &str) {
+        {
+            let mut st = self.state();
+            if matches!(st.phase, Phase::Quitting | Phase::Gone) {
+                return;
+            }
+            st.phase = Phase::Quitting;
+            self.changed.notify_all();
+        }
+        self.say(&format!("quitting ({reason})"));
+        let me = Arc::clone(self);
+        if std::thread::Builder::new().name("shell-quit".into()).spawn(move || me.finish()).is_err() {
+            // (no thread to be had: then on this one)
+            self.finish();
+        }
+    }
+
+    /// Quit, and come back when the backend's process has ended.  The exit
+    /// code for the shell's own process.  Everybody who calls this waits for
+    /// the same quit, and nobody waits longer than the quit's own limits.
+    pub fn quit_and_wait(self: &Arc<Self>, reason: &str) -> i32 {
+        self.quit(reason);
+        // (a little more than the quit can take, so that a mistake in it is a
+        // failed check and not a wait without an end)
+        let slack = (self.settings.quit_within / 4).max(Duration::from_secs(2));
+        let at_most = self.settings.quit_within + self.settings.quit_unready_within + slack;
+        self.wait_for(at_most, |phase| *phase == Phase::Gone);
+        self.state().exit_code
+    }
+
+    /// The quit itself.  Runs once.
+    fn finish(self: &Arc<Self>) {
+        let began = Instant::now();
+        // Out of sight first: to the person at the PC, that is the quit.
+        if let Some(window) = self.window() {
+            window.hide();
+        }
+        let (port, was_ready) = {
+            let st = self.state();
+            (st.port, st.was_ready)
+        };
+        let limit = if was_ready { self.settings.quit_within } else { self.settings.quit_unready_within };
+        let give_up = began + limit;
+
+        // Tell the backend, on a thread of its own: its answer only comes
+        // when it has put the system back, and the wait below is for its
+        // process, whatever becomes of the answer.
+        if self.state().child.is_some() {
+            let me = Arc::clone(self);
+            let _ = std::thread::Builder::new().name("shell-quit-call".into()).spawn(move || {
+                let ask = Request::new("POST", "/api/window/quit")
+                    .with_header(token::HEADER, me.token.as_str())
+                    .with_header("Content-Type", "application/json")
+                    .with_body("{}");
+                let limits = forward::Limits { connect: Duration::from_millis(250), silence: limit + Duration::from_secs(1), body: 64 * 1024 };
+                while Instant::now() < give_up && me.state().child.is_some() {
+                    match forward::send(port, &ask, &limits) {
+                        Ok(answer) => {
+                            me.say(&format!("the backend took the quit (status {})", answer.status));
+                            return;
+                        }
+                        // (not listening yet, or not any more: ask again shortly)
+                        Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                    }
+                }
+            });
+        }
+
+        let code = loop {
+            {
+                let mut st = self.state();
+                match st.child.as_mut().map(|child| child.exit_code()) {
+                    None => break 0,
+                    Some(Some(code)) => {
+                        st.child = None;
+                        drop(st);
+                        self.say(&format!("the backend ended (exit code {code}) {} ms after the quit began", began.elapsed().as_millis()));
+                        break 0;
+                    }
+                    Some(None) => {}
+                }
+            }
+            if Instant::now() >= give_up {
+                self.end_backend();
+                self.say(&format!(
+                    "the backend had not ended {} s after it was told to quit, and was ended. What it had not put back, the next start puts back.",
+                    limit.as_secs()
+                ));
+                break 0;
+            }
+            std::thread::sleep(self.settings.look_while_starting);
+        };
+
+        {
+            let mut st = self.state();
+            st.phase = Phase::Gone;
+            st.exit_code = code;
+            st.quit_took = Some(began.elapsed());
+            self.changed.notify_all();
+        }
+        let hook = self.exit_hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        if let Some(hook) = hook {
+            hook(code);
+        }
+    }
+}

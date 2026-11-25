@@ -1,0 +1,36 @@
+[package]
+name = "vispora-shell-core"
+# Not the app's version: that is read from config.py when this is built
+# (build.rs), so that it is written in one place only.
+version = "0.1.0"
+edition = "2021"
+description = "The Rust shell for Vispora, without its window: which request is answered where, the backend's start and stop, and quitting"
+license = "MIT"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "vispora_shell_core"
+doctest = false
+
+# The shell without a window, for trying it and for the Python tests
+# (tests/test_shell_rs.py, shell_rs/try_it.py).  It reads JSON lines and
+# prints JSON lines.  It only ever starts the backend it is told to start.
+[[bin]]
+name = "vispora-shell-try"
+path = "src/bin/try.rs"
+
+# No outside crates, on purpose: this is the part of Vispora.exe that starts
+# a program as administrator and decides which calls reach it.  The one
+# dependency is the updater's core in this repository, for its JSON reader
+# and its idea of where the app keeps its data; that crate has no outside
+# crates either, and a build downloads nothing.
+[dependencies]
+vispora-updater-core = { path = "../../updater_rs/core" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"

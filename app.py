@@ -46,6 +46,121 @@ def _ui_url() -> str:
     return f"http://127.0.0.1:{config.APP_PORT}/#t={_API_TOKEN}"
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Running behind the shell
+# ═══════════════════════════════════════════════════════════════════════════
+# The Rust shell (shell_rs/) is Vispora.exe in the making.  It owns the
+# window, the tray, the single-instance check and quitting, and it starts
+# this program as its backend: with `--backend`, and with one environment
+# variable that says where to listen, which secret the shell's calls will
+# carry, and which process the shell is:
+#
+#     VISPORA_SHELL={"port": 49213, "token": "...", "shell_pid": 1234}
+#
+# No release starts the app this way yet.  Started as it always was, none of
+# this is used.
+_SHELL_HANDOFF_VAR = "VISPORA_SHELL"
+_behind_shell = None            # the hand-over, when this process is a shell's backend
+
+
+class ShellHandoffError(ValueError):
+    """--backend without a hand-over that can be used."""
+
+
+def _take_shell_handoff(argv=None, environ=None):
+    """The shell's hand-over as a dict, or None when this is an ordinary start.
+
+    The variable is taken out of the environment at once, whatever this
+    start is: every program this process starts inherits its environment,
+    and the secret in the variable is what tells the shell's calls from
+    anybody else's."""
+    argv = sys.argv if argv is None else argv
+    environ = os.environ if environ is None else environ
+    raw = environ.pop(_SHELL_HANDOFF_VAR, None)
+    if "--backend" not in argv[1:]:
+        return None
+    try:
+        given = json.loads(raw or "")
+        port, token, pid = given["port"], given["token"], given["shell_pid"]
+    except (ValueError, TypeError, KeyError):
+        raise ShellHandoffError("--backend needs the shell's hand-over, and none was given that can be read")
+
+    def whole(n):
+        return isinstance(n, int) and not isinstance(n, bool)
+
+    if not (whole(port) and 1024 <= port <= 65535):
+        raise ShellHandoffError("the shell's hand-over names no usable port")
+    if not (isinstance(token, str) and len(token) >= 32
+            and all(c.isascii() and (c.isalnum() or c in "-_") for c in token)):
+        raise ShellHandoffError("the shell's hand-over carries no usable secret")
+    if not (whole(pid) and pid > 0):
+        raise ShellHandoffError("the shell's hand-over does not say which process the shell is")
+    return {"port": port, "token": token, "shell_pid": pid}
+
+
+def _serve_for_the_shell(handoff) -> None:
+    """Become the backend the hand-over describes: listen where the shell
+    said, and answer only calls that carry the shell's secret."""
+    global _behind_shell, _API_TOKEN, _LOCAL_HOSTS, _LOCAL_ORIGINS, _TOKEN_EXEMPT_PATHS
+    config.APP_PORT = handoff["port"]
+    # (the shell asks for 127.0.0.1 and nothing else)
+    _LOCAL_HOSTS = frozenset({f"127.0.0.1:{config.APP_PORT}"})
+    _LOCAL_ORIGINS = frozenset(f"http://{h}" for h in _LOCAL_HOSTS)
+    _API_TOKEN = handoff["token"]
+    # The one call without the secret was a second copy of the app asking
+    # the first for its window.  The window is the shell's now, and so is
+    # telling a second copy from the first.
+    _TOKEN_EXEMPT_PATHS = frozenset()
+    _behind_shell = dict(handoff)
+
+
+def _wait_for_process_to_end(pid: int) -> str:
+    """Wait until the process `pid` has ended.  "ended", or why it cannot be
+    waited for."""
+    if sys.platform != "win32":
+        return "cannot be watched (not on Windows)"
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    SYNCHRONIZE, INFINITE, ERROR_INVALID_PARAMETER = 0x00100000, 0xFFFFFFFF, 87
+    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+    if not handle:
+        err = ctypes.get_last_error()
+        # (no process has that id any more: it ended before it could be watched)
+        return "ended" if err == ERROR_INVALID_PARAMETER else f"cannot be watched (Windows error {err})"
+    try:
+        if kernel32.WaitForSingleObject(handle, INFINITE) != 0:
+            return f"cannot be watched (Windows error {ctypes.get_last_error()})"
+        return "ended"
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _leave_with_the_shell(wait=None, leave=None) -> str:
+    """Stay for as long as the shell does, then go.
+
+    The shell is the only way this process is seen, asked anything or
+    closed.  With the shell gone (crashed, or ended from Task Manager),
+    nothing would ever close a backend left behind: it would sit there as
+    administrator with its tweaks applied.  So when the shell ends without
+    having said quit, the system is put back as every quit puts it back,
+    and this process ends too."""
+    pid = _behind_shell["shell_pid"]
+    outcome = (wait or _wait_for_process_to_end)(pid)
+    if outcome != "ended":
+        log.warning(f"The shell (pid {pid}) {outcome}: staying until it says quit")
+        return outcome
+    log.warning(f"The shell (pid {pid}) is gone without a quit, shutting down")
+    _restore_system_before_exit("shell gone")
+    (leave or os._exit)(0)
+    return outcome
+
+
 @app.before_request
 def _reject_foreign_requests():
     """Only answer our own UI.
@@ -3160,6 +3275,14 @@ class WindowJSAPI:
         return _window_hidden
 
 
+@app.route("/api/shell/hello")
+def api_shell_hello():
+    """What the shell asks its backend first: are you up, and are you the
+    build I came with?  (Asked with the secret, like every other call.)"""
+    return jsonify({"ok": True, "app": config.APP_NAME, "version": config.APP_VERSION,
+                    "pid": os.getpid(), "behind_shell": _behind_shell is not None})
+
+
 @app.route("/api/window/minimize", methods=["POST"])
 def api_window_minimize():
     return jsonify({"ok": _win_minimize()})
@@ -3199,10 +3322,17 @@ def api_window_quit():
     _restore_system_before_exit("user quit")
 
     def _suicide():
-        time.sleep(0.5)
+        time.sleep(_QUIT_ANSWER_HEAD_START_S[_behind_shell is not None])
         os._exit(0)
     threading.Thread(target=_suicide, daemon=True).start()
     return jsonify({"ok": True, "msg": "Goodbye"})
+
+
+# How long the answer to "quit" is given to reach whoever asked, before the
+# process ends.  The window waited for that answer; the shell does not: it
+# waits for the process itself to end, so behind the shell (the second
+# value) a moment is enough, and half a second of every quit is saved.
+_QUIT_ANSWER_HEAD_START_S = (0.5, 0.05)
 
 
 def _restore_system_before_exit(reason: str) -> None:
@@ -4031,11 +4161,23 @@ def _a_game_is_running_at_start_up() -> bool:
 def main():
     global _webview_window
 
+    # Started by the shell as its backend (see "Running behind the shell")?
+    # Then telling a second copy from the first, the administrator prompt,
+    # the window and the tray are the shell's.  Everything else a start does
+    # is done here as always.
+    try:
+        shell = _take_shell_handoff()
+    except ShellHandoffError as e:
+        log.error(f"Not started: {e}")
+        sys.exit(2)
+    if shell is not None:
+        _serve_for_the_shell(shell)
+
     # v2.9.6 — single-instance check.
     # If Vispora is already running, hand off to it and exit silently.
     # Done BEFORE the admin elevation prompt so the user doesn't get a
     # UAC popup just to be told "already running".
-    if not _acquire_single_instance_lock():
+    if shell is None and not _acquire_single_instance_lock():
         log.info("Another Vispora instance is running, handing off")
         if _focus_running_instance():
             sys.exit(0)
@@ -4046,7 +4188,7 @@ def main():
         sys.exit(0)
 
     # Check admin on Windows
-    if sys.platform == "win32" and not is_admin():
+    if shell is None and sys.platform == "win32" and not is_admin():
         log.warning("Not running as administrator, requesting elevation")
         try:
             import ctypes
@@ -4064,7 +4206,8 @@ def main():
     from_autostart = "--from-autostart" in sys.argv
 
     log.info(f"Starting {config.APP_NAME} v{config.APP_VERSION}"
-             + (" (autostart mode, gentle launch)" if from_autostart else ""))
+             + (" (autostart mode, gentle launch)" if from_autostart else "")
+             + (f" (as the backend of the shell, pid {shell['shell_pid']})" if shell is not None else ""))
 
     # v2.9.4 — post-install detection.
     # Right after an auto-update swap, this returns 'updated' (success) or
@@ -4433,6 +4576,17 @@ def main():
             log.warning(f"integrity-scan scheduler boot failed: {e}")
     threading.Thread(target=_boot_integrity_scan, daemon=True,
                      name="integrity-scan-boot").start()
+
+    if shell is not None:
+        # No window and no tray here: they are the shell's.  Nothing in this
+        # process changes its DPI mode later, so the crosshair may start.
+        _crosshair_allow_start()
+        log.info(f"Serving the shell on 127.0.0.1:{config.APP_PORT}")
+        _leave_with_the_shell()
+        # (only reached when the shell could not be watched: stay until it
+        # says quit, which ends the process from /api/window/quit)
+        threading.Event().wait()
+        return
 
     def show_window():
         _win_show()

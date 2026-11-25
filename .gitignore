@@ -33,3 +33,6 @@ updater_rs/core/target/
 updater_rs/app/target/
 # (Tauri writes the list of its permissions here at every build; the updater grants none)
 updater_rs/app/gen/
+
+# The Rust shell (shell_rs/): build output.
+shell_rs/core/target/
