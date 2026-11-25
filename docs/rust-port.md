@@ -308,6 +308,65 @@ hot the code is and how much depends on it.
    that runs once.
 7. **Capture**: clips, screenshots, OBS, hotkeys.
 
+### Item 1, cut into pieces
+
+Looked at again before the first module moved (2026-11-25), the seven are
+not alike any more. Since steps 1 and 2 only three of them run all the
+time: the game monitor (a scan every three seconds), the temperature
+ceiling (the card's temperature every second) and the popup watchdog (every
+visible window every second). Idle Mode is off unless a person switches it
+on. The network monitor, the hardware monitor and the performance sampler
+run only while their page is open. And they differ in what they do: three
+only read the PC, four change it.
+
+Item 1 is cut by that, and what only reads goes first. One module to a pull
+request, in this order:
+
+| | Module | What it reads, and when | What it changes | Where it stops |
+| --- | --- | --- | --- | --- |
+| 1 | The performance sampler (`core/perf_monitor.py`) | the graphics card, five times a second, while the Monitor page is open | nothing | **moved**: `shell_rs/core/src/moved/perf.rs` |
+| 2 | The hardware monitor (`core/hw_monitor.py`) | processor, card, memory, DPC time, ping: once a second while the Monitor page is open | nothing | its benchmark writes a file, and its list of programs starts PowerShell: both stay in Python until they have a reading of their own |
+| 3 | The network monitor (`core/net_monitor.py`) | bytes per program and per network card, once a second while the Network page is open | nothing in its loop | pausing a program is process tuning (item 3 of the plan) and stays; which game is running is the game monitor's to say, and is asked of the backend until piece 7 |
+| 4 | The popup watchdog (`core/popup_killer.py`) | every visible window, once a second, always | closes Windows' own "get an app to open this link" windows | the first piece that changes something: looking and closing are kept apart, and the closing is never run against a PC by a test or a trial |
+| 5 | The temperature ceiling (`core/temp_ceiling.py`) | the card's temperature, once a second, always | when it trips: resets the overclock | the reset is GPU overclock's and stays in Python: the shell watches and decides, and asks the backend to carry it out |
+| 6 | Idle Mode (`core/idle_mode.py`) | whether a game runs, every twenty seconds, when switched on | the power plan, and the overclock | the power plan moves; the overclock is GPU overclock's and stays |
+| 7 | The game monitor's looking (`core/game_profiles.py`, the scan) | which programs have a window, every three seconds, always | nothing, while no game runs | what a game's start changes is item 4 of the plan (game mode), and it reads Adaptive Tuning and GPU overclock at its border |
+
+After piece 7 nothing in the backend runs while the app idles with no page
+open, and item 1's last step can be taken: the backend is started only when
+a page needs it.
+
+Why the sampler first, though it is the coldest of the seven: it is the
+smallest module that has everything a move needs (a loop of its own, state,
+five calls, numbers that have to come out the same). So what every later
+module stands on was laid down with the least else in the way:
+
+* **The door to the machine** (`shell_rs/core/src/moved/mod.rs`,
+  `Readings`): a question to the native helper by its name, and the time.
+  It has a real side (the helper, compiled into the shell as an ordinary
+  Rust library: the code the Python app loads as a DLL) and a made-up side
+  (a table and a clock set by hand). Nothing that changes the PC can be
+  reached through it: the helper's two actions are behind another function
+  of its own, which the shell names nowhere.
+* **What the shell takes, and what it passes on.** The shell answers a
+  moved call only where it gives the answer Python gives. Anything else of
+  the same path (another method, a body Python stops at before it does
+  anything) is passed on, so the backend answers it as before.
+* **The old way stays.** The Python module and its routes are not changed.
+  They answer when the app is started as it always was; behind the shell
+  when it is started with `--all-to-backend`; and on a PC whose card gives
+  the shell no reading (Python then asks `nvidia-smi`, which the shell does
+  not start: such a PC keeps the backend's sampler).
+* **The same answers**, proven before anything is removed:
+  `tests/test_moved_perf.py` asks the Python module (through its routes)
+  and the shell's (in the trial tool) the same things on the same made-up
+  machine, and compares every answer: 860 of them, among them the score
+  for cards that idle, work steadily, jump about, come and go.
+* **Tried for real, and measured**: `python shell_rs/app/try_it.py --moved`
+  (the app's own page in the real window, with this PC's card read by the
+  shell) and `python shell_rs/try_it.py --moved` (the numbers, in
+  [performance.md](performance.md)).
+
 ## What goes last
 
 * **GPU overclock and Adaptive Tuning.** They write clocks to the card, their

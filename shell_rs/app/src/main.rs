@@ -30,6 +30,7 @@ use tauri::{RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use vispora_shell_core::http::Request;
 use vispora_shell_core::instance::{self, Begin, Held};
 use vispora_shell_core::json::Json;
+use vispora_shell_core::moved::{self, Moved};
 use vispora_shell_core::platform::{Command, Window};
 use vispora_shell_core::pack::Pack;
 use vispora_shell_core::trouble::Trouble;
@@ -44,6 +45,10 @@ const ASKS_FOR_RIGHTS: bool = cfg!(feature = "elevated");
 static CARRIED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/backend.pack"));
 /// Which of the two ways the backend is kept on the PC (Cargo.toml).
 const KEEPS_ITS_BACKEND: bool = cfg!(feature = "keep-backend");
+/// Started with this, the shell answers nothing of what has moved from the
+/// backend itself (core/src/moved/): every call is the backend's, as it
+/// was before anything moved.
+const ALL_TO_BACKEND: &str = "--all-to-backend";
 /// "vispora" is a name of this program's own: WebView2 shows the page as
 /// http://vispora.localhost/ and asks nobody outside for it.
 const PAGE: &str = "vispora://localhost/";
@@ -69,6 +74,8 @@ struct Trial {
     pack: Option<String>,
     /// Which of the two ways the backend is kept, in place of the build's.
     keep: Option<bool>,
+    /// False: every call is the backend's, as with ALL_TO_BACKEND.
+    moved: Option<bool>,
 }
 
 fn trial() -> Option<Trial> {
@@ -91,6 +98,10 @@ fn trial() -> Option<Trial> {
         pack: told["pack"].as_str().map(str::to_string),
         keep: match &told["keep"] {
             Json::Bool(keep) => Some(*keep),
+            _ => None,
+        },
+        moved: match &told["moved"] {
+            Json::Bool(moved) => Some(*moved),
             _ => None,
         },
     })
@@ -161,6 +172,10 @@ fn main() {
     // (lossily: an argument that is not valid Unicode is not a reason to stop)
     let arguments: Vec<String> = std::env::args_os().skip(1).map(|word| word.to_string_lossy().into_owned()).collect();
     let from_autostart = arguments.iter().any(|argument| argument == "--from-autostart");
+    // Every call to the backend, as it was before anything moved into the
+    // shell (core/src/moved/): for telling apart, on a PC, whether something
+    // is the shell's doing or the backend's.
+    let all_to_backend = arguments.iter().any(|argument| argument == ALL_TO_BACKEND);
     let trial = trial();
     if !ASKS_FOR_RIGHTS && trial.is_none() {
         win::tell(APP_NAME, "This build of the shell is for trials only and has no backend of its own.\n\nSee shell_rs/app/try_it.py.");
@@ -209,7 +224,8 @@ fn main() {
     // What a person starts is this program: the backend is told where it
     // is (it needs it where it names the app's exe).
     settings.shell_exe = std::env::current_exe().ok().map(|exe| exe.to_string_lossy().into_owned());
-    let code = match run(settings, &folders, held, from_autostart, trial.as_ref(), &ignored, carried) {
+    let all_to_backend = all_to_backend || trial.as_ref().is_some_and(|trial| trial.moved == Some(false));
+    let code = match run(settings, &folders, held, from_autostart, trial.as_ref(), &ignored, carried, all_to_backend) {
         Ok(code) => code,
         // Each kind of trouble in words of its own (core/src/trouble.rs).
         Err(trouble) => {
@@ -300,8 +316,9 @@ fn the_backend_made_ready(shell: &Arc<Shell>, carried: &'static [u8], places: ba
 }
 
 /// Open the window, start the backend, and stay until the app is quit.
+#[allow(clippy::too_many_arguments)]
 fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, from_autostart: bool, trial: Option<&Trial>, ignored: &[String],
-       carried: &'static [u8]) -> Result<i32, Trouble> {
+       carried: &'static [u8], all_to_backend: bool) -> Result<i32, Trouble> {
     // Asked before anything is opened: where WebView2 is missing, creating
     // the window does not fail, it waits for ever.
     let webview2 = tauri::webview_version().map_err(no_window)?;
@@ -317,6 +334,15 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
                        if from_autostart { ", at sign-in" } else { "" }));
     if !ignored.is_empty() {
         shell.say(&format!("settings for WebView2 were in the environment and were not used: {}", ignored.join(", ")));
+    }
+    // What has moved from the backend is answered by the shell itself, from
+    // readings of this PC that it takes itself (core/src/moved/: they only
+    // read).  The backend's own routes are as they were, and answer
+    // whatever the shell does not take.
+    if all_to_backend {
+        shell.say("every call is the backend's: the shell answers nothing of what has moved itself");
+    } else {
+        *shell.moved.lock().unwrap_or_else(|p| p.into_inner()) = Some(Moved::new(Arc::new(moved::Real), true));
     }
 
     // The window's own folder, new at every start and gone after it (see

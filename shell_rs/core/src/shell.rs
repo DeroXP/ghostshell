@@ -174,6 +174,10 @@ pub struct Shell {
     /// Asked once, before the first start, on the thread that starts the
     /// backend, so that the window is not kept waiting for it.
     pub prepare_hook: Mutex<Option<PrepareHook>>,
+    /// What has moved from the backend into the shell, with the door it
+    /// reads the machine through (moved/).  None: every call is the
+    /// backend's, as it was before anything moved.
+    pub moved: Mutex<Option<Arc<crate::moved::Moved>>>,
 }
 
 /// What the page is told when the backend never came up.  It may be a PC
@@ -227,6 +231,7 @@ impl Shell {
             exit_hook: Mutex::new(None),
             log_hook: Mutex::new(None),
             prepare_hook: Mutex::new(None),
+            moved: Mutex::new(None),
         }))
     }
 
