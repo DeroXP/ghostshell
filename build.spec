@@ -46,6 +46,22 @@ if _missing:
     print("build.spec: WARNING - the features that need them will not work in this build")
 
 
+# The native helper (native/, Rust): one DLL that answers the app's hottest
+# questions in-process (see core/native.py).  It is built before this spec runs:
+#     cargo build --release --manifest-path native/Cargo.toml
+# and bundled beside the app's other files, which is the one place
+# core/native.py looks for it.  A build without it still works (the app then
+# asks PowerShell and nvidia-smi, as it always did), only slower, so say so
+# loudly rather than fail.
+_native_dll = os.path.join(base_path, 'native', 'target', 'release', 'vispora_native.dll')
+_native_binaries = [(_native_dll, '.')] if os.path.isfile(_native_dll) else []
+if _native_binaries:
+    print(f"build.spec: native helper bundled ({os.path.getsize(_native_dll) // 1024} KB)")
+else:
+    print("build.spec: WARNING - native helper NOT FOUND: this build will start PowerShell and nvidia-smi "
+          "for every reading.  Run: cargo build --release --manifest-path native/Cargo.toml")
+
+
 # v3.2.2 — the standalone updater (VisporaUpdater.exe) is NO LONGER
 # bundled inside Vispora.exe.  Vispora auto-downloads it from the
 # Railway release server on first run, into %APPDATA%/Vispora/updater/.
@@ -57,7 +73,7 @@ if _missing:
 a = Analysis(
     ['app.py'],
     pathex=[base_path],
-    binaries=_pyaudio_binaries,
+    binaries=_pyaudio_binaries + _native_binaries,
     datas=[
         ('templates', 'templates'),
         ('static', 'static'),
@@ -118,7 +134,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    upx_exclude=['vispora_native.dll'],
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,

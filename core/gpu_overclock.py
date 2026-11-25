@@ -27,6 +27,7 @@ import threading
 import time
 from collections import deque
 from typing import Optional
+from core import native
 from core.utils import run_cmd, run_ps, get_logger, atomic_write_json
 from config import APPDATA_DIR
 
@@ -478,8 +479,54 @@ def detect_gpu_oc_capability() -> dict:
     }
 
 
+def _live_state_from_native():
+    """read_live_state()'s answer from the native helper, which reads the
+    driver's NVML library in-process (the library nvidia-smi itself reads), or
+    None when the helper is not there, there is no NVIDIA card, or it could
+    not read the temperature - the temperature ceiling lives on this reading,
+    so an answer without it is not taken.
+
+    A value the card does not report is 0 here, as it is from nvidia-smi
+    (which prints "[N/A]" for it)."""
+    live = native.gpu_live()
+    if live is None or live.get("temp_c") is None:
+        return None
+
+    def n(key):
+        v = live.get(key)
+        return int(v) if v is not None else 0
+
+    def watts(key):                 # NVML counts milliwatts; nvidia-smi prints watts with two decimals
+        v = live.get(key)
+        return round(v / 1000.0, 2) if v is not None else 0.0
+
+    return {
+        "ok": True,
+        "core_mhz": n("core_mhz"),
+        "mem_mhz": n("mem_mhz"),
+        "temp_c": n("temp_c"),
+        "power_w": watts("power_mw"),
+        "power_limit_w": watts("power_limit_mw"),
+        "gpu_util_pct": n("gpu_util_pct"),
+        "mem_util_pct": n("mem_util_pct"),
+        "fan_pct": n("fan_pct"),
+        "core_app_mhz": n("core_app_mhz"),
+        "mem_app_mhz": n("mem_app_mhz"),
+        "core_max_mhz": n("core_max_mhz"),
+        "mem_max_mhz": n("mem_max_mhz"),
+    }
+
+
 def read_live_state() -> dict:
-    """Read real-time GPU stats. Fast — polls nvidia-smi once."""
+    """Read real-time GPU stats: from the native helper when it is there (no
+    process started), else by running nvidia-smi once.
+
+    The temperature ceiling asks every second and the performance sampler
+    five times a second while a game runs; through nvidia-smi that was about
+    250 processes started a minute on the owner's PC (version 3.7.0)."""
+    live = _live_state_from_native()
+    if live is not None:
+        return live
     rows = _nvidia_smi_query(
         "clocks.current.graphics,clocks.current.memory,temperature.gpu,power.draw,"
         "utilization.gpu,utilization.memory,fan.speed,power.limit,"
