@@ -13,7 +13,7 @@ import re
 import time
 import threading
 from config import APP_NAME, APPDATA_DIR, OWN_PROCESS_NAMES
-from core import process_tuning, reg_originals, session_report
+from core import native, process_tuning, reg_originals, session_report
 from core.network_tweaks import qos_policy_filter
 from core.utils import run_ps, run_cmd, get_logger, atomic_write_json, is_safe_ps_exe_name
 
@@ -2109,10 +2109,21 @@ def _scan_game_candidates() -> list[dict]:
     return _scan_windowed_games() or []
 
 
-def _scan_windowed_games():
-    """_scan_game_candidates(), but None when the scan itself failed (the
-    PowerShell call failed or answered something that is not a process list),
-    so a caller can tell "no game is running" from "could not look"."""
+def _windowed_processes():
+    """Every process with a visible main window, as the rows Get-Process
+    prints: [{"Id", "ProcessName", "WS"}], WS being the working set in MB.
+    None when the scan itself failed.
+
+    Asked of the native helper when it is there (one call, no process
+    started); of PowerShell otherwise, as it always was.  This runs at every
+    tick of the game monitor while no game is tracked, so the PowerShell way
+    started a process every three seconds for as long as the app was open."""
+    rows = native.windowed_processes()
+    if rows is not None:
+        # The order Get-Process prints in (by name, then id), so that two
+        # candidates with the same score still come out in the same order.
+        rows.sort(key=lambda p: (p["name"].lower(), p["pid"]))
+        return [{"Id": p["pid"], "ProcessName": p["name"], "WS": round(p["ws"] / 1048576)} for p in rows]
     # Pull PID, ProcessName, and WorkingSet64 (in MB) in a single PS call.
     # Filter out background processes so we don't waste time on services.
     r = run_ps(
@@ -2132,6 +2143,17 @@ def _scan_windowed_games():
     if isinstance(procs, dict):
         procs = [procs]
     if not isinstance(procs, list):
+        return None
+    return procs
+
+
+def _scan_windowed_games():
+    """_scan_game_candidates(), but None when the scan itself failed (the
+    native helper is not there and the PowerShell call failed or answered
+    something that is not a process list), so a caller can tell "no game is
+    running" from "could not look"."""
+    procs = _windowed_processes()
+    if procs is None:
         return None
 
     fg_pid = _get_foreground_pid()
@@ -2179,8 +2201,8 @@ def running_game_candidates():
     start-up task.  Takes no lock of game mode's and changes nothing of its
     state (the games held off after Force normal mode are still listed: they
     are still being played), so it can be called from any thread, also from
-    one that game mode is waiting for.  One PowerShell call (seconds under
-    load); never raises."""
+    one that game mode is waiting for.  One call into the native helper, or
+    one PowerShell call without it (seconds under load); never raises."""
     try:
         found = _scan_windowed_games()
     except Exception as e:

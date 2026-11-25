@@ -23,3 +23,7 @@ dist-*/
 # Local env / secrets — never commit credentials
 .env
 *.env
+
+# The native helper (Rust): build output.  The DLL is built before a release
+# (cargo build --release --manifest-path native/Cargo.toml) and bundled by build.spec.
+native/target/

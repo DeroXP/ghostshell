@@ -12,6 +12,8 @@ Importing it
   * replaces the registry (`winreg`) and the command runners
     (core.utils.run_cmd / run_ps) with in-memory fakes, so no test can change a
     system setting - or even start a process: subprocess.Popen raises;
+  * keeps the native helper (core/native.py) out: NATIVE is empty, so the app
+    asks everything the old way unless a test puts an answer in it;
   * stands in for the Windows APIs app modules call directly: process priority
     and affinity, the mouse-acceleration call, the timer-resolution request,
     the NVIDIA clock interface (which simply reports "not available") and the
@@ -891,6 +893,29 @@ if not config.APPDATA_DIR.startswith(ROOT):
 import core.utils as _utils                         # noqa: E402
 
 _utils.run_cmd, _utils.run_ps = run_cmd, run_ps     # before anything does `from core.utils import run_cmd`
+
+# The native helper (core/native.py): never the real library, even on a PC
+# where it has been built.  NATIVE maps a question ("windowed_processes",
+# "gpu_live", ...) to its answer, or to a callable taking the question's
+# arguments.  A question that is not in it is answered None, which is what the
+# app sees when the helper is not installed - so unless a test fills NATIVE,
+# everything is asked the old way (PowerShell, nvidia-smi, ping) and the fakes
+# below answer.  NATIVE_CALLS lists every question asked: (question, arguments).
+from core import native as _native                  # noqa: E402
+
+real_native_call, real_native_open = _native.call, _native._open
+NATIVE: dict = {}
+NATIVE_CALLS: list = []
+
+
+def _native_call(query, /, **args):
+    NATIVE_CALLS.append((query, dict(args)))
+    answer = NATIVE.get(query)
+    return answer(**args) if callable(answer) else answer
+
+
+_native.call = _native_call
+_native.available = lambda: bool(NATIVE)
 
 from core import reg_originals, sys_state           # noqa: E402
 from core import process_tuning as _pt              # noqa: E402
@@ -1932,9 +1957,10 @@ def _wipe_app_data() -> None:
 def fresh(plan: str = USERPLAN) -> None:
     """A clean machine and a clean app: nothing tweaked, nothing on record."""
     for box in (STORE, _KEY_CASE, REG_FAIL, SC_FAIL, RUNNING, TASKS, TASK_FAIL, TASK_NO_FLAG, BCD, BCD_FAIL, TCP,
-                STACK, FEATURES, DISM_3010, FSUTIL, DEF, PNP, COUNTS, GPU, ALIVE, POWER_LIMITS, K.snapshots):
+                STACK, FEATURES, DISM_3010, FSUTIL, DEF, PNP, COUNTS, GPU, ALIVE, POWER_LIMITS, K.snapshots, NATIVE):
         box.clear()
-    for log_ in (WRITES, DELETES, PTOUCH, CMDS, PSC, CMD_HOOKS, PS_HOOKS, SPI, TIMER, K.calls, PRIV, CPU_TIMES):
+    for log_ in (WRITES, DELETES, PTOUCH, CMDS, PSC, CMD_HOOKS, PS_HOOKS, SPI, TIMER, K.calls, PRIV, CPU_TIMES,
+                 NATIVE_CALLS):
         del log_[:]
     for flag in (BCD_OK, DISM_OK, FSUTIL_OK, DEF_OK, STACK_OK, TCP_OK, DUPLICATE_OK, HIBERNATE, DRS_OK, DRS_SAVE_OK):
         flag[0] = True
@@ -1957,7 +1983,7 @@ def fresh(plan: str = USERPLAN) -> None:
 
 
 def clear_logs() -> None:
-    for log_ in (WRITES, DELETES, PTOUCH, CMDS, PSC):
+    for log_ in (WRITES, DELETES, PTOUCH, CMDS, PSC, NATIVE_CALLS):
         del log_[:]
 
 

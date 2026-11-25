@@ -685,6 +685,21 @@ def _watch_install(target_version: str, prev_version: str):
         _state["installing"] = False
 
 
+_GPU_LIBRARY_HOLD_S = 900       # how long the native helper stays off NVML once an installer is launched
+
+
+def _release_gpu_library() -> None:
+    """Ask the native helper to unload NVIDIA's library and leave it alone
+    for a while.  Nothing to do when the helper is not in use.  Never raises."""
+    try:
+        from core import native
+        if native.gpu_release(_GPU_LIBRARY_HOLD_S):
+            log.info(f"Native helper let go of the NVIDIA library for {_GPU_LIBRARY_HOLD_S // 60} minutes "
+                     "(driver install)")
+    except Exception as e:
+        log.debug(f"could not release the NVIDIA library before the install: {e}")
+
+
 def install_driver() -> dict:
     """Launch the downloaded NVIDIA installer the SAME way a user
     double-clicking it in File Explorer would.
@@ -720,6 +735,11 @@ def install_driver() -> dict:
         return {"ok": False, "err": "Driver installer not downloaded yet"}
     if _state.get("installing"):
         return {"ok": False, "err": "An install is already in progress"}
+
+    # The native helper keeps the driver's NVML library loaded for its GPU
+    # readings.  Let go of it for the length of an install, so the installer
+    # can replace the file; nvidia-smi answers the readings in the meantime.
+    _release_gpu_library()
 
     launched = False
     method = ""

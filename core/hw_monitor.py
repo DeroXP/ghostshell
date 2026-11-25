@@ -31,6 +31,7 @@ import time
 import threading
 from collections import deque
 from ctypes import wintypes
+from core import native
 from core.utils import run_ps, run_cmd, get_logger
 
 log = get_logger("monitor")
@@ -84,6 +85,12 @@ def _sample_cpu():
     # fall back to Get-Counter when NT API returns None on the very
     # first sample (no delta baseline yet).
     nt_load = _read_cpu_load_via_ntapi()
+    if nt_load is None and native.available():
+        # The first pass has nothing to compare with yet.  With the native
+        # helper in use nothing in a pass starts PowerShell, this included:
+        # read again a moment later instead.
+        time.sleep(_CPU_TIMES_FIRST_WAIT_S)
+        nt_load = _read_cpu_load_via_ntapi()
     if nt_load is not None:
         data["load"] = nt_load
     else:
@@ -99,16 +106,21 @@ def _sample_cpu():
             except ValueError:
                 pass
 
-    # CPU clock speed
-    r2 = run_ps(
-        "(Get-CimInstance Win32_Processor).CurrentClockSpeed",
-        timeout=5
-    )
-    if r2["ok"] and r2["out"]:
-        try:
-            data["clock"] = int(r2["out"].strip())
-        except ValueError:
-            pass
+    # CPU clock speed: the native helper when it is there (PowerShell took
+    # over a second for this one number on the owner's PC, at every pass).
+    mhz = native.cpu_clock_mhz()
+    if mhz is not None:
+        data["clock"] = mhz
+    else:
+        r2 = run_ps(
+            "(Get-CimInstance Win32_Processor).CurrentClockSpeed",
+            timeout=5
+        )
+        if r2["ok"] and r2["out"]:
+            try:
+                data["clock"] = int(r2["out"].strip())
+            except ValueError:
+                pass
 
     # CPU temperature — try in order, log which one wins.
     # 1) LibreHardwareMonitor WMI (gold standard, requires LHM installed)
@@ -172,9 +184,39 @@ def _sane_temp(v) -> bool:
     return True
 
 
+def _first_named(rows, wanted):
+    """The Value of the first sensor row whose Name contains one of `wanted`
+    (lower-case), the row `Where-Object Name -like ... | Select-Object -First 1`
+    picks.  None when no row matches."""
+    for row in rows:
+        name = str(row.get("Name") or "").lower()
+        if any(w in name for w in wanted):
+            return row.get("Value")
+    return None
+
+
+def _tenths_of_kelvin(k):
+    """A WMI thermal-zone reading (tenths of a kelvin) as °C, or None when it
+    is missing or not a real temperature."""
+    try:
+        if isinstance(k, bool) or not k or k <= 0:
+            return None
+        c = (float(k) / 10.0) - 273.15
+    except (TypeError, ValueError):
+        return None
+    return round(c, 1) if _sane_temp(c) else None
+
+
+_TEMPERATURE_SENSORS = "SELECT Name, SensorType, Value FROM Sensor WHERE SensorType = 'Temperature'"
+
+
 def _read_cpu_temp_via_lhm():
     """Try LibreHardwareMonitor's WMI provider.  Picks the Package
     sensor by name (matches Intel + AMD)."""
+    rows = native.wmi(r"root\LibreHardwareMonitor", _TEMPERATURE_SENSORS)
+    if rows is not None:            # the helper asked WMI itself: no PowerShell
+        v = _first_named(rows, ("package", "ccd1", "tctl"))
+        return round(float(v), 1) if _sane_temp(v) else None
     r = run_ps(
         "Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor -ErrorAction SilentlyContinue "
         "| Where-Object {$_.SensorType -eq 'Temperature' -and ($_.Name -like '*Package*' -or $_.Name -like '*CCD1*' -or $_.Name -like '*Tctl*')} "
@@ -194,6 +236,10 @@ def _read_cpu_temp_via_lhm():
 
 def _read_cpu_temp_via_ohm():
     """OpenHardwareMonitor — older WMI namespace, same API shape."""
+    rows = native.wmi(r"root\OpenHardwareMonitor", _TEMPERATURE_SENSORS)
+    if rows is not None:
+        v = _first_named(rows, ("package", "ccd1"))
+        return round(float(v), 1) if _sane_temp(v) else None
     r = run_ps(
         "Get-CimInstance -Namespace root/OpenHardwareMonitor -ClassName Sensor -ErrorAction SilentlyContinue "
         "| Where-Object {$_.SensorType -eq 'Temperature' -and ($_.Name -like '*Package*' -or $_.Name -like '*CCD1*')} "
@@ -213,6 +259,9 @@ def _read_cpu_temp_via_ohm():
 
 def _read_cpu_temp_via_msacpi():
     """ACPI ThermalZone via WMI.  Reading is tenths of Kelvin."""
+    rows = native.wmi(r"root\WMI", "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature")
+    if rows is not None:
+        return _tenths_of_kelvin(rows[0].get("CurrentTemperature")) if rows else None
     r = run_ps(
         "Get-CimInstance MSAcpi_ThermalZoneTemperature -Namespace root/WMI -ErrorAction SilentlyContinue "
         "| Select-Object -First 1 CurrentTemperature | ConvertTo-Json -Compress",
@@ -235,6 +284,12 @@ def _read_cpu_temp_via_perf_thermal():
     """Win32_PerfFormattedData_Counters_ThermalZoneInformation.HighPrecisionTemperature
     — ACPI thermal data through the perfmon surface.  Sometimes
     populated when the direct MSAcpi class isn't."""
+    rows = native.wmi(r"root\cimv2", "SELECT HighPrecisionTemperature FROM "
+                                     "Win32_PerfFormattedData_Counters_ThermalZoneInformation")
+    if rows is not None:
+        readings = [x.get("HighPrecisionTemperature") for x in rows]
+        readings = [k for k in readings if isinstance(k, (int, float)) and not isinstance(k, bool)]
+        return _tenths_of_kelvin(max(readings)) if readings else None
     r = run_ps(
         "Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ThermalZoneInformation -ErrorAction SilentlyContinue "
         "| Sort-Object HighPrecisionTemperature -Descending "
@@ -254,8 +309,24 @@ def _read_cpu_temp_via_perf_thermal():
     return None
 
 
-def _sample_gpu():
-    """Sample GPU metrics via nvidia-smi."""
+def _gpu_from_native():
+    """The GPU numbers from the native helper (the driver's NVML library,
+    which is what nvidia-smi reads), or None when the helper is not there,
+    there is no NVIDIA card, or it could not read the temperature."""
+    live = native.gpu_live()
+    if live is None or live.get("temp_c") is None:
+        return None
+    data = {"temp": live["temp_c"], "load": live.get("gpu_util_pct"), "clock": live.get("core_mhz"),
+            "vram_pct": None}
+    used, total = live.get("mem_used_bytes"), live.get("mem_total_bytes")
+    if used is not None and total is not None:
+        used, total = used // 1048576, total // 1048576     # whole MiB, as nvidia-smi prints them
+        data["vram_pct"] = round(used / total * 100, 1) if total > 0 else 0
+    return data
+
+
+def _gpu_from_nvidia_smi():
+    """The GPU numbers from one nvidia-smi run (a process started per call)."""
     data = {"temp": None, "load": None, "clock": None, "vram_pct": None}
 
     r = run_cmd([
@@ -269,14 +340,25 @@ def _sample_gpu():
         parts = r["out"].strip().splitlines()[0].split(",")
         if len(parts) >= 5:
             try:
-                data["temp"] = int(parts[0].strip())
-                data["load"] = int(parts[1].strip())
-                data["clock"] = int(parts[2].strip())
-                used = int(parts[3].strip())
-                total = int(parts[4].strip())
+                # Through float: newer drivers print the temperature with
+                # decimals ("55.10"), int() of that raised, and every GPU
+                # tile stayed blank.
+                data["temp"] = int(float(parts[0].strip()))
+                data["load"] = int(float(parts[1].strip()))
+                data["clock"] = int(float(parts[2].strip()))
+                used = int(float(parts[3].strip()))
+                total = int(float(parts[4].strip()))
                 data["vram_pct"] = round(used / total * 100, 1) if total > 0 else 0
             except ValueError:
                 pass
+    return data
+
+
+def _sample_gpu():
+    """Sample GPU metrics: the native helper, else nvidia-smi."""
+    data = _gpu_from_native()
+    if data is None:
+        data = _gpu_from_nvidia_smi()
 
     # Fallback: WMI
     # 3.4.0 — LHM GPU fallback broadened for AMD + Intel.  nvidia-smi
@@ -307,22 +389,28 @@ def _read_gpu_via_lhm() -> dict:
     pick the best-matching one per metric in Python — cheaper than
     three separate queries."""
     out = {"temp": None, "load": None, "clock": None}
-    r = run_ps(
-        "Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor "
-        "-ErrorAction SilentlyContinue "
-        "| Where-Object { $_.Identifier -like '*gpu*' } "
-        "| Select-Object Name,SensorType,Value,Identifier | ConvertTo-Json -Compress",
-        timeout=5)
-    if not (r.get("ok") and r.get("out")):
-        return out
-    try:
-        # A sensor reading NaN arrives as a bare NaN: read it as missing, or
-        # it reaches the snapshot JSON, which the browser cannot parse.
-        rows = json.loads(r["out"], parse_constant=lambda _c: None)
-        if isinstance(rows, dict):
-            rows = [rows]
-    except Exception:
-        return out
+    rows = native.wmi(r"root\LibreHardwareMonitor", "SELECT Name, SensorType, Value, Identifier FROM Sensor")
+    if rows is not None:            # the helper asked WMI itself: no PowerShell
+        rows = [x for x in rows if "gpu" in str(x.get("Identifier") or "").lower()]
+        if not rows:
+            return out
+    else:
+        r = run_ps(
+            "Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor "
+            "-ErrorAction SilentlyContinue "
+            "| Where-Object { $_.Identifier -like '*gpu*' } "
+            "| Select-Object Name,SensorType,Value,Identifier | ConvertTo-Json -Compress",
+            timeout=5)
+        if not (r.get("ok") and r.get("out")):
+            return out
+        try:
+            # A sensor reading NaN arrives as a bare NaN: read it as missing, or
+            # it reaches the snapshot JSON, which the browser cannot parse.
+            rows = json.loads(r["out"], parse_constant=lambda _c: None)
+            if isinstance(rows, dict):
+                rows = [rows]
+        except Exception:
+            return out
 
     def _pick(sensor_type, name_prefs):
         """Return the Value of the first sensor matching sensor_type
@@ -582,6 +670,38 @@ def _read_dpc_rate_via_ntapi():
     return int(sum(arr[i].DpcRate for i in range(n)))
 
 
+# The native helper's processor-time totals at the previous pass, and when
+# that was (time.monotonic()).  The share of time since then is the reading.
+_cpu_times_prev = {"totals": None, "at": 0.0}
+_CPU_TIMES_STALE_S = 10.0       # older than this is not "the previous pass" (the monitor was off)
+_CPU_TIMES_FIRST_WAIT_S = 0.25  # with nothing to compare with, how long the first reading spans
+
+
+def _dpc_shares_from_native():
+    """(% DPC time, % interrupt time) over all processors since the previous
+    pass, rounded like Get-Counter's were, from the native helper.  None when
+    the helper is not there or the totals did not move."""
+    now = native.cpu_times()
+    if now is None:
+        return None
+    prev, at = _cpu_times_prev["totals"], _cpu_times_prev["at"]
+    if prev is None or time.monotonic() - at > _CPU_TIMES_STALE_S or prev["processors"] != now["processors"]:
+        # Nothing recent to compare with: take a second reading a moment later
+        # (Get-Counter measures over a second of its own for the same reason).
+        prev = now
+        time.sleep(_CPU_TIMES_FIRST_WAIT_S)
+        now = native.cpu_times()
+        if now is None:
+            return None
+    _cpu_times_prev["totals"], _cpu_times_prev["at"] = now, time.monotonic()
+    total = now["total"] - prev["total"]
+    if total <= 0:
+        return None
+    dpc = max(0.0, (now["dpc"] - prev["dpc"]) / total * 100.0)
+    isr = max(0.0, (now["interrupt"] - prev["interrupt"]) / total * 100.0)
+    return round(dpc, 3), round(isr, 3)
+
+
 def _sample_dpc():
     """Sample CPU time spent in DPCs + interrupts (as percentages).
 
@@ -593,30 +713,38 @@ def _sample_dpc():
     with LatencyMon.  Returns dict {dpc_pct, isr_pct, ok}; ok=False
     means the perfmon counter couldn't be read at all (different
     from a real 0% reading)."""
-    r = run_ps(
-        "try { "
-            "$perf = Get-Counter "
-              "'\\Processor(_Total)\\% DPC Time',"
-              "'\\Processor(_Total)\\% Interrupt Time' -ErrorAction Stop;"
-            "$dpc = $perf.CounterSamples | Where-Object {$_.Path -like '*DPC*'} | Select-Object -First 1;"
-            "$isr = $perf.CounterSamples | Where-Object {$_.Path -like '*Interrupt*'} | Select-Object -First 1;"
-            "$out = @{ dpc_pct = [math]::Round($dpc.CookedValue, 3); "
-                    "  isr_pct = [math]::Round($isr.CookedValue, 3); ok = $true };"
-            "$out | ConvertTo-Json -Compress "
-        "} catch { '{\"ok\":false}' }",
-        timeout=5)
     perfmon_ok = False
     dpc_pct = None
     isr_pct = None
-    if r.get("ok") and r.get("out"):
-        try:
-            d = json.loads(r["out"], parse_constant=lambda _c: None)     # (NaN: see _read_gpu_via_lhm)
-            if isinstance(d, dict) and d.get("ok"):
-                dpc_pct = float(d.get("dpc_pct", 0.0))
-                isr_pct = float(d.get("isr_pct", 0.0))
-                perfmon_ok = True
-        except Exception as e:
-            log.debug(f"DPC perfmon parse failed: {e}")
+    shares = _dpc_shares_from_native()
+    if shares is not None:
+        # The same two percentages, worked out from the kernel's own
+        # processor-time totals: no PowerShell, and no performance-counter
+        # library to be corrupt.
+        dpc_pct, isr_pct = shares
+        perfmon_ok = True
+    else:
+        r = run_ps(
+            "try { "
+                "$perf = Get-Counter "
+                  "'\\Processor(_Total)\\% DPC Time',"
+                  "'\\Processor(_Total)\\% Interrupt Time' -ErrorAction Stop;"
+                "$dpc = $perf.CounterSamples | Where-Object {$_.Path -like '*DPC*'} | Select-Object -First 1;"
+                "$isr = $perf.CounterSamples | Where-Object {$_.Path -like '*Interrupt*'} | Select-Object -First 1;"
+                "$out = @{ dpc_pct = [math]::Round($dpc.CookedValue, 3); "
+                        "  isr_pct = [math]::Round($isr.CookedValue, 3); ok = $true };"
+                "$out | ConvertTo-Json -Compress "
+            "} catch { '{\"ok\":false}' }",
+            timeout=5)
+        if r.get("ok") and r.get("out"):
+            try:
+                d = json.loads(r["out"], parse_constant=lambda _c: None)     # (NaN: see _read_gpu_via_lhm)
+                if isinstance(d, dict) and d.get("ok"):
+                    dpc_pct = float(d.get("dpc_pct", 0.0))
+                    isr_pct = float(d.get("isr_pct", 0.0))
+                    perfmon_ok = True
+            except Exception as e:
+                log.debug(f"DPC perfmon parse failed: {e}")
     # Fallback path: even when perflib is corrupt (lodctr /R territory)
     # the kernel interrupt-info syscall still works.  Returns DPCs/sec,
     # which is more meaningful to users than the % anyway — LatencyMon
@@ -632,7 +760,11 @@ def _sample_dpc():
 
 
 def _sample_ping(target: str = "1.1.1.1"):
-    """Quick single ping."""
+    """Quick single ping: the native helper for an IPv4 address, else
+    ping.exe (which also looks up host names)."""
+    answer = native.ping(target, 500)
+    if answer is not None:
+        return answer["ms"] if answer["ok"] else None
     r = run_cmd(["ping", "-n", "1", "-w", "500", target], timeout=3)
     if r["ok"] and r["out"]:
         for line in r["out"].splitlines():

@@ -34,6 +34,7 @@ from collections import deque
 from typing import Optional
 
 from config import OWN_PROCESS_NAMES
+from core import native
 from core.utils import get_logger
 
 log = get_logger(__name__)
@@ -98,6 +99,32 @@ _latest: dict = {
 # Sampling loop
 # ────────────────────────────────────────────────────────────────────
 
+def _process_io_rows(psutil):
+    """(pid, lower-case name, other-I/O bytes so far) of every process.
+
+    From the native helper when it is there: one system call returns the
+    counters of all processes at once.  Otherwise from psutil, which opens
+    each process in turn; on the owner's PC that one loop, once a second for
+    as long as the app was open, was a quarter of a processor core and nine
+    tenths of all the processor time the app ever used."""
+    rows = native.process_io()
+    if rows is not None:
+        for r in rows:
+            yield r["pid"], r["name"].lower(), r["other_bytes"]
+        return
+    for p in psutil.process_iter(["pid", "name", "io_counters"]):
+        try:
+            pid = p.info["pid"]
+            name = (p.info.get("name") or "").lower()
+            io = p.info.get("io_counters")
+            if not io:
+                continue
+            other = int(io.other_bytes)
+        except Exception:
+            continue
+        yield pid, name, other
+
+
 def _sample_once():
     """One sampling pass.  Updates _per_proc, _history, _latest."""
     global _last_nic_rx, _last_nic_tx, _last_sample_t
@@ -125,17 +152,8 @@ def _sample_once():
     burst_candidates: list[dict] = []
     active_game_exe = _get_active_game_exe()
 
-    for p in psutil.process_iter(["pid", "name", "io_counters"]):
-        try:
-            pid = p.info["pid"]
-            name = (p.info.get("name") or "").lower()
-            io = p.info.get("io_counters")
-            if not io:
-                continue
-        except Exception:
-            continue
+    for pid, name, cur_other in _process_io_rows(psutil):
         seen_pids.add(pid)
-        cur_other = int(io.other_bytes)
         prev = _per_proc.get(pid)
         if prev is None:
             _per_proc[pid] = {

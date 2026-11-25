@@ -1,0 +1,33 @@
+[package]
+name = "vispora-native"
+version = "0.1.0"
+edition = "2021"
+description = "Vispora's native helper: answers the app's hottest questions in-process instead of starting a program for each"
+license = "MIT"
+publish = false
+
+[lib]
+name = "vispora_native"
+# cdylib: the DLL the Python app loads (core/native.py).
+# rlib:   the same code as a Rust library, for the command-line tool below and,
+#         later, for the Rust shell that replaces the Python start (docs/rust-port.md).
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "vispora-native"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+# WMI (the temperature sensors LibreHardwareMonitor publishes, and from the next
+# piece on the system information page).  Pulls in Microsoft's `windows` crate.
+wmi = "0.14"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+# A panic must never unwind into the Python process or abort it: every call is
+# wrapped in catch_unwind (lib.rs), which needs unwinding.
+panic = "unwind"
