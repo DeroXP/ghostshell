@@ -60,6 +60,7 @@ const WBEM_S_FALSE: Hresult = 1;
 const WBEM_S_TIMEDOUT: Hresult = 0x4_0004;
 const WBEM_S_NO_MORE_DATA: Hresult = 0x4_0005;
 
+const CIM_UINT32: i32 = 19;
 const CIM_SINT64: i32 = 20;
 const CIM_UINT64: i32 = 21;
 
@@ -373,6 +374,9 @@ unsafe fn variant_to_json(v: &Variant, cim_type: i32) -> Json {
     }
     match v.vt {
         2 => (low as u16 as i16).into(),
+        // WMI hands an unsigned 32-bit property over in a signed slot: a
+        // graphics card's memory size would read as a negative number.
+        3 if cim_type == CIM_UINT32 => (low as u32).into(),
         3 => (low as u32 as i32).into(),
         4 => single(f32::from_bits(low as u32)),
         5 => Json::from(f64::from_bits(low)),

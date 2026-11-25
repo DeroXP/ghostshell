@@ -3,7 +3,7 @@ import json
 import os
 from config import (BLOATWARE_APPS, SERVICES_TO_DISABLE,
                     SCHEDULED_TASKS_TO_DISABLE, APPDATA_DIR)
-from core import sys_state
+from core import reg_originals, sys_state
 from core.utils import run_ps, run_cmd, get_logger, backup_registry, detect_drive_type
 
 log = get_logger("debloat")
@@ -378,13 +378,23 @@ def block_gamebar_protocols() -> list[dict]:
     for scheme in GAMEBAR_PROTOCOLS:
         try:
             base = rf"HKCU\Software\Classes\{scheme}"
+            cmd_key = rf"{base}\shell\open\command"
+            # This runs at every launch, and after the first one the three
+            # values are already there.  They are read first (directly, no
+            # program is started), and written only when one is missing or
+            # different: nine reg.exe starts before the window opened, saved.
+            if (reg_originals.reads_as(base, "", f"URL:{scheme}", "REG_SZ")
+                    and reg_originals.reads_as(base, "URL Protocol", "", "REG_SZ")
+                    and reg_originals.reads_as(cmd_key, "", NOOP_CMD, "REG_SZ")):
+                log.debug(f"  {scheme}:// is already blocked")
+                results.append({"scheme": scheme, "ok": True})
+                continue
             # Required values for a custom URL protocol
             run_cmd(["reg", "add", base, "/ve", "/t", "REG_SZ",
                      "/d", f"URL:{scheme}", "/f"])
             run_cmd(["reg", "add", base, "/v", "URL Protocol",
                      "/t", "REG_SZ", "/d", "", "/f"])
             # The shell\open\command tree
-            cmd_key = rf"{base}\shell\open\command"
             r = run_cmd(["reg", "add", cmd_key, "/ve", "/t", "REG_SZ",
                          "/d", NOOP_CMD, "/f"])
             ok = bool(r.get("ok"))

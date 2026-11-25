@@ -65,6 +65,31 @@ QUESTIONS = {
                                               query="SELECT Caption, Version FROM Win32_OperatingSystem"),
     "wmi: a namespace that is not there": lambda: ask("wmi", namespace="root\\NoSuchNamespace",
                                                       query="SELECT Name FROM Sensor"),
+    # The start-up questions (step 2).  The first screen is the eight below from "gpu_identity" on.
+    "gpu_identity (first screen)": lambda: ask("gpu_identity"),
+    "wmi: first screen, operating system": lambda: ask(
+        "wmi", namespace="root\\cimv2", query="SELECT Caption,Version,BuildNumber,OSArchitecture FROM Win32_OperatingSystem"),
+    "wmi: first screen, processor": lambda: ask(
+        "wmi", namespace="root\\cimv2",
+        query="SELECT Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,CurrentClockSpeed FROM Win32_Processor"),
+    "wmi: first screen, memory sticks": lambda: ask(
+        "wmi", namespace="root\\cimv2", query="SELECT Capacity,Speed,ConfiguredClockSpeed FROM Win32_PhysicalMemory"),
+    "wmi: first screen, memory in use": lambda: ask(
+        "wmi", namespace="root\\cimv2", query="SELECT TotalVisibleMemorySize,FreePhysicalMemory FROM Win32_OperatingSystem"),
+    "wmi: first screen, physical disks": lambda: ask(
+        "wmi", namespace="root\\Microsoft\\Windows\\Storage", query="SELECT MediaType,BusType FROM MSFT_PhysicalDisk"),
+    "wmi: first screen, drives": lambda: ask(
+        "wmi", namespace="root\\cimv2", query="SELECT DeviceID,Size,FreeSpace FROM Win32_LogicalDisk WHERE DriveType=3"),
+    "wmi: first screen, DNS servers": lambda: ask(
+        "wmi", namespace="root\\StandardCimv2",
+        query="SELECT InterfaceAlias,ServerAddresses FROM MSFT_DNSClientServerAddress WHERE AddressFamily=2"),
+    "wmi: graphics adapters (before the window)": lambda: ask(
+        "wmi", namespace="root\\cimv2",
+        query="SELECT Name,DriverVersion,AdapterRAM,PNPDeviceID,Status FROM Win32_VideoController"),
+    "service_state": lambda: ask("service_state", name="PresentMonSharedService"),
+    "power_scheme": lambda: ask("power_scheme"),
+    "power_setting": lambda: ask("power_setting", scheme="current", sub="54533251-82be-4824-96c1-47b60b740d00",
+                                 setting="bc5038f7-23e0-4960-96da-33abaf5935ec"),
 }
 out = {"repeats": repeats, "helper_ms_per_answer": {}}
 for name, fn in QUESTIONS.items():

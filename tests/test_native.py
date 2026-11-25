@@ -4,9 +4,13 @@ ping, that nothing is started when it answers, and that every caller falls
 back to the old way when the helper is missing, old, or wrong.
 
 The real library is never loaded by the app in these tests: the sandbox
-answers for it from m.NATIVE (empty = "not installed").  The loader and the
-call itself are tested against a stand-in library; the last test asks the real
-one a few read-only questions, on a PC where it has been built.
+answers for it from m.NATIVE (empty = "not installed"), and for its two
+actions from m.NATIVE_ACTS.  The loader and the call itself are tested against
+a stand-in library; the last test asks the real one a few read-only questions,
+on a PC where it has been built, and has it trim this test's own process (the
+one action a test ever carries out for real).
+
+The start-up readings have a file of their own: tests/test_native_startup.py.
 """
 import sandbox as m
 
@@ -41,14 +45,22 @@ class _Fn:
 
 
 class FakeLib:
-    """What ctypes.WinDLL returns for the helper: the two exported functions.
-    `answer` is what the library replies with: a value (wrapped as a good
-    answer), raw bytes, or a callable taking the request."""
+    """What ctypes.WinDLL returns for the helper: the three exported
+    functions.  `answer` is what the library replies with: a value (wrapped as
+    a good answer), raw bytes, or a callable taking the request.  `acted`
+    lists the requests that came in through the door for actions."""
 
     def __init__(self, abi=N.ABI, answer=None):
-        self.requests, self.sizes, self.answer = [], [], answer
+        self.requests, self.sizes, self.answer, self.acted = [], [], answer, []
         self.vispora_native_abi = _Fn(lambda: abi)
         self.vispora_native_call = _Fn(self._call)
+        self.vispora_native_act = _Fn(self._act)
+
+    def _act(self, request, length, buf, cap):
+        self.acted.append(json.loads(request[:length].decode("utf-8")))
+        if cap < 4096:
+            return -4096                    # as the library does: refused before anything is done
+        return self._call(request, length, buf, cap)
 
     def _call(self, request, length, buf, cap):
         req = json.loads(request[:length].decode("utf-8"))
@@ -141,6 +153,17 @@ def test_a_library_of_another_version_is_not_used():
     assert lib is None and "could not be loaded" in why
     lib, why = _open_standing_in(types.SimpleNamespace())           # some other DLL of that name
     assert lib is None and "could not be loaded" in why
+    # The version before this one had no door for actions.  It says so by its
+    # number, and is refused for that, not for the missing function.
+    old = FakeLib(abi=N.ABI - 1)
+    del old.vispora_native_act
+    lib, why = _open_standing_in(old)
+    assert lib is None and f"version {N.ABI - 1}" in why
+    # The right number without that door is not our library.
+    broken = FakeLib()
+    del broken.vispora_native_act
+    lib, why = _open_standing_in(broken)
+    assert lib is None and "could not be loaded" in why
 
 
 def test_the_abi_number_is_the_one_the_library_is_built_with():
@@ -205,6 +228,74 @@ def test_a_library_that_keeps_crashing_is_switched_off():
 
 
 # ═════════════════════════════════════════════════════════════════════
+# Actions: their own door, asked once
+# ═════════════════════════════════════════════════════════════════════
+def test_an_action_goes_through_its_own_door():
+    lib = FakeLib(answer=lambda req: {"processes": 300, "trimmed": 250} if req.get("do") else {"asked": req})
+    with_library(lib)
+    assert m.real_native_act("trim_working_sets") == {"processes": 300, "trimmed": 250}
+    assert lib.acted == [{"do": "trim_working_sets"}], "sent as an action, through the action door"
+    assert "q" not in lib.acted[0]
+    # A question never arrives there.
+    assert m.real_native_call("process_io") == {"asked": {"q": "process_io"}}
+    assert len(lib.acted) == 1
+
+
+def test_an_action_is_never_asked_twice():
+    # The answer does not fit: a question is asked again with more room, an
+    # action is not (it would be carried out again).
+    lib = FakeLib(answer=-100_000)
+    with_library(lib)
+    assert m.real_native_act("purge_standby_list") is None
+    assert len(lib.acted) == 1 and lib.sizes == [N._ACTION_BUFFER]
+    assert N._ACTION_BUFFER >= 4096, "the library refuses an action a smaller buffer"
+    # The library gave up, answered an error, or crashed: None, and asked once.
+    for answer in (0, b'{"ok":false,"err":"the standby list can only be cleared with administrator rights"}'):
+        lib = FakeLib(answer=answer)
+        with_library(lib)
+        assert m.real_native_act("purge_standby_list") is None and len(lib.acted) == 1
+
+    def boom(req):
+        raise OSError("exception: access violation")
+    lib = FakeLib(answer=boom)
+    with_library(lib)
+    assert m.real_native_act("trim_working_sets") is None and len(lib.acted) == 1
+
+
+def test_the_sandbox_keeps_the_actions_out_too():
+    m.fresh()
+    assert N.act is not m.real_native_act
+    assert N.trim_working_sets() is None and N.purge_standby_list() is False
+    assert m.NATIVE_ACTED == [("trim_working_sets", {}), ("purge_standby_list", {})]
+    assert m.NATIVE_CALLS == [], "an action is never sent as a question"
+    m.NATIVE_ACTS.update(trim_working_sets={"processes": 310, "trimmed": 262, "debug_privilege": True},
+                         purge_standby_list={"purged": True})
+    assert N.trim_working_sets() == {"processes": 310, "trimmed": 262, "reached_services": True}
+    assert N.purge_standby_list() is True
+    m.NATIVE_ACTS["trim_working_sets"] = {"processes": 310, "trimmed": 40}
+    assert N.trim_working_sets()["reached_services"] is False, "not said, so not assumed"
+    for bad in ({"processes": "many", "trimmed": 1}, {"trimmed": 1}, [1, 2], "done"):
+        m.NATIVE_ACTS["trim_working_sets"] = bad
+        assert N.trim_working_sets() is None, bad
+    for bad in ({"purged": False}, {"purged": 1}, {}, "yes"):
+        m.NATIVE_ACTS["purge_standby_list"] = bad
+        assert N.purge_standby_list() is False, bad
+
+
+def test_only_the_two_memory_actions_use_the_action_door():
+    source = open(N.__file__, encoding="utf-8").read()
+    assert sorted(re.findall(r'\bact\("(\w+)"', source)) == ["purge_standby_list", "trim_working_sets"]
+    rust = open(os.path.join(m.REPO, "native", "src", "lib.rs"), encoding="utf-8").read()
+    actions = rust[rust.index("fn dispatch_action"):rust.index("// The three functions the DLL exports")]
+    questions = rust[rust.index("fn dispatch("):rust.index("fn dispatch_action")]
+    assert sorted(re.findall(r'^        "(\w+)" =>', actions, re.M)) == ["purge_standby_list", "trim_working_sets"]
+    assert "actions::" not in questions, "no question can reach the code that changes something"
+    # And the command-line tool only asks questions.
+    tool = open(os.path.join(m.REPO, "native", "src", "main.rs"), encoding="utf-8").read()
+    assert "vispora_native::answer(" in tool and "vispora_native::act(" not in tool
+
+
+# ═════════════════════════════════════════════════════════════════════
 # The answers are checked before anything uses them
 # ═════════════════════════════════════════════════════════════════════
 def test_answers_of_the_wrong_shape_are_refused():
@@ -237,6 +328,57 @@ def test_answers_of_the_wrong_shape_are_refused():
     assert N.wmi("root\\x", "SELECT * FROM Sensor") is None
     m.NATIVE["wmi"] = []
     assert N.wmi("root\\x", "SELECT * FROM Sensor") == []
+
+
+def test_start_up_answers_of_the_wrong_shape_are_refused():
+    m.fresh()
+    m.NATIVE["gpu_identity"] = {"name": " NVIDIA GeForce RTX 5070 Ti ", "driver_version": "621.40",
+                                "mem_total_bytes": 17094934528}
+    assert N.gpu_identity() == {"name": "NVIDIA GeForce RTX 5070 Ti", "driver_version": "621.40",
+                                "mem_total_bytes": 17094934528}
+    m.NATIVE["gpu_identity"] = {"name": "Old Card", "driver_version": None, "mem_total_bytes": None}
+    assert N.gpu_identity() == {"name": "Old Card", "driver_version": None, "mem_total_bytes": None}
+    for bad in ({"name": ""}, {"name": 5}, {"driver_version": "1.0"}, ["x"], {"name": "x", "mem_total_bytes": "16 GB"}):
+        m.NATIVE["gpu_identity"] = bad
+        assert N.gpu_identity() is None, bad
+
+    m.NATIVE["service_state"] = {"installed": True, "state": 4}
+    assert N.service_state("Spooler") == {"installed": True, "running": True}
+    m.NATIVE["service_state"] = {"installed": True, "state": 1}
+    assert N.service_state("Spooler") == {"installed": True, "running": False}
+    m.NATIVE["service_state"] = {"installed": False, "state": None}
+    assert N.service_state("NoSuch") == {"installed": False, "running": False}
+    for bad in ({"installed": "yes", "state": 4}, {"state": 4}, {"installed": True, "state": None},
+                {"installed": True, "state": "RUNNING"}, [True]):
+        m.NATIVE["service_state"] = bad
+        assert N.service_state("Spooler") is None, bad
+    del m.NATIVE_CALLS[:]
+    assert N.service_state("") is None and N.service_state(None) is None and m.NATIVE_CALLS == []
+
+    m.NATIVE["power_scheme"] = {"guid": m.HIGH_PERF.upper(), "schemes": [m.BALANCED, m.HIGH_PERF]}
+    assert N.power_scheme() == {"guid": m.HIGH_PERF, "schemes": [m.BALANCED, m.HIGH_PERF]}
+    for bad in ({"guid": "High performance", "schemes": []}, {"guid": m.BALANCED}, {"guid": m.BALANCED, "schemes": ["x"]},
+                {"schemes": [m.BALANCED]}, m.BALANCED):
+        m.NATIVE["power_scheme"] = bad
+        assert N.power_scheme() is None, bad
+
+    m.NATIVE["power_setting"] = {"scheme": m.BALANCED, "ac": 100, "dc": 5, "min": 0, "max": 100, "increment": 1}
+    assert N.power_setting("SCHEME_CURRENT", m.PROC_SUB, m.PROC_MAX) == {"ac": 100, "dc": 5, "max": 100}
+    assert m.NATIVE_CALLS[-1] == ("power_setting", {"scheme": "current", "sub": m.PROC_SUB, "setting": m.PROC_MAX})
+    m.NATIVE["power_setting"] = {"ac": 1, "dc": 0, "min": None, "max": None, "increment": None}
+    assert N.power_setting(m.BALANCED, m.PROC_SUB, m.IDLE) == {"ac": 1, "dc": 0, "max": None}
+    for bad in ({"ac": 1}, {"ac": "1", "dc": 0}, [1, 0], {"ac": 1, "dc": 0, "max": "100"}):
+        m.NATIVE["power_setting"] = bad
+        assert N.power_setting(m.BALANCED, m.PROC_SUB, m.IDLE) is None, bad
+    # powercfg's own names are not sent: the caller turns them into GUIDs, and
+    # a name it does not know goes to powercfg, which does.
+    m.NATIVE["power_setting"] = {"ac": 1, "dc": 0}
+    del m.NATIVE_CALLS[:]
+    for scheme, sub, setting in (("SCHEME_CURRENT", "SUB_PROCESSOR", m.IDLE), (m.BALANCED, m.PROC_SUB, "IDLEDISABLE"),
+                                 ("SCHEME_BALANCED", m.PROC_SUB, m.IDLE), (m.BALANCED, m.PROC_SUB, m.IDLE + "; calc"),
+                                 (None, m.PROC_SUB, m.IDLE)):
+        assert N.power_setting(scheme, sub, setting) is None, (scheme, sub, setting)
+    assert m.NATIVE_CALLS == []
 
 
 def test_ping_only_takes_an_ipv4_address():
@@ -658,6 +800,7 @@ def _fresh_network_monitor():
     sys.modules["psutil"] = ps
     CLOCK[0] = 1000.0
     NM.time = types.SimpleNamespace(time=lambda: CLOCK[0])      # the monitor's clock: a second is exactly a second
+    NM._wanted = lambda: None           # reading the result does not start the real sampler here
     NM._per_proc.clear()
     NM._history.clear()
     NM._last_nic_rx = NM._last_nic_tx = 0
@@ -740,8 +883,9 @@ def test_the_build_bundles_the_library():
 
 
 def test_the_real_library_where_it_has_been_built():
-    """Read-only questions to the library itself.  On a PC where it has not
-    been built this only checks that its absence is reported as such."""
+    """Read-only questions to the library itself, and one action on this
+    test's own process.  On a PC where it has not been built this only checks
+    that its absence is reported as such."""
     path = N.dll_path()
     lib, why = m.real_native_open(path)
     if not os.path.isfile(path):
@@ -768,5 +912,23 @@ def test_the_real_library_where_it_has_been_built():
         assert call("no such question") is None
         assert call("wmi", namespace="root\\cimv2", query="SELECT Caption FROM Win32_OperatingSystem")[0]["Caption"]
         assert call("wmi", namespace="root\\no_such_namespace", query="SELECT * FROM Nothing") == []
+        # The start-up questions (all of them only read).
+        assert call("service_state", name="EventLog") == {"installed": True, "state": 4}
+        assert call("service_state", name="VisporaNoSuchService_7f3a") == {"installed": False, "state": None}
+        plan = call("power_scheme")
+        assert plan["guid"] in plan["schemes"] and len(plan["guid"]) == 36
+        cap = call("power_setting", scheme="current", sub=m.PROC_SUB, setting=m.PROC_MAX)
+        assert cap["scheme"] == plan["guid"] and 0 <= cap["ac"] <= cap["max"] <= 100, cap
+        assert call("power_setting", scheme="current", sub=m.PROC_SUB,
+                    setting="12345678-1234-1234-1234-123456789abc") is None
+        card = call("gpu_identity")
+        assert card is None or (card["name"] and set(card) == {"name", "driver_version", "mem_total_bytes"}), card
+        # An action's name is not a question, and the one action tried here is
+        # on this test's own process only (its working set is trimmed; Windows
+        # hands the pages back as they are used).
+        assert call("trim_working_sets") is None and call("purge_standby_list") is None
+        done = m.real_native_act("trim_working_sets", pids=[os.getpid()])
+        assert done and done["processes"] == 1 and done["trimmed"] == 1, done
+        assert m.real_native_act("process_io") is None, "a question is not an action"
     finally:
         N._state.update(tried=True, lib=None, why="(test over)")

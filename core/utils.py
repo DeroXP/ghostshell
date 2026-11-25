@@ -416,8 +416,33 @@ def create_restore_point(description: str = "Vispora Pre-Modification") -> bool:
     return r["ok"]
 
 
+def _drive_type_from_native():
+    """detect_drive_type() from the native helper, or None to ask PowerShell.
+
+    Get-PhysicalDisk is a wrapper around the WMI class read here, and prints
+    two of its numbers as words: bus type 17 is "NVMe", media type 4 is "SSD".
+    The disks come in the same order, and the answer is the same: the first
+    disk that is NVMe or an SSD decides, and a PC with neither is "hdd"."""
+    try:
+        from core import native         # (not at the top: core.native imports this module)
+        disks = native.wmi("root\\Microsoft\\Windows\\Storage", "SELECT MediaType,BusType FROM MSFT_PhysicalDisk")
+        if not disks:
+            return None
+        for disk in disks:
+            if disk.get("BusType") == 17:
+                return "nvme"
+            if disk.get("MediaType") == 4:
+                return "ssd"
+        return "hdd"
+    except Exception:
+        return None
+
+
 def detect_drive_type() -> str:
     """Return 'ssd', 'nvme', or 'hdd'."""
+    native_answer = _drive_type_from_native()
+    if native_answer:
+        return native_answer
     r = run_ps("Get-PhysicalDisk | Select-Object MediaType,BusType | ConvertTo-Json")
     if r["ok"] and r["out"]:
         try:

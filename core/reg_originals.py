@@ -36,6 +36,7 @@ import winreg
 from typing import Optional
 
 from config import APPDATA_DIR
+from core import native
 from core.utils import get_logger, run_cmd, atomic_write_json
 
 log = get_logger("originals")
@@ -283,7 +284,16 @@ def reads_as(key_path: str, value_name: str, data: str, vtype: str = "REG_DWORD"
 _HEX = re.compile(r"0x[0-9a-fA-F]{8}")
 
 
-def _active_scheme() -> str:
+# Reading a power plan.  Each of these asks the native helper first
+# (core/native.py: Windows' own power functions, the ones powercfg calls) and
+# runs powercfg only when the helper is not there or does not answer.  A game
+# starting used to run powercfg some thirty times for these reads alone.
+def active_scheme() -> str:
+    """GUID of the active power plan, in lower case, or "" if it cannot be
+    read."""
+    plan = native.power_scheme()
+    if plan:
+        return plan["guid"]
     r = run_cmd(["powercfg", "/getactivescheme"])
     for part in (r.get("out") or "").split():
         if len(part) == 36 and part.count("-") == 4:
@@ -291,11 +301,40 @@ def _active_scheme() -> str:
     return ""
 
 
+_active_scheme = active_scheme
+
+
 def scheme_gone(scheme: str) -> bool:
     """True only when powercfg lists the power plans and `scheme` is not one
     of them.  A failed listing says nothing about the plan."""
+    plan = native.power_scheme()
+    if plan and plan["schemes"]:
+        return scheme.lower() not in plan["schemes"]
     r = run_cmd(["powercfg", "/list"])
     return bool(r.get("ok")) and scheme.lower() not in (r.get("out") or "").lower()
+
+
+def _power_from_native(scheme: str, sub: str, setting: str) -> Optional[dict]:
+    """One power setting from the native helper: {"ac", "dc", "max"}, or None
+    when it is not there, the names are not ones it can take, or the plan or
+    setting does not exist (powercfg is asked then, and says so itself)."""
+    return native.power_setting(
+        "current" if str(scheme).lower() == "scheme_current" else scheme,
+        _POWER_ALIASES.get(str(sub).lower(), sub),
+        _POWER_ALIASES.get(str(setting).lower(), setting))
+
+
+def power_limit(scheme: str, sub: str, setting: str) -> Optional[int]:
+    """The largest value Windows accepts for a power setting, or None if that
+    cannot be read or the setting is a list of choices and not a range.
+    (powercfg /qh lists, for a range: minimum, maximum, increment, then the AC
+    and DC values.)"""
+    cur = _power_from_native(scheme, sub, setting)
+    if cur is not None:
+        return cur["max"]
+    r = run_cmd(["powercfg", "/qh", scheme, sub, setting])
+    found = _HEX.findall(r.get("out") or "") if r.get("ok") else []
+    return int(found[-4], 16) if len(found) >= 5 else None
 
 
 def query_power(scheme: str, sub: str, setting: str) -> Optional[tuple]:
@@ -306,6 +345,9 @@ def query_power(scheme: str, sub: str, setting: str) -> Optional[tuple]:
     /qh, not /query: /query leaves out hidden settings altogether (processor
     idle disable, boost mode, ...) while still exiting 0, so those could
     never be read — and so never recorded or restored."""
+    cur = _power_from_native(scheme, sub, setting)
+    if cur is not None:
+        return cur["ac"], cur["dc"]
     r = run_cmd(["powercfg", "/qh", scheme, sub, setting])
     found = _HEX.findall(r.get("out") or "") if r.get("ok") else []
     if len(found) < 2:

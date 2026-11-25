@@ -5,7 +5,13 @@ hammers the network (Steam download wakes up, OneDrive syncs, npm install
 fires, an update kicks in) — ping spikes, packets drop, the user has no
 idea what caused it.  Task Manager doesn't show per-process bytes/sec.
 
-This module fills that gap by running a 1 Hz sampler in the background:
+This module fills that gap with a 1 Hz sampler that runs WHILE SOMETHING IS
+READING IT.  Its only reader is the Network page, which asks every two
+seconds while it is on screen.  The sampler starts with the first question
+and stops by itself once nobody has asked for IDLE_STOP_S seconds.  It used to
+run from the first second of every start until the app quit, whether or not
+the page was ever opened: on the owner's PC that was a quarter of a processor
+core, all day (docs/performance.md).  What it does while it runs:
 
   • Per-process delta-bytes from psutil's `Process.io_counters().other_bytes`,
     which on Windows includes network + IPC.  For real network hogs
@@ -19,8 +25,11 @@ process exceeding `BURST_BYTES_PER_SEC` for `BURST_CONSECUTIVE` consecutive
 seconds is flagged.  The UI surfaces the top offender with a one-click
 pause action that reuses the v3.1 `background_pauser` ctypes suspend.
 
+A burst needs BURST_CONSECUTIVE seconds of samples, so one that is already
+going on when the page is opened shows a few seconds later.
+
 Public API:
-    start() / stop() / is_running()
+    start() / stop() / is_running()      (get_live / get_history start it)
     get_live() -> { total_rx_per_sec, total_tx_per_sec, top: [...],
                     burst_alert: {...} | None, last_sampled_at }
     get_history(seconds=60) -> [{ts, total_rx, total_tx}, ...]
@@ -45,6 +54,10 @@ log = get_logger(__name__)
 
 SAMPLE_INTERVAL = 1.0      # seconds between samples
 HISTORY_LEN = 60           # ring buffer size (60s)
+# With no reader for this long the sampler stops.  The page asks every two
+# seconds while it is on screen; this is long enough to look at another page
+# and come back to an unbroken graph.
+IDLE_STOP_S = 30.0
 
 # A single non-game process exceeding this for BURST_CONSECUTIVE seconds
 # in a row triggers a burst alert.  5 MB/s is a comfortable threshold —
@@ -72,6 +85,9 @@ NEVER_FLAG = {
 _thread: Optional[threading.Thread] = None
 _stop = threading.Event()
 _lock = threading.Lock()
+_run_lock = threading.Lock()   # starting and stopping the sampler, one at a time
+_sample_lock = threading.Lock()   # one sampling pass at a time (held by the sampler for each pass)
+_last_wanted = 0.0             # when a reader last asked (time.monotonic()); 0: never
 
 # Ring buffer of total-throughput samples (for sparkline)
 _history: deque = deque(maxlen=HISTORY_LEN)
@@ -247,16 +263,45 @@ def _get_active_game_exe() -> Optional[str]:
     return None
 
 
-def _loop():
-    log.info("net_monitor: sampler thread started")
-    while not _stop.is_set():
-        try:
-            _sample_once()
-        except Exception as e:
-            log.warning(f"net_monitor sample failed: {e}")
-        if _stop.wait(SAMPLE_INTERVAL):
+def _nobody_is_reading() -> bool:
+    return time.monotonic() - _last_wanted > IDLE_STOP_S
+
+
+def _forget_readings() -> None:
+    """Drop what the last run measured.  A run that starts later must not
+    work out a rate from counters read minutes ago, nor show the old figures
+    as if they were live."""
+    global _last_nic_rx, _last_nic_tx, _last_sample_t
+    with _sample_lock:          # (a sampler that was just told to stop may still be finishing a pass)
+        _per_proc.clear()
+        _last_nic_rx = _last_nic_tx = 0
+        _last_sample_t = 0.0
+        with _lock:
+            _latest.update({"total_rx_per_sec": 0, "total_tx_per_sec": 0, "top": [], "burst_alert": None})
+
+
+def _loop(me: threading.Event):
+    """Sample once a second until told to stop (`me`), or until nobody has
+    read the result for IDLE_STOP_S seconds."""
+    log.info("net_monitor: sampler started")
+    why = "stopped"
+    while not me.is_set():
+        with _sample_lock:
+            if me.is_set():
+                break
+            try:
+                _sample_once()
+            except Exception as e:
+                log.warning(f"net_monitor sample failed: {e}")
+        if me.wait(SAMPLE_INTERVAL):
             break
-    log.info("net_monitor: sampler thread exiting")
+        with _run_lock:
+            if _nobody_is_reading() and not me.is_set():
+                # Decided with the lock held: a reader that asks now either
+                # got in first (and we go on) or starts a new sampler.
+                me.set()
+                why = f"nobody has read it for {IDLE_STOP_S:.0f} s"
+    log.info(f"net_monitor: sampler exiting ({why})")
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -264,26 +309,49 @@ def _loop():
 # ────────────────────────────────────────────────────────────────────
 
 def start() -> dict:
-    global _thread
-    if _thread and _thread.is_alive():
-        return {"ok": True, "msg": "already running"}
-    _stop.clear()
-    _thread = threading.Thread(target=_loop, daemon=True, name="net-monitor")
-    _thread.start()
+    """Start the sampler if it is not running.  It keeps going for as long as
+    get_live() or get_history() are called, and stops IDLE_STOP_S seconds
+    after the last call."""
+    global _thread, _stop, _last_wanted
+    with _run_lock:
+        _last_wanted = time.monotonic()
+        if _thread and _thread.is_alive() and not _stop.is_set():
+            return {"ok": True, "msg": "already running"}
+        _forget_readings()
+        _stop = threading.Event()
+        _thread = threading.Thread(target=_loop, args=(_stop,), daemon=True, name="net-monitor")
+        _thread.start()
     return {"ok": True}
 
 
 def stop() -> dict:
-    _stop.set()
+    with _run_lock:
+        _stop.set()
     return {"ok": True}
 
 
 def is_running() -> bool:
-    return bool(_thread and _thread.is_alive())
+    return bool(_thread and _thread.is_alive() and not _stop.is_set())
+
+
+def _wanted() -> None:
+    """A reader is asking: note it, and start the sampler if it is not
+    running.  Never raises."""
+    global _last_wanted
+    try:
+        _last_wanted = time.monotonic()
+        if not is_running():
+            start()
+    except Exception as e:
+        log.debug(f"net_monitor could not be started for a reader: {e}")
 
 
 def get_live() -> dict:
-    """Latest computed snapshot.  Cheap to call repeatedly from the UI."""
+    """Latest computed snapshot.  Cheap to call repeatedly from the UI.
+    Calling it is what keeps the sampler running (see the top of this file):
+    the first call after a pause starts it, and answers zeroes until the
+    second sample is in, a second later."""
+    _wanted()
     with _lock:
         # Shallow copy to avoid the UI seeing a partial mid-update state
         snap = dict(_latest)
@@ -293,6 +361,7 @@ def get_live() -> dict:
 
 
 def get_history(seconds: int = 60) -> list[dict]:
+    _wanted()
     with _lock:
         rows = list(_history)
     cutoff = time.time() - seconds
