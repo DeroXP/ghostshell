@@ -67,12 +67,33 @@ fn fill(template: &str, version: &str, appdata_dir: &str) -> String {
 /// themselves, not the buttons inside them), and a right click does not
 /// open the browser's menu.
 ///
-/// The window gives this to its own page only; it is never served.
-pub fn shim(token: &crate::token::Token) -> String {
-    SHIM.replace("%TOKEN%", token.as_str())
+/// The window gives this to its own page only; it is never served.  The
+/// window runs it in every frame it ever shows, so the script itself looks
+/// where it is: anywhere but in the app's own page, at the top of the
+/// window, it does nothing, and hands the secret to nobody.
+pub fn shim(token: &crate::token::Token, origin: &str) -> String {
+    // (an origin is letters, digits, dots, a colon and slashes: nothing that
+    // ends the text it is written into)
+    let origin: String = origin.chars().filter(|c| c.is_ascii_alphanumeric() || ".:/-".contains(*c)).collect();
+    SHIM.replace("%TOKEN%", token.as_str()).replace("%ORIGIN%", &origin)
+}
+
+/// Is `address` a page of the app's own?  `origin` is where the app's page
+/// lives (`http://vispora.localhost`); the window stays there and goes
+/// nowhere else.  The whole of the origin is compared, not the host alone:
+/// another scheme or another port under the same host name is another place.
+pub fn is_the_apps_page(address: &str, origin: &str) -> bool {
+    match address.strip_prefix(origin) {
+        // Exactly the origin, or the origin followed by a path, a query or a
+        // fragment.  Anything else that begins the same way (a longer host
+        // name, a port, a user name in front of another host) is not it.
+        Some(rest) => rest.is_empty() || rest.starts_with(['/', '?', '#']),
+        None => false,
+    }
 }
 
 const SHIM: &str = r#"(function () {
+    if (window.top !== window.self || location.origin !== "%ORIGIN%") { return; }
     if (window.pywebview && window.pywebview.api) { return; }
     var token = "%TOKEN%";
     var hidden = false;
@@ -139,7 +160,13 @@ mod tests {
     #[test]
     fn the_window_stands_in_for_what_the_page_asked_pywebview_for() {
         let token = crate::token::Token::from_text("abcdefghijklmnopqrstuvwxyz0123456789-_ABCDEFG").unwrap();
-        let script = shim(&token);
+        let script = shim(&token, "http://vispora.localhost");
+        // Before anything else: only in the app's own page, at the top of the window.
+        let guard = "if (window.top !== window.self || location.origin !== \"http://vispora.localhost\") { return; }";
+        assert!(script.find(guard).unwrap() < script.find("var token").unwrap(), "the secret is named before the script has looked where it is");
+        assert!(!script.contains("%ORIGIN%"));
+        // An origin cannot carry script in with it.
+        assert!(!shim(&token, "http://x\"; alert(1); //").contains("alert(1); //\""));
         assert!(script.contains("var token = \"abcdefghijklmnopqrstuvwxyz0123456789-_ABCDEFG\";") && !script.contains("%TOKEN%"));
         for name in ["get_api_token", "minimize", "close_to_tray", "show", "is_hidden"] {
             assert!(script.contains(&format!("        {name}: function")), "{name}");
@@ -151,6 +178,30 @@ mod tests {
         assert!(script.contains(".pywebview-drag-region *:not(.pywebview-drag-region) { -webkit-app-region: no-drag; }"));
         // It leaves a pywebview that is really there alone.
         assert!(script.contains("if (window.pywebview && window.pywebview.api) { return; }"));
+    }
+
+    #[test]
+    fn only_the_apps_own_origin_is_the_apps_page() {
+        let origin = "http://vispora.localhost";
+        for own in ["http://vispora.localhost", "http://vispora.localhost/", "http://vispora.localhost/#t=abc",
+                    "http://vispora.localhost/?x=1", "http://vispora.localhost/static/js/app.js"] {
+            assert!(is_the_apps_page(own, origin), "{own}");
+        }
+        for other in [
+            "https://vispora.localhost/",           // another scheme
+            "https://vispora.localhost:8443/",      // and another port
+            "http://vispora.localhost:8080/",
+            "ftp://vispora.localhost/",
+            "file://vispora.localhost/c$/Windows/",
+            "http://vispora.localhost.evil.example/",
+            "http://vispora.localhost@evil.example/",
+            "http://evil.example/http://vispora.localhost/",
+            "http://vispora.localhostx/",
+            "about:blank",
+            "",
+        ] {
+            assert!(!is_the_apps_page(other, origin), "{other}");
+        }
     }
 
     #[test]

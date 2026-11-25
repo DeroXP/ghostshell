@@ -15,8 +15,8 @@
 //!     {"do": "wait", "for": "ready", "within": 30}      ready | down | gone
 //!     {"do": "state"}        where the shell is, its backend's process id, what it has said
 //!     {"do": "token"}        the run's secret (this is a trial tool)
-//!     {"do": "start_other", "target": "...", "parameters": "..."}
-//!         start another program the way the shell starts a browser for a link
+//!     {"do": "start_other", "program": "...", "arguments": ["..."]}
+//!         start another program the way the shell starts everything but its backend
 //!     {"do": "quit"}         quit as the app would, answer, and end
 //!     {"do": "crash"}        end at once without quitting, as a shell that died would
 //!
@@ -141,10 +141,11 @@ fn answer(shell: &Arc<Shell>, asked: &Json) -> Result<Json, String> {
         }
         Some("state") => Ok(state_of(shell)),
         // Start another program the way the shell starts everything that
-        // is not its backend (a browser for a link, say): see win::start_other.
+        // is not its backend: see win::start_without_handles.
         Some("start_other") => {
-            let target = asked["target"].as_str().ok_or("\"target\" is missing")?;
-            let started = win::start_other(target, asked["parameters"].as_str().unwrap_or(""));
+            let program = asked["program"].as_str().ok_or("\"program\" is missing")?;
+            let arguments: Vec<String> = asked["arguments"].as_array().unwrap_or(&[]).iter().map(Json::py_str).collect();
+            let started = win::start_without_handles(program, &arguments);
             Ok(Json::object([("ok", started.is_ok().into()), ("err", started.err().unwrap_or_default().into())]))
         }
         Some("token") => Ok(Json::object([("token", shell.token().as_str().into())])),
@@ -154,6 +155,16 @@ fn answer(shell: &Arc<Shell>, asked: &Json) -> Result<Json, String> {
 
 fn main() {
     let arguments: Vec<String> = std::env::args_os().skip(1).map(|word| word.to_string_lossy().into_owned()).collect();
+    // Where the shell finds the two folders it takes from Windows, and
+    // nothing else: for the test that plants variables in the environment
+    // and sees the answers stay the same.
+    if arguments == ["--where"] {
+        println!("{}", Json::object([
+            ("windows", win::windows_folder().unwrap_or_default().into()),
+            ("administrators_folder", win::administrators_folder().unwrap_or_default().into()),
+        ]));
+        return;
+    }
     let settings = match settings_from(&arguments) {
         Ok(settings) => settings,
         Err(why) => {

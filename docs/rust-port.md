@@ -179,6 +179,11 @@ touched until then.
    the app's own page; the few lines that stand in for
    `window.pywebview.api`; telling a second copy from the first, before
    anything asks for administrator rights; a start at sign-in out of sight.
+   What a program without the app's rights could otherwise use is closed:
+   the window is a private one in a folder made for one run and removed
+   after it, WebView2 takes no settings from the environment, the window
+   stays on the app's own page, a link is handed to Explorer and not opened
+   with the app's rights, and signing out does not skip the quit.
    Tried for real against the app on the fake machine.
 3. **The tray.** Its icon and menu, which need calls the backend does not
    have yet, and autostart pointing at the shell.

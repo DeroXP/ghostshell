@@ -30,6 +30,10 @@ each time it puts the (fake) system back, with the reason: that is how a test
 sees that a backend restored before it went.  With VISPORA_STAND_IN_CALLS=<file>
 it writes a line for every call it answers (the time, the status, the
 method and the path): that is how a trial sees what the window's page asked.
+With VISPORA_STAND_IN_SECRET=<file> it writes the run's secret there, as it
+was handed over: that is how a trial knows what to look for when it checks
+that the secret is nowhere it should not be.  (The file is the trial's own,
+in its throwaway folder; the real backend writes the secret nowhere.)
 """
 import sandbox as m                                 # noqa: F401  (first: the fake machine)
 
@@ -59,6 +63,10 @@ def main():
               file=sys.stderr)
         return 2
     threading.Timer(LIFETIME_S, lambda: _really_exit(4)).start()
+    secret = os.environ.get("VISPORA_STAND_IN_SECRET")
+    if secret:
+        with open(secret, "w", encoding="utf-8") as f:
+            f.write(handoff["token"])
     A._serve_for_the_shell(handoff)
     notes = os.environ.get("VISPORA_STAND_IN_NOTES")
     if notes:
