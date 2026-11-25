@@ -530,7 +530,7 @@ here:
   * On a PC whose card answers the helper not at all (only
     `nvidia-smi` does), the same question is there at all times, not
     only during an install.
-* **The clean install's script.** `POST /api/gpu/clean-install` writes a
+* **The clean install's script.** `POST /api/gpu/clean-prepare` writes a
   script that the person runs by hand later, and that script removes
   NVIDIA's drivers. Today's app does not let go of the library for it,
   and neither the backend nor the shell can know when the script is run:
