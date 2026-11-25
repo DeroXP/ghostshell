@@ -142,6 +142,9 @@ def _build_deny_prefixes() -> list:
         APPDATA_DIR,
         # Currently running Vispora exe — block its dir.
         os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else None,
+        # ...and the dir of the exe a person starts, where that is another
+        # one (see _the_shells_folder).
+        _the_shells_folder(),
         # PyInstaller _MEI* extraction dir — block it explicitly even
         # though the dir name is randomized.
         getattr(sys, "_MEIPASS", None),
@@ -159,6 +162,21 @@ def _build_deny_prefixes() -> list:
             seen.add(real)
             out.append(real)
     return out
+
+def _the_shells_folder() -> Optional[str]:
+    """Where the exe a person starts is, when that is not this process's
+    own: behind the shell (shell_rs/) this process is the app's backend,
+    unpacked somewhere else.  The shell says where it is before the app
+    serves anything (app.py, _serve_for_the_shell), and this module is not
+    loaded before a page asks for it.  No release starts the app that way
+    yet."""
+    try:
+        from core import updater
+        exe = updater._app_exe
+        return os.path.dirname(os.path.abspath(exe)) if exe else None
+    except Exception:
+        return None
+
 
 _DENY_PREFIXES = _build_deny_prefixes()
 

@@ -77,8 +77,11 @@ build downloads Tauri and the crates it needs from crates.io; which ones, in
 which versions, is fixed by `updater_rs/app/Cargo.lock`. See
 [updater_rs/README.md](updater_rs/README.md).
 
-The shell that is to become `Vispora.exe` is being written in `shell_rs/`.
-It is not part of any build yet; see [shell_rs/README.md](shell_rs/README.md).
+The shell that is to become `Vispora.exe` is written in `shell_rs/`. It
+carries the app in its own exe; `backend.spec` builds the app as a folder
+for that. It is not part of any release yet, and `build.spec` is still what
+a release is built with; see [shell_rs/README.md](shell_rs/README.md), "One
+file", for how the one file is built.
 
 **Where Rust's build output goes.** It is large (over a gigabyte for the
 updater's window) and changes at every build. If this repository is in a
@@ -151,9 +154,10 @@ exe can be tried against a made-up install in a temporary folder with
 The shell's core has its tests in `shell_rs/core`
 (`cargo test --release --manifest-path shell_rs/core/Cargo.toml`), against a
 backend that exists only in the test. `tests/test_backend_mode.py`,
-`tests/test_shell_rs.py` and `tests/test_tray_calls.py` check the app's side
-of the arrangement (the last one holds the shell's tray icon against
-today's), and, where
+`tests/test_shell_rs.py`, `tests/test_tray_calls.py` and
+`tests/test_one_file.py` check the app's side of the arrangement (the third
+holds the shell's tray icon against today's, the fourth is about the shell
+carrying the app in its exe), and, where
 the shell's trial tool has been built, start it for real with the app on the
 fake machine as its backend. The real backend is never started by a test.
 
@@ -168,7 +172,8 @@ fake machine as its backend. The real backend is never started by a test.
 | `native/` | The native helper: a Rust library for the readings the app takes all the time and the ones a start waits for (see `native/README.md`) |
 | `static/`, `templates/` | The UI (plain JS/CSS, no build step) |
 | `updater/` | The standalone updater app (its own Flask + pywebview window) |
-| `shell_rs/` | The shell that is to become `Vispora.exe`, in Rust, not released yet: so far its core (which request is answered where, the backend's start and stop, quitting) and its window, without the tray. See `shell_rs/README.md` |
+| `shell_rs/` | The shell that is to become `Vispora.exe`, in Rust, not released yet: its core (which request is answered where, the backend's start and stop, quitting), its window, its tray, and carrying the app in its own exe. See `shell_rs/README.md` |
+| `backend.spec` | Builds the app as a folder for the shell to carry. Not used by a release; `build.spec` is |
 | `updater_rs/` | The same updater rewritten in Rust, not released yet: `core/` does the work with no outside crates, `app/` is its window (Tauri). See `updater_rs/README.md` |
 | `tests/` | The test suite and the fake machine it runs on (see [Test](#test)) |
 | `cloud/` | Optional FastAPI licensing / trial backend (see `cloud/README.md`) |

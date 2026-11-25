@@ -133,6 +133,9 @@ struct State {
     /// A backend is being started right now: its process may exist already
     /// and is not in `child` yet.  A quit waits for this to be over.
     launching: bool,
+    /// How the backend is started, where that had to be found out first
+    /// (`prepare_hook`); `settings.backend` otherwise.
+    backend: Option<Command>,
     /// How many backends in a row never came up.
     never_up_in_a_row: usize,
     /// Has a backend been up in this run?
@@ -148,6 +151,7 @@ struct State {
 
 type ExitHook = Arc<dyn Fn(i32) + Send + Sync>;
 type LogHook = Arc<dyn Fn(&str) + Send + Sync>;
+type PrepareHook = Arc<dyn Fn() -> Result<Command, String> + Send + Sync>;
 
 pub struct Shell {
     pub settings: Settings,
@@ -165,6 +169,11 @@ pub struct Shell {
     pub exit_hook: Mutex<Option<ExitHook>>,
     /// Takes every line the shell has to say (the app writes them to its log).
     pub log_hook: Mutex<Option<LogHook>>,
+    /// Finds out how the backend is started, where that takes finding out:
+    /// a shell that carries its backend unpacks it first (backend.rs).
+    /// Asked once, before the first start, on the thread that starts the
+    /// backend, so that the window is not kept waiting for it.
+    pub prepare_hook: Mutex<Option<PrepareHook>>,
 }
 
 /// What the page is told when the backend never came up.  It may be a PC
@@ -204,6 +213,7 @@ impl Shell {
                 phase: Phase::Starting,
                 child: None,
                 launching: false,
+                backend: None,
                 never_up_in_a_row: 0,
                 was_ready: false,
                 starts: Vec::new(),
@@ -216,6 +226,7 @@ impl Shell {
             window: Mutex::new(None),
             exit_hook: Mutex::new(None),
             log_hook: Mutex::new(None),
+            prepare_hook: Mutex::new(None),
         }))
     }
 
@@ -337,6 +348,9 @@ impl Shell {
     }
 
     fn keep(self: &Arc<Self>) {
+        if !self.prepared() {
+            return;
+        }
         loop {
             match self.start_backend() {
                 Ok(true) => {}
@@ -391,6 +405,39 @@ impl Shell {
         }
     }
 
+    /// Find out how the backend is started, where there is something to
+    /// find out.  False when there is nothing to start: it could not be
+    /// made ready, or the shell is quitting.
+    fn prepared(&self) -> bool {
+        let Some(prepare) = self.prepare_hook.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone() else { return true };
+        {
+            let mut st = self.state();
+            if matches!(st.phase, Phase::Quitting | Phase::Gone) {
+                return false;
+            }
+            // A quit waits for this as it waits for a start in flight: what
+            // is being made ready is the quit's to take away again, and it
+            // cannot take away what is still being made.
+            st.launching = true;
+        }
+        let made = prepare();
+        let mut st = self.state();
+        st.launching = false;
+        self.changed.notify_all();
+        match made {
+            Ok(command) => {
+                st.backend = Some(command);
+                true
+            }
+            Err(why) => {
+                drop(st);
+                self.say(&format!("the backend could not be made ready: {why}"));
+                self.give_up(format!("Vispora could not get its background program ready ({why}). Close it and open it again."));
+                false
+            }
+        }
+    }
+
     /// The backend will not be started again.
     fn give_up(&self, why: String) {
         let mut st = self.state();
@@ -423,7 +470,8 @@ impl Shell {
             ("shell_exe", self.settings.shell_exe.as_deref().map_or(Json::Null, Json::from)),
         ])
         .to_string();
-        let started = self.platform.start(&self.settings.backend, &handoff);
+        let command = self.state().backend.clone().unwrap_or_else(|| self.settings.backend.clone());
+        let started = self.platform.start(&command, &handoff);
         let mut st = self.state();
         st.launching = false;
         self.changed.notify_all();

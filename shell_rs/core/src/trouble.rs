@@ -12,6 +12,8 @@ pub enum Trouble {
     Folder { place: String, why: String },
     /// WebView2 is missing, or the window could not be opened.
     Window(String),
+    /// The backend, which the exe carries, could not be unpacked.
+    Backend(String),
 }
 
 impl Trouble {
@@ -32,6 +34,14 @@ impl Trouble {
                      The folder is made in {place}. That folder has to be there, and Vispora has to be allowed to make a folder in it. \
                      This has nothing to do with Microsoft Edge WebView2: installing or repairing that does not help here."
                 ),
+                why,
+            ),
+            Trouble::Backend(why) => (
+                "Vispora could not get its background program ready.\n\n\
+                 The program is inside Vispora.exe and is unpacked when the app starts, into a folder that only administrators can change. \
+                 That takes free room on the drive Windows is on. If Vispora.exe was damaged on its way to this PC, downloading it again helps. \
+                 This has nothing to do with Microsoft Edge WebView2."
+                    .to_string(),
                 why,
             ),
             Trouble::Window(why) => (
@@ -62,7 +72,11 @@ mod tests {
         assert!(folder.contains("The folder is made in C:\\Windows\\Temp.") && folder.contains("nothing to do with Microsoft Edge WebView2"));
         assert!(!folder.contains("usually fixes this") && !shell.contains("WebView2"));
         assert!(shell.starts_with("Vispora could not start."));
-        for (said, why) in [(&window, "WebView2 is not installed"), (&folder, "C:\\Windows\\Temp is missing"), (&shell, "Windows error 10106")] {
+        let backend = Trouble::Backend("there is no room left on the drive".into()).words();
+        assert!(backend.starts_with("Vispora could not get its background program ready.") && backend.contains("is unpacked when the app starts"));
+        assert!(!backend.contains("usually fixes this") && backend.contains("nothing to do with Microsoft Edge WebView2"));
+        for (said, why) in [(&window, "WebView2 is not installed"), (&folder, "C:\\Windows\\Temp is missing"), (&shell, "Windows error 10106"),
+                            (&backend, "there is no room left on the drive")] {
             assert!(said.ends_with(&format!("Nothing was changed on this PC.\n\nDetails: {why}")), "{said}");
             assert!(!said.contains('\u{2014}') && !said.contains("  "), "{said}");
         }

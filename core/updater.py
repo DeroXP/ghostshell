@@ -81,6 +81,31 @@ os.makedirs(UPDATER_DIR, exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Which exe is the app
+# ═══════════════════════════════════════════════════════════════════════════
+# An update swaps the app's exe and starts it again.  Started as it always
+# was, the app's exe is this process's own, and nothing is set here.  Behind
+# the shell (shell_rs/) this process is the app's backend, unpacked
+# somewhere by the shell, and the exe a person has is the shell: the shell
+# says where it is when it starts the backend (app.py, _serve_for_the_shell),
+# and that is the exe an update is for.  Swapping the backend's own exe
+# would change a file the shell unpacks again anyway, and leave the app as
+# it was.  No release starts the app that way yet.
+_app_exe = None
+
+
+def use_app_exe(path) -> None:
+    """The exe an update swaps from now on; None for this process's own."""
+    global _app_exe
+    _app_exe = path or None
+
+
+def _the_apps_exe() -> str:
+    """The exe an update swaps, and starts again afterwards."""
+    return _app_exe or sys.executable
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # install_info.json — written by the app, read by the standalone updater
 # ═══════════════════════════════════════════════════════════════════════════
 def write_install_info() -> dict:
@@ -90,11 +115,11 @@ def write_install_info() -> dict:
     Called on every Vispora startup so the file always tracks the
     current truth (user may have moved the exe between runs)."""
     try:
+        # (behind the shell: the shell's exe, see _the_apps_exe)
+        installed = _app_exe or (sys.executable if getattr(sys, "frozen", False) else os.path.abspath(sys.argv[0]))
         info = {
-            "install_path": sys.executable if getattr(sys, "frozen", False)
-                              else os.path.abspath(sys.argv[0]),
-            "install_dir":  os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
-                              else os.path.dirname(os.path.abspath(sys.argv[0])),
+            "install_path": installed,
+            "install_dir":  os.path.dirname(installed),
             "channel":      _load_settings().get("channel", APP_CHANNEL_DEFAULT),
             "version":      APP_VERSION,
             "updated_at":   time.time(),
@@ -1285,7 +1310,7 @@ def _install_update_now(force: bool = False) -> dict:
             if not getattr(sys, "frozen", False):
                 return {"ok": True,
                         "msg": "Update staged. Running from source, so no exe swap."}
-            return _apply_exe_update_via_bat(path, sys.executable)
+            return _apply_exe_update_via_bat(path, _the_apps_exe())
         return _apply_exe_update_async(path)
     if path.lower().endswith(".zip"):
         return _apply_zip_update(path)
@@ -1431,7 +1456,7 @@ def _apply_exe_update_async(new_exe: str) -> dict:
     s["pending_install_version"] = target_version
     _save_settings(s)
 
-    current_exe = sys.executable
+    current_exe = _the_apps_exe()
 
     args = [
         UPDATER_EXE,

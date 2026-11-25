@@ -32,7 +32,7 @@ use vispora_shell_core::http::Request;
 use vispora_shell_core::json::Json;
 use vispora_shell_core::platform::Command;
 use vispora_shell_core::shell::Phase;
-use vispora_shell_core::{token, tray, win, Settings, Shell};
+use vispora_shell_core::{pack, token, tray, win, Settings, Shell};
 
 fn text_of(phase: &Phase) -> String {
     match phase {
@@ -181,10 +181,48 @@ fn main() {
         println!("{}", tray::picture(icon).iter().map(|byte| format!("{byte:02x}")).collect::<String>());
         return;
     }
+    // Make a pack of a folder (the backend, built as a folder), and say
+    // what a pack holds: how the exe's build gets what it carries.
+    if arguments.len() == 4 && arguments[0] == "--pack" {
+        let Some(way) = pack::Way::named(&arguments[3]) else {
+            eprintln!("{} is no way to squeeze: plain, mszip, xpress-huff or lzms", arguments[3]);
+            std::process::exit(2);
+        };
+        let made = pack::make(&arguments[1], vispora_shell_core::APP_VERSION, "VisporaBackend.exe", way)
+            .and_then(|bytes| std::fs::write(&arguments[2], &bytes).map_err(|e| format!("{}: {e}", arguments[2])));
+        if let Err(why) = made {
+            eprintln!("{why}");
+            std::process::exit(1);
+        }
+    }
+    if matches!(arguments.first().map(String::as_str), Some("--pack" | "--pack-says")) && arguments.len() >= 2 {
+        let file = if arguments[0] == "--pack" { &arguments[2] } else { &arguments[1] };
+        let said = std::fs::read(file).map_err(|e| format!("{file}: {e}")).and_then(|bytes| {
+            let read = pack::Pack::read(&bytes)?;
+            Ok(Json::object([
+                ("version", read.version.as_str().into()),
+                ("start", read.start.as_str().into()),
+                ("files", (read.files.len() as u64).into()),
+                ("bytes", (read.size() as u64).into()),
+                ("packed", (bytes.len() as u64).into()),
+                ("id", read.id.as_str().into()),
+                ("kept_as", vispora_shell_core::backend::kept_name(&read).as_str().into()),
+            ]))
+        });
+        match said {
+            Ok(said) => println!("{said}"),
+            Err(why) => {
+                eprintln!("{why}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if arguments == ["--where"] {
         println!("{}", Json::object([
             ("windows", win::windows_folder().unwrap_or_default().into()),
             ("administrators_folder", win::administrators_folder().unwrap_or_default().into()),
+            ("all_users_folder", win::all_users_folder().unwrap_or_default().into()),
         ]));
         return;
     }

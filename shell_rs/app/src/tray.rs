@@ -10,7 +10,6 @@
 //! backend every three seconds, as today's tray asks.
 
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
 
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, ContextMenu, Menu, MenuItem, PredefinedMenuItem};
@@ -20,13 +19,6 @@ use vispora_shell_core::platform::Window;
 use vispora_shell_core::shell::Phase;
 use vispora_shell_core::tray::{self, Kind, Look, State};
 use vispora_shell_core::Shell;
-
-/// How often the backend is asked what the tray shows.
-const LOOK_EVERY: Duration = Duration::from_secs(3);
-/// How soon it is looked at again while there is no backend to ask (it is
-/// starting, or being started again).  Nothing is sent meanwhile: whether
-/// there is a backend is the shell's own knowledge.
-const LOOK_SOON: Duration = Duration::from_millis(250);
 
 /// What a click on the icon or in its menu acts on.
 struct Hands {
@@ -132,6 +124,7 @@ pub fn make(app: &App, shell: Arc<Shell>, window: Arc<dyn Window>, for_a_trial: 
     let watching = hands.clone();
     std::thread::spawn(move || {
         let mut shown = first;
+        let mut complaints = tray::Complaints::default();
         loop {
             if matches!(shell.phase(), Phase::Quitting | Phase::Gone) {
                 return;
@@ -145,13 +138,22 @@ pub fn make(app: &App, shell: Arc<Shell>, window: Arc<dyn Window>, for_a_trial: 
             if asked_for || look != shown {
                 match show(&icon, &look) {
                     Ok(number) => {
+                        if let Some(line) = complaints.worked() {
+                            shell.say(&line);
+                        }
                         said(&shell, &look, number);
                         shown = look;
                     }
-                    Err(why) => shell.say(&format!("the tray icon could not be brought up to date: {why}")),
+                    // (tried again at every round, and said once)
+                    Err(why) => {
+                        if let Some(line) = complaints.failed(&why.to_string()) {
+                            shell.say(&line);
+                        }
+                    }
                 }
             }
-            let pause = if state.is_some() { LOOK_EVERY } else { LOOK_SOON };
+            // (soon only while the backend is not up: see tray::look_again_in)
+            let pause = tray::look_again_in(shell.phase() == Phase::Ready);
             let waiting = watching.look_again.lock().unwrap_or_else(|p| p.into_inner());
             let _ = watching.wake.wait_timeout_while(waiting, pause, |again| !*again);
         }

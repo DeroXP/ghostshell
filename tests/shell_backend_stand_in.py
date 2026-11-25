@@ -39,7 +39,10 @@ One call is the stand-in's own and not the app's: POST /api/stand-in/game
 with {"name": "..."} makes the fake machine look as if that game were
 running ({"name": null}: as if it had ended).  That is how a trial sees the
 tray icon change, which on a real PC takes a real game.  It needs the
-run's secret like every other call.
+run's secret like every other call.  So does POST /api/stand-in/tray-state
+with {"broken": true}, after which the app's call that says what the tray
+shows fails until {"broken": false}: that is how a trial sees how often a
+backend that is up, and gives no usable answer, is asked.
 """
 import sandbox as m                                 # noqa: F401  (first: the fake machine)
 
@@ -99,6 +102,15 @@ def main():
         game_profiles._engine["active_game"] = name
         game_profiles._engine["active_pid"] = 4242 if name else None
         return A.jsonify({"ok": True, "active_game": name})
+
+    whole = A.app.view_functions["api_tray_state"]
+
+    @A.app.route("/api/stand-in/tray-state", methods=["POST"])
+    def the_trays_state_fails_or_not():
+        broken = bool((A.request.get_json(silent=True) or {}).get("broken"))
+        A.app.view_functions["api_tray_state"] = (
+            lambda: (A.jsonify({"ok": False, "err": "made to fail for a trial"}), 500)) if broken else whole
+        return A.jsonify({"ok": True, "broken": broken})
 
     if "--die-with" in sys.argv:
         return int(_value("--die-with", "1"))

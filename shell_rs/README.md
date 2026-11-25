@@ -14,7 +14,7 @@ are as they were. The pieces:
 | `core/` | The shell without a window: which request is answered where, the backend's start and stop, quitting with a time limit, and whether this is the one copy | written, tested, tried against a stand-in backend |
 | `app/` | The window (Tauri, as for the updater), on the app's own page | written, tried for real against a stand-in backend |
 | the tray | The tray icon and its menu, and what the entry for starting at sign-in names | written, tried for real against a stand-in backend |
-| one file | `Vispora.exe` carrying the backend and unpacking it once per version | not started |
+| one file | The exe carrying the backend and unpacking it before it starts it, in one of two ways that the owner still has to choose between | written, tried for real with the real backend's files and a stand-in started in their place |
 
 ## How the two sides work together
 
@@ -302,16 +302,212 @@ entry names what it always named. This is written and tested as far as
 "what the entry would be"; no task is made by a test or a trial, and the
 task today's app makes is not touched.
 
-The exe is `VisporaShell.exe` for now. It gets the app's name in the
-one-file piece; until then no exe named after the app is ever started in a
-trial, because the app itself is running on the PC the trials are made on.
+## One file
+
+The download is to stay one file named `Vispora.exe`. That file is the
+shell, and it carries the app in itself: the app is built as a folder, the
+folder is made into one piece of bytes (a pack), the pack is compiled into
+the shell's exe, and the shell unpacks it before it starts it as its
+backend.
+
+### Building it
+
+Three steps: the folder, the pack, the exe. Nothing of it goes into
+`dist/`, `dist-*` or `build/`; `<out>` is a folder outside the repository,
+and `<target>` is where cargo builds to (see "Build" in the
+[README](../README.md)). As for `build.spec`, the native helper has to be
+built first, with the Python that releases are built with.
+
+```powershell
+pyinstaller backend.spec --noconfirm --distpath <out>\dist --workpath <out>\work
+
+cargo build --release --manifest-path shell_rs/core/Cargo.toml
+<target>\release\vispora-shell-try.exe --pack <out>\dist\VisporaBackend <out>\backend.pack lzms
+
+$env:VISPORA_BACKEND_PACK = "<out>\backend.pack"
+cargo build --release --locked --manifest-path shell_rs/app/Cargo.toml
+```
+
+* **`backend.spec`** builds what `build.spec` builds, as a folder with a
+  program in it (`VisporaBackend.exe`) and not as one exe that unpacks
+  itself. It runs `build.spec`'s own text up to the list of what goes in,
+  so the two cannot drift apart. `build.spec` is not changed and is still
+  what a release is built with. Why a folder: an exe that unpacks itself
+  does so into the person's temporary folder, which any of their programs
+  can write to, and runs as two processes. The folder's program is one
+  process, so a forced end ends all of the backend.
+* **The pack** (`core/src/pack.rs`; `vispora-shell-try` is the tool that
+  makes one, built with `core/`) is every file of the folder, squeezed by
+  itself, behind a list of the files with their lengths and SHA-256 marks.
+  The same folder gives the same pack, byte for byte. A file comes out of
+  it with its length and its mark, or not at all.
+* **Squeezing is Windows' own** (the Compression API in `cabinet.dll`, part
+  of Windows since Windows 8), and so are the marks (`bcrypt.dll`). No crate
+  was added for either and no squeezing code is written here. The library
+  is loaded from Windows' own folder and from nowhere else. `lzms` is the
+  smallest of the three ways Windows offers and the slowest to unpack;
+  the numbers are below.
+* **The exe carries the pack in itself** (`app/build.rs`, `include_bytes!`):
+  it is part of the program as Windows loaded it. It is not a file beside
+  the exe and not read back from the exe's file, which can be exchanged
+  under a running program. Built without `VISPORA_BACKEND_PACK` the exe
+  carries nothing: the trial build is made that way and is given a pack by
+  the trial; the build that ships, made that way, says that its files are
+  incomplete and ends.
+
+The exe that comes out is `VisporaShell.exe`. A release would carry it
+under the app's name. That has not been done, and no exe named after the
+app is ever made or started by a test or a trial: the app itself is running
+on the PC the trials are made on.
+
+### Where it is unpacked
+
+The backend runs with administrator rights. So where its files are before
+it is started decides whether a program without those rights can get code
+of its own run with them. The rules (`core/src/backend.rs`):
+
+* **Never into the person's own folders** (their temporary folder, their
+  AppData): any of their programs can write there. The two places that are
+  used are found without asking the environment, which a program without
+  rights sets for the next one: Windows' own folder for temporary files
+  (where the window's folder is) for a folder of one run, and the folder
+  for all users' data on the drive Windows is on (`ProgramData`) for a
+  folder that stays.
+* **Programs without rights can make folders of their own in both places.**
+  They cannot get into a folder that is the administrators'. So everything
+  rests on which folder the shell uses, and it uses one of two kinds only:
+  * one it made itself in this run: new (never one that was there), under
+    a name nobody can guess, owned by the administrators and closed to
+    everybody but them and Windows itself, marked as in use like the
+    window's folder;
+  * one that stays, which it has checked and holds. Checked: the folder is
+    a folder (no link), is owned by the administrators, its access list is
+    exactly the one the shell gives its folders, and its files are exactly
+    the files the exe carries, each with the same length and SHA-256, none
+    missing and none too many. Whose it is comes first: only in a folder
+    nobody else can write to does what the files hold now say anything
+    about what they hold a moment later. Held: the shell opens the folder
+    before it checks it, asks whose it is of what it opened, and keeps it
+    open until the app ends. Windows lets nobody remove or rename a folder
+    that is held this way, so the folder that was checked is the folder
+    every start of the backend runs from, also a start after a backend
+    that died.
+* **A folder with the right name that does not pass is never used, and
+  never put right.** It is left exactly as it is, the log says why, and the
+  backend is unpacked for this run instead. (Putting it right would mean
+  writing as administrator into something somebody else may own.)
+* **A folder that stays is made whole under another name** and given its
+  own only then, never onto something that is there, and is then checked
+  and held like one that was found. A start that is cut short leaves no
+  half folder under the name. What it leaves under the other name is taken
+  away by a later start, once it is ten minutes old: until then it may be
+  a folder that a copy in another session is unpacking into.
+* **Only folders of the shell's own making are ever taken away**, and only
+  ones that no copy of the app is using: a copy holds its folder, and
+  Windows refuses to hand out a held folder for removal. A folder of the
+  right kind of name that somebody else made is not touched.
+
+### Two ways of keeping it, and one switch
+
+Which of the two a build uses is one switch, and the choice is the owner's:
+
+| | (a) Unpacked at every start | (b) Unpacked once per version |
+| --- | --- | --- |
+| Build | the default | `--features keep-backend` |
+| Where | a new folder in Windows' own Temp folder, `Vispora-backend-run-<32 letters>` | `ProgramData\Vispora-backend-kept-<version>-<16 letters of the pack's mark>` |
+| At the quit | the folder is taken away | the folder stays |
+| At the next start | unpacked again | checked against the exe, then used |
+| After a run that was ended from outside | the next start takes the folder away | nothing to take away |
+| After an update | the same: nothing of the old version is left once the new one has started | the new version unpacks its own folder and takes the old one away |
+| On the PC when the app is not running | nothing | 57 MB in one folder, which stays when `Vispora.exe` is deleted |
+| Cleaning programs | the folder is in a temp folder, like today's app's. The app's own cleaner leaves it alone (below); another program's cleaner may not | not in a temp folder |
+
+A build that keeps none also takes away what a build that kept one left, so
+switching from (b) back to (a) leaves nothing behind either.
+
+What it costs, measured on the development PC with the real backend's
+files (206 files, 57.1 MB) in a trial build that carries them, everything
+already in the disk cache. The files, the unpacking, the checking and the
+taking away are real. The program that is then started is the stand-in, so
+"the first screen" is a trial's number in both columns; what counts there
+is the difference.
+
+| | Today's `Vispora.exe` | (a) every start | (b) first start | (b) later starts |
+| --- | --- | --- | --- | --- |
+| The download | 28.2 MB | 32.8 MB | 32.8 MB | 32.8 MB |
+| Unpacking, or checking | 0.3 s replayed from the disk cache, 2.9 s at a sign-in ([performance.md](../docs/performance.md)) | 94 ms | 108 ms (unpacking, then the check) | 11 ms |
+| The backend can be started, after the window was made | (it is the same process) | 109 ms | 121 ms | 23 ms |
+| A window on screen | after the unpacking and Python | 36 ms | 36 ms | 36 ms |
+| The first screen has its data (stand-in) | | 1.01 s | 1.02 s | 0.93 s |
+| Quit, until the shell's process has ended (stand-in) | | 0.27 s | 0.24 s | 0.24 s |
+| On the PC when the app is not running | nothing | nothing | 57.1 MB | 57.1 MB |
+
+The window does not wait for the unpacking in either way: it is on screen
+after 36 ms, and the backend is unpacked on the thread that starts it.
+
+Of the 32.8 MB, 6.8 MB are the shell and 26.1 MB the pack. The other two
+ways of squeezing: 28.4 MB (MSZIP) and 30.0 MB (XPRESS with Huffman, which
+unpacks in 42 ms where LZMS takes 94 ms).
+
+What these numbers do not say: a start from a cold disk (after a restart of
+the PC, and at sign-in, which is the worst moment for the disk), and what a
+virus scanner adds. In (a) the scanner sees 206 freshly written files at
+every start, as it does with today's app; in (b) only at the first start
+of a version, and the check reads files it has seen before. Neither has
+been measured.
+
+### What else changes behind the shell, for the one file
+
+* **An update is for the shell's exe.** Behind the shell the backend's own
+  exe is a file the shell unpacked. The shell says where it is when it
+  starts the backend (`shell_exe` in the hand-over), and `core/updater.py`
+  takes that wherever it took the app's exe: for what the standalone
+  updater is told, for the swap without it, and for what is started again
+  afterwards. Started as it always was, the app's own exe is used, as
+  before.
+* **An update leaves no unpacked backend of the old version behind.** The
+  updater swaps one exe and knows nothing about folders. The old version's
+  shell takes its folder for the run away when it quits for the update, as
+  at every quit; if it was ended instead, the new version's first start
+  takes it away; and a folder that stayed is taken away by the new
+  version's first start.
+* **The entry for starting at sign-in** names the exe it was made for. An
+  update swaps `Vispora.exe` where it is, so the entry stays right, as it
+  does today. Three cases where an entry is already there and names
+  something else: (1) An entry today's app made names today's
+  `Vispora.exe`; a one-file `Vispora.exe` put in its place by an update is
+  what the entry then starts, and nothing has to change. (2) The person
+  moves or renames the exe: the entry names the old place and starts
+  nothing, exactly as with today's app; switching the setting off and on
+  in the app makes it again. Nothing repairs it on its own, today or
+  behind the shell. (3) An entry that names another program altogether is
+  not looked at by the shell, and is not changed.
+* **The app's own cleaner leaves the shell's folders alone.** Clean now,
+  Refresh PC and the junk clean empty Windows' own Temp folder, which is
+  where the window's folder and a backend that is unpacked at every start
+  are. The cleaner already left unpacked one-file programs alone (`_MEI...`
+  folders), after it once deleted the app's own files from under it; it now
+  knows the shell's folders by name as well (`core/utils.py`,
+  `RUNNING_PROGRAMS_FOLDERS`).
+* **The Disk Analyzer refuses the folder the shell's exe is in**, as it
+  refuses the folder of today's exe.
+* **Not done: a program beside the exe.** The frame counter looks for
+  `PresentMon.exe` in the app's own data folder first, and then beside the
+  app's exe. Behind the shell "beside the app's exe" is the folder the
+  backend was unpacked into, where nothing of the person's is. The folder
+  the shell's exe is in is not searched: a program found there would be
+  run with administrator rights from a folder anybody can write to.
+  Whether to search it is the owner's to say.
 
 ### Trying the window
 
 ```
 cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
-python shell_rs/app/try_it.py                  # 71 checks; the window is never shown
+python shell_rs/app/try_it.py                  # 101 checks; the window is never shown
 python shell_rs/app/try_it.py --time           # the times
+python shell_rs/app/try_it.py --time --pack P  # ... and what unpacking the pack P costs, both ways
+python shell_rs/app/try_it.py --time --pack P --carried-by E
+                                               # the same, with a trial build E that carries P itself
 python shell_rs/app/try_it.py --picture x.png  # a picture of the window
 python shell_rs/app/try_it.py --show           # the window, to look at and click
 ```
@@ -327,8 +523,14 @@ to ship is made without that flag:
 cargo build --release --locked --manifest-path shell_rs/app/Cargo.toml
 ```
 
-It has nothing to start yet (the backend is packed in the one-file piece)
-and says that its files are incomplete.
+Built like that it carries no backend and says that its files are
+incomplete; "Building it" above has the command that gives it one.
+
+A trial build unpacks a pack too: one the trial names, or one it was built
+with. It then starts its stand-in whatever it unpacked. So the unpacking,
+the checking, the holding and the taking away are tried for real, with the
+real backend's files where its pack is used, and nothing of the real
+backend is ever started.
 
 Besides the page, the calls, the second start and the quit, the checks look
 at what another program on the PC could get at, with the real window:
@@ -357,7 +559,20 @@ at what another program on the PC could get at, with the real window:
   the folder that run has to leave behind is then searched for the secret
   as well;
 * where the window's folder cannot be made, the shell must not start and
-  must say so in words of its own.
+  must say so in words of its own;
+* the backend is unpacked both ways from a made-up pack of five files: the
+  folder for one run must hold exactly what the exe carries and the run's
+  mark, be closed like the window's, and be gone after the quit; one that a
+  run left behind (Windows ended it) must be taken away by the next start;
+  the folder that stays must be found, checked and used by the next start
+  without unpacking, must not be renamable while a copy runs from it, and
+  must be left alone by another version's start for as long; a folder
+  whose program was changed, and a folder of the right name that somebody
+  else made with the right files in it, must not be used and must be left
+  as they are; another version's start must take the old folder away, and
+  a build that keeps none must take away what was kept; and a pack that
+  cannot be read must end the app with words of its own and nothing left
+  behind.
 
 The tray is tried without a mouse, and for real. Its menu is read as
 Windows has it (the words, the ticks, what is greyed) and compared with
@@ -384,7 +599,10 @@ folder is tried, that it works in one for administrators only is not.
 | --- | --- |
 | `app/src/main.rs` | The window: first copy, WebView2, the page, the requests, the quit |
 | `app/src/tray.rs` | The tray icon: Tauri's, showing what `core/src/tray.rs` decides |
-| `app/build.rs`, `app/app.manifest`, `app/tauri.conf.json` | What the exe carries besides its code: icon, version (from `config.py`), a manifest that asks for no rights |
+| `app/build.rs`, `app/app.manifest`, `app/tauri.conf.json` | What the exe carries besides its code: icon, version (from `config.py`), a manifest that asks for no rights, and the backend's pack |
+| `core/src/pack.rs` | The pack: a folder of files as one piece of bytes, made, read, unpacked and held against a folder |
+| `core/src/backend.rs` | Where the backend is unpacked and which folder it is run from: the two ways, the checks, taking old folders away |
+| `../backend.spec` | The app built as a folder for the shell to carry (PyInstaller) |
 | `app/try_it.py` | Runs the real window exe against a stand-in backend, out of the way |
 | `core/src/instance.rs` | Is this the one copy, and does it have the rights it needs: the order of a start |
 | `core/src/router.rs` | Which request is answered where, and which is refused |
@@ -395,13 +613,16 @@ folder is tried, that it works in one for administrators only is not.
 | `core/src/tray.rs`, `core/pictures/` | Which picture the tray shows, its tooltip and its menu, decided from what the backend says; the three pictures, and the script that has the app draw them |
 | `core/src/trouble.rs` | What the person is told when the app cannot start |
 | `core/src/platform.rs`, `core/src/win.rs` | The doors to the outside (starting a program, a free port, random numbers), and the real ones |
-| `core/src/bin/try.rs` | `vispora-shell-try`: the shell without a window, driven by lines of JSON. For trying and for the tests; never shipped |
+| `core/src/bin/try.rs` | `vispora-shell-try`: the shell without a window, driven by lines of JSON, and the tool that makes a pack (`--pack`) and says what is in one (`--pack-says`). For trying, for the tests and for building; never shipped |
 | `core/build.rs` | Reads the app's version from `config.py`, the one place it is written |
 | `try_it.py` | Runs the trial tool against a stand-in backend and takes the times |
 
 In the app: `app.py`, "Running behind the shell" (the hand-over, whom the
 backend answers, leaving with the shell) and "The tray, behind the shell"
-(its calls); `core/autostart.py` (which exe the entry at sign-in names); and
+(its calls); `core/autostart.py` (which exe the entry at sign-in names);
+`core/updater.py` (which exe an update is for); `core/utils.py` and
+`core/cleaner.py` (the folders a cleaner leaves alone);
+`core/disk_analyzer.py` (the folder of the shell's exe is refused); and
 `tests/shell_backend_stand_in.py` (the app on the fake machine, as a backend
 for trials).
 
@@ -412,6 +633,11 @@ and decides which calls reach it. It uses no crates from outside this
 repository: its one dependency is `updater_rs/core`, for its JSON reader, and
 that has none either. A build of it downloads nothing. The window brings
 Tauri with it, as the updater's window did, in a crate of its own (`app/`).
+
+Carrying the backend added no crate to either lock file. Squeezing and the
+SHA-256 marks are Windows' own (`cabinet.dll`, `bcrypt.dll`), called
+directly; `updater_rs/core` has a SHA-256 of its own, which is used where
+Windows' is not to be had and which a test holds against Windows'.
 
 ## Build
 
@@ -471,12 +697,38 @@ it is told to start, and the only thing to tell it is the stand-in.
   does not say what an icon of another program shows): the trial reads the
   shell's own account of them, and a test compares the three pictures'
   files with what the app draws.
+* **The one-file exe has never been started.** The build that ships was
+  built with the real backend's pack in it (32.8 MB), to know its size,
+  and never run. So nobody has seen: the administrator prompt followed by
+  the unpacking; the real backend started from an unpacked folder; either
+  place as it really is (Windows' own Temp folder and `ProgramData`, with
+  folders that are the administrators': the trial's are in its own data
+  folder and closed to its own account); or an update from today's exe to
+  this one. The real backend was built as a folder to measure it, and was
+  never started either: that the app works when built that way, and not
+  as one exe, is not known. "The first real start" in
+  [docs/rust-port.md](../docs/rust-port.md) is the list for the owner.
+* **A cold start and the virus scanner** are not in the unpacking times
+  (see "Two ways of keeping it").
+* **A new exe has no reputation** with SmartScreen and virus scanners, and
+  this one writes 206 program files and then runs one of them, which is
+  what an installer does. How scanners take that is not known.
+* **A full disk, or a place that cannot be written to:** the shell says
+  that it could not get its background program ready, and ends. It does
+  not fall back to a place a program without rights can write to.
+* **The exe's manifest asks for nothing, and the shell asks for rights
+  itself.** Today's exe has Windows ask before it starts. Behind the shell
+  the person sees the same prompt a moment later: the app asks for it
+  itself, after it has looked whether a copy is already running, so a
+  second start that only wants the first copy's window gets no prompt at
+  all. To be told to the owner before a release, as a change in how the
+  app starts.
 * **The entry for starting at sign-in has never been made behind the
-  shell.** What it would be is tested. An entry that today's app made
-  names today's exe; once the shell is the app under the same name in the
-  same place, that is the shell. If the shell ever lives somewhere else,
-  an entry that is already there has to be made again: nothing does that
-  yet.
+  shell.** What it would be is tested. What becomes of an entry that is
+  already there is in "What else changes behind the shell, for the one
+  file": one that names the exe an update swaps stays right; one that
+  names a place the exe was moved away from starts nothing, as today, and
+  nothing repairs it on its own.
 * **The administrator prompt and a second start beside a copy that has
   administrator rights** have not been seen: the trials run without them.
   The event a second start rings is made so that a program without those
@@ -531,19 +783,33 @@ it is told to start, and the only thing to tell it is the stand-in.
   WebView2's switches for the PC's graphics card before it opens its
   window. The shell's window opens before the backend is up, and uses
   WebView2's defaults for now.
-* **Ending a backend ends one process.** That is right for a backend that
-  is one process. If the backend is ever packed so that the program the
-  shell starts is only an unpacker for the real one, a forced end would
-  leave the real one running as administrator with a valid secret, and a
-  restart would make two. Whatever the packaging piece does, a forced end
-  has to end all of it, and a test needs a stand-in with a child of its own.
+* **Ending a backend ends one process.** That is right for the backend as
+  it is packed: `backend.spec` builds a folder whose program is the backend
+  itself, not an unpacker that starts it. (A one-file exe from PyInstaller
+  would be two processes, and a forced end would leave the real one running
+  as administrator with a valid secret. `tests/test_one_file.py` holds
+  `backend.spec` to a folder.) What the backend itself starts and leaves
+  running is the backend's to end, as it is today.
 * **A backend that is alive but stuck is not noticed.** Once it is up, only
   its process is looked at. One that hangs is not started again; its calls
   wait until the page gives up on them.
 * The real backend has never been started by the shell. Its side of the
   arrangement is tested on the fake machine only, where the start-up work
   and a real quit's undoing do not happen.
-* Where the app's exe is, for the updater: behind the shell the backend's
-  own exe is not `Vispora.exe` any more. The hand-over says where the shell
-  is, and the entry at sign-in uses it; the updater does not yet, and
-  nothing needs it before the one-file piece.
+* **Other programs' cleaners.** A backend that is unpacked at every start
+  is in Windows' own Temp folder for as long as the app runs. The app's own
+  cleaner leaves it alone. A cleaner of somebody else's that empties that
+  folder while the app runs can take files from under it, as it can with
+  today's app, whose files are in the person's temporary folder. A folder
+  that stays is not in a temp folder.
+* **The shell ended by force, and a new start at once.** The updater's last
+  resort ends the app's exe by force, which behind the shell is the shell;
+  so does a person who starts the app again right after its shell crashed.
+  The old backend ends on its own when it sees the shell gone, after it has
+  put the system back. Whether that and the new backend's start-up work
+  can get in each other's way has not been tried.
+* **A folder of the right name that somebody else made stays for ever.**
+  The shell neither uses nor removes it. A program without rights can so
+  keep a build that unpacks once per version from ever doing that: every
+  start then unpacks for the run, which costs a tenth of a second and
+  nothing else.
