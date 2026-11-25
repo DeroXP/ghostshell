@@ -34,7 +34,7 @@ cargo build --release --locked --manifest-path updater_rs/app/Cargo.toml
 ```
 
 The exe is `updater_rs/app/target/release/VisporaUpdater.exe`: one file of
-5.6 MB (5,558,784 bytes), where the Python updater's is 14.5 MB. Nothing else
+5.6 MB (5,560,832 bytes), where the Python updater's is 14.5 MB. Nothing else
 has to be next to it. It needs Microsoft Edge WebView2 for its window, which
 is part of Windows 11 and of most Windows 10 PCs, and which the app's own
 window needs too.
@@ -124,19 +124,33 @@ install. The network is a table of answers, `tasklist` and `taskkill` are
 recorded, the clock does not wait, and the "install" is a folder in a
 temporary directory; Program Files and the user's folders point into it too.
 One file, `core/tests/http.rs`, runs the real HTTP client, against a listener
-on 127.0.0.1 that the test starts itself. Another, `core/tests/dialog.rs`,
-opens the real folder dialog and presses its buttons; it is left out of a
-normal run because it puts a window on the screen (how to run it is at its
-top).
+on 127.0.0.1 that the test starts itself.
+
+Two files are left out of a normal run, and say at their top how to run
+them. `core/tests/dialog.rs` opens the real folder dialog and presses its
+buttons, which puts a window on the screen. `core/tests/live.rs` runs the
+real HTTP client against the real internet, which the others never touch: it
+asks GitHub for the releases over https, downloads the app's file through
+GitHub's redirect into a temporary folder and compares its hash (nothing is
+installed or started), and sees two certificates that are wrong on purpose
+refused.
+
+Not from the Python tests, because the Python updater could not get there:
+the cases in `core/tests/robustness.rs` about closing more than once. Whoever
+stops an install waits until it has really ended, however many ask and in
+whatever order, so the updater cannot exit in the middle of the exe swap; and
+once it is closing, no install is started.
 
 `tests/test_updater_rs.py` (part of `python tests/run_all.py`) checks what
 only the Python side can: that the two updaters and the app agree on every
 name, address, argument and step, that the window is the Python one's, that
 Tauri is pinned and the exe asks for administrator rights, and, where the
 Rust side has been built, that it decides the same as `update_sources.py`
-for the same answers from GitHub. It does that through
-`vispora-updater-decide.exe`, a small tool built with `core/` that reads
-JSON, prints JSON, and opens no file and no connection.
+for the same answers from GitHub and reads a command line the way the Python
+updater's argparse does (the odd ones included: a few thousand made-up
+command lines). It does that through `vispora-updater-decide.exe`, a small
+tool built with `core/` that reads JSON, prints JSON, and opens no file and
+no connection.
 
 ### The exe itself
 
@@ -184,6 +198,20 @@ None changes what a normal update does.
   updater opened the page in the default browser in a similar spot.
 * **WebView2's profile folder** is `updater\webview` in the app's data folder,
   beside the updater's log.
+* **A number JSON cannot say is not handed to the page.** A server can send
+  `NaN` or a number beyond any machine's (Python's reader takes them, and so
+  does this one). Python then wrote `NaN` into the status the page reads,
+  which no browser accepts: the page lost its backend. Here it is written
+  as `null`.
+* **An answer that is not a download may be 8 MB at most.** GitHub's list of
+  releases is a few hundred KB. The Python updater read whatever came.
+* **Once the updater is closing, Install is refused.** In the Python updater
+  an install could begin in the moment between the end of the one that
+  Close waited for and the end of the process.
+* **Where Pythons disagree about a command line, 3.12 is followed.** That is
+  the Python the Python updater's exe is built with. Its argparse does not
+  take `-5.`, `-1e5`, `-1_000` or `-5a` as a value; later ones do. Everything
+  else is read the same by all three.
 
 ## What has not been done yet
 

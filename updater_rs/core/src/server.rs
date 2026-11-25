@@ -81,7 +81,10 @@ pub fn handle(updater: &Arc<Updater>, method: &str, path: &str, body: &[u8]) -> 
         "/static/app.js" => Response::new(200, "text/javascript; charset=utf-8", APP_JS),
         "/static/style.css" => Response::new(200, "text/css; charset=utf-8", STYLE_CSS),
         "/api/status" => Response::json(updater.lock().to_json()),
-        "/api/start" => Response::json(if updater.start_install() { ok() } else { refused("install already running") }),
+        "/api/start" => Response::json(match updater.start_install() {
+            Ok(()) => ok(),
+            Err(why) => refused(why),
+        }),
         "/api/cancel" => {
             let mut st = updater.lock();
             st.cancelled = true;
@@ -157,12 +160,16 @@ fn launch_app(updater: &Updater) -> Json {
 }
 
 /// Close the updater: a moment later, and only once an install that is
-/// running has stopped (the swap is never cut off half-way).
+/// running has ended (the swap is never cut off half-way).  That holds for
+/// every close, the second and the third as much as the first.  From the
+/// first one on, no install is started any more: the window stays while
+/// this waits, and its Install button with it.
 fn quit(updater: &Arc<Updater>) {
+    updater.begin_closing();
     let me = Arc::clone(updater);
     let _ = std::thread::Builder::new().name("updater-quit".into()).spawn(move || {
         me.platform.clock.sleep(0.3);
-        me.stop_install();
+        me.shut_down();
         let exit = me.exit_hook.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if let Some(exit) = exit {
             exit(0);

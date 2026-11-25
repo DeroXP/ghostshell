@@ -30,7 +30,7 @@
 //!     later run finds the right state.
 
 use std::io::Write as _;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::json::Json;
 use crate::paths::{self, Env, Paths, APP_EXE_NAMES, APP_NAME, LEGACY_APP_NAME};
@@ -48,11 +48,24 @@ pub struct Updater {
     pub paths: Paths,
     pub platform: Platform,
     pub state: Mutex<State>,
-    pub(crate) install_thread: Mutex<Option<std::thread::JoinHandle<i32>>>,
+    /// Whether an install is running beside the window, and whether the
+    /// updater is closing (see start_install, stop_install, shut_down).
+    pub(crate) run: Mutex<Run>,
+    /// Rung when a running install has ended, for everybody who waits for it.
+    pub(crate) run_ended: Condvar,
     /// Ends the process (the window's Close button, once the pipeline has stopped).
     pub exit_hook: Mutex<Option<ExitHook>>,
     /// The "pick a folder" dialog: the folder, or None when it was cancelled.
     pub folder_hook: Mutex<Option<FolderHook>>,
+}
+
+/// The install that runs beside the window.
+#[derive(Default)]
+pub(crate) struct Run {
+    /// The pipeline is on its thread and has not come back yet.
+    alive: bool,
+    /// The updater is on its way out: nothing new is begun.
+    closing: bool,
 }
 
 /// A build one of the places has.
@@ -139,7 +152,8 @@ impl Updater {
             paths,
             platform,
             state: Mutex::new(State::default()),
-            install_thread: Mutex::new(None),
+            run: Mutex::new(Run::default()),
+            run_ended: Condvar::new(),
             exit_hook: Mutex::new(None),
             folder_hook: Mutex::new(None),
         })
@@ -972,11 +986,28 @@ impl Updater {
 
     // ─── Running it beside the window ────────────────────────────────
 
-    /// Start the pipeline on a thread of its own.  False when one is running.
-    pub fn start_install(self: &Arc<Self>) -> bool {
-        let mut slot = self.install_thread.lock().unwrap_or_else(|p| p.into_inner());
-        if slot.as_ref().is_some_and(|t| !t.is_finished()) {
-            return false;
+    // One install at a time, on a thread of its own.  Whoever wants it
+    // stopped (the Close button, the window going away, both, either of
+    // them twice) waits until it has really ended: the process must never
+    // end while the exe is being swapped.  So nobody holds the thread
+    // itself, which only one of them could wait on.  `run` says whether an
+    // install is under way, and `run_ended` is rung when it is over, for as
+    // many as are waiting.
+
+    fn run(&self) -> MutexGuard<'_, Run> {
+        self.run.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Start the pipeline on a thread of its own.  Refused, with the reason,
+    /// while one is running (also one that was asked to stop and has not
+    /// stopped yet), and once the updater is closing.
+    pub fn start_install(self: &Arc<Self>) -> Result<(), &'static str> {
+        let mut run = self.run();
+        if run.alive {
+            return Err("install already running");
+        }
+        if run.closing {
+            return Err("the updater is closing");
         }
         {
             let now = self.platform.clock.now();
@@ -990,27 +1021,62 @@ impl Updater {
             st.ended_at = 0.0;
             st.steps = fresh_steps();
         }
-        let me = Arc::clone(self);
-        let thread = std::thread::Builder::new().name("updater-pipeline".into()).spawn(move || me.run_install_pipeline());
-        *slot = thread.ok();
-        slot.is_some()
+        /// Says that the install is over when the pipeline's thread is done
+        /// with it, however it ends.
+        struct Over(Arc<Updater>);
+        impl Drop for Over {
+            fn drop(&mut self) {
+                self.0.run().alive = false;
+                self.0.run_ended.notify_all();
+            }
+        }
+        run.alive = true;
+        // (let go of before the thread is made: should that fail, `Over` is
+        // dropped right here and takes this lock itself)
+        drop(run);
+        let over = Over(Arc::clone(self));
+        let started = std::thread::Builder::new().name("updater-pipeline".into()).spawn(move || {
+            over.0.run_install_pipeline();
+        });
+        match started {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.log(&format!("the install's thread could not be started: {e}"));
+                Err("the install could not be started")
+            }
+        }
     }
 
     pub fn install_running(&self) -> bool {
-        self.install_thread.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|t| !t.is_finished())
+        self.run().alive
     }
 
-    /// Cancel the install, if one is running, and wait until it has stopped.
+    /// Cancel the install, if one is running, and wait until it has ended.
     /// A cancel does not interrupt the exe swap, and exiting in the middle of
-    /// it can leave neither the old exe nor the new one in place.
+    /// it can leave neither the old exe nor the new one in place.  Everybody
+    /// who calls this waits, however many they are and whoever came first.
     pub fn stop_install(&self) {
-        let thread = self.install_thread.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if let Some(thread) = thread {
-            if !thread.is_finished() {
-                self.lock().cancelled = true;
-            }
-            let _ = thread.join();
+        let mut run = self.run();
+        if run.alive {
+            self.lock().cancelled = true;
         }
+        while run.alive {
+            run = self.run_ended.wait(run).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// The updater is closing: from here on no install is started.  Without
+    /// this, one could begin in the moment between the end of the install
+    /// that was waited for and the end of the process.
+    pub fn begin_closing(&self) {
+        self.run().closing = true;
+    }
+
+    /// The last thing before the process ends: no install is started any
+    /// more, and a running one is cancelled and waited for.
+    pub fn shut_down(&self) {
+        self.begin_closing();
+        self.stop_install();
     }
 }
 

@@ -11,8 +11,12 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use common::*;
 use vispora_updater_core::json::Json;
+use vispora_updater_core::platform::{Body, ANSWER_LIMIT};
 use vispora_updater_core::sha256;
 use vispora_updater_core::sources::{github_app_release, github_updater};
 use vispora_updater_core::state::PIPELINE_STEPS;
@@ -460,4 +464,56 @@ fn the_updater_keeps_the_apps_note_of_where_updates_come_from() {
     assert_eq!((info["version"].as_str(), info["update_source"].as_str()), (Some(NEWER), Some("server")),
                "a second run by hand asks the same place");
     assert!(!rig.net.calls().contains(&GITHUB.to_string()));
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Not among the Python cases: what a wild answer does to the window
+// ═════════════════════════════════════════════════════════════════════
+
+#[test]
+fn a_number_json_cannot_say_does_not_reach_the_page() {
+    // Python's json takes NaN and Infinity from a server, and the reader
+    // here does too.  The status the page reads must still be something a
+    // browser can read: one NaN in it, and the page could read no status
+    // again ("Cannot reach updater backend", and buttons that do nothing).
+    let rig = Rig::update();
+    rig.net.publish("stable", NEWER, &app_new(), None, SERVER);
+    let url = format!("{SERVER}/version/stable");
+    let meta = String::from_utf8(rig.net.routes.lock().unwrap()[&url].clone()).unwrap();
+    let wild = "\"notes\": NaN, \"released_at\": 1e999, \"size_bytes\": -Infinity";
+    rig.net.route(&url, format!("{}, {wild}}}", meta.trim_end().trim_end_matches('}')));
+    assert_eq!(rig.run(), 0);
+    let status = rig.get("/api/status");
+    let text = String::from_utf8(status.body.clone()).unwrap();
+    assert!(!text.contains("NaN") && !text.contains("Infinity"), "{text}");
+    let read = status.to_json();
+    assert_eq!((&read["channel_check"]["notes"], &read["channel_check"]["released_at"]), (&Json::Null, &Json::Null));
+    assert_eq!(read["channel_check"]["version"], Json::from(NEWER));
+    assert_eq!(read["phase"], Json::from("done"));
+}
+
+#[test]
+fn an_answer_without_an_end_is_given_up_on() {
+    /// Blanks for as long as anybody reads.
+    struct Endless(Arc<AtomicUsize>);
+    impl Body for Endless {
+        fn content_length(&self) -> Option<u64> {
+            None
+        }
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, String> {
+            buf.fill(b' ');
+            self.0.fetch_add(buf.len(), Ordering::SeqCst);
+            Ok(buf.len())
+        }
+    }
+    let rig = Rig::update();
+    let handed_out = Arc::new(AtomicUsize::new(0));
+    let counter = handed_out.clone();
+    *rig.net.opener.lock().unwrap() = Some(Box::new(move |url: &str| {
+        url.contains("api.github.com").then(|| Ok(Box::new(Endless(counter.clone())) as Box<dyn Body>))
+    }));
+    assert_eq!(rig.updater.check_github("stable").unwrap_err(), "could not reach GitHub");
+    let read = handed_out.load(Ordering::SeqCst);
+    assert!(read > ANSWER_LIMIT && read <= ANSWER_LIMIT + 2 * 65536,
+            "{read} bytes were read of an answer that never ends");
 }

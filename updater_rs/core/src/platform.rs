@@ -16,6 +16,12 @@ pub trait Body {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, String>;
 }
 
+/// The most a whole answer may be (Net::get).  GitHub's list of releases is
+/// a few hundred KB and the update server's answer a few hundred bytes; a
+/// JSON answer many times this size, made of small values, would need
+/// gigabytes once read.
+pub const ANSWER_LIMIT: usize = 8 * 1024 * 1024;
+
 pub trait Net: Send + Sync {
     /// GET `url` and hand back its body to read piece by piece.  Anything but
     /// a 2xx answer (after following redirects) is an error.
@@ -32,7 +38,7 @@ pub trait Net: Send + Sync {
                 return Ok(out);
             }
             out.extend_from_slice(&buf[..n]);
-            if out.len() > 64 * 1024 * 1024 {
+            if out.len() > ANSWER_LIMIT {
                 return Err("the answer is far too large to be one".into());
             }
         }

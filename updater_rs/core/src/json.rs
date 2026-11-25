@@ -6,7 +6,12 @@
 //! and numbers too large for any machine number are values, not errors (the
 //! update server's `size_bytes` is only a hint, and a wild one must not stop
 //! an install).  A key that appears twice keeps its last value, as a Python
-//! dict does.
+//! dict does.  What Python refuses is refused here too: a number with a
+//! leading zero, say.
+//!
+//! The writer is stricter than Python's: a number JSON has no way to write
+//! (`NaN`, an infinity) comes out as `null`.  Python wrote `NaN`, which no
+//! browser reads, and what is written here is read by the window's page.
 //!
 //! No outside crates (see Cargo.toml).
 
@@ -167,6 +172,9 @@ impl Json {
             Json::Int(n) => {
                 let _ = write!(out, "{n}");
             }
+            // (see the top of the file: one `NaN` in a status and the page
+            // could not read any status again)
+            Json::Float(f) if !f.is_finite() => out.push_str("null"),
             Json::Float(f) => out.push_str(&float_text(*f, "NaN", "Infinity")),
             Json::Str(s) => write_string(out, s),
             Json::Array(items) if items.is_empty() => out.push_str("[]"),
@@ -408,8 +416,13 @@ impl Parser<'_> {
         if self.bytes.get(self.at) == Some(&b'-') {
             self.at += 1;
         }
+        let first_digit = self.at;
         if !digits(self) {
             return Err(format!("not a number at byte {start}"));
+        }
+        // 0 or a number that does not begin with 0: "01" is not one.
+        if self.bytes[first_digit] == b'0' && self.at > first_digit + 1 {
+            return Err(format!("a number with a leading zero at byte {start}"));
         }
         let mut whole = true;
         if self.bytes.get(self.at) == Some(&b'.') {
@@ -510,6 +523,29 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_json_cannot_say_is_written_as_null() {
+        // What a server can send and Python's json.loads takes ...
+        let read = Json::parse("{\"a\": NaN, \"b\": Infinity, \"c\": -Infinity, \"d\": 1e999, \"e\": [-1e999, 1.5]}").unwrap();
+        assert!(matches!(read["d"], Json::Float(f) if f.is_infinite()));
+        // ... is never handed on in a form a browser's JSON.parse refuses.
+        assert_eq!(read.to_string(), "{\"a\":null,\"b\":null,\"c\":null,\"d\":null,\"e\":[null,1.5]}");
+        let pretty = read.to_pretty();
+        assert!(!pretty.contains("NaN") && !pretty.contains("Infinity") && pretty.contains("\"a\": null"));
+        // Python's str() of them is another matter, and stays.
+        assert_eq!((read["a"].py_str(), read["c"].py_str()), ("nan".to_string(), "-inf".to_string()));
+    }
+
+    #[test]
+    fn a_number_with_a_leading_zero_is_refused_as_python_refuses_it() {
+        for bad in ["01", "-01", "00", "-00", "[01]", "{\"a\": 007}", "01.5", "00e1"] {
+            assert!(Json::parse(bad).is_err(), "{bad}");
+        }
+        for good in ["0", "-0", "0.5", "-0.5", "0e1", "10", "[0, 10, 0.01]", "100"] {
+            assert!(Json::parse(good).is_ok(), "{good}");
+        }
+    }
 
     #[test]
     fn what_is_written_reads_back_the_same() {

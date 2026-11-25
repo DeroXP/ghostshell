@@ -30,7 +30,9 @@ const TITLE: &str = "Vispora Updater";
 const EXIT_UNEXPECTED: i32 = 9;
 
 fn main() {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // (lossily: an argument that is not valid Unicode is a wrong argument,
+    // not a reason to stop before the first line of the log)
+    let argv: Vec<String> = std::env::args_os().skip(1).map(|word| word.to_string_lossy().into_owned()).collect();
     let args = match cli::parse_args(&argv) {
         Ok(args) => args,
         Err(e) => {
@@ -52,8 +54,9 @@ fn with_window(updater: &Arc<Updater>) -> i32 {
     };
     let code = app.run_return(|_, _| {});
     // The window is gone (Alt+F4, say), but an install may still be running:
-    // returning now would cut an exe swap off half-way.
-    updater.stop_install();
+    // returning now would cut an exe swap off half-way.  This waits for it,
+    // whoever else is waiting for it already.
+    updater.shut_down();
     code
 }
 
