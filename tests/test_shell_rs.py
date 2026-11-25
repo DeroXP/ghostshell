@@ -305,6 +305,192 @@ def can_be_listened_on(port):
     return tuple(got)
 
 
+def app_crate(*path):
+    with open(os.path.join(SHELL, "app", *path), encoding="utf-8") as f:
+        return f.read()
+
+
+# ═════════════════════════════════════════════════════════════════════
+# The window (shell_rs/app)
+# ═════════════════════════════════════════════════════════════════════
+def test_the_window_brings_no_crate_the_updaters_window_did_not():
+    manifest = app_crate("Cargo.toml")
+    pinned = dict(re.findall(r'^(tauri(?:-build)?) = \{ version = "=(\d+\.\d+\.\d+)"', manifest, re.M))
+    theirs = dict(re.findall(r'^(tauri(?:-build)?) = \{ version = "=(\d+\.\d+\.\d+)"',
+                             repo("updater_rs", "app", "Cargo.toml"), re.M))
+    assert pinned == theirs and set(pinned) == {"tauri", "tauri-build"}, "the versions the updater's window pinned"
+    assert 'default-features = false, features = ["wry", "custom-protocol"]' in manifest, "the window and nothing else"
+    wanted = manifest[manifest.index("[dependencies]"):manifest.index("[profile.release]")]
+    assert sorted(re.findall(r"^([\w-]+) = ", wanted, re.M)) == ["tauri", "tauri-build", "vispora-shell-core"]
+
+    def outside(lock):
+        packages = re.split(r"\n\[\[package\]\]\n", lock)[1:]
+        found = set()
+        for package in packages:
+            name, version = re.match(r'name = "([^"]+)"\nversion = "([^"]+)"', package).groups()
+            if "source = " in package:
+                assert 'source = "registry+https://github.com/rust-lang/crates.io-index"' in package, name
+                assert re.search(r'^checksum = "[0-9a-f]{64}"$', package, re.M), name
+                found.add((name, version))
+            else:
+                assert name.startswith("vispora-"), name
+        return found
+
+    ours, updaters = outside(app_crate("Cargo.lock")), outside(repo("updater_rs", "app", "Cargo.lock"))
+    assert ours == updaters and len(ours) > 100, sorted(ours ^ updaters)
+    assert "cargo build --release --locked --manifest-path shell_rs/app/Cargo.toml" in repo("shell_rs", "README.md")
+
+
+def test_the_window_is_the_python_apps_window():
+    python, main = repo("app.py"), app_crate("src", "main.rs")
+    made = python[python.index("_webview_window = webview.create_window("):python.index("if from_autostart:\n            global _window_hidden")]
+    width, height = re.search(r"width=(\d+),\s*height=(\d+)", made).groups()
+    least = re.search(r"min_size=\((\d+), (\d+)\)", made).groups()
+    assert f".inner_size({width}.0, {height}.0)" in main and f".min_inner_size({least[0]}.0, {least[1]}.0)" in main
+    colour = re.search(r'background_color="#([0-9a-f]{6})"', made).group(1)
+    red, green, blue = (int(colour[i:i + 2], 16) for i in (0, 2, 4))
+    assert f".background_color(Color({red}, {green}, {blue}, 255))" in main
+    assert "frameless=True" in made and ".decorations(false)" in main
+    assert "hidden=from_autostart" in made and "_ if from_autostart => window.visible(false)," in main
+    assert ".title(APP_NAME)" in main and "config.APP_NAME," in made
+    # The page is opened with the secret at the end of its address, as it always was.
+    assert 'f"http://127.0.0.1:{config.APP_PORT}/#t={_API_TOKEN}"' in python
+    assert 'format!("{PAGE}{}", shell.fragment())' in main and 'format!("#t={}", self.token.as_str())' in rust("src", "shell.rs")
+    # What the page asks goes to the core, and nowhere else.
+    assert "let answer = shell.handle(&request);" in main
+    # A window closed from outside does not end the process before the backend has put the system back.
+    assert 'shell.quit_and_wait("the window was closed")' in main
+    assert main.index("app.run_return(") < main.index('shell.quit_and_wait("the window was closed")')
+
+
+def test_the_page_finds_what_it_asked_pywebview_for():
+    """static/js/app.js was written for pywebview's window and is not changed.
+    Everything it asks of `window.pywebview.api` is there in the shell's
+    window, and the parts of the page that moved pywebview's window move
+    this one."""
+    page, script = rust("src", "page.rs"), repo("static", "js", "app.js")
+    shim = page[page.index('const SHIM: &str = r#"'):page.index('"#;', page.index('const SHIM: &str = r#"'))]
+    asked = set(re.findall(r"\bapi\.([a-z_]+)\b", script))
+    assert asked == {"get_api_token", "minimize", "close_to_tray"}, asked
+    offered = set(re.findall(r"^        ([a-z_]+): function", shim, re.M))
+    a = app()
+    in_python = {name for name in vars(a.WindowJSAPI) if not name.startswith("_")}
+    assert offered == in_python and asked <= offered, (offered, in_python)
+    # Each of them is a call to the shell, with the secret, which answers it itself.
+    router = rust("src", "router.rs")
+    for path in ("/api/window/minimize", "/api/window/close", "/api/window/show"):
+        assert f"ask('{path}')" in shim and f'"{path}" =>' in router, path
+    assert "'X-Vispora-Token': token" in shim and a._API_TOKEN_HEADER == "X-Vispora-Token"
+    # Dragging: only the marked parts themselves, as pywebview did it, not the buttons inside them.
+    assert "pywebview-drag-region" in repo("templates", "index.html")
+    assert ".pywebview-drag-region { -webkit-app-region: drag; }" in shim
+    assert ".pywebview-drag-region *:not(.pywebview-drag-region) { -webkit-app-region: no-drag; }" in shim
+    assert "-webkit-app-region" not in repo("static", "css", "style.css"), "the page's own style does not do it"
+    # It is given to the window's own page by the window, and never served.
+    assert ".initialization_script(page::shim(shell.token()))" in app_crate("src", "main.rs")
+    assert "SHIM" not in router and "shim" not in router
+
+
+def test_the_windows_page_cannot_reach_tauris_commands():
+    main = app_crate("src", "main.rs")
+    for word in ("invoke_handler", "generate_handler", "tauri::command", ".plugin("):
+        assert word not in main, word
+    conf = json.loads(app_crate("tauri.conf.json"))
+    assert conf["app"]["security"]["capabilities"] == [] and conf["app"]["windows"] == []
+    assert not conf["app"].get("withGlobalTauri") and conf["bundle"]["active"] is False
+    assert not os.path.isdir(os.path.join(SHELL, "app", "capabilities"))
+    assert ".on_navigation(" in main and "NewWindowResponse::Deny" in main
+    # A link goes to the browser the way Explorer would start it, not as a
+    # child that inherits this program's handles (the listening socket).
+    assert "win::start_other(url.as_str(), \"\")" in main and 'matches!(url.scheme(), "http" | "https")' in main
+    assert "std::process::Command" not in main, "the window starts nothing itself"
+    # WebView2 is asked for before a window is made, and a missing one is said in a plain message.
+    run = main[main.index("fn run("):]
+    assert run.index("tauri::webview_version()?") < run.index("Shell::new(") < run.index("WebviewWindowBuilder::new(")
+    assert "Microsoft Edge WebView2" in main and "win::tell(APP_NAME" in main
+
+
+def test_a_first_copy_is_looked_for_before_anything_asks_for_rights():
+    """A second start must not put Windows' prompt on the screen only to say
+    that the app is running.  So the exe itself does not ask for rights (a
+    manifest that did would put the prompt before everything); the shell
+    asks, after it has looked for a first copy."""
+    main, instance = app_crate("src", "main.rs"), rust("src", "instance.rs")
+    manifest, build = app_crate("app.manifest"), app_crate("build.rs")
+    assert 'level="asInvoker"' in manifest and "requireAdministrator" not in manifest
+    assert 'include_str!("app.manifest")' in build and '!manifest.contains("requireAdministrator")' in build
+    assert re.search(r'^default = \["elevated"\]$', app_crate("Cargo.toml"), re.M)
+    assert 'const ASKS_FOR_RIGHTS: bool = cfg!(feature = "elevated");' in main
+    # In main(): first copy, then everything else.
+    body = main[main.index("fn main() {"):main.index("/// Open the window, start the backend")]
+    begun = body.index("instance::begin(&win::session(names), ASKS_FOR_RIGHTS, &arguments)")
+    assert begun < body.index("paths::Paths::resolve(") < body.index("run(Settings::new(")
+    assert "Begin::Shown | Begin::Running | Begin::Elevating => return," in body
+    # In begin(): show the other, then rights, then the name.
+    order = instance[instance.index("pub fn begin("):instance.index("#[cfg(test)]")]
+    assert order.index("session.ask_other_to_show()") < order.index("session.another_is_running()") \
+        < order.index("session.has_administrator_rights()") < order.index("session.become_the_one()")
+    # The name is the one the Python app holds, so that an old copy and a new one see each other.
+    win = rust("src", "win.rs")
+    name = re.search(r'MUTEX_NAME\s*=\s*r"([^"]+)"', repo("app.py")).group(1)
+    assert f'one_copy: r"{name}".to_string(),' in win
+
+
+def test_a_trial_of_the_window_never_meets_the_installed_app():
+    main, trial, manifest = app_crate("src", "main.rs"), app_crate("try_it.py"), app_crate("Cargo.toml")
+    names = [name.lower() for name in re.findall(r'^name = "([^"]+)"$', manifest, re.M)]
+    assert "vispora" not in names and "ghostshell" not in names and "visporashell" in names, \
+        "no exe named after the app is ever started in a trial"
+    # A trial build takes its backend and its names from the trial, the build that ships reads none of it.
+    assert "if ASKS_FOR_RIGHTS {\n        return None;\n    }" in main
+    assert "win::Names::for_a_trial(&trial.tag)" in main and "win::Names::of_the_app" in main
+    assert "if !ASKS_FOR_RIGHTS && trial.is_none() {" in main, "a trial build without a trial does not act as the app"
+    # The script: the stand-in backend, redirected folders, never elevated, never the build that ships.
+    assert 'STAND_IN = os.path.join(REPO, "tests", "shell_backend_stand_in.py")' in trial
+    assert '"backend": {"program": sys.executable, "args": ["-u", STAND_IN], "cwd": REPO},' in trial
+    for folder in ("APPDATA", "LOCALAPPDATA", "USERPROFILE"):
+        assert f'("{folder}", ' in trial, folder
+    assert 'refuse("this terminal runs as administrator' in trial
+    assert 'if b"VISPORA_SHELL_TRY" not in f.read():' in trial
+    assert "taskkill\", \"/PID\", str(self.process.pid)" in trial and "/IM" not in trial, \
+        "only the process the trial started is ever ended, and by its number"
+
+
+def test_what_else_the_shell_starts_does_not_get_its_socket():
+    """The shell's listening socket is inheritable on purpose: the backend
+    inherits it.  A browser the shell opens for a link must not."""
+    app()
+    if not TRY:
+        return
+    t = Trial()
+    try:
+        assert t.ask(do="wait", **{"for": "ready"}, within=90) == {"phase": "ready"}
+        state = t.ask(do="state")
+        handle, port = state["listen"], state["port"]
+        out = os.path.join(m.ROOT, "inherited.txt")
+        looks = ("import socket, sys\n"
+                 "try:\n"
+                 "    s = socket.socket(fileno=int(sys.argv[1]))\n"
+                 "    got = 'got it' if s.getsockname()[1] == int(sys.argv[2]) else 'another socket'\n"
+                 "    s.detach()\n"
+                 "except OSError:\n"
+                 "    got = 'nothing there'\n"
+                 "open(sys.argv[3], 'w').write(got)\n")
+        script = os.path.join(m.ROOT, "looks_for_the_socket.py")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(looks)
+        started = t.ask(do="start_other", target=sys.executable.replace("python.exe", "pythonw.exe"),
+                        parameters=subprocess.list2cmdline([script, str(handle), str(port), out]))
+        assert started["ok"] is True, started
+        deadline = time.time() + 30
+        while not os.path.isfile(out) and time.time() < deadline:
+            time.sleep(0.05)
+        with open(out, encoding="utf-8") as f:
+            assert f.read() == "nothing there", "a program the shell started got the shell's listening socket"
+    finally:
+        t.close()
+
+
 def ended(pid, within=30):
     """Has the process `pid` ended, at the latest `within` seconds from now?"""
     done = []

@@ -1,0 +1,16 @@
+{
+  "productName": "Vispora",
+  "identifier": "com.vispora.shell",
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null,
+      "capabilities": []
+    }
+  },
+  "bundle": {
+    "active": false,
+    "publisher": "Vispora",
+    "icon": ["../../assets/vispora.ico"]
+  }
+}

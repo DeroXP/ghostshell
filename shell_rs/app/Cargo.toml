@@ -1,0 +1,38 @@
+[package]
+name = "vispora-shell"
+# Not the app's version: that is read from config.py when this is built
+# (build.rs here and in ../core), so that it is written in one place only.
+version = "0.1.0"
+edition = "2021"
+description = "The shell that is to become Vispora.exe: the window around shell_rs/core"
+license = "MIT"
+publish = false
+
+# Not named Vispora yet, on purpose: no exe of that name is ever started in a
+# trial (the app's own is running on the PC the trials are made on).  The
+# one-file piece gives it its name.
+[[bin]]
+name = "VisporaShell"
+path = "src/main.rs"
+
+[features]
+default = ["elevated"]
+# The build that is meant to ship: it asks for administrator rights when it
+# is the first copy and does not have them (see ../core/src/instance.rs).
+# Without this feature the exe never asks, and only runs as a trial: with a
+# stand-in backend and names of its own (see try_it.py).
+elevated = []
+
+[dependencies]
+vispora-shell-core = { path = "../core" }
+tauri = { version = "=2.12.7", default-features = false, features = ["wry", "custom-protocol"] }
+
+[build-dependencies]
+tauri-build = { version = "=2.7.6", default-features = false, features = ["config-json"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"

@@ -158,6 +158,12 @@ pub struct Shell {
     pub log_hook: Mutex<Option<LogHook>>,
 }
 
+/// What the page is told when the backend never came up.  It may be a PC
+/// on which opening the app again does not help either (old network filter
+/// software can keep a program from using a socket it inherits), so it
+/// says where the reason is written down.
+pub const NEVER_UP: &str = "Vispora's background program does not start. Close Vispora and open it again. \n                            If that does not help, the reason is in the file vispora.log in Vispora's data folder.";
+
 /// How a backend that was being watched stopped being watched.
 enum Watched {
     /// The shell is quitting: the end of the backend is the quit's business.
@@ -230,6 +236,11 @@ impl Shell {
         self.listening.port()
     }
 
+    /// The number the backend finds that socket under.
+    pub fn listening_handle(&self) -> u64 {
+        self.listening.handle()
+    }
+
     /// The backend's process id, while there is one.
     pub fn backend_pid(&self) -> Option<u32> {
         self.state().child.as_ref().map(|child| child.id())
@@ -251,7 +262,7 @@ impl Shell {
         self.state().history.clone()
     }
 
-    pub(crate) fn say(&self, line: &str) {
+    pub fn say(&self, line: &str) {
         {
             let mut st = self.state();
             if st.history.len() < 500 {
@@ -343,7 +354,7 @@ impl Shell {
                     let tries = self.state().never_up_in_a_row;
                     if tries > self.settings.restarts {
                         self.say(&format!("the backend did not come up ({what}), {tries} times in a row: not started again"));
-                        self.give_up("Vispora's background program does not start. Close Vispora and open it again.".to_string());
+                        self.give_up(NEVER_UP.to_string());
                         return;
                     }
                     what

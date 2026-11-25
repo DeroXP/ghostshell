@@ -455,21 +455,23 @@ number PowerShell prints.
 
 ## The shell (step 3), so far
 
-The shell's core exists (`shell_rs/core`); its window does not yet. So what
-can be timed is the shell without a window, with a backend that is **not
-the real one**: the app on the fake machine of the tests
-(`python shell_rs/try_it.py`, five runs, the middle value). Which of these
-numbers say something about a real PC and which do not:
+The shell's core and its window exist (`shell_rs/core`, `shell_rs/app`).
+What can be timed is the shell with a backend that is **not the real one**:
+the app on the fake machine of the tests (`python shell_rs/try_it.py` for
+the core alone, `python shell_rs/app/try_it.py --time` for the window; five
+runs each, the middle value). Which of these numbers say something about a
+real PC and which do not:
 
 | | Today | The shell, in the trial | What the trial's number is worth |
 | --- | --- | --- | --- |
 | The shell's process is up | (does not exist) | 12 ms | Real: it is the shell's own exe. Without the window, which will add to it |
 | The page can be handed to a window | after the unpacking (0.3 to 2.9 s) and Python and Flask (0.5 s and more) | **14 ms** after the shell's process started | Real for the shell. It does not wait for the backend: the page is compiled in |
-| A window on screen | 1 s (1 to 5) after the first log line, by hand | not measured | There is no window yet. The next piece |
+| A window on screen | 1 s (1 to 5) after the first log line, by hand, which itself comes after the unpacking | **35 ms** after the shell's process started | Real: the shell's own exe and window, drawn beyond the edge of the desktop. Not the build that asks for administrator rights, whose prompt comes first |
+| The first screen has its data | 14 s (6 to 44) after the first log line, by hand | 0.9 s after the shell's process started | A trial's: it waits for the backend, which here is the app on the fake machine with no start-up work. The window and the page in it are the real ones |
 | The backend answers | (the same process) | 0.6 s after the shell started it | A trial's. Python 3.14 from source on the fake machine: no unpacking, no start-up work. A real backend does more |
 | A call the page makes | straight to Flask | 0.8 ms through the shell and back (1.0 ms for the slowest in twenty) | Real for the way through the shell; the route asked is the cheapest one |
 | A call the shell answers itself | (goes to Flask) | under 0.05 ms | Real |
-| Quit, until both processes are gone | not measured (see Quitting) | 0.1 s | A trial's: on the fake machine a quit has nothing to undo. What is real: the fixed half second before the old exit is not waited behind the shell |
+| Quit, until both processes are gone | not measured (see Quitting) | 0.1 s (the same with the window: 0.13 s from closing it) | A trial's: on the fake machine a quit has nothing to undo. What is real: the fixed half second before the old exit is not waited behind the shell |
 
 What the shell changes about waiting, whatever the numbers turn out to be:
 
@@ -480,9 +482,10 @@ What the shell changes about waiting, whatever the numbers turn out to be:
   of 30 seconds, after which the backend is ended and the next start puts
   back what was left.
 
-Still to be measured, and by whom: a window on screen (the next piece, in
-its trial); the real backend's start behind the shell and a real quit (the
-owner's PC, once a build exists that they choose to run).
+Still to be measured, and by whom: when the page is first painted in the
+window (the trial sees the window appear and the page's first call, not the
+paint in between); the real backend's start behind the shell and a real quit
+(the owner's PC, once a build exists that they choose to run).
 
 ## Measuring again
 

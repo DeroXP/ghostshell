@@ -13,13 +13,15 @@
 //!   else;
 //! * `shell`: starting the backend, noticing when it stops, starting it
 //!   again, and quitting with a time limit;
+//! * `instance`: is this the one copy, and does it have the rights it
+//!   needs;
 //! * `token`: the secret of one run, which tells the shell's own page from a
 //!   stranger and the shell's calls from anybody else's;
 //! * `platform` and `win`: the doors to the outside (starting a program,
 //!   random numbers), and the real ones.
 //!
-//! The window, the tray, telling a second copy from the first and autostart
-//! are not here yet.  Nothing in a release uses this crate yet.
+//! The window itself is the crate next to this one (shell_rs/app).  The
+//! tray is not here yet.  Nothing in a release uses this crate yet.
 //!
 //! No outside crates (see Cargo.toml).
 
@@ -27,6 +29,7 @@
 
 pub mod forward;
 pub mod http;
+pub mod instance;
 pub mod page;
 pub mod platform;
 pub mod router;
@@ -35,6 +38,13 @@ pub mod token;
 pub mod win;
 
 pub use vispora_updater_core::json;
+/// Where the app keeps its data (the folder the page shows, and the logs).
+pub use vispora_updater_core::paths;
+
+/// The local time, as the app's logs write it.
+pub fn stamp() -> String {
+    vispora_updater_core::win::platform().clock.stamp()
+}
 
 /// The app's version and name, from config.py (see build.rs).
 pub const APP_VERSION: &str = env!("VISPORA_APP_VERSION");

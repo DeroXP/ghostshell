@@ -89,11 +89,12 @@ Name a folder elsewhere, in the terminal the builds are run in:
 $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\vispora-build"
 cargo build --release --locked --manifest-path updater_rs/app/Cargo.toml
 cargo build --release --manifest-path shell_rs/core/Cargo.toml
+cargo build --release --locked --manifest-path shell_rs/app/Cargo.toml
 ```
 
 The tests and the trial scripts look in that folder first for what cargo
 built (`tests/test_shell_rs.py`, `tests/test_updater_rs.py`,
-`shell_rs/try_it.py`, `updater_rs/app/try_it.py`), so run them from the same
+`shell_rs/try_it.py`, `shell_rs/app/try_it.py`, `updater_rs/app/try_it.py`), so run them from the same
 terminal. **Build `native/` without it** (a new terminal, or
 `Remove-Item Env:CARGO_TARGET_DIR`): `build.spec` and the app look for the
 helper in `native/target`, and that folder is small.
@@ -165,7 +166,7 @@ fake machine as its backend. The real backend is never started by a test.
 | `native/` | The native helper: a Rust library for the readings the app takes all the time and the ones a start waits for (see `native/README.md`) |
 | `static/`, `templates/` | The UI (plain JS/CSS, no build step) |
 | `updater/` | The standalone updater app (its own Flask + pywebview window) |
-| `shell_rs/` | The shell that is to become `Vispora.exe`, in Rust, not released yet: so far its core, without a window (which request is answered where, the backend's start and stop, quitting). See `shell_rs/README.md` |
+| `shell_rs/` | The shell that is to become `Vispora.exe`, in Rust, not released yet: so far its core (which request is answered where, the backend's start and stop, quitting) and its window, without the tray. See `shell_rs/README.md` |
 | `updater_rs/` | The same updater rewritten in Rust, not released yet: `core/` does the work with no outside crates, `app/` is its window (Tauri). See `updater_rs/README.md` |
 | `tests/` | The test suite and the fake machine it runs on (see [Test](#test)) |
 | `cloud/` | Optional FastAPI licensing / trial backend (see `cloud/README.md`) |
