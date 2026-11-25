@@ -82,12 +82,16 @@ def test_the_core_uses_no_outside_crates():
     manifest = rust("Cargo.toml")
     wanted = manifest[manifest.index("[dependencies]"):manifest.index("[profile.release]")]
     lines = [line for line in wanted.splitlines()[1:] if line.strip() and not line.startswith("#")]
-    assert lines == ['vispora-updater-core = { path = "../../updater_rs/core" }'], \
-        "the one dependency is a crate of this repository that has none itself"
+    assert lines == ['vispora-updater-core = { path = "../../updater_rs/core" }', 'vispora-native = { path = "../../native" }'], \
+        "its dependencies are crates of this repository that have none themselves"
     assert "[build-dependencies]" not in manifest and "[dev-dependencies]" not in manifest
+    for theirs in (repo("updater_rs", "core", "Cargo.toml"), repo("native", "Cargo.toml")):
+        own = theirs[theirs.index("[dependencies]"):theirs.index("[profile.release]")]
+        assert [line for line in own.splitlines()[1:] if line.strip() and not line.startswith("#")] == [], \
+            "a crate the core uses has dependencies of its own"
     lock = rust("Cargo.lock")
     names = re.findall(r'^name = "([^"]+)"$', lock, re.M)
-    assert sorted(names) == ["vispora-shell-core", "vispora-updater-core"]
+    assert sorted(names) == ["vispora-native", "vispora-shell-core", "vispora-updater-core"]
     assert "source = " not in lock and "checksum = " not in lock, "a build of the shell's core downloads nothing"
 
 

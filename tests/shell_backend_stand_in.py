@@ -103,6 +103,18 @@ def main():
         game_profiles._engine["active_pid"] = 4242 if name else None
         return A.jsonify({"ok": True, "active_game": name})
 
+    @A.app.route("/api/stand-in/card", methods=["POST"])
+    def the_card_says():
+        # What the native helper says about the graphics card on the fake
+        # machine (nothing, unless a trial says so here): for timing the
+        # backend's own sampler with samples that hold something.
+        says = A.request.get_json(force=True, silent=True) or None
+        if says:
+            m.NATIVE["gpu_live"] = says
+        else:
+            m.NATIVE.pop("gpu_live", None)
+        return A.jsonify({"ok": True, "card": says})
+
     whole = A.app.view_functions["api_tray_state"]
 
     @A.app.route("/api/stand-in/tray-state", methods=["POST"])

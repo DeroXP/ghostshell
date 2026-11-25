@@ -21,12 +21,19 @@ name = "vispora-shell-try"
 path = "src/bin/try.rs"
 
 # No outside crates, on purpose: this is the part of Vispora.exe that starts
-# a program as administrator and decides which calls reach it.  The one
-# dependency is the updater's core in this repository, for its JSON reader
-# and its idea of where the app keeps its data; that crate has no outside
-# crates either, and a build downloads nothing.
+# a program as administrator and decides which calls reach it.  Its two
+# dependencies are crates of this repository that have no outside crates
+# either, so a build downloads nothing:
+#
+# * the updater's core, for its JSON reader and its idea of where the app
+#   keeps its data;
+# * the native helper (native/), for the readings that have moved from the
+#   backend into the shell (src/moved/).  It is the code the Python app
+#   loads as a DLL, used here as an ordinary Rust library.  The shell asks
+#   it questions only.
 [dependencies]
 vispora-updater-core = { path = "../../updater_rs/core" }
+vispora-native = { path = "../../native" }
 
 [profile.release]
 opt-level = "s"

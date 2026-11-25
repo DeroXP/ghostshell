@@ -157,7 +157,9 @@ backend that exists only in the test. `tests/test_backend_mode.py`,
 `tests/test_shell_rs.py`, `tests/test_tray_calls.py` and
 `tests/test_one_file.py` check the app's side of the arrangement (the third
 holds the shell's tray icon against today's, the fourth is about the shell
-carrying the app in its exe), and, where
+carrying the app in its exe). `tests/test_moved_perf.py` asks a module that
+has moved into the shell and the Python module it came from the same
+things on the same fake machine, and compares the answers. And, where
 the shell's trial tool has been built, start it for real with the app on the
 fake machine as its backend. The real backend is never started by a test.
 

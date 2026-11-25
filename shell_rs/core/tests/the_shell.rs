@@ -677,3 +677,94 @@ fn a_call_is_not_waited_for_once_the_backend_is_gone_for_good() {
     assert_eq!(answer.status, 502);
     assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// What has moved from the backend into the shell
+// ═════════════════════════════════════════════════════════════════════
+
+/// A shell that reads a made-up machine: a card that answers.
+fn with_a_machine(rig: &Rig) -> Arc<vispora_shell_core::moved::Fake> {
+    let machine = vispora_shell_core::moved::Fake::new();
+    machine.answers("gpu_live", Some(Json::object([("temp_c", 61.into()), ("gpu_util_pct", 97.into()), ("core_mhz", 2100.into())])));
+    machine.at(1000.0);
+    *rig.shell.moved.lock().unwrap() = Some(vispora_shell_core::moved::Moved::new(machine.clone(), false));
+    machine
+}
+
+#[test]
+fn a_call_that_has_moved_is_answered_by_the_shell_and_does_not_reach_the_backend() {
+    // (a backend that takes a while to come up: the shell's own answers do not wait for it)
+    let rig = Rig::with(vec![Behaviour { up_after: Duration::from_millis(400), ..Behaviour::default() }], settings());
+    with_a_machine(&rig);
+    rig.shell.start();
+    let began = Instant::now();
+    let post = |target: &str, body: &str| rig.shell.handle(&rig.asking("POST", target).with_body(body));
+    let started = post("/api/perf/start", r#"{"consumer": "hwmon-page"}"#);
+    assert_eq!((started.status, text(&started)), (200, r#"{"ok":true,"consumers":["hwmon-page"]}"#.to_string()));
+    let status = rig.call("GET", "/api/perf/status");
+    assert_eq!((status.status, status.header("Content-Type")), (200, Some("application/json")));
+    assert_eq!((status.to_json()["running"].truthy(), status.to_json()["max_samples"].as_int()), (true, Some(300)));
+    assert_eq!(rig.call("GET", "/api/perf/samples?seconds=5").to_json()["window_s"].as_int(), Some(5));
+    assert_eq!(rig.call("GET", "/api/perf/score").to_json()["verdict"].as_str(), Some("no-data"));
+    assert_eq!(text(&post("/api/perf/stop", r#"{"consumer": "hwmon-page"}"#)), r#"{"ok":true,"stopped":true}"#);
+    assert!(began.elapsed() < Duration::from_millis(300) && rig.shell.phase() == Phase::Starting, "a call that has moved waited for the backend");
+    assert_eq!(rig.wait_ready(), Phase::Ready);
+    assert!(rig.stage.last().calls().iter().all(|seen| !seen.target.starts_with("/api/perf/")), "a call that has moved reached the backend");
+    // Every other call is the backend's, as before.
+    assert_eq!(rig.call("GET", "/api/echo").status, 200);
+    assert_eq!(rig.stage.last().times_asked("/api/echo"), 1);
+}
+
+#[test]
+fn a_call_that_has_moved_is_asked_what_every_call_is_asked() {
+    let rig = Rig::ready();
+    with_a_machine(&rig);
+    // Without the run's secret, from another page: refused before anything is answered or started.
+    let strangers = [Request::new("GET", "/api/perf/status"),
+                     Request::new("POST", "/api/perf/start").with_body("{}"),
+                     rig.asking("POST", "/api/perf/start").with_header("Origin", "https://example.org").with_body("{}"),
+                     rig.asking("GET", "/api/perf/samples").with_header("Sec-Fetch-Site", "cross-site")];
+    for stranger in strangers {
+        let answer = rig.shell.handle(&stranger);
+        assert_eq!(answer.status, 403, "{} {}", stranger.method, stranger.target);
+    }
+    let moved = rig.shell.moved.lock().unwrap().clone().unwrap();
+    assert!(!moved.perf.is_running(), "a stranger started the sampler");
+}
+
+#[test]
+fn what_the_shell_does_not_take_of_a_moved_path_is_the_backends() {
+    let rig = Rig::ready();
+    with_a_machine(&rig);
+    let backend = rig.stage.last();
+    // Another method, a body Python stops at, a path the sampler does not have.
+    let not_taken = [rig.asking("POST", "/api/perf/status"), rig.asking("GET", "/api/perf/start"),
+                     rig.asking("POST", "/api/perf/start").with_body("not json"), rig.asking("POST", "/api/perf/stop").with_body("[1]"),
+                     rig.asking("POST", "/api/perf/start").with_body(r#"{"consumer": []}"#), rig.asking("GET", "/api/perf/other")];
+    for (n, request) in not_taken.iter().enumerate() {
+        rig.shell.handle(request);
+        let seen = backend.calls();
+        assert_eq!(seen.len(), n + 1, "{} {} was not passed on", request.method, request.target);
+        let last = seen.last().unwrap();
+        assert_eq!((last.method.as_str(), last.target.as_str(), &last.body), (request.method.as_str(), request.target.as_str(), &request.body));
+    }
+    let moved = rig.shell.moved.lock().unwrap().clone().unwrap();
+    assert!(!moved.perf.is_running());
+}
+
+#[test]
+fn without_a_door_to_the_machine_every_call_is_the_backends_as_before() {
+    let rig = Rig::ready();
+    assert!(rig.shell.moved.lock().unwrap().is_none());
+    for target in ["/api/perf/status", "/api/perf/samples?seconds=60", "/api/perf/score"] {
+        rig.call("GET", target);
+        assert_eq!(rig.stage.last().times_asked(target), 1, "{target}");
+    }
+    rig.shell.handle(&rig.asking("POST", "/api/perf/start").with_body(r#"{"consumer": "hwmon-page"}"#));
+    assert_eq!(rig.stage.last().times_asked("/api/perf/start"), 1);
+    // And with a door, when the card gives the shell no reading: the same.
+    let machine = with_a_machine(&rig);
+    machine.answers("gpu_live", None);
+    rig.call("GET", "/api/perf/score");
+    assert_eq!(rig.stage.last().times_asked("/api/perf/score"), 2);
+}

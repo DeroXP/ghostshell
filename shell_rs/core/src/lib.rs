@@ -34,6 +34,7 @@ pub mod backend;
 pub mod forward;
 pub mod http;
 pub mod instance;
+pub mod moved;
 pub mod pack;
 pub mod page;
 pub mod platform;

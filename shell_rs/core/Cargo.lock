@@ -3,9 +3,14 @@
 version = 4
 
 [[package]]
+name = "vispora-native"
+version = "0.1.0"
+
+[[package]]
 name = "vispora-shell-core"
 version = "0.1.0"
 dependencies = [
+ "vispora-native",
  "vispora-updater-core",
 ]
 

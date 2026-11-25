@@ -6,9 +6,11 @@
 //! * the page and its two files are answered from what is compiled in;
 //! * the window's own calls (`/api/window/...`) are answered by the shell,
 //!   because the window is the shell's;
+//! * the calls of what has moved from the backend into the shell are
+//!   answered by the shell (moved/), where the shell takes them;
 //! * every other `/api/...` call is passed on to the backend, unchanged.
 //!   As modules move from Python to Rust, their calls move from the last
-//!   line of this list to a line of their own.
+//!   line of this list to the one above it.
 //!
 //! Before any `/api/...` call is answered or passed on, it is asked the three
 //! things the backend has always asked (app.py, _reject_foreign_requests):
@@ -96,7 +98,16 @@ impl Shell {
                 }
                 answer
             }
-            _ => self.pass_on(request),
+            _ => {
+                // What has moved is answered here, without the backend and
+                // without waiting for it.  What the shell does not take of
+                // a moved path (see moved/) is the backend's like any other.
+                let moved = self.moved.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+                if let Some(answer) = moved.and_then(|moved| moved.answer(request)) {
+                    return answer;
+                }
+                self.pass_on(request)
+            }
         }
     }
 

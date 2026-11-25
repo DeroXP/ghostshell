@@ -549,6 +549,52 @@ window (the trial sees the window appear and the page's first call, not the
 paint in between); the real backend's start behind the shell and a real quit
 (the owner's PC, once a build exists that they choose to run).
 
+## Step 4: the backend, one module at a time
+
+Each module that moves from the backend into the shell gets a line here:
+what it cost in the backend, and what it costs in the shell.
+
+### The performance sampler (the first module)
+
+The Monitor page's live charts and its stability score: the graphics card
+read five times a second while that page is open, 300 samples kept
+(`core/perf_monitor.py`, now also `shell_rs/core/src/moved/perf.rs`). It is
+the coldest of the seven things the plan lists as running all the time: it
+has run only while its page is open since 3.8.0. It went first because it
+is the smallest, not because it was slow.
+
+Measured with `python shell_rs/try_it.py --moved`: two shells, each with a
+backend on the fake machine. One reads this PC's card itself and answers
+the sampler's calls itself. The other passes them on, and the backend's own
+sampler runs, with a made-up reading for every sample. Both sample for a
+minute, and then the same call is made 300 times in each (the middle
+value, and the slowest one in twenty).
+
+| | In the backend, behind the shell | In the shell |
+| --- | --- | --- |
+| One reading of the card | 0.14 ms through the helper ("What the first native piece changes"); a started `nvidia-smi` without it | 0.09 ms, in the shell's own process (the first one 26 ms: the driver's library is loaded) |
+| The chart's data, a minute of it (`/api/perf/samples?seconds=60`) | 1.03 ms (1.15) | **0.09 ms** (0.11) |
+| The score (`/api/perf/score?seconds=30`) | 0.95 ms (1.05) | **0.005 ms** (0.009) |
+| `/api/perf/status` | 0.81 ms (0.91) | **0.002 ms** (0.003) |
+| The shell's process while the sampler runs | (not the shell's work) | 0.03 to 0.11 s of processor time a minute: 0.05 to 0.2% of one core |
+| While the Monitor page is closed | nothing | nothing |
+
+What is real in these numbers: the shell's reading of this PC's card (it
+only reads), its sampling, its answers, and a call's way through the shell
+to a backend and back, which is most of what the left column is. What is a
+trial's: the backend's sampler read a made-up card, which costs nothing; on
+a PC its reading is the 0.14 ms above.
+
+What it comes to for the person: the Monitor page's two calls every two
+seconds take a tenth of a millisecond together where they took two, and
+they are answered before the backend is up. Nobody waits for either. The
+gain of this piece is not speed: it is that a module of the backend now
+runs in the shell with the same answers, which is what the six after it
+need to have been shown.
+
+Not measured: the backend's processor time for its own sampler on a real
+PC (in the trial it reads a table), and anything with the real backend.
+
 ## Measuring again
 
 After each piece of the port, run the same scripts and put the new numbers
@@ -565,6 +611,7 @@ python tools/measure/real_reads.py --helper
 python tools/measure/log_timeline.py
 python tools/measure/live_sample.py 120         (with the app running)
 python native/check_parity.py                   (needs the helper built)
+python shell_rs/try_it.py --moved               (what has moved into the shell; needs the shell's core built)
 ```
 
 None of them changes a setting on the PC, and none needs the app to be

@@ -4,6 +4,7 @@
 
     python shell_rs/app/try_it.py                  the checks; the window is never shown
     python shell_rs/app/try_it.py --one-file       only the checks of the exe carrying its backend
+    python shell_rs/app/try_it.py --moved          only the checks of what has moved from the backend into the shell
     python shell_rs/app/try_it.py --time           the times, five runs
     python shell_rs/app/try_it.py --time --pack P  ... and what unpacking the pack P costs, both ways
     python shell_rs/app/try_it.py --time --pack P --carried-by E
@@ -188,7 +189,7 @@ class Elsewhere:
 class Run:
     """One start of the exe, with everything it is given."""
 
-    def __init__(self, root, window, planted=False, beside=None, folder_in=None, plant=None, pack=None, keep=None):
+    def __init__(self, root, window, planted=False, beside=None, folder_in=None, plant=None, pack=None, keep=None, moved=None):
         """`beside`: another run whose folders this one shares, as a second
         person's copy on the same PC shares the place the window's folders
         are made in.  `folder_in`: where this run makes its window's folder,
@@ -224,6 +225,8 @@ class Run:
             told["pack"] = pack
         if keep is not None:
             told["keep"] = keep
+        if moved is not None:
+            told["moved"] = moved
         self.env["VISPORA_SHELL_TRY"] = json.dumps(told)
         self.debug_port = self.planted_profile = self.left_behind = self.not_marked = self.somebody_elses = None
         if planted:
@@ -766,6 +769,77 @@ TRAY_STATE = """(function () {
 })();"""
 
 
+# What the Monitor page does with the performance sampler, and what it was
+# told, said in a call the stand-in backend writes down.
+THE_SAMPLER = """(function () {
+    window.pywebview.api.get_api_token().then(function (token) {
+        var with_it = { 'X-Vispora-Token': token, 'Content-Type': 'application/json' };
+        var body = JSON.stringify({ consumer: 'trial' });
+        fetch('/api/perf/start', { method: 'POST', body: body, headers: with_it })
+            .then(function () { return new Promise(function (go_on) { setTimeout(go_on, 1500); }); })
+            .then(function () { return fetch('/api/perf/status', { headers: with_it }); })
+            .then(function (answer) { return answer.json(); })
+            .then(function (status) {
+                var last = status.last ? (status.last.ok ? 'a-reading' : 'no-reading') : 'nothing';
+                return fetch('/api/trial/sampler/' + (status.running ? 'running' : 'not-running') + '/' + status.sample_count + '/' + last,
+                             { headers: with_it });
+            })
+            .then(function () { return fetch('/api/perf/score?seconds=30', { headers: with_it }); })
+            .then(function (answer) { return answer.json(); })
+            .then(function (score) { return fetch('/api/trial/score/' + score.verdict + '/' + score.samples_used, { headers: with_it }); })
+            .then(function () { return fetch('/api/perf/stop', { method: 'POST', body: body, headers: with_it }); })
+            .then(function () { return fetch('/api/trial/sampler-done', { headers: with_it }); });
+    });
+})();"""
+
+
+def moved(root, check):
+    """What has moved from the backend into the shell: the performance
+    sampler's calls are answered by the shell, from this PC's graphics card
+    (the shell only reads it), and do not reach the backend."""
+    card = subprocess.run([PACK_TOOL, "--reads", "gpu_live"], capture_output=True, text=True, creationflags=NO_WINDOW)
+    card = json.loads(card.stdout or "null") if card.returncode == 0 else None
+    answers = isinstance(card, dict) and card.get("temp_c") is not None
+
+    def the_page_uses_the_sampler(run):
+        up = first_screen(run)
+        run.in_the_page(THE_SAMPLER)
+        done = run.wait_for(lambda: [c for c in run.calls() if c[3] == "/api/trial/sampler-done"], 30)
+        calls = run.calls()
+        told = [c[3].split("/")[4:] for c in calls if c[3].startswith("/api/trial/sampler/")]
+        score = [c[3].split("/")[4:] for c in calls if c[3].startswith("/api/trial/score/")]
+        reached = [c[3] for c in calls if c[3].startswith("/api/perf/")]
+        return bool(up and done), (told[0] if told else None), (score[0] if score else None), reached
+
+    run = Run(root, "hidden")
+    try:
+        done, told, score, reached = the_page_uses_the_sampler(run)
+        if answers:
+            check("the performance sampler's calls are answered by the shell, from this PC's card (%s degrees just now): %r, score %r"
+                  % (card.get("temp_c"), told, score),
+                  done and told and told[0] == "running" and 4 <= int(told[1]) <= 12 and told[2] == "a-reading"
+                  and score and score[0] in ("no-data", "idle", "healthy", "warn", "unstable"))
+            check("and none of them reached the backend", done and reached == [])
+        else:
+            check("this PC's card gives the shell no reading, so the sampler's calls are the backend's, all of them: %r" % (reached,),
+                  done and told and reached == ["/api/perf/start", "/api/perf/status", "/api/perf/score", "/api/perf/stop"])
+            check("and the backend's sampler answers as it always did: %r" % (told,), done and told and told[0] == "running")
+        check("the shell quits as ever with a sampler that ran (exit code %r)" % (quit_by_its_window(run),), run.process.returncode == 0)
+    finally:
+        run.end()
+
+    run = Run(root, "hidden", moved=False)
+    try:
+        done, told, score, reached = the_page_uses_the_sampler(run)
+        check("told to leave every call to the backend, the shell passes the sampler's on, and says so in its log: %r" % (reached,),
+              done and reached == ["/api/perf/start", "/api/perf/status", "/api/perf/score", "/api/perf/stop"]
+              and "every call is the backend's" in run.log())
+        check("the backend's own sampler is as it was: %r" % (told,), done and told and told[0] == "running" and told[2] in ("no-reading", "nothing"))
+        quit_by_its_window(run)
+    finally:
+        run.end()
+
+
 def first_screen(run):
     return run.wait_for(lambda: [c for c in run.page_calls() if c[3] == "/api/dashboard"])
 
@@ -842,7 +916,8 @@ def every_check(root, check):
               and os.path.isfile(os.path.join(run.not_marked, "EBWebView", "Default", "Service Worker", "planted.js"))
               and os.listdir(run.not_marked) == ["EBWebView"])
         check("one with the same name and the same mark that somebody else made was not touched, and not used",
-              tidied and tidied[0][4] == 1 and sorted(os.listdir(run.somebody_elses)) == ["EBWebView", "in-use"]
+              tidied and tidied[0][4] == 1 and os.path.isdir(run.somebody_elses)
+              and sorted(os.listdir(run.somebody_elses)) == ["EBWebView", "in-use"]
               and os.path.isfile(os.path.join(run.somebody_elses, "EBWebView", "Default", "Service Worker", "planted.js"))
               and who_gets_in(run.somebody_elses, os.path.join(run.root, "somebody-who.txt")) != who_gets_in(run.not_marked, os.path.join(run.root, "ours-who.txt")))
         check("this run's folder is marked as in use: nobody else can open the mark", folder and not can_open(os.path.join(folder, "in-use")))
@@ -1067,6 +1142,7 @@ def every_check(root, check):
         check("no backend was started for it", "backend started" not in run.log())
     finally:
         run.end()
+    moved(root, check)
     one_file(root, check)
 
 
@@ -1486,7 +1562,7 @@ def main(argv):
             refuse("VisporaShell.exe is the build that is meant to ship (it asks for administrator rights). "
                    "Build it with --no-default-features first.")
     # (the checks of the one file, and its times, make and read packs)
-    needs_the_tool = not argv or argv == ["--one-file"] or argv[:2] == ["--time", "--pack"]
+    needs_the_tool = not argv or argv in (["--one-file"], ["--moved"]) or argv[:2] == ["--time", "--pack"]
     if needs_the_tool and not os.path.isfile(PACK_TOOL):
         refuse("%s is missing: build it first (cargo build --release --manifest-path shell_rs/core/Cargo.toml). "
                "It makes the packs that the exe is given to unpack." % PACK_TOOL)
@@ -1497,6 +1573,8 @@ def main(argv):
             ok = checks(root)
         elif argv == ["--one-file"]:
             ok = checks(root, one_file)
+        elif argv == ["--moved"]:
+            ok = checks(root, moved)
         elif argv == ["--time"]:
             ok = times(root)
         elif argv[:2] == ["--time", "--pack"] and len(argv) == 3:

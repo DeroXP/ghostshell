@@ -15,6 +15,7 @@ are as they were. The pieces:
 | `app/` | The window (Tauri, as for the updater), on the app's own page | written, tried for real against a stand-in backend |
 | the tray | The tray icon and its menu, and what the entry for starting at sign-in names | written, tried for real against a stand-in backend |
 | one file | The exe carrying the backend and unpacking it before it starts it, in one of two ways that the owner still has to choose between | written, tried for real with the real backend's files and a stand-in started in their place |
+| what has moved | Modules of the backend that the shell now does itself (step 4 of the plan): so far the performance sampler | written, proven to give Python's answers on a made-up machine, tried for real with this PC's graphics card read by the shell |
 
 ## How the two sides work together
 
@@ -530,7 +531,7 @@ been measured.
 
 ```
 cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
-python shell_rs/app/try_it.py                  # 105 checks; the window is never shown
+python shell_rs/app/try_it.py                  # 110 checks; the window is never shown
 python shell_rs/app/try_it.py --time           # the times
 python shell_rs/app/try_it.py --time --pack P  # ... and what unpacking the pack P costs, both ways
 python shell_rs/app/try_it.py --time --pack P --carried-by E
@@ -625,6 +626,62 @@ the account the trial runs under, which keeps WebView2's own helper programs
 out as the shipping build's folder does: that WebView2 works in a closed
 folder is tried, that it works in one for administrators only is not.
 
+## What has moved from the backend
+
+Step 4 of [docs/rust-port.md](../docs/rust-port.md) moves the backend into
+the shell one module at a time. A module that has moved is in
+`core/src/moved/`: the shell answers its calls itself, from readings it
+takes itself, and they do not reach the backend. The order, and why, is in
+the plan ("Item 1, cut into pieces").
+
+So far: **the performance sampler** (`core/src/moved/perf.rs`, which is
+`core/perf_monitor.py`): the graphics card read five times a second while
+the Monitor page is open, for its live charts and its stability score.
+
+The rules every module there keeps:
+
+* **It only reads, and can only read.** Its one door to the PC is
+  `Readings` (`core/src/moved/mod.rs`): a question to the native helper by
+  its name, and the time. The helper (`native/`, the code the Python app
+  loads as a DLL) is compiled into the shell as an ordinary Rust library,
+  and the shell uses its door for questions only. Its other door, for the
+  two things that change the PC, is named nowhere in the shell
+  (`tests/test_moved_perf.py` holds that, and that nothing in the folder
+  starts a program, writes a file or calls Windows itself). What changes
+  the PC will get a door of its own when the first such module moves.
+* **A real side and a made-up side.** `Real` asks the helper. `Fake`
+  answers from a table and tells a time that is set by hand: the tests'
+  machine, and the trial tool's (`vispora-shell-try --moved`).
+* **The same answers as Python, or the call is not taken.** The shell
+  answers a moved call only where it gives the answer the Python route
+  gives; `tests/test_moved_perf.py` asks both the same things on the same
+  made-up machine and compares every answer. Anything else of a moved path
+  is passed on, and the backend answers it as before: another method, a
+  body that is no JSON, JSON that Python cannot use. Python stops at those
+  before it touches the module, so its answer is the answer.
+* **The old way stays.** The Python module and its routes are not changed.
+  They answer when the app is started as it always was. Behind the shell
+  they answer every call when the shell is started with
+  `--all-to-backend` (for telling apart, on a PC, whether something is the
+  shell's doing or the backend's), and they answer the sampler's calls on
+  a PC whose card gives the shell no reading: Python then asks
+  `nvidia-smi`, which the shell does not start. Whether the card answers
+  is asked once, at the sampler's first call, so there is one sampler for
+  a run, in one place.
+* **Asked what every call is asked first.** A moved call needs the run's
+  secret and the app's own page like any other; only then is it answered.
+  It is answered without the backend and without waiting for it.
+
+```
+python shell_rs/app/try_it.py --moved   # the real window: the page's calls, this PC's card
+python shell_rs/try_it.py --moved       # what it costs, beside the backend's own (a minute and a half)
+```
+
+The numbers are in [docs/performance.md](../docs/performance.md): a reading
+of the card takes the shell 0.09 ms, the chart's data 0.09 ms where a call
+to the backend and back takes 1 ms, and the shell's process uses 0.05 to
+0.2% of one core while the sampler runs.
+
 ## What is where
 
 | File | What it does |
@@ -634,6 +691,8 @@ folder is tried, that it works in one for administrators only is not.
 | `app/build.rs`, `app/app.manifest`, `app/tauri.conf.json` | What the exe carries besides its code: icon, version (from `config.py`), a manifest that asks for no rights, and the backend's pack |
 | `core/src/pack.rs` | The pack: a folder of files as one piece of bytes, made, read, unpacked and held against a folder |
 | `core/src/backend.rs` | Where the backend is unpacked and which folder it is run from: the two ways, the checks, taking old folders away |
+| `core/src/moved/mod.rs` | What has moved from the backend: the door to the PC's readings (real and made-up), and what a route reads off a call the way Flask reads it |
+| `core/src/moved/perf.rs` | The performance sampler, moved from `core/perf_monitor.py` |
 | `../backend.spec` | The app built as a folder for the shell to carry (PyInstaller) |
 | `app/try_it.py` | Runs the real window exe against a stand-in backend, out of the way |
 | `core/src/instance.rs` | Is this the one copy, and does it have the rights it needs: the order of a start |
@@ -665,6 +724,10 @@ and decides which calls reach it. It uses no crates from outside this
 repository: its one dependency is `updater_rs/core`, for its JSON reader, and
 that has none either. A build of it downloads nothing. The window brings
 Tauri with it, as the updater's window did, in a crate of its own (`app/`).
+
+What has moved from the backend reads the PC through the native helper,
+`native/`: a crate of this repository with no outside crates either, which
+the lock files name by its path, with nothing that was downloaded.
 
 Carrying the backend added no crate to either lock file. Squeezing and the
 SHA-256 marks are Windows' own (`cabinet.dll`, `bcrypt.dll`), called
@@ -729,6 +792,12 @@ it is told to start, and the only thing to tell it is the stand-in.
   does not say what an icon of another program shows): the trial reads the
   shell's own account of them, and a test compares the three pictures'
   files with what the app draws.
+* **What has moved has not run with administrator rights, or beside the
+  real backend.** The sampler was tried in the real window against the
+  stand-in, reading this PC's card. That its answers are the Python
+  module's is proven on a made-up machine, not on a PC: one reading of a
+  real card can differ by a degree between the helper and `nvidia-smi`
+  (docs/performance.md, step 1), and the shell has no `nvidia-smi` way.
 * **The one-file exe has never been started.** The build that ships was
   built with the real backend's pack in it (32.8 MB), to know its size,
   and never run. So nobody has seen: the administrator prompt followed by
