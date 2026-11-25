@@ -3,7 +3,7 @@ import os
 import json
 import re
 from config import APPDATA_DIR
-from core.utils import run_ps, get_logger, is_reparse_point
+from core.utils import run_ps, get_logger, is_reparse_point, is_running_programs_folder
 
 log = get_logger("cleaner")
 
@@ -41,10 +41,15 @@ def _is_in_pyinstaller_extract(p: str) -> bool:
     Skipping any `_MEI*` segment also protects every OTHER
     PyInstaller-bundled app the user might be running (ShareX,
     OBS portable, etc.).
+
+    The same goes for the folders the app's shell makes for one run (its
+    window's, and the one the app is unpacked into and running from): they
+    are in Windows' own Temp folder, which is cleaned here.
+    utils.RUNNING_PROGRAMS_FOLDERS names all of them.
     """
     try:
         for seg in os.path.normpath(p).split(os.sep):
-            if seg.startswith("_MEI"):
+            if is_running_programs_folder(seg):
                 return True
     except Exception:
         pass
@@ -78,7 +83,7 @@ def _safe_rmtree(path: str) -> tuple[int, int]:
                 pass
     # Deepest first, so a folder is already empty by the time it's its turn.
     for dp in reversed(subdirs):
-        if os.path.basename(dp).startswith("_MEI") or _is_in_pyinstaller_extract(dp):
+        if _is_in_pyinstaller_extract(dp):
             continue
         try:
             os.rmdir(dp)
@@ -137,7 +142,7 @@ def scan_temp_sizes() -> list[dict]:
             for root, dirs, files in os.walk(loc["path"]):
                 # Count only what clean_location() can remove: it does not
                 # follow junctions (os.walk does, loops included) or touch _MEI*.
-                dirs[:] = [d for d in dirs if not d.startswith("_MEI")
+                dirs[:] = [d for d in dirs if not is_running_programs_folder(d)
                            and not is_reparse_point(os.path.join(root, d))]
                 for f in files:
                     try:
@@ -391,7 +396,7 @@ def _measure_dir(path):
     try:
         for root, dirs, files in os.walk(path):
             # What _safe_rmtree() would leave: junctions and _MEI* runtimes.
-            dirs[:] = [d for d in dirs if not d.startswith("_MEI")
+            dirs[:] = [d for d in dirs if not is_running_programs_folder(d)
                        and not is_reparse_point(os.path.join(root, d))]
             for f in files:
                 try: total += os.path.getsize(os.path.join(root, f))
@@ -404,7 +409,7 @@ def _count_files(path):
     count = 0
     try:
         for root, dirs, files in os.walk(path):
-            dirs[:] = [d for d in dirs if not d.startswith("_MEI")
+            dirs[:] = [d for d in dirs if not is_running_programs_folder(d)
                        and not is_reparse_point(os.path.join(root, d))]
             count += len(files)
     except (PermissionError, OSError): pass

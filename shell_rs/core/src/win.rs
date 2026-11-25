@@ -40,6 +40,7 @@ struct Address {
 #[link(name = "bcrypt")]
 extern "system" {
     fn BCryptGenRandom(algorithm: *mut c_void, buffer: *mut u8, length: u32, flags: u32) -> i32;
+    fn BCryptHash(algorithm: *mut c_void, secret: *mut u8, secret_length: u32, input: *const u8, input_length: u32, output: *mut u8, output_length: u32) -> i32;
 }
 
 #[link(name = "ws2_32")]
@@ -279,6 +280,9 @@ extern "system" {
     fn SetEvent(event: *mut c_void) -> i32;
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
     fn CreateDirectoryW(path: *const u16, attributes: *const SecurityAttributes) -> i32;
+    fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
     fn GetSystemWindowsDirectoryW(path: *mut u16, length: u32) -> u32;
     #[allow(clippy::too_many_arguments)]
     fn CreateProcessW(program: *const u16, line: *mut u16, process: *const c_void, thread: *const c_void, inherit: i32, flags: u32,
@@ -291,6 +295,13 @@ extern "system" {
     fn GetTokenInformation(token: *mut c_void, class: u32, information: *mut c_void, length: u32, needed: *mut u32) -> i32;
     fn ConvertStringSecurityDescriptorToSecurityDescriptorW(text: *const u16, revision: u32, descriptor: *mut *mut c_void, size: *mut u32) -> i32;
     fn ConvertSidToStringSidW(account: *mut c_void, text: *mut *mut u16) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn GetNamedSecurityInfoW(name: *const u16, kind: u32, what: u32, owner: *mut *mut c_void, group: *mut *mut c_void,
+                             list: *mut *mut c_void, audit: *mut *mut c_void, descriptor: *mut *mut c_void) -> u32;
+    #[allow(clippy::too_many_arguments)]
+    fn GetSecurityInfo(handle: *mut c_void, kind: u32, what: u32, owner: *mut *mut c_void, group: *mut *mut c_void,
+                       list: *mut *mut c_void, audit: *mut *mut c_void, descriptor: *mut *mut c_void) -> u32;
+    fn ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor: *mut c_void, revision: u32, what: u32, text: *mut *mut u16, length: *mut u32) -> i32;
 }
 
 #[link(name = "shell32")]
@@ -569,6 +580,26 @@ pub fn administrators_folder() -> Result<String, String> {
     Ok(folder)
 }
 
+/// Where the app, which runs with administrator rights, keeps what is to
+/// stay on the PC: the folder for all users' data (`C:\ProgramData`).
+/// People without administrator rights can make folders in it, and can
+/// neither rename nor remove what somebody else made there.  None where it
+/// is not where it is on every ordinary PC.
+///
+/// Windows' calls for this folder follow the SystemDrive variable of the
+/// program that asks (see administrators_folder), so it is not asked for:
+/// it is taken to be on the drive Windows is on, which is where it is
+/// unless somebody moved it when Windows was set up, and it has to be a
+/// folder that is really there, and no link.
+pub fn all_users_folder() -> Option<String> {
+    use std::os::windows::fs::MetadataExt as _;
+    let windows = windows_folder().ok()?;
+    let drive = windows.get(..3).filter(|drive| drive.ends_with(":\\"))?;
+    let folder = format!("{drive}ProgramData");
+    let found = std::fs::symlink_metadata(&folder).ok()?;
+    (found.is_dir() && found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0).then_some(folder)
+}
+
 // ═════════════════════════════════════════════════════════════════════
 // The window's own folder, one per run
 // ═════════════════════════════════════════════════════════════════════
@@ -589,6 +620,11 @@ pub fn administrators_folder() -> Result<String, String> {
 
 /// How the folders begin, so that what a run left behind is recognised.
 pub const WINDOW_FOLDER_PREFIX: &str = "Vispora-window-";
+/// The folder a run unpacks its backend into, where it is unpacked for one
+/// run (backend.rs).  Made, marked and taken away like the window's.
+pub const BACKEND_FOLDER_PREFIX: &str = "Vispora-backend-run-";
+/// Every kind of folder that is one run's own.
+const ONE_RUNS_FOLDERS: [&str; 2] = [WINDOW_FOLDER_PREFIX, BACKEND_FOLDER_PREFIX];
 /// The file in a window's folder that its run keeps open, for as long as
 /// it runs, in a way that lets nobody else open it.  A run that has ended,
 /// however it ended, holds it no more.
@@ -625,6 +661,8 @@ pub struct Tidied {
     pub left: usize,
 }
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 const TOKEN_USER: u32 = 1;
 
 /// Who may get into the window's folder.  Either way: everything, also in
@@ -669,14 +707,24 @@ fn own_account() -> Result<String, String> {
     }
 }
 
+/// Who that is, the way Windows writes it in an access list.
+fn written(open_to: OpenTo) -> Result<String, String> {
+    match open_to {
+        OpenTo::Administrators => Ok("BA".to_string()),
+        OpenTo::ThisAccount => own_account().map_err(|why| format!("the account this runs under could not be read ({why})")),
+    }
+}
+
 /// Make a new folder for the window in `parent`, marked as in use.  It did
 /// not exist before: a folder that is already there is never taken.
 pub fn private_folder(parent: &str, open_to: OpenTo) -> Result<OwnFolder, String> {
+    private_folder_named(parent, WINDOW_FOLDER_PREFIX, open_to)
+}
+
+/// The same for any of one run's folders: its name begins with `prefix`.
+pub fn private_folder_named(parent: &str, prefix: &str, open_to: OpenTo) -> Result<OwnFolder, String> {
     std::fs::create_dir_all(parent).map_err(|e| format!("{parent}: {e}"))?;
-    let who = match open_to {
-        OpenTo::Administrators => "BA".to_string(),
-        OpenTo::ThisAccount => own_account().map_err(|why| format!("the account this runs under could not be read ({why})"))?,
-    };
+    let who = written(open_to)?;
     let mut why = String::new();
     // More than once only if the folder was taken away between being made
     // and being marked.  A start in another session does not do that (see
@@ -686,7 +734,7 @@ pub fn private_folder(parent: &str, open_to: OpenTo) -> Result<OwnFolder, String
         let mut random = [0u8; 16];
         Windows.random(&mut random)?;
         let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-        let path = format!("{parent}\\{WINDOW_FOLDER_PREFIX}{name}");
+        let path = format!("{parent}\\{prefix}{name}");
         // Theirs, too: whoever owns a folder may change who gets into it.
         // So the owner is said here, and not left to what Windows would
         // pick.  (A program without administrator rights cannot make a
@@ -738,6 +786,300 @@ fn closed_folder(path: &str, described: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Make the folder `path`, which must not be there yet: owned by, and
+/// open to, `open_to` and Windows itself, and nobody else.
+pub fn make_closed_folder(path: &str, open_to: OpenTo) -> Result<(), String> {
+    let who = written(open_to)?;
+    closed_folder(path, &format!("O:{who}{}", open_only_to(&who)))
+}
+
+const SE_FILE_OBJECT: u32 = 1;
+const OWNER_AND_ACCESS_LIST: u32 = 1 | 4;
+
+/// Whose `path` is and who gets into it, the way Windows writes it down.
+pub fn described(path: &str) -> Result<String, String> {
+    let path_w = wide(path);
+    // SAFETY: a string that ends in a NUL; a descriptor Windows allocates,
+    // which written_down frees.
+    unsafe {
+        let mut descriptor = std::ptr::null_mut();
+        let status = GetNamedSecurityInfoW(path_w.as_ptr(), SE_FILE_OBJECT, OWNER_AND_ACCESS_LIST, std::ptr::null_mut(), std::ptr::null_mut(),
+                                           std::ptr::null_mut(), std::ptr::null_mut(), &mut descriptor);
+        if status != 0 {
+            return Err(format!("{path}: Windows error {status}"));
+        }
+        written_down(descriptor, path)
+    }
+}
+
+/// The same for what was opened as `held`: asked of the open folder itself,
+/// not of whatever is under its name by now.
+fn described_held(held: &std::fs::File, path: &str) -> Result<String, String> {
+    use std::os::windows::io::AsRawHandle as _;
+    // SAFETY: a handle that is open for as long as `held` is borrowed; a
+    // descriptor Windows allocates, which written_down frees.
+    unsafe {
+        let mut descriptor = std::ptr::null_mut();
+        let status = GetSecurityInfo(held.as_raw_handle() as *mut c_void, SE_FILE_OBJECT, OWNER_AND_ACCESS_LIST, std::ptr::null_mut(),
+                                     std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut descriptor);
+        if status != 0 {
+            return Err(format!("{path}: Windows error {status}"));
+        }
+        written_down(descriptor, path)
+    }
+}
+
+/// What Windows keeps in `descriptor`, as text.  The descriptor is freed.
+///
+/// # Safety
+/// `descriptor` is one that Windows allocated and that nothing else frees.
+unsafe fn written_down(descriptor: *mut c_void, path: &str) -> Result<String, String> {
+    let mut text: *mut u16 = std::ptr::null_mut();
+    let turned = ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, OWNER_AND_ACCESS_LIST, &mut text, std::ptr::null_mut());
+    let error = GetLastError();
+    LocalFree(descriptor);
+    if turned == 0 {
+        return Err(format!("{path}: Windows error {error}"));
+    }
+    let length = (0..).take_while(|at| *text.add(*at) != 0).count();
+    let written = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+    LocalFree(text as *mut c_void);
+    Ok(written)
+}
+
+/// Is `is` what Windows keeps about a folder of make_closed_folder's making
+/// for `open_to`: theirs, and its access list exactly that one?
+fn is_of_this_programs_making(is: &str, open_to: OpenTo, path: &str) -> Result<(), String> {
+    let who = written(open_to)?;
+    // (Windows adds "AI" where entries were handed down automatically at
+    // some time; the entries themselves are what is compared)
+    let wanted = format!("O:{who}{}", open_only_to(&who));
+    if is == wanted || is == wanted.replacen("D:P(", "D:PAI(", 1) {
+        Ok(())
+    } else {
+        Err(format!("{path} is not this program's folder: it is \"{is}\", and one of this program's making is \"{wanted}\""))
+    }
+}
+
+/// Is the folder `path` as make_closed_folder makes one: owned by `open_to`,
+/// and its access list exactly that one?  Why not, if not.  A folder that
+/// is somebody else's, or lets somebody else in, is not one of this
+/// program's making, whatever its name.
+///
+/// This says what is under the name at this moment.  A folder that is to
+/// be used afterwards is held instead (hold_own_folder).
+pub fn is_closed_to_all_but(path: &str, open_to: OpenTo) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt as _;
+    let found = std::fs::symlink_metadata(path).map_err(|e| format!("{path}: {e}"))?;
+    if !found.is_dir() || found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!("{path} is not a folder of its own (a link, or a file)"));
+    }
+    is_of_this_programs_making(&described(path)?, open_to, path)
+}
+
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+const FILE_READ_ATTRIBUTES: u32 = 0x80;
+const DELETE: u32 = 0x0001_0000;
+const READ_CONTROL: u32 = 0x0002_0000;
+const ERROR_SHARING_VIOLATION: i32 = 32;
+/// What is under the name itself is opened, a folder too: a link is opened
+/// as the link it is, not as what it points to.
+const AS_IT_IS: u32 = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+
+/// Is what was opened as `held` a folder of this program's making for
+/// `open_to` (and no link, and no file)?  Asked of the open folder.
+fn own_folder_behind(held: &std::fs::File, path: &str, open_to: OpenTo) -> Result<(), String> {
+    use std::os::windows::fs::MetadataExt as _;
+    let found = held.metadata().map_err(|e| format!("{path}: {e}"))?;
+    if !found.is_dir() || found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(format!("{path} is not a folder of its own (a link, or a file)"));
+    }
+    is_of_this_programs_making(&described_held(held, path)?, open_to, path)
+}
+
+/// Hold the folder `path` under its name, if it is one of this program's
+/// making (as is_closed_to_all_but asks, but asked of the folder that was
+/// opened).  For as long as what is given back is kept, the name is that
+/// folder's: Windows lets nobody take it away, give it another name, or
+/// put something else in its place.  So what is found in it afterwards is
+/// found in the folder that was checked, and a program started from it is
+/// started from there.
+///
+/// Two copies of the app (two people signed in) hold the same folder side
+/// by side.  What is in the folder can still be read and written by whoever
+/// its access list lets in: nobody but its makers.
+pub fn hold_own_folder(path: &str, open_to: OpenTo) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let read_and_write_but_not_remove = 1 | 2;
+    let held = std::fs::OpenOptions::new().read(true).share_mode(read_and_write_but_not_remove).custom_flags(AS_IT_IS)
+        .open(path).map_err(|e| format!("{path}: {e}"))?;
+    own_folder_behind(&held, path, open_to)?;
+    Ok(held)
+}
+
+/// What became of asking for a folder in order to take it away.
+#[derive(Debug)]
+pub enum ToRemove {
+    /// One of this program's making that nobody holds.  While this is kept,
+    /// nobody can come to hold it either.
+    Ours(std::fs::File),
+    /// Somebody holds it (hold_own_folder): a copy of the app is using it.
+    InUse,
+    /// Not of this program's making (or a link, or a file): never touched.
+    NotOurs,
+}
+
+/// Open the folder `path` to take it away.
+pub fn open_to_remove(path: &str, open_to: OpenTo) -> ToRemove {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let anything = 1 | 2 | 4;
+    let opened = std::fs::OpenOptions::new().access_mode(DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES).share_mode(anything)
+        .custom_flags(AS_IT_IS).open(path);
+    match opened {
+        Ok(held) if own_folder_behind(&held, path, open_to).is_ok() => ToRemove::Ours(held),
+        Ok(_) => ToRemove::NotOurs,
+        // Asking to remove what somebody holds against removing is what
+        // Windows refuses with this, and with nothing else.
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => ToRemove::InUse,
+        Err(_) => ToRemove::NotOurs,
+    }
+}
+
+/// Give the folder `from` the name `to`.  Never onto something that is
+/// there already.
+pub fn move_without_replacing(from: &str, to: &str) -> Result<(), String> {
+    let (from_w, to_w) = (wide(from), wide(to));
+    let replacing_nothing = 0;
+    // SAFETY: two strings that end in a NUL.
+    if unsafe { MoveFileExW(from_w.as_ptr(), to_w.as_ptr(), replacing_nothing) } == 0 {
+        return Err(format!("{to}: Windows error {}", unsafe { GetLastError() }));
+    }
+    Ok(())
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Squeezing, and the mark of what a file holds: Windows' own
+// ═════════════════════════════════════════════════════════════════════
+// The backend's files are carried squeezed (pack.rs).  Windows squeezes
+// and brings back itself (cabinet.dll, part of Windows since Windows 8), so
+// no code for it is written here and no crate brought in.  The library is
+// taken from Windows' own folder and from nowhere else: by name alone,
+// Windows would look beside the exe first, where anybody may have put one.
+
+const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+type MakeSqueezer = unsafe extern "system" fn(u32, *mut c_void, *mut *mut c_void) -> i32;
+type Squeeze = unsafe extern "system" fn(*mut c_void, *const u8, usize, *mut u8, usize, *mut usize) -> i32;
+type EndSqueezer = unsafe extern "system" fn(*mut c_void) -> i32;
+
+struct Cabinet {
+    make_squeezer: MakeSqueezer,
+    squeeze: Squeeze,
+    end_squeezer: EndSqueezer,
+    make_unsqueezer: MakeSqueezer,
+    unsqueeze: Squeeze,
+    end_unsqueezer: EndSqueezer,
+}
+
+fn cabinet() -> Result<&'static Cabinet, String> {
+    static LOADED: std::sync::OnceLock<Result<Cabinet, String>> = std::sync::OnceLock::new();
+    LOADED
+        .get_or_init(|| {
+            let name = wide("cabinet.dll");
+            // SAFETY: a string that ends in a NUL; the names asked for are
+            // the library's own, with the shapes Windows documents.
+            unsafe {
+                let library = LoadLibraryExW(name.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
+                if library.is_null() {
+                    return Err(format!("Windows' own cabinet.dll could not be loaded (Windows error {})", GetLastError()));
+                }
+                let find = |name: &[u8]| -> Result<*mut c_void, String> {
+                    let found = GetProcAddress(library, name.as_ptr());
+                    if found.is_null() {
+                        return Err(format!("cabinet.dll has no {}", String::from_utf8_lossy(&name[..name.len() - 1])));
+                    }
+                    Ok(found)
+                };
+                Ok(Cabinet {
+                    make_squeezer: std::mem::transmute::<*mut c_void, MakeSqueezer>(find(b"CreateCompressor\0")?),
+                    squeeze: std::mem::transmute::<*mut c_void, Squeeze>(find(b"Compress\0")?),
+                    end_squeezer: std::mem::transmute::<*mut c_void, EndSqueezer>(find(b"CloseCompressor\0")?),
+                    make_unsqueezer: std::mem::transmute::<*mut c_void, MakeSqueezer>(find(b"CreateDecompressor\0")?),
+                    unsqueeze: std::mem::transmute::<*mut c_void, Squeeze>(find(b"Decompress\0")?),
+                    end_unsqueezer: std::mem::transmute::<*mut c_void, EndSqueezer>(find(b"CloseDecompressor\0")?),
+                })
+            }
+        })
+        .as_ref()
+        .map_err(String::clone)
+}
+
+/// Squeeze `data` the way Windows calls number `way` (pack.rs has the
+/// names).  Not for nothing at all: Windows refuses to squeeze nothing.
+pub fn squeeze(way: u32, data: &[u8]) -> Result<Vec<u8>, String> {
+    let cabinet = cabinet()?;
+    let mut out = vec![0u8; data.len() + data.len() / 2 + 4096];
+    // SAFETY: buffers and their lengths; a squeezer made and ended here.
+    unsafe {
+        let mut squeezer = std::ptr::null_mut();
+        if (cabinet.make_squeezer)(way, std::ptr::null_mut(), &mut squeezer) == 0 {
+            return Err(format!("Windows cannot squeeze that way (way {way}, Windows error {})", GetLastError()));
+        }
+        let mut length = 0usize;
+        let mut done = (cabinet.squeeze)(squeezer, data.as_ptr(), data.len(), out.as_mut_ptr(), out.len(), &mut length);
+        if done == 0 && GetLastError() == ERROR_INSUFFICIENT_BUFFER {
+            out = vec![0u8; length];
+            done = (cabinet.squeeze)(squeezer, data.as_ptr(), data.len(), out.as_mut_ptr(), out.len(), &mut length);
+        }
+        let error = GetLastError();
+        (cabinet.end_squeezer)(squeezer);
+        if done == 0 {
+            return Err(format!("Windows could not squeeze {} bytes (Windows error {error})", data.len()));
+        }
+        out.truncate(length);
+    }
+    Ok(out)
+}
+
+/// Bring back what `squeeze` made: exactly `size` bytes, or an error.
+pub fn unsqueeze(way: u32, squeezed: &[u8], size: usize) -> Result<Vec<u8>, String> {
+    let cabinet = cabinet()?;
+    let mut out = vec![0u8; size];
+    // SAFETY: buffers and their lengths; an unsqueezer made and ended here.
+    unsafe {
+        let mut unsqueezer = std::ptr::null_mut();
+        if (cabinet.make_unsqueezer)(way, std::ptr::null_mut(), &mut unsqueezer) == 0 {
+            return Err(format!("Windows cannot bring that back (way {way}, Windows error {})", GetLastError()));
+        }
+        let mut length = 0usize;
+        let done = (cabinet.unsqueeze)(unsqueezer, squeezed.as_ptr(), squeezed.len(), out.as_mut_ptr(), out.len(), &mut length);
+        let error = GetLastError();
+        (cabinet.end_unsqueezer)(unsqueezer);
+        if done == 0 || length != size {
+            return Err(format!("what was squeezed did not come back as {size} bytes (Windows error {error}, {length} bytes)"));
+        }
+    }
+    Ok(out)
+}
+
+/// The SHA-256 of `data`, in sixty-four letters.  Windows' own where it has
+/// it at hand (it uses what the processor offers for it); this
+/// repository's own otherwise, which says the same, more slowly.
+pub fn sha256_hex(data: &[u8]) -> String {
+    let sha256_of_windows = 0x41 as *mut c_void;
+    let mut out = [0u8; 32];
+    // (in pieces: the call takes lengths up to four thousand million)
+    if data.len() <= u32::MAX as usize {
+        // SAFETY: a buffer and its length in, thirty-two bytes out.
+        let status = unsafe { BCryptHash(sha256_of_windows, std::ptr::null_mut(), 0, data.as_ptr(), data.len() as u32, out.as_mut_ptr(), 32) };
+        if status == 0 {
+            return out.iter().map(|byte| format!("{byte:02x}")).collect();
+        }
+    }
+    vispora_updater_core::sha256::hex_of(data)
+}
+
 /// Remove the window's folder of a run that is over.  WebView2's own
 /// programs let go of their files a moment after the window is gone, so
 /// this tries for a few seconds.
@@ -768,7 +1110,9 @@ pub fn remove_private_folders(parent: &str) -> Tidied {
     let Ok(entries) = std::fs::read_dir(parent) else { return tidied };
     for entry in entries.flatten() {
         tidied.entries += 1;
-        if !entry.file_name().to_string_lossy().starts_with(WINDOW_FOLDER_PREFIX) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !ONE_RUNS_FOLDERS.iter().any(|prefix| name.starts_with(prefix)) {
             continue;
         }
         let Ok(found) = entry.metadata() else { continue };
@@ -785,13 +1129,38 @@ pub fn remove_private_folders(parent: &str) -> Tidied {
     tidied
 }
 
-/// Is the window's folder `path` one that no run is using any more?
-fn left_behind(path: &std::path::Path, found: &std::fs::Metadata) -> bool {
+/// Open what is under the mark's name in `folder`, for this program alone.
+///
+/// The folder may be anybody's: the place the folders are in lets programs
+/// without rights make folders of their own, with whatever they like under
+/// that name.  So a link there is not followed (what is opened is the link
+/// itself), and whoever is at the other end of what is opened is not handed
+/// this program's rights (a pipe's owner could otherwise act as this
+/// program).
+fn open_mark(folder: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt as _;
     let nobody_else = 0;
-    match std::fs::OpenOptions::new().read(true).share_mode(nobody_else).open(path.join(IN_USE_MARK)) {
-        // The mark is there and nobody holds it: its run is over.
-        Ok(_) => true,
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(nobody_else)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .security_qos_flags(SECURITY_IDENTIFICATION)
+        .open(folder.join(IN_USE_MARK))
+}
+
+/// Only a plain file is a mark: not a link, not a folder, not a pipe.
+fn is_a_plain_file(opened: &std::fs::File) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    opened.metadata().is_ok_and(|found| found.is_file() && found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0)
+}
+
+/// Is the window's folder `path` one that no run is using any more?
+fn left_behind(path: &std::path::Path, found: &std::fs::Metadata) -> bool {
+    match open_mark(path) {
+        // The mark is there and nobody holds it: its run is over.  Anything
+        // else under the mark's name is not a mark, and the folder is not
+        // this start's to remove.
+        Ok(mark) => is_a_plain_file(&mark),
         // No mark: being made right now, or left in that moment.  Old
         // enough, it is the second.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -912,6 +1281,37 @@ mod tests {
 
     /// A folder as a run that was ended from outside leaves it: made and
     /// marked like any other, with something in it, and the mark let go of.
+    /// Make the file `path` one that Windows passes on to somebody else
+    /// when it is opened (a reparse point, as a link is one), of a kind
+    /// that no program on the PC answers for.  Unlike a link to a file,
+    /// any account may make one of these.
+    fn make_it_lead_elsewhere(path: &str) -> bool {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::os::windows::io::AsRawHandle as _;
+        #[link(name = "kernel32")]
+        extern "system" {
+            #[allow(clippy::too_many_arguments)]
+            fn DeviceIoControl(device: *mut c_void, code: u32, input: *const u8, input_length: u32, output: *mut u8, output_length: u32,
+                               returned: *mut u32, overlapped: *mut c_void) -> i32;
+        }
+        const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+        // Whose kind it is (nobody's: not one of Microsoft's), how much
+        // follows the name, the name of whoever made it, and what follows.
+        let mut said = Vec::new();
+        said.extend_from_slice(&0x0000_7C57u32.to_le_bytes());
+        said.extend_from_slice(&4u16.to_le_bytes());
+        said.extend_from_slice(&0u16.to_le_bytes());
+        said.extend_from_slice(b"a-test-of-shell.");
+        said.extend_from_slice(b"mark");
+        let file = std::fs::OpenOptions::new().write(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path).unwrap();
+        let mut returned = 0u32;
+        // SAFETY: an open file, a buffer and its length, nothing asked back.
+        unsafe {
+            DeviceIoControl(file.as_raw_handle() as *mut c_void, FSCTL_SET_REPARSE_POINT, said.as_ptr(), said.len() as u32, std::ptr::null_mut(), 0,
+                            &mut returned, std::ptr::null_mut()) != 0
+        }
+    }
+
     fn one_left_behind(parent: &str) -> String {
         let folder = private_folder(parent, OpenTo::ThisAccount).unwrap();
         std::fs::create_dir_all(format!("{}\\EBWebView\\Default", folder.path)).unwrap();
@@ -964,9 +1364,45 @@ mod tests {
         let linked = std::process::Command::new("cmd.exe").args(["/d", "/c", "mklink", "/J", &link, &elsewhere]).output().unwrap();
         assert!(linked.status.success(), "{}", String::from_utf8_lossy(&linked.stderr));
 
+        // What is under the mark's name is not a mark: a folder, a link
+        // to a folder, a file that Windows passes on to somebody else
+        // when it is opened, and (where this account may make one) a link
+        // to a file somewhere else.  None of these folders is this start's
+        // to remove, and nothing is opened through a link.
+        let odd = |name: &str| {
+            let folder = format!("{parent}\\{WINDOW_FOLDER_PREFIX}{name}");
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::write(format!("{folder}\\kept.txt"), b"x").unwrap();
+            folder
+        };
+        let (a_folder, a_link_to_a_folder, a_link_to_a_file) = (odd("mark-is-a-folder"), odd("mark-is-a-link-to-a-folder"), odd("mark-is-a-link-to-a-file"));
+        // (the one kind that can be opened as a file and is no plain file,
+        // and that any account may make: the rule "only a plain file is a
+        // mark" is what keeps this folder)
+        let leads_elsewhere = odd("mark-leads-elsewhere");
+        std::fs::write(format!("{leads_elsewhere}\\{IN_USE_MARK}"), b"").unwrap();
+        assert!(make_it_lead_elsewhere(&format!("{leads_elsewhere}\\{IN_USE_MARK}")), "Windows error {}", unsafe { GetLastError() });
+        let opened = open_mark(std::path::Path::new(&leads_elsewhere)).expect("opened as what it is, it can be opened");
+        assert!(!is_a_plain_file(&opened), "a file that leads elsewhere was taken for a mark");
+        drop(opened);
+        std::fs::create_dir(format!("{a_folder}\\{IN_USE_MARK}")).unwrap();
+        let joined = std::process::Command::new("cmd.exe").args(["/d", "/c", "mklink", "/J", &format!("{a_link_to_a_folder}\\{IN_USE_MARK}"), &elsewhere]).output().unwrap();
+        assert!(joined.status.success());
+        // (a link to a file takes a right most accounts do not have; where
+        // it cannot be made, the folder simply has no mark and is too new)
+        let linked_a_file = std::os::windows::fs::symlink_file(format!("{elsewhere}\\precious.txt"), format!("{a_link_to_a_file}\\{IN_USE_MARK}")).is_ok();
+        if linked_a_file {
+            let opened = open_mark(std::path::Path::new(&a_link_to_a_file)).expect("the link itself can be opened");
+            assert!(!is_a_plain_file(&opened), "a link was taken for a mark");
+        }
+        assert!(is_a_plain_file(&open_mark(std::path::Path::new(&left)).unwrap()), "a real mark is a plain file");
+
         let tidied = remove_private_folders(&parent);
-        assert_eq!(tidied, Tidied { entries: 7, removed: 2, left: 2 }, "the two that no run is using, and only those");
+        assert_eq!(tidied, Tidied { entries: 11, removed: 2, left: 6 }, "the two that no run is using, and only those");
         assert!(!there(&left) && !there(&never_marked));
+        for folder in [&a_folder, &a_link_to_a_folder, &a_link_to_a_file, &leads_elsewhere] {
+            assert!(there(&format!("{folder}\\kept.txt")), "{folder} was taken away, with something that is no mark under the mark's name");
+        }
         assert!(there(&cookies) && there(&format!("{}\\{IN_USE_MARK}", theirs.path)), "a folder that is in use was emptied");
         assert!(there(&format!("{being_made}\\planted.js")), "a folder that may be being made was removed");
         assert!(there(&other) && there(&format!("{elsewhere}\\precious.txt")), "a link was followed and what it points to removed");
@@ -975,7 +1411,10 @@ mod tests {
         let was = theirs.path.clone();
         drop(_open);
         assert!(theirs.remove() && !there(&was));
-        assert_eq!(remove_private_folders(&parent), Tidied { entries: 4, removed: 0, left: 1 });
+        assert_eq!(remove_private_folders(&parent), Tidied { entries: 8, removed: 0, left: 5 });
+        let _ = std::fs::remove_file(format!("{leads_elsewhere}\\{IN_USE_MARK}"));
+        let _ = std::fs::remove_dir(format!("{a_link_to_a_folder}\\{IN_USE_MARK}"));
+        let _ = std::fs::remove_file(format!("{a_link_to_a_file}\\{IN_USE_MARK}"));
         let _ = std::fs::remove_dir(&link);
         tidy(&parent);
         tidy(&elsewhere);
@@ -1043,6 +1482,135 @@ mod tests {
     }
 
     #[test]
+    fn what_windows_squeezes_comes_back_as_it_was() {
+        // Something that squeezes well, something that does not, one byte.
+        let words: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".iter().cycle().take(200_000).copied().collect();
+        let mut noise = vec![0u8; 70_000];
+        Windows.random(&mut noise).unwrap();
+        for way in [2u32, 4, 5] {
+            for data in [&words[..], &noise[..], &b"x"[..]] {
+                let squeezed = squeeze(way, data).unwrap();
+                assert_eq!(unsqueeze(way, &squeezed, data.len()).unwrap(), data, "way {way}, {} bytes", data.len());
+            }
+            assert!(squeeze(way, &words).unwrap().len() < words.len() / 10, "way {way} did not squeeze");
+            // Squeezed bytes that are not what they should be: an error,
+            // never other bytes, and never more than was asked for.
+            let squeezed = squeeze(way, &words).unwrap();
+            assert!(unsqueeze(way, &squeezed, words.len() - 1).is_err(), "way {way}: a wrong length was taken");
+            assert!(unsqueeze(way, &squeezed, words.len() + 1).is_err(), "way {way}: less came back than was said, and it was taken");
+            assert!(unsqueeze(way, &squeezed[..squeezed.len() / 2], words.len()).is_err(), "way {way}: half of it was taken");
+            assert!(unsqueeze(way, b"not squeezed at all", 19).is_err());
+        }
+        assert!(squeeze(99, &words).is_err() && unsqueeze(99, &words, 1).is_err(), "a way Windows does not have");
+    }
+
+    #[test]
+    fn windows_and_this_repository_put_the_same_mark_on_the_same_bytes() {
+        for data in [&b""[..], b"abc", &vec![7u8; 1_000_000]] {
+            assert_eq!(sha256_hex(data), vispora_updater_core::sha256::hex_of(data));
+        }
+        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn a_folder_of_this_programs_making_is_told_from_any_other() {
+        let parent = a_place("whose");
+        let (mine, plain) = (format!("{parent}\\mine"), format!("{parent}\\plain"));
+        make_closed_folder(&mine, OpenTo::ThisAccount).unwrap();
+        std::fs::create_dir(&plain).unwrap();
+        let account = own_account().unwrap();
+        assert_eq!(described(&mine).unwrap(), format!("O:{account}D:P(A;OICI;FA;;;{account})(A;OICI;FA;;;SY)"));
+        assert_eq!(is_closed_to_all_but(&mine, OpenTo::ThisAccount), Ok(()));
+        // An ordinary folder lets in whoever the folder above lets in.
+        let ordinary = is_closed_to_all_but(&plain, OpenTo::ThisAccount).unwrap_err();
+        assert!(ordinary.contains("is not this program's folder"), "{ordinary}");
+        // One that is this account's is not the administrators'.
+        assert!(is_closed_to_all_but(&mine, OpenTo::Administrators).is_err());
+        // One of this program's making that somebody was let into as well:
+        // whose it is, is as it should be; who gets in, is not.
+        let widened = format!("{parent}\\widened");
+        make_closed_folder(&widened, OpenTo::ThisAccount).unwrap();
+        let everybody = "*S-1-1-0:(OI)(CI)F";
+        assert!(std::process::Command::new("icacls.exe").args([&widened, "/grant", everybody]).output().unwrap().status.success());
+        let refused = is_closed_to_all_but(&widened, OpenTo::ThisAccount).unwrap_err();
+        assert!(refused.contains("is not this program's folder") && refused.contains(";;;WD)") && refused.contains(&format!("\"O:{account}D:")), "{refused}");
+        assert!(hold_own_folder(&widened, OpenTo::ThisAccount).unwrap_err().contains("is not this program's folder"));
+        assert!(matches!(open_to_remove(&widened, OpenTo::ThisAccount), ToRemove::NotOurs));
+        // A file, a link and nothing at all are no folder of its own.
+        std::fs::write(format!("{parent}\\a-file"), b"x").unwrap();
+        let link = format!("{parent}\\a-link");
+        let linked = std::process::Command::new("cmd.exe").args(["/d", "/c", "mklink", "/J", &link, &mine]).output().unwrap();
+        assert!(linked.status.success());
+        for not_one in [format!("{parent}\\a-file"), link.clone(), format!("{parent}\\nothing")] {
+            assert!(is_closed_to_all_but(&not_one, OpenTo::ThisAccount).is_err(), "{not_one}");
+        }
+        // A folder is never given the name of something that is there.
+        std::fs::write(format!("{mine}\\inside"), b"x").unwrap();
+        let moved = format!("{parent}\\moved");
+        assert!(move_without_replacing(&mine, &plain).unwrap_err().ends_with("Windows error 183"));
+        move_without_replacing(&mine, &moved).unwrap();
+        assert!(there(&format!("{moved}\\inside")) && !there(&mine));
+        assert_eq!(is_closed_to_all_but(&moved, OpenTo::ThisAccount), Ok(()), "it keeps whose it is under its new name");
+        let _ = std::fs::remove_dir(&link);
+        tidy(&parent);
+    }
+
+    #[test]
+    fn a_folder_that_is_held_stays_under_its_name_and_one_that_is_going_cannot_be_held() {
+        let parent = a_place("held");
+        let (mine, plain, elsewhere) = (format!("{parent}\\mine"), format!("{parent}\\plain"), format!("{parent}\\elsewhere"));
+        make_closed_folder(&mine, OpenTo::ThisAccount).unwrap();
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(format!("{mine}\\inside"), b"x").unwrap();
+
+        // Held: nobody takes it away, gives it another name, or puts
+        // something else under its name.  What is in it is used as before.
+        let held = hold_own_folder(&mine, OpenTo::ThisAccount).unwrap();
+        assert!(std::fs::rename(&mine, &elsewhere).is_err(), "it was given another name while it was held");
+        assert!(std::fs::remove_dir(&mine).is_err() && there(&mine), "it was taken away while it was held");
+        assert!(matches!(open_to_remove(&mine, OpenTo::ThisAccount), ToRemove::InUse));
+        assert_eq!(std::fs::read(format!("{mine}\\inside")).unwrap(), b"x");
+        std::fs::write(format!("{mine}\\more"), b"y").unwrap();
+        std::fs::remove_file(format!("{mine}\\more")).unwrap();
+        // A second copy holds it beside the first, and it stays until the
+        // last of them has let go.
+        let second = hold_own_folder(&mine, OpenTo::ThisAccount).unwrap();
+        drop(held);
+        assert!(matches!(open_to_remove(&mine, OpenTo::ThisAccount), ToRemove::InUse));
+        drop(second);
+
+        // Nobody holds it: it can be asked for to be taken away, and while
+        // it is, nobody comes to hold it.
+        let ToRemove::Ours(going) = open_to_remove(&mine, OpenTo::ThisAccount) else { panic!("it could not be asked for") };
+        let refused = hold_own_folder(&mine, OpenTo::ThisAccount).unwrap_err();
+        assert!(refused.contains("os error 32"), "{refused}");
+        assert!(std::fs::remove_dir_all(&mine).is_ok());
+        drop(going);
+        assert!(!there(&mine));
+
+        // What is not this program's making is neither held nor taken away:
+        // an ordinary folder, the administrators' kind asked for by somebody
+        // else's, a link to a folder that would pass, a file, nothing.
+        make_closed_folder(&mine, OpenTo::ThisAccount).unwrap();
+        let link = format!("{parent}\\a-link");
+        assert!(std::process::Command::new("cmd.exe").args(["/d", "/c", "mklink", "/J", &link, &mine]).output().unwrap().status.success());
+        std::fs::write(format!("{parent}\\a-file"), b"x").unwrap();
+        for (not_one, why) in [(plain.clone(), "is not this program's folder"), (link.clone(), "is not a folder of its own"),
+                               (format!("{parent}\\a-file"), "is not a folder of its own"), (format!("{parent}\\nothing"), "os error 2")] {
+            let refused = hold_own_folder(&not_one, OpenTo::ThisAccount).unwrap_err();
+            assert!(refused.contains(why), "{not_one}: {refused}");
+            assert!(matches!(open_to_remove(&not_one, OpenTo::ThisAccount), ToRemove::NotOurs), "{not_one}");
+        }
+        assert!(hold_own_folder(&mine, OpenTo::Administrators).is_err());
+        assert!(matches!(open_to_remove(&mine, OpenTo::Administrators), ToRemove::NotOurs));
+        // (the link was looked at as the link it is: what it points to was
+        // neither held nor asked for)
+        assert!(matches!(open_to_remove(&mine, OpenTo::ThisAccount), ToRemove::Ours(_)));
+        let _ = std::fs::remove_dir(&link);
+        tidy(&parent);
+    }
+
+    #[test]
     fn webview2s_settings_are_taken_out_of_the_environment() {
         std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", "C:\\somewhere\\planted");
         std::env::set_var("webview2_additional_browser_arguments", "--remote-debugging-port=9222");
@@ -1075,6 +1643,7 @@ mod tests {
         let windows = windows_folder().unwrap();
         assert!(std::path::Path::new(&format!("{windows}\\explorer.exe")).is_file(), "{windows}");
         assert_eq!(administrators_folder().unwrap(), format!("{windows}\\Temp"));
+        assert_eq!(all_users_folder(), Some(format!("{}ProgramData", &windows[..3])));
     }
 
     #[test]

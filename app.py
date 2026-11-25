@@ -158,8 +158,10 @@ def _serve_for_the_shell(handoff) -> None:
     # the first for its window.  The window is the shell's now, and so is
     # telling a second copy from the first.
     _TOKEN_EXEMPT_PATHS = frozenset()
-    # What a person starts is the shell, not this process.
+    # What a person starts is the shell, not this process: that is the
+    # exe to start at sign-in, and the exe an update is for.
     autostart.use_app_exe(handoff.get("shell_exe"))
+    updater.use_app_exe(handoff.get("shell_exe"))
     _behind_shell = dict(handoff)
 
 

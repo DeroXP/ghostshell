@@ -22,6 +22,13 @@ default = ["elevated"]
 # Without this feature the exe never asks, and only runs as a trial: with a
 # stand-in backend and names of its own (see try_it.py).
 elevated = []
+# Which of the two ways the backend is kept on the PC (../core/src/backend.rs).
+# Without this feature it is unpacked at every start into a folder for that
+# run, and taken away at the quit: nothing stays on the PC.  With it, it is
+# unpacked once per version into a folder that stays, and checked and used
+# again at later starts.  The choice is the owner's; until they have made
+# it, builds are made without.
+keep-backend = []
 
 [dependencies]
 vispora-shell-core = { path = "../core" }

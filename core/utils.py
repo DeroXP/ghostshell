@@ -204,6 +204,28 @@ def is_reparse_point(path: str) -> bool:
         return True
 
 
+# Folders a running program's own files are in, by how their names begin.
+# Whatever empties a temp folder must leave them alone: the program's next
+# read of one of its files would fail.
+#
+#   * `_MEI<random>`: where a one-file exe made with PyInstaller unpacks
+#     itself for one run.  Today's Vispora.exe is one, and so are other
+#     people's programs.
+#   * `Vispora-window-<random>` and `Vispora-backend-<...>`: what the app's
+#     shell (shell_rs/) makes in Windows' own folder for temporary files:
+#     its window's folder, and the folder the app itself is unpacked into
+#     and running from.  The shell takes its own folders away, at the quit
+#     or at the next start (shell_rs/core/src/win.rs and backend.rs, where
+#     the names are written).  No release starts the app that way yet.
+RUNNING_PROGRAMS_FOLDERS = ("_MEI", "Vispora-window-", "Vispora-backend-")
+
+
+def is_running_programs_folder(name) -> bool:
+    """True for a folder name that a running program keeps its own files
+    under (see RUNNING_PROGRAMS_FOLDERS)."""
+    return isinstance(name, str) and name.startswith(RUNNING_PROGRAMS_FOLDERS)
+
+
 # Characters that end or escape out of a PowerShell double-quoted string:
 # the quote itself (PowerShell also accepts the typographic “ ” „ as one),
 # the backtick escape, `$` (variable / $(...) expansion) and line breaks.

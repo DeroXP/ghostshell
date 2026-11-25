@@ -93,6 +93,81 @@ fn the_shells_own_calls_carry_the_secret_and_never_wait_for_a_backend() {
 }
 
 #[test]
+fn how_the_backend_is_started_is_found_out_once_before_the_first_start() {
+    // (a shell that carries its backend unpacks it first)
+    let rig = Rig::with(vec![Behaviour { ends_after: Some((Duration::from_millis(150), 9)), ..Behaviour::default() }, Behaviour::default()], settings());
+    let asked = Arc::new(Mutex::new(0));
+    let counted = asked.clone();
+    *rig.shell.prepare_hook.lock().unwrap() = Some(Arc::new(move || {
+        *counted.lock().unwrap() += 1;
+        Ok(vispora_shell_core::platform::Command { program: "C:\\unpacked\\VisporaBackend.exe".into(), args: vec!["--backend".into()], cwd: None })
+    }));
+    rig.shell.start();
+    assert_eq!(rig.wait_ready(), Phase::Ready);
+    assert_eq!(rig.stage.last().command.program, "C:\\unpacked\\VisporaBackend.exe", "it was started from somewhere else");
+    // The first one dies; the one started in its place comes from the same
+    // place, and nothing is found out a second time.
+    assert!(wait(|| rig.stage.count() == 2, 5.0), "{:?}", rig.shell.history());
+    assert_eq!(rig.wait_ready(), Phase::Ready);
+    assert_eq!(rig.stage.last().command.program, "C:\\unpacked\\VisporaBackend.exe");
+    assert_eq!(*asked.lock().unwrap(), 1);
+}
+
+#[test]
+fn a_backend_that_cannot_be_made_ready_is_not_started_and_the_page_is_told_why() {
+    let rig = Rig::with(vec![Behaviour::default()], settings());
+    *rig.shell.prepare_hook.lock().unwrap() = Some(Arc::new(|| Err("there is no room left on the drive".to_string())));
+    rig.shell.start();
+    let phase = rig.shell.wait_for(Duration::from_secs(5), down);
+    let Phase::Down(why) = phase else { panic!("{phase:?}") };
+    assert_eq!(why, "Vispora could not get its background program ready (there is no room left on the drive). Close it and open it again.");
+    let answer = rig.call("GET", "/api/echo");
+    assert!(answer.status == 503 && text(&answer).contains("there is no room left on the drive"), "{} {}", answer.status, text(&answer));
+    // (nothing is started a moment later either)
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(rig.stage.count(), 0, "something was started all the same");
+    assert_eq!(rig.shell.quit_and_wait("test"), 0);
+    assert_eq!(rig.stage.count(), 0);
+}
+
+#[test]
+fn a_shell_that_was_quit_before_it_was_started_makes_no_backend_ready() {
+    // (nothing is unpacked for an app that is already leaving)
+    let rig = Rig::with(vec![Behaviour::default()], settings());
+    let asked = Arc::new(Mutex::new(0));
+    let counted = asked.clone();
+    *rig.shell.prepare_hook.lock().unwrap() = Some(Arc::new(move || {
+        *counted.lock().unwrap() += 1;
+        Ok(vispora_shell_core::platform::Command { program: "C:\\unpacked\\VisporaBackend.exe".into(), args: Vec::new(), cwd: None })
+    }));
+    assert_eq!(rig.shell.quit_and_wait("test"), 0);
+    rig.shell.start();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!((*asked.lock().unwrap(), rig.stage.count()), (0, 0), "a backend was made ready, or started, after the quit");
+}
+
+#[test]
+fn a_quit_waits_for_a_backend_that_is_being_made_ready_and_starts_none() {
+    let rig = Rig::with(vec![Behaviour::default()], settings());
+    let (begun, done) = (Arc::new(Mutex::new(false)), Arc::new(Mutex::new(false)));
+    let (begun_there, done_there) = (begun.clone(), done.clone());
+    *rig.shell.prepare_hook.lock().unwrap() = Some(Arc::new(move || {
+        *begun_there.lock().unwrap() = true;
+        std::thread::sleep(Duration::from_millis(400));
+        *done_there.lock().unwrap() = true;
+        Ok(vispora_shell_core::platform::Command { program: "C:\\unpacked\\VisporaBackend.exe".into(), args: Vec::new(), cwd: None })
+    }));
+    rig.shell.start();
+    assert!(wait(|| *begun.lock().unwrap(), 5.0));
+    // The quit is over only when what was being made ready is ready: its
+    // folder is the quit's to take away, whole.
+    assert_eq!(rig.shell.quit_and_wait("test"), 0);
+    assert!(*done.lock().unwrap(), "the quit was over while the backend was still being unpacked");
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(rig.stage.count(), 0, "a backend was started after the quit");
+}
+
+#[test]
 fn the_page_is_there_at_once_and_calls_wait_for_a_backend_that_is_still_starting() {
     let slow = Behaviour { up_after: Duration::from_millis(500), ..Behaviour::default() };
     let rig = Rig::with(vec![slow], settings());

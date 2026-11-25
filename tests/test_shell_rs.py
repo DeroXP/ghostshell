@@ -517,11 +517,12 @@ def test_what_keeps_the_app_from_starting_is_said_in_words_of_its_own():
     assert "Shell::new(settings, win::platform()).map_err(Trouble::Shell)?" in run
     assert run.count("Trouble::Folder {") == 2, "where the folder is made cannot be found, and it cannot be made"
     assert "win::private_folder(&folder_in, open_to).map_err(|why| Trouble::Folder { place: folder_in.clone(), why })?" in run
-    for kind in ("Shell(String)", "Folder { place: String, why: String }", "Window(String)"):
+    for kind in ("Shell(String)", "Folder { place: String, why: String }", "Window(String)", "Backend(String)"):
         assert kind in trouble, kind
     said = trouble[:trouble.index("#[cfg(test)]")]
-    # Named where the window cannot be opened (twice), and where it is not to blame.
-    assert said.count("Microsoft Edge WebView2") == 3 and "nothing to do with Microsoft Edge WebView2" in said
+    # Named where the window cannot be opened (twice), and where it is not
+    # to blame (the window's folder, and the backend's unpacking).
+    assert said.count("Microsoft Edge WebView2") == 4 and said.count("nothing to do with Microsoft Edge WebView2") == 2
     assert "Microsoft Edge WebView2" not in main, "the words are in one place"
     # In a trial the words go into a file: a box would sit on somebody's screen.
     assert "Some(file) => {" in main and '"messages": self.messages_file,' in app_crate("try_it.py")
@@ -547,9 +548,10 @@ def test_nothing_of_a_run_is_kept_in_the_windows_folder_and_nothing_found_there_
     assert run.index("let code = app.run_return(") < run.index("if !own_folder.remove() {")
     # The folder: a name nobody can guess, never one that is there already,
     # and nobody in it but the ones named and Windows itself.
-    folder = win[win.index("pub fn private_folder("):win.index("/// Remove the window's folder of a run that is over.")]
+    folder = win[win.index("fn written(open_to: OpenTo)"):win.index("/// Make the folder `path`, which must not be there yet: owned by")]
     assert "Windows.random(&mut random)?;" in folder and "let made = CreateDirectoryW(path_w.as_ptr(), &attributes);" in folder
-    assert 'OpenTo::Administrators => "BA".to_string(),' in folder
+    assert 'OpenTo::Administrators => Ok("BA".to_string()),' in folder
+    assert "private_folder_named(parent, WINDOW_FOLDER_PREFIX, open_to)" in folder
     assert 'closed_folder(&path, &format!("O:{who}{}", open_only_to(&who)))?;' in folder, "whose it is, and who gets in"
     assert 'format!("D:P(A;OICI;FA;;;{who})(A;OICI;FA;;;SY)")' in folder
     assert "std::fs::create_dir(&path)" not in folder, "every folder is made closed"
@@ -580,21 +582,32 @@ def test_a_start_never_takes_away_a_folder_that_is_in_use_and_never_keeps_the_wi
     window was made.  Now: the name first, and after the window is there."""
     main, win = app_crate("src", "main.rs"), rust("src", "win.rs")
     # The mark: made with the folder, held so that nobody else can open it.
-    folder = win[win.index("pub fn private_folder("):win.index("/// Remove the window's folder of a run that is over.")]
+    folder = win[win.index("pub fn private_folder("):win.index("/// Make the folder `path`, which must not be there yet: owned by")]
     assert "match hold_mark(&path) {" in folder and "Ok(in_use) => return Ok(OwnFolder { path, in_use: Some(in_use) })," in folder
     assert ".create_new(true).share_mode(nobody_else).open(format!(\"{folder}\\\\{IN_USE_MARK}\"))" in folder
     assert "let nobody_else = 0;" in folder
     # The tidy-up: the name first, then only what the listing already said.
-    tidy = win[win.index("pub fn remove_private_folders("):win.index("/// Is the window's folder `path` one that no run is using any more?")]
-    named = tidy.index("if !entry.file_name().to_string_lossy().starts_with(WINDOW_FOLDER_PREFIX) {\n            continue;")
+    tidy = win[win.index("pub fn remove_private_folders("):win.index("/// Open what is under the mark's name in `folder`")]
+    named = tidy.index("if !ONE_RUNS_FOLDERS.iter().any(|prefix| name.starts_with(prefix)) {\n            continue;")
     assert named < tidy.index("entry.metadata()") < tidy.index("left_behind(&path, &found)")
-    assert "symlink_metadata" not in win[:win.index("#[cfg(test)]")], "a question to Windows for every entry of the place"
-    # What may be removed: the mark is there and nobody holds it; or there
-    # is no mark and the folder is too old to be one that is being made.
-    left = win[win.index("fn left_behind("):win.index("/// Take every setting for WebView2")]
-    assert ".read(true).share_mode(nobody_else).open(path.join(IN_USE_MARK))" in left
-    assert "Ok(_) => true," in left and "Err(_) => false," in left
+    assert "symlink_metadata" not in tidy, "a question to Windows for every entry of the place"
+    # What may be removed: the mark is there, is a plain file, and nobody
+    # holds it; or there is no mark and the folder is too old to be one that
+    # is being made.
+    left = win[win.index("fn open_mark("):win.index("/// Take every setting for WebView2")]
+    assert "Ok(mark) => is_a_plain_file(&mark)," in left and "Err(_) => false," in left and "Ok(_) => true," not in left
     assert "is_some_and(|age| age >= MARK_EXPECTED_WITHIN)" in left
+    # The mark is opened for this program alone, without following a link,
+    # and without handing this program's rights to whatever is at the other
+    # end: the folder it is in may be anybody's (the place lets programs
+    # without rights make folders of their own).
+    opened = left[:left.index("/// Only a plain file is a mark")]
+    for said in (".share_mode(nobody_else)", ".custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)", ".security_qos_flags(SECURITY_IDENTIFICATION)",
+                 ".open(folder.join(IN_USE_MARK))"):
+        assert said in opened, said
+    assert "const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;" in win and "const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;" in win
+    assert "found.is_file() && found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0" in left
+    assert win.count(".open(path.join(IN_USE_MARK))") == 0, "the mark is opened in one place"
     # In the window's program: on a thread of its own, after the window is made.
     run = main[main.index("fn run("):]
     window_made = run.index(".map_err(no_window)?;", run.index("WebviewWindowBuilder::new("))

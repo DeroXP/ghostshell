@@ -11,8 +11,9 @@
 //! are registered, and the page is given no permission for the built-in
 //! ones.
 //!
-//! The tray icon is in tray.rs.  Not here yet: the backend packed into
-//! the exe.  Nothing in a release uses this program yet.
+//! The tray icon is in tray.rs.  The backend is carried in the exe itself
+//! and unpacked before it is started (core/src/backend.rs).  Nothing in a
+//! release uses this program yet.
 
 #![windows_subsystem = "windows"]
 
@@ -20,7 +21,7 @@ mod tray;
 
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tauri::http::Response as Answer;
 use tauri::utils::config::Color;
@@ -30,12 +31,19 @@ use vispora_shell_core::http::Request;
 use vispora_shell_core::instance::{self, Begin, Held};
 use vispora_shell_core::json::Json;
 use vispora_shell_core::platform::{Command, Window};
+use vispora_shell_core::pack::Pack;
 use vispora_shell_core::trouble::Trouble;
-use vispora_shell_core::{page, paths, win, Settings, Shell, APP_NAME};
+use vispora_shell_core::{backend, page, paths, win, Settings, Shell, APP_NAME};
 
 /// The build that is meant to ship asks for administrator rights; a trial
 /// build never does (Cargo.toml).
 const ASKS_FOR_RIGHTS: bool = cfg!(feature = "elevated");
+/// What the exe carries of its backend: the app, as one piece of bytes
+/// (core/src/pack.rs).  Put in when the exe is built (build.rs); nothing in
+/// a build that was made without one.
+static CARRIED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/backend.pack"));
+/// Which of the two ways the backend is kept on the PC (Cargo.toml).
+const KEEPS_ITS_BACKEND: bool = cfg!(feature = "keep-backend");
 /// "vispora" is a name of this program's own: WebView2 shows the page as
 /// http://vispora.localhost/ and asks nobody outside for it.
 const PAGE: &str = "vispora://localhost/";
@@ -55,6 +63,12 @@ struct Trial {
     /// A file that takes what would otherwise be shown in a message box (a
     /// box would sit on the screen of whoever is at the PC, and wait).
     messages: Option<String>,
+    /// A pack to unpack before the stand-in backend is started, in place
+    /// of what the exe carries (how a trial sees the unpacking for real,
+    /// the real backend's files included, without anything real running).
+    pack: Option<String>,
+    /// Which of the two ways the backend is kept, in place of the build's.
+    keep: Option<bool>,
 }
 
 fn trial() -> Option<Trial> {
@@ -74,6 +88,11 @@ fn trial() -> Option<Trial> {
         scripts: told["scripts"].as_str().map(str::to_string),
         folder_in: told["folder_in"].as_str().map(str::to_string),
         messages: told["messages"].as_str().map(str::to_string),
+        pack: told["pack"].as_str().map(str::to_string),
+        keep: match &told["keep"] {
+            Json::Bool(keep) => Some(*keep),
+            _ => None,
+        },
     })
 }
 
@@ -162,21 +181,25 @@ fn main() {
     };
 
     let folders = paths::Paths::resolve(&paths::Env::from_process());
-    let backend = match &trial {
-        Some(trial) => trial.backend.clone(),
-        None => {
-            // Where the one-file piece will put it.  Until then the build
-            // that ships has nothing to start, and says so.
-            let beside = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|folder| folder.join("backend")));
-            let program = beside.map(|folder| folder.join("VisporaBackend.exe")).unwrap_or_default();
-            if !program.is_file() {
-                win::tell(APP_NAME, "Vispora's files are incomplete: its background program is missing.\n\nDownload Vispora again.");
-                std::process::exit(1);
+    // The backend: what the exe carries.  (A trial may name a pack of its
+    // own, and starts its stand-in whatever was unpacked.)
+    let carried: &'static [u8] = match trial.as_ref().and_then(|trial| trial.pack.as_ref()) {
+        Some(named) => match std::fs::read(named) {
+            Ok(bytes) => Box::leak(bytes.into_boxed_slice()),
+            Err(why) => {
+                tell(trial.as_ref(), &format!("The trial's pack {named} cannot be read: {why}"));
+                std::process::exit(2);
             }
-            Command { program: program.to_string_lossy().into_owned(), args: Vec::new(), cwd: None }
-        }
+        },
+        None => CARRIED,
     };
-    let mut backend = backend;
+    if trial.is_none() && carried.is_empty() {
+        // A build that was made without its backend has nothing to start.
+        win::tell(APP_NAME, "Vispora's files are incomplete: its background program is missing.\n\nDownload Vispora again.");
+        std::process::exit(1);
+    }
+    // (the program is put in once it is unpacked: see the_backend_made_ready)
+    let mut backend = trial.as_ref().map_or_else(|| Command { program: String::new(), args: Vec::new(), cwd: None }, |trial| trial.backend.clone());
     backend.args.push("--backend".to_string());
     if from_autostart {
         backend.args.push("--from-autostart".to_string());
@@ -186,7 +209,7 @@ fn main() {
     // What a person starts is this program: the backend is told where it
     // is (it needs it where it names the app's exe).
     settings.shell_exe = std::env::current_exe().ok().map(|exe| exe.to_string_lossy().into_owned());
-    let code = match run(settings, &folders, held, from_autostart, trial.as_ref(), &ignored) {
+    let code = match run(settings, &folders, held, from_autostart, trial.as_ref(), &ignored, carried) {
         Ok(code) => code,
         // Each kind of trouble in words of its own (core/src/trouble.rs).
         Err(trouble) => {
@@ -202,9 +225,83 @@ fn no_window(why: impl std::fmt::Display) -> Trouble {
     Trouble::Window(why.to_string())
 }
 
+/// What became of unpacking the backend.
+#[derive(Default)]
+struct Unpacking {
+    /// The folder it was unpacked into for this run, to be taken away at
+    /// the quit.  (None for a folder that stays.)
+    for_this_run: Mutex<Option<win::OwnFolder>>,
+    /// The folder that stays, held under its name until the app ends: the
+    /// folder that was checked is the folder every start of the backend
+    /// runs from.  (None for a folder of this run's own.)
+    kept_held: Mutex<Option<std::fs::File>>,
+    /// It could not be made ready: the app then ends as one that did not start.
+    failed: std::sync::atomic::AtomicBool,
+}
+
+/// Have the shell unpack what the exe carries before it starts its backend
+/// for the first time: on the thread that starts the backend, so that the
+/// window is there meanwhile.  `places` says where; `keeps` which of the
+/// two ways.  In a trial the stand-in is started whatever was unpacked.
+fn the_backend_made_ready(shell: &Arc<Shell>, carried: &'static [u8], places: backend::Places, keeps: bool, stand_in: bool,
+                          messages: Option<String>) -> Arc<Unpacking> {
+    let unpacked: Arc<Unpacking> = Arc::default();
+    let (for_the_shell, slot, start_as) = (shell.clone(), unpacked.clone(), shell.settings.backend.clone());
+    let made_ready = move || -> Result<Command, String> {
+        let shell = &for_the_shell;
+        let began = std::time::Instant::now();
+        let pack = Pack::read(carried)?;
+        let way = if keeps { backend::Way::OncePerVersion } else { backend::Way::EveryStart };
+        let ready = backend::make_ready(&pack, way, &places)?;
+        for line in &ready.said {
+            shell.say(line);
+        }
+        shell.say(&format!("the background program was ready to be started {} ms after that began", began.elapsed().as_millis()));
+        // Folders that stay and are not this pack's are taken away (all of
+        // them, in a build that keeps none): never in the start's way.  This
+        // pack's own is never among them, whether it was used or not: one
+        // that did not pass is left exactly as it is.
+        if let Some(kept_in) = places.kept.clone() {
+            let (shell, but, start, open_to) = (shell.clone(), keeps.then(|| backend::kept_name(&pack)), pack.start.clone(), places.open_to);
+            std::thread::spawn(move || {
+                let others = backend::remove_other_kept(&kept_in, but.as_deref(), &start, open_to);
+                if others != backend::Others::default() {
+                    shell.say(&format!("folders of the background program from other versions: {} taken away, {} left because a copy of the app is using them, \
+                                        {} left because they are not this program's making", others.removed, others.in_use, others.not_ours));
+                }
+            });
+        }
+        *slot.for_this_run.lock().unwrap_or_else(|p| p.into_inner()) = ready.own;
+        *slot.kept_held.lock().unwrap_or_else(|p| p.into_inner()) = ready.held;
+        Ok(if stand_in { start_as.clone() } else { Command { program: ready.program, ..start_as.clone() } })
+    };
+    let (for_trouble, gone_wrong) = (shell.clone(), unpacked.clone());
+    *shell.prepare_hook.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(move || {
+        made_ready().map_err(|why| {
+            gone_wrong.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Said to the person, and then the app is quit: there is
+            // nothing for the window to show without its backend.
+            let (shell, words, messages) = (for_trouble.clone(), Trouble::Backend(why.clone()).words(), messages.clone());
+            std::thread::spawn(move || {
+                match &messages {
+                    Some(file) => {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
+                            let _ = writeln!(file, "{words}");
+                        }
+                    }
+                    None => win::tell(APP_NAME, &words),
+                }
+                shell.quit("the background program could not be made ready");
+            });
+            why
+        })
+    }));
+    unpacked
+}
+
 /// Open the window, start the backend, and stay until the app is quit.
-fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, from_autostart: bool, trial: Option<&Trial>, ignored: &[String])
-       -> Result<i32, Trouble> {
+fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, from_autostart: bool, trial: Option<&Trial>, ignored: &[String],
+       carried: &'static [u8]) -> Result<i32, Trouble> {
     // Asked before anything is opened: where WebView2 is missing, creating
     // the window does not fail, it waits for ever.
     let webview2 = tauri::webview_version().map_err(no_window)?;
@@ -234,6 +331,19 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
     };
     let own_folder = win::private_folder(&folder_in, open_to).map_err(|why| Trouble::Folder { place: folder_in.clone(), why })?;
     shell.say(&format!("the window's folder for this run: {}", own_folder.path));
+
+    // The backend is unpacked where the window's folder is made (for one
+    // run), or where folders stay: in the app as it ships, places that only
+    // administrators can change; in a trial, the trial's own data folder.
+    let unpacked = (!carried.is_empty()).then(|| {
+        let places = backend::Places {
+            for_one_run: folder_in.clone(),
+            kept: if ASKS_FOR_RIGHTS { win::all_users_folder() } else { Some(folder_in.clone()) },
+            open_to,
+        };
+        let keeps = trial.and_then(|trial| trial.keep).unwrap_or(KEEPS_ITS_BACKEND);
+        the_backend_made_ready(&shell, carried, places, keeps, trial.is_some(), trial.and_then(|trial| trial.messages.clone()))
+    });
 
     let for_requests = shell.clone();
     let app = tauri::Builder::default()
@@ -381,6 +491,16 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
     if !own_folder.remove() {
         shell.say("the window's folder is still in use and stays; the next start removes it");
     }
+    // The backend has ended: the folder it was unpacked into for this run goes.
+    let mut never_started = false;
+    if let Some(unpacked) = unpacked {
+        never_started = unpacked.failed.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some(folder) = unpacked.for_this_run.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            if !folder.remove() {
+                shell.say("the background program's folder is still in use and stays; the next start removes it");
+            }
+        }
+    }
     drop(held);
-    Ok(if code != 0 { code } else { quit })
+    Ok(if never_started { 1 } else if code != 0 { code } else { quit })
 }

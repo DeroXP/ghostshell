@@ -11,6 +11,16 @@
 //!
 //! The version is the app's, read from config.py, the one place it is
 //! written.
+//!
+//! And the backend: the app, built as a folder (backend.spec) and made into
+//! one piece of bytes (a pack: ../core/src/pack.rs), which the exe carries
+//! in itself.  The pack is named when the exe is built:
+//!
+//!     VISPORA_BACKEND_PACK=<the pack> cargo build --release --locked
+//!
+//! Built without one, the exe carries nothing: a trial build is given its
+//! pack by the trial, and the build that ships says that its files are
+//! incomplete.
 
 use std::path::Path;
 
@@ -26,6 +36,19 @@ fn main() {
         .expect("config.py has no line `APP_VERSION = \"...\"`");
     // (tauri-build reads what is added to tauri.conf.json from here)
     std::env::set_var("TAURI_CONFIG", format!("{{\"version\": \"{version}\"}}"));
+
+    // The pack, or nothing, under one name: main.rs takes it in from there.
+    println!("cargo:rerun-if-env-changed=VISPORA_BACKEND_PACK");
+    let carried = Path::new(&std::env::var("OUT_DIR").expect("cargo names the folder for what a build makes")).join("backend.pack");
+    match std::env::var("VISPORA_BACKEND_PACK").ok().filter(|named| !named.is_empty()) {
+        Some(named) => {
+            println!("cargo:rerun-if-changed={named}");
+            let bytes = std::fs::read(&named).unwrap_or_else(|e| panic!("VISPORA_BACKEND_PACK names {named}: {e}"));
+            assert!(bytes.starts_with(b"VSPPACK1"), "{named} is not a pack (see shell_rs/README.md, \"One file\")");
+            std::fs::write(&carried, bytes).unwrap_or_else(|e| panic!("{}: {e}", carried.display()));
+        }
+        None => std::fs::write(&carried, b"").unwrap_or_else(|e| panic!("{}: {e}", carried.display())),
+    }
 
     let manifest = include_str!("app.manifest");
     assert!(manifest.contains(r#"level="asInvoker""#) && !manifest.contains("requireAdministrator"),

@@ -3,7 +3,11 @@
     cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
 
     python shell_rs/app/try_it.py                  the checks; the window is never shown
+    python shell_rs/app/try_it.py --one-file       only the checks of the exe carrying its backend
     python shell_rs/app/try_it.py --time           the times, five runs
+    python shell_rs/app/try_it.py --time --pack P  ... and what unpacking the pack P costs, both ways
+    python shell_rs/app/try_it.py --time --pack P --carried-by E
+                                                   the same, with a trial build E that carries P itself
     python shell_rs/app/try_it.py --picture x.png  a picture of the window
     python shell_rs/app/try_it.py --show           the window, to look at and click
 
@@ -40,6 +44,14 @@ must not be used; a page from somewhere else is put into a frame and must
 find nothing of the app's there; the page is sent somewhere else and must
 stay.  "Somewhere else" is this PC every time (127.0.0.1): nothing is asked
 of the internet, and no link is opened in a browser.
+
+One file: the exe carries its backend as a pack and unpacks it before it
+starts it.  A trial gives the exe a pack to unpack (a made-up one for the
+checks: a folder of five small files; the real backend's for the times,
+with --pack) and starts its stand-in whatever was unpacked.  So the
+unpacking, the checking and the taking away are the real ones, with real
+files where the real pack is used, and nothing of the real backend is ever
+started.
 
 The tray is tried without a mouse.  Its menu is read as Windows has it (the
 words, the ticks, what is greyed), a click and a double click on the icon
@@ -102,6 +114,7 @@ def built(name):
 
 
 EXE = built("VisporaShell.exe")
+PACK_TOOL = built("vispora-shell-try.exe")      # (it also makes packs: shell_rs/README.md, "One file")
 
 
 def refuse(why):
@@ -160,12 +173,14 @@ class Elsewhere:
 class Run:
     """One start of the exe, with everything it is given."""
 
-    def __init__(self, root, window, planted=False, beside=None, folder_in=None, plant=None):
+    def __init__(self, root, window, planted=False, beside=None, folder_in=None, plant=None, pack=None, keep=None):
         """`beside`: another run whose folders this one shares, as a second
         person's copy on the same PC shares the place the window's folders
         are made in.  `folder_in`: where this run makes its window's folder,
         in place of its data folder.  `plant`: called with the run before
-        the exe is started."""
+        the exe is started.  `pack`: what the exe unpacks as its backend
+        before it starts the stand-in; `keep`: once per version (True) or at
+        every start (False)."""
         self.root = tempfile.mkdtemp(prefix="run-", dir=root)
         self.notes = os.path.join(self.root, "put-back.txt")
         self.calls_file = os.path.join(self.root, "calls.txt")
@@ -190,6 +205,10 @@ class Run:
         }
         if folder_in:
             told["folder_in"] = folder_in
+        if pack:
+            told["pack"] = pack
+        if keep is not None:
+            told["keep"] = keep
         self.env["VISPORA_SHELL_TRY"] = json.dumps(told)
         self.debug_port = self.planted_profile = self.left_behind = self.not_marked = None
         if planted:
@@ -272,6 +291,27 @@ class Run:
         return [tuple(int(n) for n in found) for found in re.findall(
             r"the window's old folders: (\d+) entries looked at in (\d+) ms, "
             r"(\d+) left behind by earlier runs and removed, (\d+) in use and left alone", self.log())]
+
+    def unpacked(self):
+        """What the shell last said about unpacking its backend: which way
+        ("run": for this run; "kept-new": into a folder that stays;
+        "kept-found": found there and checked), the folder, and how long."""
+        ways = (("run", r"the background program was unpacked for this run: (\d+) files, (\d+) bytes, (\d+) ms, into (.+)"),
+                ("kept-new", r"the background program was unpacked into (.+), to stay: (\d+) files, (\d+) bytes, (\d+) ms"),
+                ("kept-found", r"the background program is in (.+) from an earlier start, and is what the exe carries: "
+                               r"(\d+) files, (\d+) bytes, checked in (\d+) ms"))
+        last = {}
+        for line in self.log().splitlines():
+            for kind, pattern in ways:
+                found = re.search(pattern, line)
+                if found:
+                    parts = found.groups()
+                    folder = parts[3] if kind == "run" else parts[0]
+                    last = {"kind": kind, "folder": folder.strip(), "ms": int(parts[2] if kind == "run" else parts[3])}
+            ready = re.search(r"the background program was ready to be started (\d+) ms after that began", line)
+            if ready and last:
+                last["ready_ms"] = int(ready.group(1))
+        return last
 
     # ── the tray ──────────────────────────────────────────────────────
     def tray_window(self):
@@ -489,6 +529,51 @@ def own_account():
     return found.group(1) if found else "?"
 
 
+def made_up_backend(root, name, more=b""):
+    """A small folder that stands for a backend, and the pack of it: (the
+    pack's file, what the pack tool says about it, the folder)."""
+    folder = os.path.join(root, "made-up-" + name, "VisporaBackend")
+    os.makedirs(os.path.join(folder, "_internal", "certifi"))
+    for path, holds in (("VisporaBackend.exe", b"MZ not really a program" + more),
+                        (os.path.join("_internal", "python312.dll"), b"a library, a library, a library. " * 4000),
+                        (os.path.join("_internal", "certifi", "cacert.pem"), b"-----BEGIN CERTIFICATE-----\n" * 900),
+                        (os.path.join("_internal", "empty.txt"), b""),
+                        (os.path.join("_internal", "noise.bin"), os.urandom(5000))):
+        with open(os.path.join(folder, path), "wb") as f:
+            f.write(holds)
+    pack = os.path.join(root, "made-up-" + name, "backend.pack")
+    made = subprocess.run([PACK_TOOL, "--pack", folder, pack, "lzms"], capture_output=True, text=True, creationflags=NO_WINDOW)
+    return pack, (json.loads(made.stdout) if made.returncode == 0 else {}), folder
+
+
+def files_of(folder, but=()):
+    """Every file in `folder` (but the ones named): its path in the folder,
+    and what it holds."""
+    found = {}
+    for where, _, names in os.walk(folder):
+        for name in names:
+            path = os.path.relpath(os.path.join(where, name), folder).lower()
+            if path in but:
+                continue
+            with open(os.path.join(where, name), "rb") as f:
+                found[path] = f.read()
+    return found
+
+
+def same_files(folder, source, but=()):
+    """Does `folder` hold exactly what `source` holds (and what is named in `but`)?"""
+    try:
+        there = files_of(folder, but=tuple(own.lower() for own in but))
+    except OSError:
+        return False
+    # (what is named in `but` has to be there: it is the caller's own)
+    return bool(there) and there == files_of(source) and all(os.path.exists(os.path.join(folder, own)) for own in but)
+
+
+def closed_like_the_windows(folder):
+    return who_gets_in(folder, folder + ".who-gets-in.txt") == "D:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)" % own_account()
+
+
 def can_open(path):
     """Can this file be opened at all, by a program that lets everybody
     else read it, write it and delete it meanwhile?  Not while somebody
@@ -622,6 +707,14 @@ A_GAME = """(function () {
 })();"""
 
 
+TRAY_STATE = """(function () {
+    window.pywebview.api.get_api_token().then(function (token) {
+        fetch('/api/stand-in/tray-state', { method: 'POST', body: JSON.stringify({ broken: %s }),
+            headers: { 'X-Vispora-Token': token, 'Content-Type': 'application/json' } });
+    });
+})();"""
+
+
 def first_screen(run):
     return run.wait_for(lambda: [c for c in run.page_calls() if c[3] == "/api/dashboard"])
 
@@ -637,10 +730,11 @@ class NoFurther(Exception):
     """A check failed, and the trial was asked to stop at the first one."""
 
 
-def checks(root):
-    """Every check, one after the other.  With VISPORA_TRY_STOP_AT_FIRST set
-    in the environment, the trial ends at the first check that fails (for
-    when a build is broken on purpose, to see that the trial notices)."""
+def checks(root, which=None):
+    """Every check, one after the other (or those of `which` alone).  With
+    VISPORA_TRY_STOP_AT_FIRST set in the environment, the trial ends at the
+    first check that fails (for when a build is broken on purpose, to see
+    that the trial notices)."""
     results = []
     stop_at_first = bool(os.environ.get("VISPORA_TRY_STOP_AT_FIRST"))
 
@@ -651,7 +745,7 @@ def checks(root):
             raise NoFurther()
 
     try:
-        every_check(root, check)
+        (which or every_check)(root, check)
     except NoFurther:
         print("  (stopped at the first check that failed)")
     failed = [r for r in results if not r[1]]
@@ -846,6 +940,18 @@ def every_check(root, check):
         check("none of the tray's calls was refused (%d)" % len([c for c in calls if c[3].startswith("/api/tray/")]),
               all(status == 200 for _, status, _, path in calls if path.startswith("/api/tray/")))
 
+        # A backend that is up and gives no usable answer is asked every
+        # three seconds like any other, not four times a second.
+        run.in_the_page(TRAY_STATE % "true")
+        failing = run.wait_for(lambda: [c for c in run.calls() if c[3] == "/api/tray/state" and c[1] == 500], 20)
+        time.sleep(4.5)
+        asked = [c for c in run.calls() if c[3] == "/api/tray/state" and c[1] == 500]
+        check("a backend whose answer is of no use is asked for the tray every three seconds, not four times a second "
+              "(%d times in the 4.5 s after the first)" % (len(asked) - 1), failing and 1 <= len(asked) - 1 <= 2)
+        run.in_the_page(TRAY_STATE % "false")
+        check("and the tray goes on when it answers again",
+              run.wait_for(lambda: [c for c in run.calls() if c[3] == "/api/tray/state" and c[1] == 200 and c[0] > asked[-1][0]], 20))
+
         # Hidden in the tray, and Windows ends the session.
         run.in_the_page(HIDE)
         check("the window is hidden in the tray again", run.wait_for(lambda: run.window(shown=True) is None, 10))
@@ -903,6 +1009,192 @@ def every_check(root, check):
               and ("The folder is made in %s." % os.path.join(in_the_way, "inside")) in said
               and "usually fixes this" not in said and "Nothing was changed on this PC." in said)
         check("no backend was started for it", "backend started" not in run.log())
+    finally:
+        run.end()
+    one_file(root, check)
+
+
+# What a start says it did with the folders that stay and are not its own:
+# taken away, left because a copy is using them, left because they are not
+# the program's making.
+OTHER_VERSIONS = (r"from other versions: (\d+) taken away, (\d+) left because a copy of the app is using them, "
+                  r"(\d+) left because they are not this program's making")
+
+
+def can_be_renamed(folder):
+    """Can the folder be given another name (and so be exchanged for
+    something else)?  It gets its own name back."""
+    try:
+        os.rename(folder, folder + "-elsewhere")
+    except OSError:
+        return False
+    os.rename(folder + "-elsewhere", folder)
+    return True
+
+
+def quit_by_its_window(run):
+    run.close_the_window()
+    return ended(run)
+
+
+def one_file(root, check):
+    """The exe carries its backend and unpacks it before it starts it: both
+    ways of keeping it, and what is done with a folder that does not pass."""
+    pack, says, source = made_up_backend(root, "first")
+    check("a pack was made of a made-up backend: %r" % (says,), says.get("files") == 5 and says.get("start") == "VisporaBackend.exe")
+    mine = "D:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)" % own_account()
+
+    # Unpacked at every start, into a folder for that run.
+    run = Run(root, "hidden", pack=pack, keep=False)
+    try:
+        check("(unpacked at every start) the page came up: the backend was started once it was unpacked", first_screen(run))
+        got = run.unpacked()
+        folder = got.get("folder", "")
+        check("the backend was unpacked for this run, into a folder of this run's own: %s" % os.path.basename(folder),
+              got.get("kind") == "run" and os.path.dirname(folder) == run.data and re.match(r"^Vispora-backend-run-[0-9a-f]{32}$", os.path.basename(folder)))
+        check("the folder holds what the exe carries and the run's mark, and nothing else", same_files(folder, source, but=("in-use",)))
+        check("it is closed to everybody but the trial's own account and Windows itself, and marked as in use",
+              who_gets_in(folder, os.path.join(run.root, "backend-who.txt")) == mine and not can_open(os.path.join(folder, "in-use")))
+        check("at the quit the folder goes (exit code %r)" % (quit_by_its_window(run),), run.process.returncode == 0 and not os.path.exists(folder))
+    finally:
+        run.end()
+
+    # A run that Windows ended leaves its folder; the next start takes it away.
+    run = Run(root, "hidden", pack=pack, keep=False)
+    after = None
+    try:
+        first_screen(run)
+        left, window_left = run.unpacked().get("folder", ""), run.window_folder()
+        run.end_the_session()
+        check("a run that Windows ended (exit code %r) leaves its backend's folder behind, with nobody holding its mark" % (ended(run),),
+              os.path.isdir(left) and can_open(os.path.join(left, "in-use")))
+        time.sleep(3)                               # (WebView2's programs let go of the window's folder)
+        after = Run(root, "hidden", pack=pack, keep=False, beside=run)
+        first_screen(after)
+        tidied = after.wait_for(lambda: len(after.tidied()) >= 2 and after.tidied(), 20)
+        check("the next start takes it away, and the window's folder with it: %r" % (tidied and tidied[-1],),
+              tidied and tidied[-1][2] == 2 and not os.path.exists(left) and not os.path.exists(window_left))
+        check("and has a backend folder of its own", after.unpacked().get("folder") not in ("", None, left) and os.path.isdir(after.unpacked()["folder"]))
+        quit_by_its_window(after)
+    finally:
+        if after:
+            after.end()
+        run.end()
+
+    # Unpacked once per version, into a folder that stays.
+    home = Run(root, "hidden", pack=pack, keep=True)
+    try:
+        check("(unpacked once per version) the page came up", first_screen(home))
+        got = home.unpacked()
+        kept = got.get("folder", "")
+        check("the first start unpacked it into a folder that stays, named after the version and the pack: %s" % os.path.basename(kept),
+              got.get("kind") == "kept-new" and os.path.dirname(kept) == home.data and os.path.basename(kept) == says.get("kept_as"))
+        check("the folder holds exactly what the exe carries, and is closed like the window's",
+              same_files(kept, source) and who_gets_in(kept, os.path.join(home.root, "kept-who.txt")) == mine)
+        check("it stays after the quit (exit code %r), and nothing half made beside it" % (quit_by_its_window(home),),
+              home.process.returncode == 0 and os.path.isdir(kept) and not [n for n in os.listdir(home.data) if n.endswith(".making")])
+    finally:
+        home.end()
+
+    def later(what, keep=True, pack=pack):
+        """Another start in the same place; what it said about unpacking, its
+        log, and what it said it did with other versions' folders (the log
+        is the place's: only what this start added to it)."""
+        before = len(re.findall(OTHER_VERSIONS, home.log()))
+        run = Run(root, "hidden", pack=pack, keep=keep, beside=home)
+        try:
+            up = first_screen(run)
+            got = run.unpacked()
+            others = (run.wait_for(lambda: re.findall(OTHER_VERSIONS, run.log())[before:], 5) or [])
+            code = quit_by_its_window(run)
+            return bool(up) and code == 0, got, run.log(), others
+        finally:
+            run.end()
+
+    up, got, log, _ = later("the next start")
+    check("the next start finds the folder, holds it against the exe and uses it: nothing is unpacked (checked in %s ms)" % got.get("ms"),
+          up and got.get("kind") == "kept-found" and got.get("folder") == kept)
+
+    # A folder that does not pass is never used, and never put right.
+    program = os.path.join(kept, "VisporaBackend.exe")
+    with open(program, "r+b") as f:
+        f.write(b"XX")                              # (two other letters, the same length)
+    up, got, log, _ = later("a start with a changed program in the folder")
+    check("a folder whose program was changed is not used: the backend is unpacked for that run instead",
+          up and got.get("kind") == "run" and "the folder that stays is not used: VisporaBackend.exe is not what the exe carries" in log
+          and not os.path.exists(got.get("folder", kept)))
+    try:
+        with open(program, "rb") as f:
+            begins = f.read(2)
+    except OSError:
+        begins = None                               # (it was taken away)
+    check("and the changed folder is left as it is: not put right, not taken away", begins == b"XX")
+
+    # Another version: its folder stays, the other one's goes.
+    newer, says_newer, source_newer = made_up_backend(root, "newer", more=b", in another version")
+    up, got, log, others = later("another version's start", pack=newer)
+    kept_newer = got.get("folder", "")
+    check("another version unpacks into a folder of its own and takes the other one's away: %r" % (others,),
+          up and got.get("kind") == "kept-new" and os.path.basename(kept_newer) == says_newer.get("kept_as") != says.get("kept_as")
+          and others == [("1", "0", "0")] and not os.path.exists(kept) and same_files(kept_newer, source_newer))
+
+    # A copy that is running holds its folder: no start takes it away, and
+    # nothing can be put in its place.
+    open_copy = Run(root, "hidden", pack=newer, keep=True, beside=home)
+    try:
+        check("(a copy of that version stays open) it runs from the folder that stays",
+              first_screen(open_copy) and open_copy.unpacked().get("kind") == "kept-found")
+        check("while it runs, its folder cannot be given another name: nothing can be put in its place", not can_be_renamed(kept_newer))
+        up, got, log, others = later("a start of the first version meanwhile")
+        check("a start of another version meanwhile makes its own folder and leaves that one as it is: %r" % (others,),
+              up and got.get("kind") == "kept-new" and got.get("folder") == kept and others == [("0", "1", "0")]
+              and same_files(kept_newer, source_newer))
+        check("the open copy's page goes on working, and it quits as ever (exit code %r)" % (quit_by_its_window(open_copy),),
+              open_copy.process.returncode == 0)
+        check("once it is gone, its folder can be given another name again", can_be_renamed(kept_newer))
+    finally:
+        open_copy.end()
+    # A build that keeps none takes away what a build that kept one left.
+    up, got, log, others = later("a start of a build that keeps none", keep=False, pack=newer)
+    check("a build that keeps no folder takes away the ones earlier builds kept: %r" % (others,),
+          up and got.get("kind") == "run" and others == [("2", "0", "0")] and not os.path.exists(kept_newer)
+          and not os.path.exists(kept))
+
+    # Somebody made a folder of that name first, with the right files in it.
+    def somebody_was_first(run):
+        shutil.copytree(source, os.path.join(run.data, says["kept_as"]))
+        shutil.copytree(source, os.path.join(run.data, "Vispora-backend-kept-0.0.0-somebody-elses"))
+
+    run = Run(root, "hidden", pack=pack, keep=True, plant=somebody_was_first)
+    try:
+        up, got = first_screen(run), run.unpacked()
+        theirs = os.path.join(run.data, says["kept_as"])
+        check("a folder of the right name that somebody else made is not used, though the right files are in it",
+              up and got.get("kind") == "run" and "is not this program's folder" in run.log())
+        check("and is not made the program's own in place", same_files(theirs, source)
+              and who_gets_in(theirs, os.path.join(run.root, "theirs-who.txt")) != mine)
+        others = run.wait_for(lambda: re.findall(OTHER_VERSIONS, run.log()), 5)
+        check("a folder of another version's name that somebody else made is not taken away either: %r" % (others,),
+              others == [("0", "0", "1")] and same_files(os.path.join(run.data, "Vispora-backend-kept-0.0.0-somebody-elses"), source))
+        quit_by_its_window(run)
+    finally:
+        run.end()
+
+    # What the exe carries cannot be read: said in words of its own.
+    spoiled = os.path.join(root, "not-a-pack.pack")
+    with open(pack, "rb") as f:
+        whole = f.read()
+    with open(spoiled, "wb") as f:
+        f.write(whole[:len(whole) // 2])
+    run = Run(root, "hidden", pack=spoiled, keep=False)
+    try:
+        code = ended(run, 60)
+        said = run.messages()
+        check("a backend that cannot be unpacked is not started (exit code 1, got %r), and it is said in words of its own: %r"
+              % (code, said.split("\n")[0]),
+              code == 1 and said.startswith("Vispora could not get its background program ready.") and "usually fixes this" not in said
+              and "backend started" not in run.log())
+        check("nothing was left behind for it", not [n for n in os.listdir(run.data) if n.startswith(("Vispora-backend-", "Vispora-window-"))])
     finally:
         run.end()
 
@@ -984,6 +1276,76 @@ def times(root, runs=5):
     return bool(tidied)
 
 
+def unpacking_times(root, pack, runs=3, carried_by=None):
+    """What carrying the backend in the exe costs a start, both ways, with
+    the pack `pack` (the real backend's, to mean anything).  Its files are
+    unpacked, checked and taken away for real; what is started is the
+    stand-in.
+
+    `carried_by`: a trial build that was built with this pack in it (see
+    shell_rs/README.md, "One file").  It is given no pack: it unpacks what
+    it carries, as the app would."""
+    global EXE
+    said = subprocess.run([PACK_TOOL, "--pack-says", pack], capture_output=True, text=True, creationflags=NO_WINDOW)
+    if said.returncode != 0:
+        print("That is not a pack: " + said.stderr.strip())
+        return False
+    says = json.loads(said.stdout)
+    print("\nThe pack: %d files, %.1f MB unpacked, %.1f MB in the exe.\n" % (says["files"], says["bytes"] / 1e6, says["packed"] / 1e6))
+    handed = pack
+    if carried_by:
+        if os.path.basename(carried_by).lower() in ("vispora.exe", "ghostshell.exe"):
+            refuse("an exe named after the app is never started by a trial.")
+        with open(carried_by, "rb") as f, open(pack, "rb") as p:
+            exe, carried = f.read(), p.read()
+        if b"VISPORA_SHELL_TRY" not in exe:
+            refuse("%s is the build that is meant to ship. It is never started here." % carried_by)
+        if carried not in exe:
+            refuse("%s does not carry that pack." % carried_by)
+        print("The exe carries the pack itself: %.1f MB, of which %.1f MB are the shell.\n" % (len(exe) / 1e6, (len(exe) - len(carried)) / 1e6))
+        EXE, handed = carried_by, None
+
+    def one(keep, beside=None):
+        run = Run(root, "offscreen", pack=handed, keep=keep, beside=beside)
+        try:
+            seen = run.wait_for(lambda: run.window(shown=True))
+            on_screen = (time.time() - run.began) * 1000 if seen else float("nan")
+            screen = first_screen(run)
+            got = run.unpacked()
+            time.sleep(1.0)
+            began = time.time()
+            run.close_the_window()
+            run.process.wait(120)
+            return run, {"window": on_screen, "unpack": float(got.get("ms", "nan")), "ready": float(got.get("ready_ms", "nan")),
+                         "screen": screen[0][0] * 1000 if screen else float("nan"), "quit": (time.time() - began) * 1000,
+                         "kind": got.get("kind"), "folder": got.get("folder", "")}
+        finally:
+            run.end()
+
+    def show(name, rows, what):
+        def middle(key):
+            values = sorted(row[key] for row in rows)
+            return "%6.0f (%.0f to %.0f)" % (statistics.median(values), values[0], values[-1])
+        print("  %s  [%d start(s), all %s]" % (name, len(rows), "/".join(sorted({str(r["kind"]) for r in rows}))))
+        print("      %-58s %s ms" % (what, middle("unpack")))
+        print("      %-58s %s ms" % ("the backend could be started, after the window was made", middle("ready")))
+        print("      %-58s %s ms" % ("a window on screen", middle("window")))
+        print("      %-58s %s ms" % ("the first screen has its data (a trial's backend)", middle("screen")))
+        print("      %-58s %s ms" % ("quit: until the shell's process has ended", middle("quit")))
+
+    every = [one(False)[1] for _ in range(runs)]
+    show("Unpacked at every start, taken away at the quit", every, "unpacking %.0f MB into a folder for the run" % (says["bytes"] / 1e6))
+    home, first = one(True)
+    show("Unpacked once per version: the first start", [first], "unpacking %.0f MB into a folder that stays" % (says["bytes"] / 1e6))
+    later = [one(True, beside=home)[1] for _ in range(runs)]
+    show("Unpacked once per version: every later start", later, "holding the folder against the exe, file by file")
+    kept = first["folder"]
+    on_disk = sum(os.path.getsize(os.path.join(where, name)) for where, _, names in os.walk(kept) for name in names) if os.path.isdir(kept) else 0
+    print("\n  On the PC between runs: nothing (unpacked at every start); %.1f MB in one folder (once per version)." % (on_disk / 1e6))
+    print("  The files and the unpacking are the real ones; the program that is started is the stand-in.")
+    return all(row["kind"] == "run" for row in every) and first["kind"] == "kept-new" and all(row["kind"] == "kept-found" for row in later)
+
+
 # ─── To look at ──────────────────────────────────────────────────────
 
 def picture(root, path):
@@ -1026,8 +1388,14 @@ def main(argv):
     try:
         if not argv:
             ok = checks(root)
+        elif argv == ["--one-file"]:
+            ok = checks(root, one_file)
         elif argv == ["--time"]:
             ok = times(root)
+        elif argv[:2] == ["--time", "--pack"] and len(argv) == 3:
+            ok = unpacking_times(root, os.path.abspath(argv[2]))
+        elif argv[:2] == ["--time", "--pack"] and len(argv) == 5 and argv[3] == "--carried-by":
+            ok = unpacking_times(root, os.path.abspath(argv[2]), carried_by=os.path.abspath(argv[4]))
         elif argv[:1] == ["--picture"] and len(argv) == 2:
             ok = picture(root, os.path.abspath(argv[1]))
         elif argv == ["--show"]:

@@ -11,6 +11,8 @@
 //! (`call_for`), except "Open Vispora" and "Quit": the window and quitting
 //! are the shell's.
 
+use std::time::Duration;
+
 use crate::json::Json;
 
 /// What the backend says the tray shows (GET /api/tray/state).
@@ -105,6 +107,52 @@ pub const LINE: &str = "line";
 
 /// Where the backend says what the tray shows.
 pub const STATE_CALL: &str = "/api/tray/state";
+
+/// How often the backend is asked what the tray shows: as today's tray asks.
+pub const LOOK_EVERY: Duration = Duration::from_secs(3);
+/// How soon the shell looks again while its backend is not up (it is
+/// starting, or being started again).  Nothing is sent meanwhile: whether
+/// there is a backend is the shell's own knowledge.
+pub const LOOK_SOON: Duration = Duration::from_millis(250);
+
+/// How long until the tray is looked at again.
+///
+/// The short wait is for a backend that is not up, and for nothing else.  A
+/// backend that is up and gives no usable answer (its call failed, its
+/// answer was too long) is asked again after three seconds like any other:
+/// asked four times a second, it would be asked four times a second for as
+/// long as the app runs.
+pub fn look_again_in(backend_is_up: bool) -> Duration {
+    if backend_is_up {
+        LOOK_EVERY
+    } else {
+        LOOK_SOON
+    }
+}
+
+/// What goes wrong with the icon is said once, and not at every round:
+/// once for each kind of failure, and once more when it works again.
+#[derive(Debug, Default)]
+pub struct Complaints {
+    said: Option<String>,
+}
+
+impl Complaints {
+    /// The icon could not be brought up to date.  The line to write down,
+    /// or None when this very failure was written down already.
+    pub fn failed(&mut self, why: &str) -> Option<String> {
+        if self.said.as_deref() == Some(why) {
+            return None;
+        }
+        self.said = Some(why.to_string());
+        Some(format!("the tray icon could not be brought up to date: {why} (said once; the shell goes on trying)"))
+    }
+
+    /// It was brought up to date.  A line to write down if it had failed before.
+    pub fn worked(&mut self) -> Option<String> {
+        self.said.take().map(|_| "the tray icon is up to date again".to_string())
+    }
+}
 
 /// The backend's call for a menu entry that is the backend's to carry out.
 pub fn call_for(id: &str) -> Option<&'static str> {
@@ -311,6 +359,37 @@ mod tests {
         }
         assert_eq!(calls, ["/api/tray/game-mode", "/api/tray/force-normal", "/api/tray/crosshair", "/api/tray/refresh-pc", "/api/tray/clean-ram"]);
         assert!(calls.iter().all(|call| call.starts_with("/api/tray/")) && STATE_CALL == "/api/tray/state");
+    }
+
+    #[test]
+    fn a_backend_that_is_up_is_asked_every_three_seconds_whatever_it_answers() {
+        // Up: three seconds, as today's tray, also when its answer was of
+        // no use (the caller cannot say so here on purpose: the wait does
+        // not depend on the answer).
+        assert_eq!(look_again_in(true), Duration::from_secs(3));
+        // Not up (starting, or being started again): soon, and nothing is sent.
+        assert_eq!(look_again_in(false), Duration::from_millis(250));
+        assert!(LOOK_SOON < LOOK_EVERY);
+    }
+
+    #[test]
+    fn what_goes_wrong_with_the_icon_is_said_once() {
+        let mut complaints = Complaints::default();
+        assert_eq!(complaints.worked(), None, "nothing to say while nothing has gone wrong");
+        let first = complaints.failed("Windows error 1400").expect("the first time it is said");
+        assert!(first.starts_with("the tray icon could not be brought up to date: Windows error 1400") && first.contains("said once"));
+        for _ in 0..100 {
+            assert_eq!(complaints.failed("Windows error 1400"), None, "the same line at every round");
+        }
+        // Another kind of failure is said, once.
+        assert!(complaints.failed("the menu could not be made").is_some());
+        assert_eq!(complaints.failed("the menu could not be made"), None);
+        // ... and the first kind again, if it comes back.
+        assert!(complaints.failed("Windows error 1400").is_some());
+        // When it works again that is said, once; and a later failure is new.
+        assert_eq!(complaints.worked().as_deref(), Some("the tray icon is up to date again"));
+        assert_eq!(complaints.worked(), None);
+        assert!(complaints.failed("Windows error 1400").is_some());
     }
 
     #[test]

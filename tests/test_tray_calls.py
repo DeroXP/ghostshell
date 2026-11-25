@@ -314,7 +314,17 @@ def test_what_the_app_says_the_tray_shows_is_what_todays_tray_looks_at():
             assert c.get("/api/tray/state", headers=auth()).status_code == 200
         assert m.CMDS == [] and m.PSC == [], "asking what the tray shows started a program"
     watcher = inspect.getsource(A._create_tray_icon)
-    assert "time.sleep(3)" in watcher and "const LOOK_EVERY: Duration = Duration::from_secs(3);" in S.app_crate("src", "tray.rs")
+    assert "time.sleep(3)" in watcher and "pub const LOOK_EVERY: Duration = Duration::from_secs(3);" in S.rust("src", "tray.rs")
+    # A backend that is up is asked every three seconds whatever it answers:
+    # the short wait is for a backend that is not up, when nothing is sent.
+    # (With the wait taken from the answer, a state call that fails was
+    # asked four times a second for as long as the app ran.)
+    tray = S.app_crate("src", "tray.rs")
+    assert "let pause = tray::look_again_in(shell.phase() == Phase::Ready);" in tray
+    assert "state.is_some()" not in tray and "LOOK_SOON" not in tray, "the wait depends on the answer again"
+    # What goes wrong with the icon is said once, not at every round.
+    assert "if let Some(line) = complaints.failed(&why.to_string()) {" in tray and "if let Some(line) = complaints.worked() {" in tray
+    assert "could not be brought up to date" not in tray, "the words are the core's, and are said through Complaints"
 
 
 def test_the_shell_shows_the_menu_the_picture_and_the_tooltip_todays_tray_shows():
@@ -568,7 +578,7 @@ def test_started_as_it_always_was_the_entry_names_what_it_named():
         assert command_in(autostart._build_task_xml(autostart._current_exe_path(), 30)) == (own, "--from-autostart")
     # Nothing but the shell's hand-over sets another exe.
     source = S.repo("app.py")
-    assert source.count("use_app_exe(") == 1
+    assert source.count("use_app_exe(") == 2, "for the entry at sign-in, and for the updater (tests/test_one_file.py)"
     serve = inspect.getsource(A._serve_for_the_shell)
     assert 'autostart.use_app_exe(handoff.get("shell_exe"))' in serve
     assert "use_app_exe" not in inspect.getsource(A.main)

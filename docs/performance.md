@@ -486,6 +486,55 @@ screen after 36 ms in that run as in every other. (The place the app as it
 ships uses, Windows' own folder for temporary files, often holds thousands
 of files that are nothing of the app's.)
 
+### Carrying the backend in the exe
+
+The shell's exe carries the app's files and unpacks them before it starts
+the backend ("One file" in [shell_rs/README.md](../shell_rs/README.md)).
+There are two ways of keeping what was unpacked, and the owner chooses.
+Measured with `python shell_rs/app/try_it.py --time --pack <pack>
+--carried-by <exe>`: a trial build of the shell that carries the real
+backend's pack in itself, three starts each way, the middle value.
+
+What is real in these numbers: the files (the app built as a folder with
+PyInstaller 6.22.3 and Python 3.12: 206 files, 57,077,942 bytes), the pack
+(26,059,148 bytes), the exe that carries it, the unpacking, the checking
+and the taking away. What is a trial's: the place (the trial's own data
+folder, closed to its own account, where the app as it ships uses folders
+that are the administrators'), and the program that is started afterwards,
+which is the stand-in and not the backend that was unpacked. Everything was
+already in the disk cache.
+
+| | Today's exe | (a) Unpacked at every start | (b) Once per version: first start | (b) later starts |
+| --- | --- | --- | --- | --- |
+| The download | 28,208,008 bytes | 32,842,752 bytes | the same | the same |
+| Unpacking 57 MB (today: 46 MB), or checking the folder against the exe | 0.3 s replayed, 2.9 s at a sign-in | 94 ms (93 to 97) | 108 ms (unpacking, then the check) | 11 ms |
+| The backend can be started, after the window was made | | 109 ms | 121 ms | 23 ms |
+| A window on screen | after the unpacking | 36 ms | 36 ms | 36 ms |
+| The first screen has its data (stand-in backend) | | 1.01 s | 1.02 s | 0.93 s |
+| Quit, until the shell's process has ended (stand-in backend) | | 0.27 s | 0.24 s | 0.24 s |
+| On the PC while the app is not running | nothing | nothing | 57.1 MB | 57.1 MB |
+
+"Today's exe" is the one built on the development PC; its unpacking times
+are the ones from "Before Python runs" above, for the installed 3.7.0. The
+32,842,752 bytes are the build that is meant to ship, built once with the
+pack in it and never started: 6.8 MB of shell and 26.1 MB of pack.
+
+Why the shell unpacks faster than today's exe does, with more to unpack:
+each file is squeezed by itself, so up to six are brought back at the same
+time, and Windows does the work (its Compression API). The pack is squeezed
+with LZMS, the smallest of the three ways Windows has. The other two, with
+the same files: MSZIP 28,354,984 bytes; XPRESS with Huffman 30,026,295
+bytes, which unpacks in 42 ms.
+
+What is not in these numbers, and has not been measured: a start with
+nothing in the disk cache (after a restart, at sign-in); and the virus
+scanner, which looks at program files when they are written and when they
+are loaded. In (a) all 206 files are new at every start, as they are with
+today's app. In (b) they are new once per version, and the check at later
+starts reads files the scanner has seen. So the 86 ms between the two ways
+here is the least the difference can be, not what it is on a slow or busy
+disk: that is not known until it is tried on a real PC.
+
 What the shell changes about waiting, whatever the numbers turn out to be:
 
 * The page does not wait for Python any more. Its first calls do: they are

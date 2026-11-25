@@ -30,9 +30,11 @@
 
 #![cfg(windows)]
 
+pub mod backend;
 pub mod forward;
 pub mod http;
 pub mod instance;
+pub mod pack;
 pub mod page;
 pub mod platform;
 pub mod router;
