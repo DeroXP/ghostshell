@@ -37,17 +37,24 @@ The backend is `app.py`, started as a program of its own:
 
 ```
 <the backend> --backend
-VISPORA_SHELL={"port": 49213, "token": "...", "shell_pid": 1234}
+VISPORA_SHELL={"port": 49213, "listen": 812, "token": "...",
+               "shell_pid": 1234, "shell_started": 134088...}
 ```
 
 * **The hand-over** is one environment variable, not a command line (which
   other programs can read). The backend takes it out of its environment at
   once, so that the programs it starts do not inherit the secret.
-* **Where it listens:** on a port of 127.0.0.1 that the shell picked. It is
-  no longer the fixed port 5987, so a port that is taken or reserved (which
-  used to leave the window blank) is not a problem any more. The shell
-  connects to 127.0.0.1 and to nothing else; the address is written in
-  `core/src/forward.rs`, not taken from a request.
+* **The socket is the shell's.** The shell makes one listening socket on
+  127.0.0.1 when it starts, on a port Windows picks, marked so that no other
+  program can listen on that port as well, and keeps it until it ends. Every
+  backend inherits that socket (`"listen"` is its number) and serves on it;
+  behind the shell the backend opens no port of its own. So the port is
+  never free and never anybody else's: not before a backend is up, not while
+  one is started again, not after one has died. See "Why the socket is the
+  shell's" below. It is also no longer the fixed port 5987, so a port that
+  is taken or reserved (which used to leave the window blank) is not a
+  problem any more. The shell connects to 127.0.0.1 and to nothing else; the
+  address is written in `core/src/forward.rs`, not taken from a request.
 * **The secret** is made by the shell, 32 random bytes from Windows, and
   given to both sides: to the page in the fragment of the window's address
   (as before), to the backend in the hand-over. It is in no log line.
@@ -57,17 +64,47 @@ VISPORA_SHELL={"port": 49213, "token": "...", "shell_pid": 1234}
   version is not this shell's backend, and the shell says so.
 * **Stopped:** a backend that ends on its own with exit code 0 meant to go
   (an update is being installed), and the shell goes too. One that ends any
-  other way is started again, with the same secret, up to three times in
-  five minutes; after that the shell says so in the page's calls and stops
-  trying.
+  other way is started again, with the same secret, on the same socket: up
+  to three times in five minutes for one that had been up, up to three
+  times in a row for one that never came up, however long each try took.
+  After that the shell says so in the page's calls and stops trying.
 * **Quit**, however it is asked for and however often: the window goes out
   of sight at once; the backend is told (`/api/window/quit`, the call the
   page always made), puts the system back and ends; the shell waits for its
   process to end. After 30 seconds a backend that has not ended is ended
-  (5 seconds for one that never came up). Only then does the shell exit.
-  Everybody who asks for the quit, or waits for it, waits for the same one.
+  (5 seconds for one that never came up). A backend that is being started
+  at that very moment is waited for and dealt with like any other. Only
+  then does the shell exit. Everybody who asks for the quit, or waits for
+  it, waits for the same one.
 * **The shell gone without a quit** (crashed, ended from Task Manager): the
   backend watches the shell's process, puts the system back and ends too.
+  It knows the shell by its process id and the time it was started, both
+  handed over: an id alone is given out again once its process has ended.
+
+### Why the socket is the shell's
+
+Every call the shell passes on carries the run's secret, and a call goes to
+whoever listens on the port. The first version of this code asked Windows
+for a free port, let go of it, and handed the number to the backend, which
+took the port a second or two later. Until then (and again whenever a
+backend had died) anybody could listen there, and the shell's "are you up",
+sent every 50 ms with the secret, went to them. A program without
+administrator rights could learn the secret that way and then call the real,
+elevated backend with it: the step up the secret is there to prevent.
+
+Tried on Windows 11 (`core/src/win.rs` has both as tests):
+
+* a listener that asks for a shareable address, which is what a web
+  server's own listener does (Werkzeug sets address reuse), **can be joined**
+  by a second listener of the same user on the same port;
+* a listener that asks for nothing, or that asks to be alone, cannot.
+
+So it would not have been enough for the backend to make its own listener
+more carefully: the port would still have been free before and after it.
+With one socket made by the shell and kept for its whole life there is no
+"before" and no "after". A call made while no backend is accepting waits in
+that socket's queue, where nobody else can get at it, and is answered by the
+next backend or given up on when the shell stops trying.
 
 What the backend does not do behind the shell: tell a second copy from the
 first, ask for administrator rights, open a window, show a tray icon. Those
@@ -150,6 +187,15 @@ it is told to start, and the only thing to tell it is the stand-in.
 
 * No window, no tray, no single-instance check, no autostart: the next
   piece.
+* **Ending a backend ends one process.** That is right for a backend that
+  is one process. If the backend is ever packed so that the program the
+  shell starts is only an unpacker for the real one, a forced end would
+  leave the real one running as administrator with a valid secret, and a
+  restart would make two. Whatever the packaging piece does, a forced end
+  has to end all of it, and a test needs a stand-in with a child of its own.
+* **A backend that is alive but stuck is not noticed.** Once it is up, only
+  its process is looked at. One that hangs is not started again; its calls
+  wait until the page gives up on them.
 * The real backend has never been started by the shell. Its side of the
   arrangement is tested on the fake machine only, where the start-up work
   and a real quit's undoing do not happen.

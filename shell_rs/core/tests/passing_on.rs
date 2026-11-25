@@ -125,3 +125,35 @@ fn a_backend_that_goes_silent_is_not_waited_for_longer_than_the_limit() {
     // A call that takes its time within the limit is simply answered.
     assert_eq!(rig.call("GET", "/api/slow?100").status, 200);
 }
+
+#[test]
+fn an_exchange_with_a_limit_on_the_whole_of_it_ends_there() {
+    // Silence is one limit; an answer that keeps coming, slowly, needs another.
+    let rig = Rig::ready();
+    let port = rig.shell.port();
+    let ask = rig.asking("GET", "/api/slow?1500");
+    let limits = Limits { whole: Some(Duration::from_millis(300)), silence: Duration::from_secs(30), ..Limits::default() };
+    let began = std::time::Instant::now();
+    assert_eq!(forward::send(port, &ask, &limits).unwrap_err(), "the backend took too long over its answer");
+    assert!(began.elapsed() >= Duration::from_millis(290) && began.elapsed() < Duration::from_millis(1200), "{:?}", began.elapsed());
+    // Whoever knows that nobody will answer can end the wait.
+    let began = std::time::Instant::now();
+    let limits = Limits { silence: Duration::from_secs(30), ..Limits::default() };
+    let refused = forward::send_while(port, &rig.asking("GET", "/api/slow?3000"), &limits, &|| began.elapsed() < Duration::from_millis(300));
+    assert_eq!(refused.unwrap_err(), "the backend is gone");
+    assert!(began.elapsed() < Duration::from_millis(1500), "{:?}", began.elapsed());
+}
+
+#[test]
+fn what_comes_before_the_answer_is_not_taken_for_it() {
+    let rig = Rig::ready();
+    // "100 Continue" and its like only say that the answer is still to come.
+    let answer = rig.call("GET", "/api/continue-first");
+    assert_eq!((answer.status, text(&answer).as_str()), (200, "the real"));
+    assert_eq!(answer.header("X-Early"), None);
+    // A piece that says it is larger than anything can be is an error, not
+    // an addition that goes wrong.
+    let answer = rig.call("GET", "/api/piece-too-long");
+    assert_eq!(answer.status, 502);
+    assert!(rig.shell.history().join("\n").contains("far too large"), "{:?}", rig.shell.history());
+}

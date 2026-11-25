@@ -51,6 +51,7 @@ fn state_of(shell: &Shell) -> Json {
     Json::object([
         ("phase", text_of(&shell.phase()).into()),
         ("backend_pid", shell.backend_pid().map_or(Json::Null, Into::into)),
+        ("port", (shell.port() as u32).into()),
         ("starts", (shell.starts() as u32).into()),
         ("ready_ms", millis(ready)),
         ("quit_ms", millis(quit)),

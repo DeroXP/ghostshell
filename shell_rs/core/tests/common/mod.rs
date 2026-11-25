@@ -2,24 +2,30 @@
 //! test.
 //!
 //! Nothing is started for real here.  "Starting the backend" makes a stand-in:
-//! a thread that listens on the port the shell picked, on 127.0.0.1, and
-//! answers the few calls a test needs the way the real backend would (it
-//! checks the Host and the secret as app.py does), and a "process" that is
-//! alive until it is told to quit, is ended, or decides to die.  How a
-//! stand-in behaves is set by the test, one behaviour per start.
+//! a thread that accepts on the shell's listening socket, as a backend that
+//! inherited it would, and answers the few calls a test needs the way the
+//! real backend would (it checks the Host and the secret as app.py does), and
+//! a "process" that is alive until it is told to quit, is ended, or decides
+//! to die.  How a stand-in behaves is set by the test, one behaviour per
+//! start.
+//!
+//! The listening socket is a real one on 127.0.0.1, made once per shell and
+//! kept, as the real platform does: a stand-in that has "died" stops
+//! accepting, and calls made meanwhile wait in the socket's queue for the
+//! next one.
 
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vispora_shell_core::http::{Request, Response};
 use vispora_shell_core::json::Json;
-use vispora_shell_core::platform::{Child, Command, Platform, Window};
+use vispora_shell_core::platform::{Child, Command, Listening, Platform, Window};
 use vispora_shell_core::shell::Phase;
 use vispora_shell_core::{token, Settings, Shell};
 
@@ -45,11 +51,14 @@ pub struct Behaviour {
     pub on_quit: OnQuit,
     /// It ends on its own this long after its start, with this exit code.
     pub ends_after: Option<(Duration, i32)>,
+    /// It answers "are you up" one byte at a time, this far apart.
+    pub drips_hello: Option<Duration>,
 }
 
 impl Default for Behaviour {
     fn default() -> Behaviour {
-        Behaviour { up_after: Duration::ZERO, never_up: false, version: VERSION.into(), on_quit: OnQuit::Leaves(Duration::ZERO), ends_after: None }
+        Behaviour { up_after: Duration::ZERO, never_up: false, version: VERSION.into(), on_quit: OnQuit::Leaves(Duration::ZERO), ends_after: None,
+                    drips_hello: None }
     }
 }
 
@@ -74,6 +83,9 @@ pub struct StandIn {
     pub port: u16,
     pub token: String,
     pub shell_pid: i128,
+    pub shell_started: i128,
+    /// The number the shell's socket was handed over under.
+    pub listen: i128,
     pub command: Command,
     pub handoff: String,
     behaviour: Behaviour,
@@ -114,7 +126,8 @@ impl StandIn {
         self.seen.lock().unwrap().iter().filter(|s| s.target == target).count()
     }
 
-    fn listen(self: Arc<Self>) {
+    /// Accept on the shell's socket for as long as this stand-in is alive.
+    fn listen(self: Arc<Self>, listener: TcpListener) {
         if self.behaviour.never_up {
             return;
         }
@@ -124,7 +137,9 @@ impl StandIn {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        let Ok(listener) = TcpListener::bind(("127.0.0.1", self.port)) else { return };
+        // (asked of this copy of the socket too: a copy does not take the
+        // setting over, and an accept that waits would take a call in after
+        // this stand-in has died)
         listener.set_nonblocking(true).unwrap();
         while self.alive() {
             match listener.accept() {
@@ -164,8 +179,20 @@ impl StandIn {
         self.seen.lock().unwrap().push(seen.clone());
         let raw = self.reply(&seen);
         let mut stream = stream;
-        let _ = stream.write_all(&raw);
-        let _ = stream.flush();
+        match self.behaviour.drips_hello {
+            Some(apart) if seen.target == "/api/shell/hello" => {
+                for byte in raw {
+                    if stream.write_all(&[byte]).and_then(|()| stream.flush()).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(apart);
+                }
+            }
+            _ => {
+                let _ = stream.write_all(&raw);
+                let _ = stream.flush();
+            }
+        }
     }
 
     /// The whole answer, as it goes over the wire.
@@ -226,6 +253,13 @@ impl StandIn {
             ("GET", "/api/cut-short") => b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nonly this much".to_vec(),
             ("GET", "/api/not-http") => b"SSH-2.0-OpenSSH_9.0\r\n\r\n".to_vec(),
             ("GET", "/api/empty") => b"HTTP/1.1 204 NO CONTENT\r\nX-Kept: yes\r\nKeep-Alive: timeout=5\r\n\r\n".to_vec(),
+            ("GET", "/api/continue-first") => {
+                b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 102 Processing\r\nX-Early: 1\r\n\r\n\
+                  HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\n\r\nthe real".to_vec()
+            }
+            ("GET", "/api/piece-too-long") => {
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\nFFFFFFFFFFFFFFFF\r\nxyz\r\n0\r\n\r\n".to_vec()
+            }
             _ => json("404 NOT FOUND", Json::object([("ok", false.into()), ("err", "Endpoint not found".into()), ("path", path.into())])),
         }
     }
@@ -258,9 +292,35 @@ impl Child for Handle {
     }
 }
 
+/// The shell's listening socket in the tests: a real one, kept by the stage.
+struct Kept {
+    port: u16,
+}
+
+impl Listening for Kept {
+    fn port(&self) -> u16 {
+        self.port
+    }
+    fn handle(&self) -> u64 {
+        HANDLE
+    }
+}
+
+/// The number the tests' socket is handed over under.
+pub const HANDLE: u64 = 812;
+/// When the tests' shell "was started".
+pub const SHELL_STARTED: u64 = 134_088_000_000_000_000;
+
 /// The platform of the tests: every "start" makes a stand-in.
 #[derive(Default)]
 pub struct Stage {
+    /// The socket the shell asked for, and how often it asked.
+    listener: Mutex<Option<TcpListener>>,
+    pub listens: AtomicUsize,
+    /// Set: a start does not come back until it is cleared again.
+    pub start_is_held: AtomicBool,
+    /// How many starts have been begun (also those that are being held).
+    pub starts_begun: AtomicUsize,
     /// How the next stand-ins behave, in order; the last one goes on for ever.
     pub behaviours: Mutex<VecDeque<Behaviour>>,
     pub started: Mutex<Vec<Arc<StandIn>>>,
@@ -280,12 +340,21 @@ impl Stage {
     pub fn count(&self) -> usize {
         self.started.lock().unwrap().len()
     }
+    /// The port of the socket the shell asked for.
+    pub fn port(&self) -> u16 {
+        self.listener.lock().unwrap().as_ref().expect("the shell asked for its socket").local_addr().unwrap().port()
+    }
 }
 
 struct StageDoor(Arc<Stage>);
 
 impl Platform for StageDoor {
     fn start(&self, command: &Command, handoff: &str) -> Result<Box<dyn Child>, String> {
+        self.0.starts_begun.fetch_add(1, Ordering::SeqCst);
+        let held_since = Instant::now();
+        while self.0.start_is_held.load(Ordering::SeqCst) && held_since.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         if let Some(why) = self.0.cannot_start.lock().unwrap().clone() {
             return Err(why);
         }
@@ -299,6 +368,8 @@ impl Platform for StageDoor {
             port: given["port"].as_int().unwrap_or(0) as u16,
             token: given["token"].as_str().unwrap_or("").to_string(),
             shell_pid: given["shell_pid"].as_int().unwrap_or(0),
+            shell_started: given["shell_started"].as_int().unwrap_or(0),
+            listen: given["listen"].as_int().unwrap_or(0),
             command: command.clone(),
             handoff: handoff.to_string(),
             behaviour,
@@ -308,14 +379,24 @@ impl Platform for StageDoor {
             seen: Mutex::new(Vec::new()),
         });
         self.0.started.lock().unwrap().push(stand_in.clone());
-        let listener = stand_in.clone();
-        std::thread::spawn(move || listener.listen());
+        // It "inherits" the shell's socket: the same one, to accept on.
+        let socket = self.0.listener.lock().unwrap().as_ref().expect("the shell made its socket first").try_clone().map_err(|e| e.to_string())?;
+        let accepting = stand_in.clone();
+        std::thread::spawn(move || accepting.listen(socket));
         Ok(Box::new(Handle(stand_in)))
     }
 
-    fn free_port(&self) -> Result<u16, String> {
+    fn listen(&self) -> Result<Box<dyn Listening>, String> {
+        self.0.listens.fetch_add(1, Ordering::SeqCst);
         let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
-        Ok(listener.local_addr().unwrap().port())
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let port = listener.local_addr().unwrap().port();
+        *self.0.listener.lock().unwrap() = Some(listener);
+        Ok(Box::new(Kept { port }))
+    }
+
+    fn own_start(&self) -> u64 {
+        SHELL_STARTED
     }
 
     fn random(&self, bytes: &mut [u8]) -> Result<(), String> {
@@ -376,6 +457,7 @@ pub fn settings() -> Settings {
     let mut settings = Settings::new(command, "C:\\Users\\A & B\\AppData\\Roaming\\Vispora");
     settings.version = VERSION.into();
     settings.ready_within = Duration::from_secs(3);
+    settings.hello_within = Duration::from_millis(300);
     settings.calls_wait = Duration::from_secs(3);
     settings.quit_within = Duration::from_millis(1500);
     settings.quit_unready_within = Duration::from_millis(400);
