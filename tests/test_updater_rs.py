@@ -19,11 +19,14 @@ no connection.  Nothing else of the Rust updater is ever started here.
 """
 import sandbox as m
 
+import contextlib
+import io
 import json
 import os
 import random
 import re
 import subprocess
+import sys
 
 import config
 import update_sources as SRC
@@ -85,7 +88,7 @@ def test_its_release_file_is_found_the_way_the_app_looks_for_an_updater():
 def test_it_takes_every_argument_the_app_passes():
     cli = rust("src", "cli.rs")
     values = set(re.findall(r'"(--[a-z-]+)"', cli[cli.index("const VALUE_OPTIONS"):cli.index("const FLAG_OPTIONS")]))
-    flags = set(re.findall(r'"(--[a-z-]+)"', cli[cli.index("const FLAG_OPTIONS"):cli.index("const USAGE")]))
+    flags = set(re.findall(r'"(--[a-z-]+)"', cli[cli.index("const FLAG_OPTIONS"):cli.index("const HELP_OPTION")]))
     # What the Python updater declares (updater/main.py) ...
     main = open(os.path.join(m.REPO, "updater", "main.py"), encoding="utf-8").read()
     declared = dict(re.findall(r'p\.add_argument\("(--[a-z-]+)",\s*([^)]*)\)', main))
@@ -269,7 +272,7 @@ def test_the_window_is_the_python_updaters_window():
     # What the page asks goes to the function the cargo tests call.
     assert "server::handle(&updater, request.method().as_str(), request.uri().path(), request.body())" in main
     # A closed window does not cut a running install off.
-    assert "stop_install()" in python and "updater.stop_install();" in main
+    assert "stop_install()" in python and "updater.shut_down();" in main
     # --silent: no window, and the pipeline's exit code.
     assert "if args.silent { cli::run_silent(&updater) } else { with_window(&updater) }" in main
 
@@ -504,11 +507,77 @@ def test_three_thousand_made_up_answers_are_decided_the_same():
         f"the made-up answers are a real mix: {sum(found)} with a build, {sum(updaters)} with an updater"
 
 
+# Words a command line can be made of: the options, written out and by their
+# beginnings, with a value attached, and values of every odd kind.
+ARGUMENT_WORDS = [
+    "--target-dir", "--target-exe", "--channel", "--current-version", "--target-version", "--auto-confirm",
+    "--server", "--source", "--silent", "--help", "-h",
+    "--t", "--target", "--target-d", "--target-e", "--target-v", "--c", "--ch", "--cu", "--a", "--s", "--se", "--so",
+    "--si", "--h", "--he",
+    "--target-dir=x", "--channel=beta", "--channel=", "--source=github", "--silent=1", "--help=1", "--ch=stable",
+    "--target-d=a=b", "--target-dir=--silent", "--bogus=1", "--=x", "--h=1",
+    "x", "", "stable", "beta", "auto", "github", "server", "nope", "a b", "-", "--", "-5", "-5.5", "-.5", "-0",
+    "-my folder", "--my folder", "--silent x", "--target-exe x", "--target-exe=x y", "--sil x", "--help x",
+    "-x", "-hx", "-hh", "-h=1", "-h-x", "-h x", "-silent", "--bogus", "--bogus x", "=", "-5 6", "--x =1", "--x=1",
+    "-x=1", "- 5", "C:/x", "3.9.0", r"C:\Program Files\Vispora\Vispora.exe",
+]
+
+# Taken as a value by the argparse of Python 3.13 and later, and refused by
+# 3.12's.  3.12 is the Python the Python updater's exe is built with, so the
+# Rust updater does as 3.12 does.
+ONLY_NEWER_PYTHONS_TAKE = ("-5.", "-1e5", "-1_000", "-5a")
+
+
+def _python_reads(argv):
+    """What updater/main.py makes of a command line: the arguments, or the
+    exit code it stops with."""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return UM.parse_args(argv)
+    except SystemExit as stopped:
+        return {"exit": stopped.code}
+
+
+def test_a_command_line_is_read_the_same():
+    """The app passes plain words, and those are covered above.  This is the
+    rest: whatever somebody types, the Rust updater takes the words the
+    Python one took, refuses the ones it refused, and shows the help where
+    it did."""
+    if not built():
+        return
+    assert "args" in decide([{"ask": "info"}])[0].get("asks", ()), \
+        "the tool on disk is older than the source: rebuild it (cargo build --release in updater_rs/core)"
+    rng = random.Random(20261125)
+    lines = [[word] for word in ARGUMENT_WORDS]
+    lines += [[option, word] for option in ("--target-dir", "--current-version", "--channel", "--silent", "--help")
+              for word in ARGUMENT_WORDS]
+    lines += [[rng.choice(ARGUMENT_WORDS) for _ in range(rng.randint(0, 5))] for _ in range(3000)]
+    # (what the app passes, core/updater.py)
+    lines.append(["--target-exe", r"C:\Program Files\Vispora\Vispora.exe", "--target-dir", r"C:\Program Files\Vispora",
+                  "--channel", "stable", "--current-version", "3.8.1", "--target-version", "3.9.0",
+                  "--server", SRC.SERVER_URL_DEFAULT, "--auto-confirm", "--source", "github"])
+    rust = decide([{"ask": "args", "argv": argv} for argv in lines])
+    python = [_python_reads(argv) for argv in lines]
+    for argv, ours, theirs in zip(lines, rust, python):
+        assert ours == theirs, (argv, ours, theirs)
+    taken = sum("exit" not in read for read in python)
+    shown = sum(read.get("exit") == 0 for read in python)
+    refused = sum(read.get("exit") == 2 for read in python)
+    assert taken + shown + refused == len(lines) and taken > 500 and shown > 300 and refused > 1000, \
+        f"the made-up command lines are a real mix: {taken} taken, {shown} shown the help, {refused} refused"
+    # Where the Pythons themselves differ.
+    odd = [["--current-version", value] for value in ONLY_NEWER_PYTHONS_TAKE]
+    assert decide([{"ask": "args", "argv": argv} for argv in odd]) == [{"exit": 2}] * len(odd)
+    if sys.version_info < (3, 13):
+        assert [_python_reads(argv) for argv in odd] == [{"exit": 2}] * len(odd)
+
+
 def test_the_tool_says_who_it_is():
     if not built():
         return
     info = decide([{"ask": "info"}])[0]
     assert info["updater_version"] == rust_version(), "the tool on disk is from another version of the source: rebuild it"
+    assert "args" in info.get("asks", ()), "the tool on disk is older than the source: rebuild it"
     assert info["server_url_default"] == SRC.SERVER_URL_DEFAULT and info["github_releases_url"] == SRC.GITHUB_RELEASES_URL
     assert info["github_headers"] == SRC.GITHUB_HEADERS
     assert info["app_exe_names"] == list(P.APP_EXE_NAMES)

@@ -8,11 +8,13 @@
 //!     {"ask": "version", "versions": ["3.8.0", "v3.9.0-beta.1"]}
 //!     {"ask": "source_order", "setting": "auto", "server_url": "https://..."}
 //!     {"ask": "github", "releases": [...], "channel": "stable"}
+//!     {"ask": "args", "argv": ["--channel", "beta"]}    a command line: what is read from it, or the exit code
 //!     {"ask": "info"}
 //!     {"ask": "batch", "requests": [...]}      several at once, answered in order
 
 use std::io::Read as _;
 
+use vispora_updater_core::cli;
 use vispora_updater_core::json::Json;
 use vispora_updater_core::sources::{self, Offer};
 
@@ -56,12 +58,32 @@ fn answer(request: &Json) -> Result<Json, String> {
             ("app", offer(sources::github_app_release(&request["releases"], &text("channel")), true)),
             ("updater", offer(sources::github_updater(&request["releases"], &text("channel")), false)),
         ])),
+        Some("args") => {
+            let argv: Vec<String> = request["argv"].as_array().unwrap_or(&[]).iter().map(Json::py_str).collect();
+            Ok(match cli::parse_args(&argv) {
+                Err(e) => Json::object([("exit", e.exit_code.into())]),
+                Ok(a) => Json::object([
+                    ("target_dir", a.target_dir.into()),
+                    ("target_exe", a.target_exe.into()),
+                    ("channel", a.channel.into()),
+                    ("current_version", a.current_version.into()),
+                    ("target_version", a.target_version.into()),
+                    ("auto_confirm", a.auto_confirm.into()),
+                    ("server", a.server.into()),
+                    ("source", a.source.into()),
+                    ("silent", a.silent.into()),
+                ]),
+            })
+        }
         Some("batch") => {
             let requests = request["requests"].as_array().ok_or("\"requests\" must be a list")?;
             Ok(Json::Array(requests.iter().map(answer).collect::<Result<Vec<_>, _>>()?))
         }
         Some("info") => Ok(Json::object([
             ("updater_version", vispora_updater_core::UPDATER_VERSION.into()),
+            // (what this build of the tool can be asked: a tool left over
+            // from an older source is told apart by it)
+            ("asks", vec!["version", "source_order", "github", "args", "info", "batch"].into()),
             ("server_url_default", sources::SERVER_URL_DEFAULT.into()),
             ("github_releases_url", sources::GITHUB_RELEASES_URL.into()),
             ("github_releases_page", sources::GITHUB_RELEASES_PAGE.into()),

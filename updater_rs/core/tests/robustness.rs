@@ -105,12 +105,12 @@ fn the_close_button_mid_swap_waits_for_the_swap() {
 #[test]
 fn closing_the_window_mid_swap_waits_for_the_swap() {
     // The window is gone (Alt+F4) while the swap runs.  What the window's
-    // owner does then is stop_install(): it must not come back before the
+    // owner does then is shut_down(): it must not come back before the
     // swap is done, or the process would end with the exe half in place.
     let rig = Rig::update();
     rig.net.publish("stable", "3.6.1", &new(), None, SERVER);
     let gate = SlowSwap::install(&rig);
-    assert!(rig.updater.start_install());
+    assert_eq!(rig.updater.start_install(), Ok(()));
     assert!(gate.wait_until_in_swap(10));
     let released_at: Arc<Mutex<Option<Instant>>> = Arc::default();
     let (when, releaser) = (released_at.clone(), gate.clone());
@@ -119,13 +119,160 @@ fn closing_the_window_mid_swap_waits_for_the_swap() {
         *when.lock().unwrap() = Some(Instant::now());
         releaser.let_go();
     });
-    rig.updater.stop_install();
+    rig.updater.shut_down();
     let returned = Instant::now();
     timer.join().unwrap();
     let released = released_at.lock().unwrap().expect("the swap was let go");
     assert!(returned >= released, "the updater exited with the swap half done");
     assert!(!rig.updater.install_running());
     assert_eq!(rig.installed(), new());
+}
+
+// ── more than one close, and a start after a close ────────────────────
+// Three ways the Python updater could not be made to exit in the middle of
+// the swap, or to run two installs at once, because everybody who stops the
+// install there waits on the same thread.  Here too, whoever asks and however
+// often.
+
+/// Lets the held swap go when a test ends, also when it ends in a failed
+/// check: the pipeline would otherwise wait in it for ever.
+struct LetGoAtTheEnd(Arc<SlowSwap>);
+
+impl Drop for LetGoAtTheEnd {
+    fn drop(&mut self) {
+        self.0.let_go();
+    }
+}
+
+/// What each call of the exit hook saw: was an install still running, and
+/// was there an exe at the target.
+fn watch_exits(rig: &Rig) -> Arc<Mutex<Vec<(bool, bool)>>> {
+    let exits: Arc<Mutex<Vec<(bool, bool)>>> = Arc::default();
+    let (seen, updater, target) = (exits.clone(), Arc::downgrade(&rig.updater), rig.target.clone());
+    *rig.updater.exit_hook.lock().unwrap() = Some(Arc::new(move |_code| {
+        let running = updater.upgrade().is_some_and(|u| u.install_running());
+        seen.lock().unwrap().push((running, paths::is_file(&target)));
+    }));
+    exits
+}
+
+/// How often the update server was asked what it has: every pipeline asks.
+fn times_looked(rig: &Rig) -> usize {
+    rig.net.calls().iter().filter(|url| url.ends_with("/version/stable")).count()
+}
+
+/// An update that is being installed and is held inside the swap: the old
+/// exe is out of the way and the new one is not in yet.
+fn held_in_the_swap() -> (Rig, Arc<SlowSwap>, LetGoAtTheEnd, Arc<Mutex<Vec<(bool, bool)>>>) {
+    let rig = Rig::update();
+    rig.net.publish("stable", "3.6.1", &new(), None, SERVER);
+    let gate = SlowSwap::install(&rig);
+    let at_the_end = LetGoAtTheEnd(gate.clone());
+    let exits = watch_exits(&rig);
+    assert_eq!(rig.post("/api/start", "{}"), j("{\"ok\": true}"));
+    assert!(gate.wait_until_in_swap(10), "the pipeline reached the swap");
+    assert!(!paths::is_file(&rig.target));
+    (rig, gate, at_the_end, exits)
+}
+
+#[test]
+fn a_second_close_mid_swap_waits_for_the_swap_too() {
+    // The X is pressed while the exe is being swapped, and then once more.
+    let (rig, gate, _at_the_end, exits) = held_in_the_swap();
+    assert_eq!(rig.post("/api/quit", "{}"), j("{\"ok\": true}"));
+    std::thread::sleep(Duration::from_millis(200)); // (the first close is waiting for the swap by now)
+    assert_eq!(rig.post("/api/quit", "{}"), j("{\"ok\": true}"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(exits.lock().unwrap().is_empty(),
+            "the second close ended the updater with neither the old exe nor the new one in place");
+    assert!(!paths::is_file(&rig.target), "(the swap is still held)");
+    gate.let_go();
+    assert!(wait(|| exits.lock().unwrap().len() == 2, 10.0), "both closes go through once the swap is done");
+    assert_eq!(*exits.lock().unwrap(), [(false, true), (false, true)]);
+    assert_eq!(rig.installed(), new());
+    *rig.updater.exit_hook.lock().unwrap() = None;
+}
+
+#[test]
+fn the_window_closing_after_the_close_button_waits_for_the_swap_too() {
+    // The X during the swap, then Alt+F4.  The window is gone, and what its
+    // owner does before the process ends is shut_down() (app/src/main.rs).
+    let (rig, gate, _at_the_end, exits) = held_in_the_swap();
+    assert_eq!(rig.post("/api/quit", "{}"), j("{\"ok\": true}"));
+    std::thread::sleep(Duration::from_millis(200));
+    // Was the exe in place when the owner was let go on to end the process?
+    let let_go_on: Arc<Mutex<Option<bool>>> = Arc::default();
+    let (updater, target, seen) = (rig.updater.clone(), rig.target.clone(), let_go_on.clone());
+    let owner = std::thread::spawn(move || {
+        updater.shut_down();
+        *seen.lock().unwrap() = Some(paths::is_file(&target));
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(*let_go_on.lock().unwrap(), None,
+               "the process was let go on to its end with neither the old exe nor the new one in place");
+    assert!(exits.lock().unwrap().is_empty());
+    gate.let_go();
+    owner.join().unwrap();
+    assert_eq!(*let_go_on.lock().unwrap(), Some(true));
+    assert!(wait(|| exits.lock().unwrap().len() == 1, 10.0));
+    assert_eq!(*exits.lock().unwrap(), [(false, true)]);
+    assert_eq!(rig.installed(), new());
+    *rig.updater.exit_hook.lock().unwrap() = None;
+}
+
+#[test]
+fn install_cannot_be_started_while_the_updater_is_closing() {
+    // Cancel while the pipeline is under way closes the updater; the window
+    // stays for as long as that waits, and its Install button can be pressed.
+    let (rig, gate, _at_the_end, exits) = held_in_the_swap();
+    let looked = times_looked(&rig);
+    assert_eq!(rig.post("/api/quit", "{}"), j("{\"ok\": true}"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(rig.post("/api/start", "{}"), j("{\"ok\": false, \"err\": \"install already running\"}"),
+               "a second install was started beside the first");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(times_looked(&rig), looked, "a second pipeline is running beside the first");
+    assert!(rig.state().cancelled, "the close was taken back");
+    assert!(exits.lock().unwrap().is_empty());
+    gate.let_go();
+    assert!(wait(|| exits.lock().unwrap().len() == 1, 10.0), "it exits once the swap is done");
+    assert_eq!(*exits.lock().unwrap(), [(false, true)]);
+    assert_eq!(rig.installed(), new());
+    // Between the end of the install and the end of the process nothing new
+    // is begun either: the process is about to go.
+    assert_eq!(rig.post("/api/start", "{}"), j("{\"ok\": false, \"err\": \"the updater is closing\"}"));
+    assert!(!rig.updater.install_running());
+    assert_eq!(times_looked(&rig), looked);
+    *rig.updater.exit_hook.lock().unwrap() = None;
+}
+
+#[test]
+fn everybody_who_stops_an_install_waits_for_it() {
+    // Not two callers but eight, from eight threads, in no particular order.
+    let (rig, gate, _at_the_end, _exits) = held_in_the_swap();
+    let back: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let callers: Vec<_> = (0..8)
+        .map(|n| {
+            let (updater, target, seen) = (rig.updater.clone(), rig.target.clone(), back.clone());
+            std::thread::spawn(move || {
+                if n % 2 == 0 {
+                    updater.stop_install();
+                } else {
+                    updater.shut_down();
+                }
+                seen.lock().unwrap().push(paths::is_file(&target));
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(*back.lock().unwrap(), Vec::<bool>::new(), "somebody came back while the swap was held");
+    gate.let_go();
+    for caller in callers {
+        caller.join().unwrap();
+    }
+    assert_eq!(*back.lock().unwrap(), [true; 8], "everybody came back to an exe in place");
+    assert!(!rig.updater.install_running());
+    *rig.updater.exit_hook.lock().unwrap() = None;
 }
 
 #[test]

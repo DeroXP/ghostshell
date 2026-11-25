@@ -70,6 +70,7 @@ pub struct ArgsError {
 const VALUE_OPTIONS: [&str; 7] =
     ["--target-dir", "--target-exe", "--channel", "--current-version", "--target-version", "--server", "--source"];
 const FLAG_OPTIONS: [&str; 2] = ["--auto-confirm", "--silent"];
+const HELP_OPTION: &str = "--help";
 const USAGE: &str = "usage: VisporaUpdater [-h] [--target-dir TARGET_DIR] [--target-exe TARGET_EXE] \
                      [--channel {,stable,beta}] [--current-version CURRENT_VERSION] \
                      [--target-version TARGET_VERSION] [--auto-confirm] [--server SERVER] \
@@ -79,39 +80,133 @@ fn mistake(message: String) -> ArgsError {
     ArgsError { exit_code: 2, message: format!("{USAGE}\nVisporaUpdater: error: {message}") }
 }
 
-/// The option `given` names: itself, or the one option it is the beginning
-/// of (argparse takes "--chan" for "--channel").
-fn option_named(given: &str) -> Result<&'static str, ArgsError> {
-    let all = VALUE_OPTIONS.iter().chain(FLAG_OPTIONS.iter()).copied();
-    if let Some(exact) = all.clone().find(|o| *o == given) {
-        return Ok(exact);
-    }
-    let starting: Vec<&'static str> = all.filter(|o| o.starts_with(given)).collect();
-    match starting.as_slice() {
-        [one] => Ok(one),
-        [] => Err(mistake(format!("unrecognized arguments: {given}"))),
-        several => Err(mistake(format!("ambiguous option: {given} could match {}", several.join(", ")))),
+fn help() -> ArgsError {
+    ArgsError { exit_code: 0, message: USAGE.to_string() }
+}
+
+/// What a word of the command line is.  argparse decides this for every
+/// word before it reads any of them: whether the word after `--target-dir`
+/// is that option's value depends on what the word is, not on where it
+/// stands.
+enum Word {
+    /// Not an option: the value of the option before it, or a stray word.
+    Value,
+    /// A bare `--`: everything after it is a value, and it is none itself.
+    Marker,
+    /// `-h`, alone or with more after it.  `-hx` still shows the help;
+    /// `-h=x` and `-h-x` are mistakes.
+    ShortHelp { mistaken: bool },
+    /// One of the long options (`--help` among them), written out or by its
+    /// beginning, perhaps with `=value` attached.
+    Option(&'static str, Option<String>),
+    /// The beginning of more than one option.
+    Ambiguous(Vec<&'static str>),
+    /// Looks like an option and is none of them.
+    Unknown,
+}
+
+fn long_options() -> impl Iterator<Item = &'static str> + Clone {
+    std::iter::once(HELP_OPTION).chain(VALUE_OPTIONS).chain(FLAG_OPTIONS)
+}
+
+/// `-5`, `-5.5`, `-.5`: what argparse takes for a negative number, and so
+/// for a value, although it begins with a dash.  (`-5.`, `-1e5` and `-5a`
+/// are none to Python 3.12, which the Python updater is built with; later
+/// Pythons take more.)
+fn is_negative_number(word: &str) -> bool {
+    let Some(rest) = word.strip_prefix('-') else {
+        return false;
+    };
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    match rest.split_once('.') {
+        None => digits(rest),
+        Some((whole, fraction)) => (whole.is_empty() || digits(whole)) && digits(fraction),
     }
 }
 
-/// Read the command line (without the program's own name).
+/// Sort one word (argparse's `_parse_optional`).
+fn sort(word: &str) -> Word {
+    if !word.starts_with('-') || word == "-" {
+        return Word::Value;
+    }
+    if !word.starts_with("--") {
+        // One dash.  The only option of that kind is -h.
+        return match word.strip_prefix("-h") {
+            Some(rest) => Word::ShortHelp { mistaken: rest.starts_with('=') || rest.starts_with('-') },
+            None if is_negative_number(word) || word.contains(' ') => Word::Value,
+            None => Word::Unknown,
+        };
+    }
+    if let Some(exact) = long_options().find(|option| *option == word) {
+        return Word::Option(exact, None);
+    }
+    // "--name=value", the name written out or by its beginning.
+    let (name, attached) = match word.split_once('=') {
+        Some((name, value)) => (name, Some(value.to_string())),
+        None => (word, None),
+    };
+    if let Some(exact) = long_options().find(|option| *option == name) {
+        return Word::Option(exact, attached);
+    }
+    let beginning_of: Vec<&'static str> = long_options().filter(|option| option.starts_with(name)).collect();
+    match beginning_of.as_slice() {
+        [one] => Word::Option(one, attached),
+        // None of the options, but with a blank in it: a value all the same
+        // (a folder named "--my folder").
+        [] if word.contains(' ') => Word::Value,
+        [] => Word::Unknown,
+        _ => Word::Ambiguous(beginning_of),
+    }
+}
+
+/// Read the command line (without the program's own name), the way Python's
+/// argparse read it for the Python updater: the same words are taken, the
+/// same are refused, with the same exit code.  tests/test_updater_rs.py
+/// holds the two against each other.
 pub fn parse_args(argv: &[String]) -> Result<Args, ArgsError> {
+    let mut after_marker = false;
+    let words: Vec<Word> = argv
+        .iter()
+        .map(|word| {
+            if after_marker {
+                Word::Value
+            } else if word == "--" {
+                after_marker = true;
+                Word::Marker
+            } else {
+                sort(word)
+            }
+        })
+        .collect();
+
     let mut args = Args::default();
+    // Words that belong to nothing.  They are a mistake, but one that is
+    // only reported at the end: a --help further along still shows the help.
+    let mut stray: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < argv.len() {
-        let token = argv[i].as_str();
+        let (token, word) = (argv[i].as_str(), &words[i]);
         i += 1;
-        if token == "-h" || token == "--help" {
-            return Err(ArgsError { exit_code: 0, message: USAGE.to_string() });
-        }
-        if !token.starts_with("--") || token == "--" {
-            return Err(mistake(format!("unrecognized arguments: {token}")));
-        }
-        let (name, attached) = match token.split_once('=') {
-            Some((name, value)) => (name, Some(value.to_string())),
-            None => (token, None),
+        let (option, attached) = match word {
+            Word::Value | Word::Marker | Word::Unknown => {
+                stray.push(token);
+                continue;
+            }
+            Word::ShortHelp { mistaken: false } => return Err(help()),
+            Word::ShortHelp { mistaken: true } => {
+                return Err(mistake("argument -h/--help: ignored explicit argument".to_string()))
+            }
+            Word::Ambiguous(options) => {
+                return Err(mistake(format!("ambiguous option: {token} could match {}", options.join(", "))))
+            }
+            Word::Option(option, attached) => (*option, attached),
         };
-        let option = option_named(name)?;
+        if option == HELP_OPTION {
+            return Err(match attached {
+                None => help(),
+                Some(_) => mistake("argument -h/--help: ignored explicit argument".to_string()),
+            });
+        }
         if FLAG_OPTIONS.contains(&option) {
             if attached.is_some() {
                 return Err(mistake(format!("argument {option}: ignored explicit argument")));
@@ -123,9 +218,9 @@ pub fn parse_args(argv: &[String]) -> Result<Args, ArgsError> {
             continue;
         }
         let value = match attached {
-            Some(value) => value,
-            // (the next word, unless it is an option itself)
-            None if i < argv.len() && !(argv[i].starts_with('-') && argv[i].len() > 1) => {
+            Some(value) => value.clone(),
+            // (the next word, if it is a value)
+            None if matches!(words.get(i), Some(Word::Value)) => {
                 i += 1;
                 argv[i - 1].clone()
             }
@@ -149,6 +244,9 @@ pub fn parse_args(argv: &[String]) -> Result<Args, ArgsError> {
             "--server" => args.server = value,
             _ => args.source = value,
         }
+    }
+    if !stray.is_empty() {
+        return Err(mistake(format!("unrecognized arguments: {}", stray.join(" "))));
     }
     Ok(args)
 }
@@ -315,5 +413,50 @@ mod tests {
         assert!(parse(&["--source", "railway"]).unwrap_err().message.contains("invalid choice: 'railway'"));
         assert_eq!(parse(&["--help"]).unwrap_err().exit_code, 0);
         assert_eq!(parse(&["-h"]).unwrap_err().exit_code, 0);
+    }
+
+    #[test]
+    fn a_value_may_begin_with_a_dash_where_argparse_lets_it() {
+        let value = |words: &[&str]| parse(words).map(|a| (a.target_dir, a.current_version)).map_err(|e| e.exit_code);
+        let version = |v: &str| value(&["--current-version", v]).map(|(_, version)| version);
+        // A negative number, as Python 3.12 knows one.
+        for number in ["-5", "-5.5", "-.5", "-0"] {
+            assert_eq!(version(number), Ok(number.to_string()));
+        }
+        for none in ["-5.", "-1e5", "-1_000", "-5a", "-x", "--x", "-x=1", "--x=1"] {
+            assert_eq!(version(none), Err(2), "{none}");
+        }
+        // Anything with a blank in it that is not an option written out.
+        for folder in ["-my folder", "--my folder", "--silent x", "--target-exe x", "--sil x", "--help x", "--x =1", "-5 6"] {
+            assert_eq!(value(&["--target-dir", folder]).map(|(dir, _)| dir), Ok(folder.to_string()));
+        }
+        for option in ["--silent", "--sil", "--target-exe=x y", "-h", "-h x", "-hh", "--", "--s"] {
+            assert_eq!(value(&["--target-dir", option]), Err(2), "{option}");
+        }
+        // A single dash and nothing are values like any other.
+        assert_eq!(version("-"), Ok("-".to_string()));
+        assert_eq!(value(&["--target-dir", "", "--silent"]), Ok((String::new(), String::new())));
+        assert_eq!(value(&["--target-dir=--silent"]).map(|(dir, _)| dir), Ok("--silent".to_string()));
+        assert_eq!(value(&["--target-d=a=b"]).map(|(dir, _)| dir), Ok("a=b".to_string()));
+        // On their own, such words are strays.
+        for stray in [vec!["-5"], vec!["-my folder"], vec![""], vec!["-"], vec!["--", "x"], vec!["--silent", ""]] {
+            assert_eq!(parse(&stray).unwrap_err().exit_code, 2, "{stray:?}");
+        }
+    }
+
+    #[test]
+    fn help_is_shown_as_soon_as_it_is_reached() {
+        let code = |words: &[&str]| parse(words).map(|_| ()).map_err(|e| e.exit_code);
+        for shown in [vec!["--h"], vec!["--he"], vec!["--hel"], vec!["-hh"], vec!["-hx"], vec!["--help", "--s"],
+                      vec!["--help", "--channel", "nope"], vec!["x", "--help"], vec!["--bogus", "-h"],
+                      vec!["--help", "--"], vec!["--help", "--silent=1"]] {
+            assert_eq!(code(&shown), Err(0), "{shown:?}");
+        }
+        // ... and not when a mistake comes first, or when it is one itself.
+        for refused in [vec!["--help=1"], vec!["--h=1"], vec!["-h=1"], vec!["-h-x"], vec!["--s", "--help"],
+                        vec!["--channel", "nope", "--help"], vec!["--channel", "--help"], vec!["--", "--help"],
+                        vec!["--silent=1", "--help"]] {
+            assert_eq!(code(&refused), Err(2), "{refused:?}");
+        }
     }
 }
