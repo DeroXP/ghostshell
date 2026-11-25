@@ -13,6 +13,8 @@
 //!   pack was unpacked into: the administrators' own, checked against the
 //!   exe and held (backend.rs).  A trial, which has no rights, starts the
 //!   one that was built beside its own tool.
+//!   The one library it needs that is not Windows' own is beside it there
+//!   (`ITS_C_RUNTIME`), or it is not started.
 //! * **What it is given**: a pipe to ask it through and a pipe for its
 //!   answers, and nothing else of the shell's (win::start_with_pipes).
 //!   Not the listening socket, no port, no named pipe, no file, no word on
@@ -38,6 +40,17 @@ pub const PROGRAM: &str = "VisporaGpuReader.exe";
 /// beside the app's own copy of the C runtime it needs, which is the one
 /// Windows then finds for it.
 pub const IN_THE_PACK: &str = "_internal\\VisporaGpuReader.exe";
+/// The one thing the reader needs from outside itself: the C runtime a Rust
+/// program asks Windows for when it starts.  Windows looks beside the
+/// program first, and the app carries a copy of its own there.  A reader
+/// without it beside it would be given whatever Windows finds further on:
+/// in its own folder, and then in every folder of the PATH, which is not
+/// where a program with administrator rights takes a library from.  So
+/// the exe that ships is not built with a pack that has the reader and not
+/// this file, and a reader whose pack lacks it is not started.
+/// (tests/test_one_file.py holds that the reader asks for no other
+/// library that is not Windows' own.)
+pub const ITS_C_RUNTIME: &str = "_internal\\VCRUNTIME140.dll";
 /// How long a reader that was ended is waited for until it is gone.
 pub const GONE_WITHIN: Duration = Duration::from_secs(5);
 /// An answer is one line, and never longer than this.

@@ -29,7 +29,8 @@
 //! another version's, stops the build.  So does a pack without the
 //! graphics card's reader, for the exe that ships: the reader is carried
 //! in the pack (../core/src/gpu_reader.rs), and a pack is given one when
-//! it is made with `--reader`.
+//! it is made with `--reader`.  And so does a pack whose reader does not
+//! have the C runtime it needs beside it.
 
 use std::path::Path;
 
@@ -58,10 +59,18 @@ fn main() {
             }
             // (the exe that ships; a trial build carries whatever pack it is given)
             let ships = std::env::var_os("CARGO_FEATURE_ELEVATED").is_some();
-            let reader = vispora_shell_core::gpu_reader::IN_THE_PACK;
-            if ships && !vispora_shell_core::pack::Pack::read(&bytes).is_ok_and(|pack| pack.has(reader)) {
+            let (reader, runtime) = (vispora_shell_core::gpu_reader::IN_THE_PACK, vispora_shell_core::gpu_reader::ITS_C_RUNTIME);
+            let has = |path: &str| vispora_shell_core::pack::Pack::read(&bytes).is_ok_and(|pack| pack.has(path));
+            if ships && !has(reader) {
                 panic!("VISPORA_BACKEND_PACK names {named}, which has no reader for the graphics card in it ({reader}): make the pack with --reader. \
                         (See shell_rs/README.md, \"One file\".)");
+            }
+            // The reader asks Windows for one library that is not Windows'
+            // own.  It has to be the app's copy, beside the reader: without
+            // it Windows would look on, and the reader has the app's rights.
+            if ships && !has(runtime) {
+                panic!("VISPORA_BACKEND_PACK names {named}, which carries the graphics card's reader and not the C runtime it needs beside it ({runtime}). \
+                        The app's folder has it when it is built with backend.spec. (See shell_rs/README.md, \"One file\".)");
             }
             std::fs::write(&carried, bytes).unwrap_or_else(|e| panic!("{}: {e}", carried.display()));
         }

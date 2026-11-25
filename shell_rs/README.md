@@ -584,7 +584,7 @@ with it:
 
 ```
 cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
-python shell_rs/app/try_it.py                  # 134 checks; the window is never shown
+python shell_rs/app/try_it.py                  # 136 checks; the window is never shown
 python shell_rs/app/try_it.py --time           # the times
 python shell_rs/app/try_it.py --time --pack P  # ... and what unpacking the pack P costs, both ways
 python shell_rs/app/try_it.py --time --pack P --carried-by E
@@ -724,9 +724,12 @@ The rules every module there keeps:
     10 seconds, and at the quit;
   * ended, and seen by Windows to be gone, before the page's call for a
     driver's install (`POST /api/driver/install`) is passed on to the
-    backend; and then away for 900 seconds if the backend says that an
-    installer was started, as long as the backend keeps off its own copy
-    of the library;
+    backend, and not started while such a call is on its way; and then
+    away for 900 seconds if the backend says that an installer was
+    started, as long as the backend keeps off its own copy of the library;
+  * all of its times (idle, away, the pause) are counted on a clock that
+    does not jump, not on the PC's own, which can be set in the middle of
+    an install;
   * given 3 seconds for its first answer and 1 second for every later
     one; one that gives no reading is ended and tried again after 30
     seconds, then 60, up to 8 minutes; the backend's reading meanwhile;
@@ -739,7 +742,11 @@ The rules every module there keeps:
   * it is carried in the pack and started from the folder the pack was
     unpacked into, never from beside the shell's exe: the shell has
     administrator rights, and its own exe is in a folder any program can
-    write to.
+    write to;
+  * the one library it asks Windows for that is not Windows' own
+    (`VCRUNTIME140.dll`) is the app's copy beside it: the exe that ships
+    is not built with a pack whose reader lacks it, and a reader without
+    it beside it is not started (the backend is asked for the card).
 
   **What a person sees:** while the card is being read (today: while the
   Monitor page is open, and for ten seconds after it was left), Task
@@ -911,9 +918,10 @@ it is told to start, and the only thing to tell it is the stand-in.
   folder.** In the trials it has the rights of the person at the PC and
   is started from a folder in the trial's own data folder (closed to the
   trial's own account), or from beside the trial tool. It was never
-  started from `C:\ProgramData` or `C:\Windows\Temp`, and never beside
-  the app's own copy of the C runtime: on the development PC Windows has
-  one of its own, which is what the trials' reader found. Whether a
+  started from `C:\ProgramData` or `C:\Windows\Temp`. The C runtime
+  beside it in the trial's pack is this PC's copy, put there by the
+  trial: the app's own copy, from a real build of the app's folder, has
+  not been beside a reader yet. Whether a
   driver that is older than 2018 (its library is not in Windows' own
   folder) is on anybody's PC is not known; there the reader has no
   reading and the backend's is taken.

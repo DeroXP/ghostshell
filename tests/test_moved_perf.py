@@ -159,6 +159,8 @@ class Python:
                 self.sampled += 1
         elif kind in ("reader", "tend"):
             pass                                    # (the shell's own reader: Python has none)
+        elif kind == "pcs_clock":
+            self.time = step["time"]                # (the PC's clock is set to another time: `time.time()` says it)
         elif kind == "install":
             # The call that starts a driver's installer.  Nothing is
             # started: where the script says that one was, the app tells
@@ -619,6 +621,10 @@ def test_while_a_drivers_installer_runs_the_samples_stay_pythons():
           card(), smi(58)]
     for round in range(1, 21):
         s += [now(100.6 + round * 0.2), smi(58 + round % 4), STEP]
+    # The PC's clock is set forward by a day in the middle of it: no time
+    # has gone by, and the reader stays away (the sample is stamped with
+    # the new time, in both).
+    s += [{"do": "pcs_clock", "time": 100.6 + 86_400.0}, STEP]
     s += [get("/api/perf/status"), get("/api/perf/samples"), get("/api/perf/score")]
     # Ten minutes in the page asks again and is refused; nothing changes.
     s += [now(700.0), refused, STEP, now(999.0), STEP, now(1000.5), STEP, get("/api/perf/status")]
@@ -627,9 +633,9 @@ def test_while_a_drivers_installer_runs_the_samples_stay_pythons():
     answered, passed_on = both(s)
     assert passed_on == 0 and answered == sum(1 for step in s if step["do"] == "call")
     counted = both.counted
-    # Three readings of the first reader, twenty-three of the backend while
+    # Three readings of the first reader, twenty-four of the backend while
     # it was away, two of the second reader; and no reader in between.
-    assert (counted["from_the_reader"], counted["from_the_backend"], counted["readers_started"], counted["reader"]) == (5, 23, 2, 5), counted
+    assert (counted["from_the_reader"], counted["from_the_backend"], counted["readers_started"], counted["reader"]) == (5, 24, 2, 5), counted
     # An install that was not started: the reader is away for the call, and
     # back for the next sample.
     not_started = {"do": "install", "status": 200, "body": json.dumps({"ok": False, "err": "Driver installer not downloaded yet"})}
@@ -767,9 +773,9 @@ def test_what_has_moved_can_only_read_the_machine():
     # question by its name, with nothing beside it.
     assert real.count("vispora_native::answer(") == 1 and real.count("vispora_native::") == 1
     assert 'vispora_native::answer(&format!("{{\\"q\\":\\"{question}\\"}}"))' in real
-    # The door is all there is: a question, and the time.
+    # The door is all there is: a question, the time, and a clock that does not jump.
     trait = door[door.index("pub trait Readings: Send + Sync {"):door.index("/// The real machine.")]
-    assert re.findall(r"fn (\w+)\(", trait) == ["ask", "now"]
+    assert re.findall(r"fn (\w+)\(", trait) == ["ask", "now", "steady"]
     for name, text in sources.items():
         code = text[:text.index("#[cfg(test)]")]
         for word in ("std::process", "Command::new", "std::fs", "File::", "extern \"system\"", "unsafe", "crate::win", "crate::platform", "std::env",
@@ -968,7 +974,12 @@ def test_the_backends_reading_of_the_card_is_what_its_sampler_reads():
     # library, which is used for the time and nothing else.
     live = card_rs[card_rs.index("pub fn live(&self) -> Option<Live> {"):card_rs.index("/// The reader to ask now, started if need be")]
     assert live.index("self.the_reader(now)") < live.index("reader.read(within)") < live.index("let live = self.the_backends();")
-    assert card_rs[:card_rs.index("#[cfg(test)]")].count("door.") == 1 and "self.inner.door.now()" in card_rs, "the card asks the shell's own door for something"
+    code = card_rs[:card_rs.index("#[cfg(test)]")]
+    assert code.count("door.") == 2 and "self.inner.door.now()" in code and "self.inner.door.steady()" in code, "the card asks the shell's own door for something"
+    # How long a reader is idle, away or paused is counted on the clock
+    # that does not jump; the PC's own clock is for what a reading is
+    # stamped with, and is not used in the card at all.
+    assert code.count("self.steady()") == 3 and code.count("self.now()") == 0
     # (the sampler reads the card through that and through nothing else)
     perf = sources["perf.rs"]
     assert perf[:perf.index("#[cfg(test)]")].count("card.live()") == 1 and "Readings" not in perf[:perf.index("#[cfg(test)]")]
@@ -1037,12 +1048,14 @@ def test_the_install_begins_in_one_place_and_both_sides_agree_on_it():
     assert 'request.method == "POST" && as_the_backend_reads_a_path(request.path()) == THE_DRIVER_INSTALL' in sources["mod.rs"]
     around = sources["card.rs"]
     around = around[around.index("pub fn around_a_driver_install("):around.index("/// The shell quits: the reader is ended")]
-    # Ended and seen to be gone before the call is passed on; and things as
-    # they were where the backend says that nothing was started.
-    assert around.index("let before = st.away_until.replace(until);") < around.index("(st.reader.take(), before)") < around.index("reader.end()") \
-        < around.index("let answer = pass_on();") \
+    # Counted as on its way, the reader ended and seen to be gone, and only
+    # then passed on; counted off when it is answered, and a time to stay
+    # away only where the backend says that an installer was started.
+    assert around.index("st.installs += 1;") < around.index("st.reader.take()") < around.index("reader.end()") < around.index("let answer = pass_on();") \
         < around.index('let started = answer.status == 200 && answer.to_json().get("ok").is_some_and(Json::truthy);') \
-        < around.index("st.away_until = before;")
+        < around.index("st.installs -= 1;") < around.index("if started {\n                // (later than the time of any installer that was started before)\n"
+                                                           "                st.away_until = Some(until);")
+    assert "let away = st.installs > 0 || st.away_until.is_some_and(|until| now < until);" in sources["card.rs"]
     # The way the web framework reads a path, and so which calls are this
     # one: the app's own routing, asked with a few ways of writing it.
     client = A.app.test_client()

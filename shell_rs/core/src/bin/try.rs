@@ -268,7 +268,8 @@ fn main() {
     // Python module and this the same things and compares the answers
     // (tests/test_moved_perf.py).  One JSON object per line, one line back:
     //
-    //     {"do": "now", "time": 1000.0}                        what time it is
+    //     {"do": "now", "time": 1000.0}                        what time it is: time has gone by
+    //     {"do": "pcs_clock", "time": 1000.0}                  the PC's own clock is set to another time: none has gone by
     //     {"do": "answers", "question": "gpu_live", "answer": {...}}   what the library says (null: nothing)
     //     {"do": "backend_says", "answer": {...}}   what the backend says the card says (null: it does not answer)
     //     {"do": "reader", "says": {...}}  what the card's own reader says from now on: the helper's answer, or one
@@ -304,6 +305,14 @@ fn main() {
                 Ok(asked) => match asked["do"].as_str() {
                     Some("now") => {
                         machine.at(match &asked["time"] {
+                            Json::Int(whole) => *whole as f64,
+                            Json::Float(time) => *time,
+                            _ => 0.0,
+                        });
+                        Json::object([("ok", true.into())])
+                    }
+                    Some("pcs_clock") => {
+                        machine.the_pcs_clock_is_set_to(match &asked["time"] {
                             Json::Int(whole) => *whole as f64,
                             Json::Float(time) => *time,
                             _ => 0.0,
