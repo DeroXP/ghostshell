@@ -33,8 +33,9 @@ borderless WebView2 window on top (pywebview), plus a tray icon.
 
 **Also**
 - **Password vault**: PIN-protected, PBKDF2 + Fernet, stored locally.
-- **Auto-update**: stable and beta channels, SHA-256-verified downloads,
-  installed by a small standalone updater.
+- **Auto-update**: stable and beta channels, from GitHub's releases with the
+  update server as the fallback, SHA-256-verified downloads, installed by a
+  small standalone updater.
 
 ## Run from source
 
@@ -53,8 +54,19 @@ pyinstaller build.spec --noconfirm            # dist/Vispora.exe
 pyinstaller updater_helper.spec --noconfirm   # dist/VisporaUpdater.exe
 ```
 
-Release binaries are not kept in this repo; they are published through the
-release server, which serves `version.json` + the exe per channel.
+Release binaries are not kept in this repo. They are published in two places,
+and an installed copy asks them in this order:
+
+1. **GitHub releases** of this repository. A release is tagged `v<version>`
+   and carries `Vispora.exe` and the updater as `VisporaUpdater-<version>.exe`
+   (attach the current updater to every release). A release marked as a
+   pre-release only reaches the beta channel. Downloads are checked against
+   the SHA-256 GitHub records for each uploaded file.
+2. **The update server**, which serves `version.json` + the exe per channel.
+
+Settings > Auto-Update > Update source picks one of them only. A server URL
+of your own is asked before GitHub. `update_sources.py` holds the rules and
+is shared by the app and the updater.
 
 ## Test
 
@@ -85,6 +97,7 @@ the file with `import sandbox as m`, before any app import.
 | --- | --- |
 | `app.py` | Flask routes, window/tray lifecycle, startup sequence |
 | `config.py` | Names, paths and the static tweak lists |
+| `update_sources.py` | Where releases are published (GitHub, the update server) and how each answer is read |
 | `core/` | One module per feature |
 | `static/`, `templates/` | The UI (plain JS/CSS, no build step) |
 | `updater/` | The standalone updater app (its own Flask + pywebview window) |

@@ -804,12 +804,25 @@ async function loadSettingsPage() {
                   '<option value="beta" '   + (updaterS.channel === 'beta' ? 'selected' : '') + '>Beta</option>' +
                 '</select>'
             ) +
+            // 3.8.0: where updates come from.  GitHub's releases first and
+            // the update server as the fallback, or one of them only.
+            _settingsRow(
+                'Update source',
+                updaterSourceText(updaterS.update_source, updaterS.server_url),
+                '<select id="updater-source-select" onchange="setUpdaterSource(this.value)" ' +
+                  'style="background:var(--bg-input);border:1px solid var(--border);color:var(--text);' +
+                  'padding:4px 8px;border-radius:4px;font-family:var(--mono);font-size:11px">' +
+                  '<option value="auto" '   + (updaterS.update_source !== 'github' && updaterS.update_source !== 'server' ? 'selected' : '') + '>Automatic</option>' +
+                  '<option value="github" ' + (updaterS.update_source === 'github' ? 'selected' : '') + '>GitHub only</option>' +
+                  '<option value="server" ' + (updaterS.update_source === 'server' ? 'selected' : '') + '>Update server only</option>' +
+                '</select>'
+            ) +
             // v3 — update server URL override.  Used by self-hosters or for
             // pointing at a staging server.  Default is the Railway URL set
             // in config.UPDATE_SERVER_URL_DEFAULT.
             _settingsRow(
                 'Update server',
-                'Where Vispora pulls updates from.  Leave alone unless you\'re self-hosting.',
+                'Asked when GitHub does not answer.  Leave alone unless you\'re self-hosting.',
                 '<input type="text" id="updater-server-input" value="' + escAttr(updaterS.server_url || '') + '" ' +
                   'onchange="setUpdaterServerUrl(this.value)" ' +
                   'placeholder="https://vispora.up.railway.app" ' +
@@ -822,10 +835,10 @@ async function loadSettingsPage() {
             _settingsRow(
                 'Local update folder',
                 'Folder with version.json + Vispora.exe.  When set, updates come ' +
-                'from this folder instead of the update server (clear it to go back online).',
+                'from this folder instead of GitHub or the update server (clear it to go back online).',
                 '<input type="text" id="updater-localdir-input" value="' + escAttr(updaterS.local_update_dir || '') + '" ' +
                   'onchange="setUpdaterLocalDir(this.value)" ' +
-                  'placeholder="(empty = use update server)" ' +
+                  'placeholder="(empty = update online)" ' +
                   'style="background:var(--bg-input);border:1px solid var(--border);color:var(--text);' +
                   'padding:4px 8px;border-radius:4px;font-family:var(--mono);font-size:11px;min-width:280px" />'
             );
@@ -936,6 +949,36 @@ async function setUpdaterChannel(channel) {
     }
 }
 
+// 3.8.0: where updates come from.
+function updaterSourceText(source, serverUrl) {
+    if (source === 'github') return 'Updates come from GitHub only.';
+    if (source === 'server') return 'Updates come from the update server only.';
+    var own = (serverUrl || '').replace(/[/]+$/, '');
+    if (own && own !== 'https://vispora.up.railway.app') {
+        return 'Updates come from your own update server only.  Pick GitHub to get them from GitHub.';
+    }
+    return 'Updates come from GitHub.  If GitHub does not answer, the update server is asked.';
+}
+
+// What a check or a download came from, for a log line ('' when unknown).
+function updateSourceName(source) {
+    if (source === 'github') return 'GitHub';
+    if (source === 'server') return 'the update server';
+    if (source === 'local')  return 'the local update folder';
+    return '';
+}
+
+async function setUpdaterSource(source) {
+    if (source !== 'auto' && source !== 'github' && source !== 'server') return;
+    var r = await apiPost('/api/updater/settings', { update_source: source });
+    if (r && r.ok) {
+        addLog(updaterSourceText(source, r.settings && r.settings.server_url));
+    } else {
+        addLog('Could not set the update source: ' + ((r && r.err) || 'unknown'));
+    }
+    loadSettingsPage();     // the line under the name, and the select if it was not saved
+}
+
 // v3 — update server URL override.  Empty input is treated as "reset to
 // default" (the Railway URL baked into config.py).
 async function setUpdaterServerUrl(url) {
@@ -955,6 +998,7 @@ async function setUpdaterServerUrl(url) {
     var r = await apiPost('/api/updater/settings', { server_url: url });
     if (r && r.ok) {
         addLog('Update server set to "' + url + '"');
+        loadSettingsPage();     // the Update source line says who is asked with this server
     } else {
         showErrorToast('Could not set server URL: ' + ((r && r.err) || 'unknown'));
     }
@@ -981,7 +1025,7 @@ async function setUpdaterLocalDir(dir) {
     var r = await apiPost('/api/updater/settings', { local_update_dir: dir });
     if (r && r.ok) {
         addLog(dir ? 'Updates now come from local folder: ' + dir
-                   : 'Local update mode off, back to the update server');
+                   : 'Local update mode off, back to updating online');
     } else {
         showErrorToast('Could not set local update folder: ' + ((r && r.err) || 'unknown'));
     }
@@ -3552,12 +3596,13 @@ async function checkForUpdate() {
         addLog('Update check failed: ' + ((r && r.err) || 'unknown error'));
         return;
     }
+    var from = updateSourceName(r.source);
     if (r.update_available) {
-        addLog('Update available: v' + r.latest + ' (current v' + r.current + ')');
+        addLog('Update available' + (from ? ' on ' + from : '') + ': v' + r.latest + ' (current v' + r.current + ')');
         _refreshUpdateBadge(r.latest);
         showUpdateModal();
     } else {
-        addLog('Already up to date (v' + r.current + ')');
+        addLog('Already up to date (v' + r.current + (from ? ', checked with ' + from : '') + ')');
         showUpdateModal();   // still show — confirms "you're current"
     }
 }
@@ -3706,7 +3751,9 @@ async function installUpdateNow(force) {
         '<div class="modal-title">INSTALLING...</div>' +
         '<p style="color:var(--text-dim);font-size:11px;text-align:center">Vispora will close and restart in a moment.</p>';
 
-    var r = await apiPost('/api/updater/install', { force: !!force }, { timeoutMs: 10000 });
+    // Minutes, not seconds: when the updater on this PC is too old for the
+    // update at hand, a newer one is downloaded before the answer comes.
+    var r = await apiPost('/api/updater/install', { force: !!force }, { timeoutMs: 4 * 60 * 1000 });
     if (r && r.ok && r.deferred) {
         // A game is running: installing would restart Vispora, and game mode with it.
         addLog('Update waiting: ' + (r.msg || 'it installs when the game closes.'));

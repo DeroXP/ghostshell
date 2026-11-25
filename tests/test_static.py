@@ -17,7 +17,7 @@ import config
 
 
 def _python_files(with_tests=False):
-    files = [os.path.join(m.REPO, "app.py"), os.path.join(m.REPO, "config.py")]
+    files = [os.path.join(m.REPO, name) for name in ("app.py", "config.py", "update_sources.py")]
     for folder in ("core", "updater") + (("tests",) if with_tests else ()):
         files += sorted(glob.glob(os.path.join(m.REPO, folder, "*.py")))
     return files

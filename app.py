@@ -2995,7 +2995,8 @@ def api_full_spectrum():
 # ═══════════════════════════════════════════════════════════════════════════
 @app.route("/api/updater/check", methods=["POST"])
 def api_updater_check():
-    """Force an immediate check against the update server (Railway-hosted /version/<channel>)."""
+    """Force an immediate check: GitHub's releases first, then the update
+    server's /version/<channel> (see update_sources.py for the order)."""
     return jsonify(updater.check_for_update())
 
 
@@ -3041,6 +3042,9 @@ def api_updater_settings():
         auto_check, auto_download, auto_install (bool)
         channel ('stable' | 'beta')         ← v3
         server_url (str, optional)          ← v3 — override Railway URL
+        update_source ('auto' | 'github' | 'server')  where updates come from:
+                                              GitHub first, then the update
+                                              server; or one of them only
         local_update_dir (str, optional)    ← beta.11 — folder with
                                               version.json + Vispora.exe;
                                               non-empty switches the updater
@@ -3056,6 +3060,7 @@ def api_updater_settings():
         channel=data.get("channel"),
         server_url=data.get("server_url"),
         local_update_dir=data.get("local_update_dir"),
+        update_source=data.get("update_source"),
     ))
 
 
