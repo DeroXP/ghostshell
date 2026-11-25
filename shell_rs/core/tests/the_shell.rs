@@ -795,6 +795,156 @@ fn the_cards_reading_is_asked_of_the_backend_with_the_runs_secret() {
     assert_eq!(backend.times_asked(THE_CARD), asked, "a backend that is gone was asked");
 }
 
+/// A shell that reads a made-up machine and has made-up readers for the
+/// card, which say what the helper says of a card at 61 degrees.
+fn with_readers(rig: &Rig) -> (Arc<vispora_shell_core::moved::Fake>, Arc<vispora_shell_core::moved::FakeReaders>) {
+    let machine = with_a_machine(rig);
+    let readers = vispora_shell_core::moved::FakeReaders::new();
+    readers.reads(vispora_shell_core::moved::FakeReading::Says(Json::parse(r#"{"temp_c": 61, "gpu_util_pct": 97, "core_mhz": 2100, "power_mw": 215437}"#).unwrap()));
+    assert!(rig.shell.card_is_read_by(Arc::new(readers.clone())));
+    (machine, readers)
+}
+
+const THE_INSTALL: &str = "/api/driver/install";
+
+#[test]
+fn the_cards_reading_is_the_readers_and_the_backend_is_not_asked() {
+    let rig = Rig::ready();
+    let (machine, readers) = with_readers(&rig);
+    let moved = rig.shell.moved.lock().unwrap().clone().unwrap();
+    let last = || rig.call("GET", "/api/perf/status").to_json()["last"].to_string();
+    assert_eq!(rig.shell.card_reader_pid(), None);
+    rig.shell.handle(&rig.asking("POST", "/api/perf/start").with_body("{}"));
+    assert!(readers.running().is_empty(), "a reader runs before a reading was wanted");
+    for round in 0..5 {
+        machine.at(1000.0 + round as f64 * 0.2);
+        moved.perf.step(&moved.card);
+    }
+    assert_eq!(last(), r#"{"ts":1000.8,"ok":true,"core":2100,"mem":0,"temp":61,"power":215.44,"util":97,"memutil":0,"fan":0}"#);
+    assert_eq!((readers.started(), readers.asked(), rig.shell.card_reader_pid()), (1, (5, 5), Some(1)));
+    assert!(rig.stage.last().calls().is_empty(), "the backend was asked: {:?}", rig.stage.last().calls());
+    assert!(rig.shell.history().iter().any(|line| line == "the graphics card's reader was started (pid 1)"), "{:?}", rig.shell.history());
+    // The reader has no reading: the backend's it is, from the same call as before.
+    readers.reads(vispora_shell_core::moved::FakeReading::HasNone);
+    machine.at(1001.0);
+    moved.perf.step(&moved.card);
+    assert_eq!(last(), r#"{"ts":1001.0,"ok":true,"core":1800,"mem":7000,"temp":71,"power":123.45,"util":88,"memutil":33,"fan":60}"#);
+    assert_eq!(rig.stage.last().times_asked(THE_CARD), 1);
+    assert!(readers.running().is_empty() && machine.asked().is_empty());
+    // A shell that answers nothing itself has nobody who wants a reading.
+    let other = Rig::ready();
+    assert!(!other.shell.card_is_read_by(Arc::new(vispora_shell_core::moved::FakeReaders::new())));
+}
+
+#[test]
+fn before_the_backend_hears_of_a_drivers_install_the_reader_is_gone() {
+    let rig = Rig::ready();
+    let (machine, readers) = with_readers(&rig);
+    let moved = rig.shell.moved.lock().unwrap().clone().unwrap();
+    let backend = rig.stage.last();
+    // (what the backend would find at the moment the call reaches it)
+    let found = Arc::new(Mutex::new(Vec::new()));
+    let (seen, running) = (found.clone(), readers.clone());
+    *backend.when_asked_to_install.lock().unwrap() = Some(Arc::new(move || seen.lock().unwrap().push(running.running())));
+    let sample = |at: f64| {
+        machine.at(at);
+        moved.perf.step(&moved.card);
+        rig.call("GET", "/api/perf/status").to_json()["last"]["temp"].as_int()
+    };
+    rig.shell.handle(&rig.asking("POST", "/api/perf/start").with_body("{}"));
+    assert_eq!((sample(1000.0), readers.running()), (Some(61), vec![1]));
+
+    // What is not the app's own page asking does not end the reader, and
+    // does not reach the backend.
+    for stranger in [Request::new("POST", THE_INSTALL).with_body("{}"), rig.asking("POST", THE_INSTALL).with_header("Origin", "https://example.org").with_body("{}")] {
+        assert_eq!(rig.shell.handle(&stranger).status, 403);
+    }
+    // Neither does another method (the backend answers that with words of its own).
+    rig.call("GET", THE_INSTALL);
+    assert_eq!((readers.running(), found.lock().unwrap().len(), backend.times_asked(THE_INSTALL)), (vec![1], 0, 1));
+
+    // The page asks, and no installer is started (it was not downloaded):
+    // the reader was gone when the backend heard, the answer is the
+    // backend's, and the next reading starts a reader again.
+    let answer = rig.shell.handle(&rig.asking("POST", THE_INSTALL).with_body("{}"));
+    assert_eq!((answer.status, text(&answer)), (200, r#"{"ok":false,"err":"Driver installer not downloaded yet"}"#.to_string()));
+    assert_eq!(*found.lock().unwrap(), [Vec::<u32>::new()], "the backend heard of the install with the reader still running");
+    assert_eq!((sample(1000.2), readers.running(), backend.times_asked(THE_CARD)), (Some(61), vec![2], 0));
+
+    // Written another way, which the backend's web framework reads as the
+    // same call (this stand-in does not, and says it has no such call):
+    // the reader is ended for it all the same.
+    rig.shell.handle(&rig.asking("POST", "/api/driver/%69nstall").with_body("{}"));
+    assert!(readers.running().is_empty(), "a call the backend would take for the install did not end the reader");
+    assert_eq!((sample(1000.4), readers.running()), (Some(61), vec![3]));
+
+    // The page asks again and an installer is started: the reader is gone
+    // before, and stays away for 900 seconds, with the backend's reading
+    // meanwhile.
+    *backend.install_says.lock().unwrap() = Json::parse(r#"{"ok": true, "msg": "NVIDIA installer launched."}"#).unwrap();
+    let answer = rig.shell.handle(&rig.asking("POST", "/api/driver/install?from=the-page").with_body("{}"));
+    assert_eq!((answer.status, text(&answer)), (200, r#"{"ok":true,"msg":"NVIDIA installer launched."}"#.to_string()));
+    assert_eq!(*found.lock().unwrap(), [Vec::<u32>::new(), Vec::new()]);
+    for later in [0.2, 60.0, 899.0] {
+        assert_eq!((sample(1000.4 + later), readers.running().len()), (Some(71), 0), "{later} s after the installer was started");
+    }
+    assert_eq!((readers.started(), backend.times_asked(THE_CARD)), (3, 3));
+    assert_eq!((sample(1900.4), readers.running()), (Some(61), vec![4]));
+    let said = rig.shell.history().join("\n");
+    for line in ["a graphics driver's installer may be about to start: the graphics card's reader was ended first (pid 1), and was seen to be gone",
+                 "no graphics driver's installer was started: the graphics card's reader may be started again",
+                 "a graphics driver's installer may be about to start: the graphics card's reader was ended first (pid 3), and was seen to be gone",
+                 "a graphics driver's installer was started: no reader for the graphics card for 900 s, the backend is asked meanwhile"] {
+        assert!(said.contains(line), "not said: {line}\n{said}");
+    }
+    assert!(machine.asked().is_empty());
+}
+
+#[test]
+fn a_drivers_install_is_passed_on_as_ever_where_the_shell_reads_nothing_itself() {
+    let rig = Rig::ready();
+    let answer = rig.shell.handle(&rig.asking("POST", THE_INSTALL).with_body("{}"));
+    assert_eq!((answer.status, text(&answer)), (200, r#"{"ok":false,"err":"Driver installer not downloaded yet"}"#.to_string()));
+    assert_eq!(rig.stage.last().times_asked(THE_INSTALL), 1);
+    // ... and where it does, but has no reader of its own for the card.
+    with_a_machine(&rig);
+    let answer = rig.shell.handle(&rig.asking("POST", THE_INSTALL).with_body("{}"));
+    assert_eq!((answer.status, rig.stage.last().times_asked(THE_INSTALL)), (200, 2));
+    // A backend that is not there: the page is told so, as for any call,
+    // and that is "no installer was started".
+    let down = Rig::with(vec![Behaviour { never_up: true, ..Behaviour::default() }], vispora_shell_core::Settings { calls_wait: Duration::from_millis(100), ..settings() });
+    let (machine, readers) = with_readers(&down);
+    let moved = down.shell.moved.lock().unwrap().clone().unwrap();
+    down.shell.start();
+    moved.perf.start(&moved.card, "x".into());
+    moved.perf.step(&moved.card);
+    assert_eq!(readers.running(), [1]);
+    let answer = down.shell.handle(&down.asking("POST", THE_INSTALL).with_body("{}"));
+    assert_ne!(answer.status, 200);
+    machine.at(1000.2);
+    moved.perf.step(&moved.card);
+    assert_eq!((readers.started(), readers.running()), (2, vec![2]), "the reader stayed away though no installer was started");
+}
+
+#[test]
+fn at_the_quit_the_reader_is_ended_first_and_none_is_started_after() {
+    let rig = Rig::ready();
+    let (machine, readers) = with_readers(&rig);
+    let moved = rig.shell.moved.lock().unwrap().clone().unwrap();
+    moved.perf.start(&moved.card, "x".into());
+    moved.perf.step(&moved.card);
+    assert_eq!(readers.running(), [1]);
+    // (what the backend would find when it is told to quit)
+    assert_eq!(rig.shell.quit_and_wait("a test"), 0);
+    assert!(readers.running().is_empty(), "the reader outlived the quit");
+    let said = rig.shell.history();
+    let at = |line: &str| said.iter().position(|said| said.starts_with(line)).unwrap_or_else(|| panic!("not said: {line}\n{said:?}"));
+    assert!(at("the graphics card's reader was ended (pid 1): the app quits") < at("the backend took the quit"), "{said:?}");
+    machine.at(2000.0);
+    moved.perf.step(&moved.card);
+    assert_eq!(readers.started(), 1, "a reader was started after the quit");
+}
+
 #[test]
 fn with_its_thread_the_sampler_asks_the_backend_five_times_a_second_and_only_while_it_runs() {
     let rig = Rig::ready();

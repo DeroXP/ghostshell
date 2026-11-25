@@ -103,8 +103,16 @@ impl Shell {
                 // without waiting for it.  What the shell does not take of
                 // a moved path (see moved/) is the backend's like any other.
                 let moved = self.moved.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
-                if let Some(answer) = moved.and_then(|moved| moved.answer(request)) {
+                if let Some(answer) = moved.as_ref().and_then(|moved| moved.answer(request)) {
                     return answer;
+                }
+                // The call that starts a graphics driver's installer is the
+                // backend's.  But the installer has to replace the driver's
+                // library, which the card's reader holds: the reader is
+                // ended, and seen to be gone, before the backend hears of
+                // the call (moved/card.rs).
+                if let Some(moved) = moved.filter(|_| crate::moved::Moved::starts_a_driver_install(request)) {
+                    return moved.card.around_a_driver_install(|| self.pass_on(request));
                 }
                 self.pass_on(request)
             }

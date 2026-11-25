@@ -157,6 +157,8 @@ impl Platform for Windows {
     }
 
     fn start(&self, command: &Command, handoff: &str) -> Result<Box<dyn Child>, String> {
+        // (one start at a time: see `start_with_pipes`)
+        let _one_at_a_time = STARTING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut process = std::process::Command::new(&command.program);
         process
             .args(&command.args)
@@ -516,6 +518,222 @@ fn start_line_without_handles(program: &str, line: &str) -> Result<u32, String> 
         CloseHandle(started.thread);
         CloseHandle(started.process);
         Ok(started.pid)
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// A program with two pipe ends of its own, and nothing else of this one's
+// ═════════════════════════════════════════════════════════════════════
+// For the graphics card's reader (gpu_reader.rs).  It is talked to through
+// its standard input and output, so it has to inherit two handles.  It must
+// inherit no others: not the shell's listening socket, which is inheritable
+// on purpose, and nothing another thread happens to hold.  Windows does
+// that when it is given the list of handles by name.
+//
+// And it must never outlive this program, however this program ends.  It
+// ends by itself when its input ends, which Windows sees to when this
+// program is gone.  A reader that hangs inside the driver would not notice,
+// so it is also put into a job of its own that Windows ends with this
+// program: the job's last handle is this program's.
+const STARTF_USESTDHANDLES: u32 = 0x100;
+const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+const CREATE_SUSPENDED: u32 = 4;
+const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
+const JOB_EXTENDED_LIMITS: u32 = 9;
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+const WAIT_OBJECT_0: u32 = 0;
+
+#[repr(C)]
+struct StartupInfoWithList {
+    info: StartupInfo,
+    list: *mut c_void,
+}
+
+#[repr(C)]
+struct JobBasicLimits {
+    per_process_user_time: i64,
+    per_job_user_time: i64,
+    flags: u32,
+    least_working_set: usize,
+    most_working_set: usize,
+    processes: u32,
+    affinity: usize,
+    priority_class: u32,
+    scheduling_class: u32,
+}
+
+#[repr(C)]
+struct JobExtendedLimits {
+    basic: JobBasicLimits,
+    io: [u64; 6],
+    process_memory: usize,
+    job_memory: usize,
+    peak_process_memory: usize,
+    peak_job_memory: usize,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreatePipe(read: *mut *mut c_void, write: *mut *mut c_void, attributes: *const SecurityAttributes, size: u32) -> i32;
+    fn InitializeProcThreadAttributeList(list: *mut c_void, count: u32, flags: u32, size: *mut usize) -> i32;
+    fn UpdateProcThreadAttribute(list: *mut c_void, flags: u32, attribute: usize, value: *const c_void, size: usize, before: *mut c_void,
+                                 returned: *mut usize) -> i32;
+    fn DeleteProcThreadAttributeList(list: *mut c_void);
+    fn CreateJobObjectW(attributes: *const SecurityAttributes, name: *const u16) -> *mut c_void;
+    fn SetInformationJobObject(job: *mut c_void, class: u32, information: *const c_void, length: u32) -> i32;
+    fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+    fn TerminateProcess(process: *mut c_void, code: u32) -> i32;
+    fn ResumeThread(thread: *mut c_void) -> u32;
+}
+
+/// One start of a program at a time, of the two kinds that hand handles
+/// over (the backend, and a program with pipes).  While a program with
+/// pipes is being started, its two pipe ends are inheritable for a moment;
+/// a backend started in that moment, with everything inheritable handed
+/// to it, would get them too.
+static STARTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A handle of Windows' that is closed when this goes.
+struct Owned(*mut c_void);
+
+// SAFETY: a kernel handle is a number that any thread may use.
+unsafe impl Send for Owned {}
+unsafe impl Sync for Owned {}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: a handle this program opened, closed once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// A program that was started with pipes (`start_with_pipes`).  When this
+/// goes, the program is ended.
+pub struct Piped {
+    pub pid: u32,
+    process: Owned,
+    /// The job it is in.  Its only handle: when this program ends, in
+    /// whatever way, Windows closes it and ends what is in the job.
+    _job: Owned,
+}
+
+impl Piped {
+    /// End it now, and wait until Windows says it is gone (at most
+    /// `within`).  True when it is.
+    pub fn end(&self, within: std::time::Duration) -> bool {
+        // SAFETY: the process's own handle, which this holds.
+        unsafe {
+            TerminateProcess(self.process.0, 1);
+            WaitForSingleObject(self.process.0, within.as_millis().min(60_000) as u32) == WAIT_OBJECT_0
+        }
+    }
+
+    /// Has it ended?
+    pub fn is_gone(&self) -> bool {
+        // SAFETY: as above.
+        unsafe { WaitForSingleObject(self.process.0, 0) == WAIT_OBJECT_0 }
+    }
+}
+
+impl Drop for Piped {
+    fn drop(&mut self) {
+        self.end(std::time::Duration::from_secs(5));
+    }
+}
+
+/// Start `program` (a full path; no arguments) with a pipe for its standard
+/// input and one for its standard output, and with nothing else of this
+/// program's: the two pipe ends are the only handles it inherits, it has no
+/// window, and its current folder is its own.  It is ended when this
+/// program ends.
+///
+/// What comes back: the program, the end to write its input to, and the
+/// end to read its output from.
+pub fn start_with_pipes(program: &str) -> Result<(Piped, std::fs::File, std::fs::File), String> {
+    use std::os::windows::io::FromRawHandle as _;
+    let folder = std::path::Path::new(program).parent().filter(|folder| folder.is_absolute()).ok_or_else(|| format!("{program}: not a full path"))?;
+    let (program_w, mut line_w, folder_w) = (wide(program), wide(&quoted(program)), wide(&folder.to_string_lossy()));
+    let failed = |what: &str| -> String { format!("{program}: {what} (Windows error {})", unsafe { GetLastError() }) };
+    let _one_at_a_time = STARTING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: every pointer is to something that lives through its call;
+    // every handle is owned from the moment it exists, and closed once.
+    unsafe {
+        // Two pipes.  No end of either is inheritable as it is made.
+        let (mut its_input, mut to_it, mut from_it, mut its_output) = (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+        if CreatePipe(&mut its_input, &mut to_it, std::ptr::null(), 0) == 0 {
+            return Err(failed("no pipe could be made"));
+        }
+        let (its_input, to_it) = (Owned(its_input), Owned(to_it));
+        if CreatePipe(&mut from_it, &mut its_output, std::ptr::null(), 0) == 0 {
+            return Err(failed("no pipe could be made"));
+        }
+        let (from_it, its_output) = (Owned(from_it), Owned(its_output));
+        // The program's two ends are made inheritable, and are named: it
+        // gets these two and no other handle of this program's.
+        for end in [&its_input, &its_output] {
+            if SetHandleInformation(end.0, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
+                return Err(failed("a pipe's end could not be handed over"));
+            }
+        }
+        let given = [its_input.0, its_output.0];
+        let mut size = 0usize;
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
+        if size == 0 {
+            return Err(failed("the list of what it is given could not be made"));
+        }
+        let mut room = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+        let list = room.as_mut_ptr() as *mut c_void;
+        if InitializeProcThreadAttributeList(list, 1, 0, &mut size) == 0 {
+            return Err(failed("the list of what it is given could not be made"));
+        }
+        if UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, given.as_ptr() as *const c_void, std::mem::size_of_val(&given),
+                                     std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
+            let why = failed("the list of what it is given could not be filled");
+            DeleteProcThreadAttributeList(list);
+            return Err(why);
+        }
+        // The job that ends it with this program.
+        let job = Owned(CreateJobObjectW(std::ptr::null(), std::ptr::null()));
+        let mut limits: JobExtendedLimits = std::mem::zeroed();
+        limits.basic.flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if job.0.is_null() || SetInformationJobObject(job.0, JOB_EXTENDED_LIMITS, &limits as *const JobExtendedLimits as *const c_void,
+                                                      std::mem::size_of::<JobExtendedLimits>() as u32) == 0 {
+            let why = failed("no job could be made for it");
+            DeleteProcThreadAttributeList(list);
+            return Err(why);
+        }
+        let mut startup: StartupInfoWithList = std::mem::zeroed();
+        startup.info.size = std::mem::size_of::<StartupInfoWithList>() as u32;
+        startup.info.flags = STARTF_USESTDHANDLES;
+        startup.info.standard = [its_input.0, its_output.0, std::ptr::null_mut()];
+        startup.list = list;
+        let mut started: ProcessInformation = std::mem::zeroed();
+        // (inheritance is on, and the list says what "everything" is: the two ends)
+        let inherit_what_is_listed = 1;
+        let made = CreateProcessW(program_w.as_ptr(), line_w.as_mut_ptr(), std::ptr::null(), std::ptr::null(), inherit_what_is_listed,
+                                  EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_SUSPENDED, std::ptr::null(), folder_w.as_ptr(),
+                                  &startup as *const StartupInfoWithList as *const StartupInfo, &mut started);
+        let why_not = failed("it could not be started");
+        DeleteProcThreadAttributeList(list);
+        if made == 0 {
+            return Err(why_not);
+        }
+        let (process, thread) = (Owned(started.process), Owned(started.thread));
+        // Into its job before it has run at all, and only then let go.
+        if AssignProcessToJobObject(job.0, process.0) == 0 {
+            let why = failed("it could not be put into its job");
+            TerminateProcess(process.0, 1);
+            return Err(why);
+        }
+        ResumeThread(thread.0);
+        // This program's copies of the other side's ends are closed: when
+        // the program ends, its output ends, and when this one ends, its
+        // input does.
+        drop((its_input, its_output));
+        let (to_it, from_it) = (std::mem::ManuallyDrop::new(to_it), std::mem::ManuallyDrop::new(from_it));
+        Ok((Piped { pid: started.pid, process, _job: job }, std::fs::File::from_raw_handle(to_it.0), std::fs::File::from_raw_handle(from_it.0)))
     }
 }
 
@@ -1117,15 +1335,15 @@ fn remove_private_folder(path: &str) -> bool {
 pub fn programs_let_go(folder: &std::path::Path) -> bool {
     use std::os::windows::fs::MetadataExt as _;
     let Ok(entries) = std::fs::read_dir(folder) else { return true };
-    for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().to_lowercase().ends_with(".exe") {
-            continue;
-        }
-        let Ok(found) = entry.metadata() else { continue };
+    // The programs at the top of the folder, and the one program the shell
+    // itself starts from deeper in it: the graphics card's reader.
+    let programs = entries.flatten().filter(|entry| entry.file_name().to_string_lossy().to_lowercase().ends_with(".exe")).map(|entry| entry.path());
+    for program in programs.chain(std::iter::once(folder.join(crate::gpu_reader::IN_THE_PACK))) {
+        let Ok(found) = std::fs::symlink_metadata(&program) else { continue };
         if !found.is_file() || found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             continue;
         }
-        match std::fs::remove_file(entry.path()) {
+        match std::fs::remove_file(&program) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return false,
@@ -1490,6 +1708,37 @@ mod tests {
     }
 
     #[test]
+    fn a_program_with_pipes_is_ended_with_its_job_also_while_its_input_is_open() {
+        // A reader ends by itself when its input ends.  One that hangs
+        // (inside the driver, say) would not notice: it is the job that
+        // ends it, when the job's last handle goes, which is when this
+        // program ends in whatever way.  Here the handle is closed by hand,
+        // with the program's input still open: only the job can end it.
+        let sort = format!("{}\\System32\\sort.exe", windows_folder().unwrap());
+        let (program, to_it, _from_it) = start_with_pipes(&sort).unwrap();
+        assert!(!program.is_gone());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!program.is_gone(), "it ended by itself with its input open");
+        // SAFETY: the job's handle, closed once here; the structure that
+        // owns it is forgotten below and so never closes it again.
+        unsafe { CloseHandle(program._job.0) };
+        let gone = unsafe { WaitForSingleObject(program.process.0, 5000) } == WAIT_OBJECT_0;
+        drop(to_it);
+        std::mem::forget(program);
+        assert!(gone, "the job's last handle went, and the program in it lives on");
+    }
+
+    #[test]
+    fn what_windows_is_told_about_a_job_has_the_size_windows_expects() {
+        // (a wrong size and Windows refuses the job's one rule, and the
+        // reader would not be ended with the shell)
+        if std::mem::size_of::<usize>() == 8 {
+            assert_eq!((std::mem::size_of::<JobBasicLimits>(), std::mem::size_of::<JobExtendedLimits>()), (64, 144));
+            assert_eq!(std::mem::size_of::<StartupInfoWithList>(), std::mem::size_of::<StartupInfo>() + 8);
+        }
+    }
+
+    #[test]
     fn a_backend_that_outlived_its_shell_keeps_its_folder_whole() {
         use std::os::windows::fs::OpenOptionsExt as _;
         // The shell was ended by force.  Nobody holds the folder's mark any
@@ -1516,6 +1765,26 @@ mod tests {
             assert!(there(file), "{file} was taken away under a backend that is still running");
         }
         // It has ended: the next start takes the folder away.
+        drop(running);
+        assert_eq!(remove_private_folders(&parent, OpenTo::ThisAccount), Tidied { entries: 1, removed: 1, left: 0, not_ours: 0 });
+        assert!(!there(&path));
+        // The graphics card's reader is a program too, and not at the top
+        // of the folder: one that still runs keeps the folder whole as well.
+        let folder = private_folder_named(&parent, BACKEND_FOLDER_PREFIX, OpenTo::ThisAccount).unwrap();
+        let OwnFolder { path, in_use } = folder;
+        std::fs::create_dir(format!("{path}\\_internal")).unwrap();
+        let (first, program, reader) = (format!("{path}\\0-comes-first.txt"), format!("{path}\\VisporaBackend.exe"),
+                                        format!("{path}\\{}", crate::gpu_reader::IN_THE_PACK));
+        for (file, holds) in [(&first, &b"still needed"[..]), (&program, b"MZ"), (&reader, b"MZ")] {
+            std::fs::write(file, holds).unwrap();
+        }
+        drop(in_use);
+        let running = std::fs::OpenOptions::new().read(true).share_mode(1).open(&reader).unwrap();
+        assert!(!programs_let_go(std::path::Path::new(&path)));
+        // (the backend's own program went first, and was not running: what
+        // is left is still everything the reader needs, and the folder)
+        assert_eq!(remove_private_folders(&parent, OpenTo::ThisAccount), Tidied { entries: 1, removed: 0, left: 1, not_ours: 0 });
+        assert!(there(&first) && there(&reader), "the folder was taken apart under a reader that is still running");
         drop(running);
         assert_eq!(remove_private_folders(&parent, OpenTo::ThisAccount), Tidied { entries: 1, removed: 1, left: 0, not_ours: 0 });
         assert!(!there(&path));

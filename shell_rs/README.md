@@ -15,7 +15,7 @@ are as they were. The pieces:
 | `app/` | The window (Tauri, as for the updater), on the app's own page | written, tried for real against a stand-in backend |
 | the tray | The tray icon and its menu, and what the entry for starting at sign-in names | written, tried for real against a stand-in backend |
 | one file | The exe carrying the backend and unpacking it before it starts it: once per version, into a folder that stays (the owner's choice of two ways) | written, tried for real with the real backend's files and a stand-in started in their place |
-| what has moved | Modules of the backend that the shell now does itself (step 4 of the plan): so far the performance sampler | written, proven to give Python's answers on a made-up machine, tried for real in the window against the stand-in backend (the card's reading is the backend's: the shell never opens the driver's library) |
+| what has moved | Modules of the backend that the shell now does itself (step 4 of the plan): so far the performance sampler; and the graphics card's own reader, a small program the shell starts for the card's readings | written, proven to give Python's answers on a made-up machine, tried for real in the window against the stand-in backend with the reader reading this PC's card (the shell's own process never opens the driver's library) |
 
 ## How the two sides work together
 
@@ -331,7 +331,7 @@ built first, with the Python that releases are built with.
 pyinstaller backend.spec --noconfirm --distpath <out>\dist --workpath <out>\work
 
 cargo build --release --manifest-path shell_rs/core/Cargo.toml
-<target>\release\vispora-shell-try.exe --pack <out>\dist\VisporaBackend <out>\backend.pack lzms
+<target>\release\vispora-shell-try.exe --pack <out>\dist\VisporaBackend <out>\backend.pack lzms --reader <target>\release\VisporaGpuReader.exe
 
 $env:VISPORA_BACKEND_PACK = "<out>\backend.pack"
 cargo build --release --locked --manifest-path shell_rs/app/Cargo.toml
@@ -350,6 +350,14 @@ cargo build --release --locked --manifest-path shell_rs/app/Cargo.toml
   itself, behind a list of the files with their lengths and SHA-256 marks.
   The same folder gives the same pack, byte for byte. A file comes out of
   it with its length and its mark, or not at all.
+* **The pack also carries the graphics card's reader** (`--reader`): a
+  small program of the shell's own, built with the pack tool by the same
+  `cargo build`, which reads the card for what has moved from the backend
+  ("What has moved from the backend", below). It is one more file of the
+  pack, `_internal\VisporaGpuReader.exe`, and is unpacked, checked and
+  held with the rest. The folder that is packed is not touched. The exe
+  that ships is not built with a pack that has none: the build stops and
+  says so. A pack without one is for trials.
 * **Squeezing is Windows' own** (the Compression API in `cabinet.dll`, part
   of Windows since Windows 8), and so are the marks (`bcrypt.dll`). No crate
   was added for either and no squeezing code is written here. The library
@@ -497,8 +505,8 @@ with it:
 
 * **Where, and how much.** One folder,
   `C:\ProgramData\Vispora-backend-kept-<version>-<16 letters>` (on the
-  drive Windows is on), with about 57 MB in 206 files. It is made at the
-  first start of a version. It is the administrators' own: a program
+  drive Windows is on), with about 57 MB in 207 files (the app's 206 and
+  the graphics card's reader). It is made at the first start of a version. It is the administrators' own: a program
   without administrator rights cannot open it, and an ordinary Explorer
   window is refused too.
 * **It stays when `Vispora.exe` is deleted.** The app has no installer, and
@@ -576,7 +584,7 @@ with it:
 
 ```
 cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
-python shell_rs/app/try_it.py                  # 121 checks; the window is never shown
+python shell_rs/app/try_it.py                  # 134 checks; the window is never shown
 python shell_rs/app/try_it.py --time           # the times
 python shell_rs/app/try_it.py --time --pack P  # ... and what unpacking the pack P costs, both ways
 python shell_rs/app/try_it.py --time --pack P --carried-by E
@@ -695,25 +703,55 @@ The rules every module there keeps:
   (`tests/test_moved_perf.py` holds that, and that nothing in the folder
   starts a program, writes a file or calls Windows itself). What changes
   the PC will get a door of its own when the first such module moves.
-* **The shell does not open the graphics driver's library.** To read the
-  card, a program starts NVIDIA's library (`nvml.dll`) in its own process,
-  and a library that was started stays in its process until the process
-  ends, whatever is shut down or freed
+* **The shell's own process does not open the graphics driver's library.**
+  To read the card, a program starts NVIDIA's library (`nvml.dll`) in its
+  own process, and a library that was started stays in its process until
+  the process ends, whatever is shut down or freed
   (`python tools/measure/nvml_release.py` shows it on a PC with an NVIDIA
   card). A driver's installer has to replace that file, and the shell
   lives as long as the app. So `Real` refuses every question about the
-  card before the helper hears it, and a module that needs the card's
-  reading asks the backend for it (`Card`, in `core/src/moved/mod.rs`):
-  `GET /api/gpu/oc/live`, which is the reading the Python modules take
-  themselves, asked with the run's secret as the shell asks for the tray.
-  The backend reads the card as it always did: through its own copy of
-  the helper, or with `nvidia-smi` where the helper has no answer or was
-  told to let go. Without a backend to ask (it is starting, or has ended
-  and is being started again) there is no reading, and a sample says so.
+  card before the helper hears it. The card is read by **the graphics
+  card's reader** (next), and by the backend wherever the reader is away
+  or has no reading: `GET /api/gpu/oc/live`, which is the reading the
+  Python modules take themselves, asked with the run's secret as the
+  shell asks for the tray.
+* **The graphics card's reader** is `VisporaGpuReader.exe`
+  (`core/src/bin/gpu_reader.rs`): the native helper, asked its one
+  question about the card, in a process of its own that can be ended.
+  When it runs, and how it is started, asked and ended, is in
+  `core/src/moved/card.rs` and `core/src/gpu_reader.rs`:
+  * started when a reading is wanted, ended when nobody asked for one for
+    10 seconds, and at the quit;
+  * ended, and seen by Windows to be gone, before the page's call for a
+    driver's install (`POST /api/driver/install`) is passed on to the
+    backend; and then away for 900 seconds if the backend says that an
+    installer was started, as long as the backend keeps off its own copy
+    of the library;
+  * given 3 seconds for its first answer and 1 second for every later
+    one; one that gives no reading is ended and tried again after 30
+    seconds, then 60, up to 8 minutes; the backend's reading meanwhile;
+  * started with two pipe ends and nothing else of the shell's (no
+    socket, no port, no file, no word on its command line), in a job of
+    Windows' that ends with the shell, also a shell ended by force;
+  * it takes nothing from whoever starts it: not its command line, not
+    what comes in on its input, not its environment. Started by hand it
+    reads the card, and with no input it ends at once;
+  * it is carried in the pack and started from the folder the pack was
+    unpacked into, never from beside the shell's exe: the shell has
+    administrator rights, and its own exe is in a folder any program can
+    write to.
+
+  **What a person sees:** while the card is being read (today: while the
+  Monitor page is open, and for ten seconds after it was left), Task
+  Manager shows a second process of the app's, `VisporaGpuReader.exe`,
+  with about 30 MB of memory, most of it NVIDIA's library. It is not
+  there otherwise. On a PC without an NVIDIA card it is started, says that
+  it has no reading, and is ended at once; it is tried again now and then.
 * **A real side and a made-up side.** `Real` asks the helper. `Fake`
-  answers from a table and tells a time that is set by hand, and
-  `FakeBackend` says what the card says: the tests' machine, and the trial
-  tool's (`vispora-shell-try --moved`).
+  answers from a table and tells a time that is set by hand; `FakeReaders`
+  are made-up readers for the card, and `FakeBackend` says what the
+  backend says of it: the tests' machine, and the trial tool's
+  (`vispora-shell-try --moved`).
 * **The same answers as Python, or the call is not taken.** The shell
   answers a moved call only where it gives the answer the Python route
   gives; `tests/test_moved_perf.py` asks both the same things on the same
@@ -731,23 +769,25 @@ The rules every module there keeps:
   shell's doing or the backend's).
 * **Asked what every call is asked first.** A moved call needs the run's
   secret and the app's own page like any other; only then is it answered.
-  It is answered without the backend and without waiting for it. (A
-  sample of the card needs the backend; an answer about the samples does
-  not.)
+  It is answered without the backend and without waiting for it. (So is
+  a sample of the card, where the reader has a reading.)
 
 ```
-python shell_rs/app/try_it.py --moved   # the real window: the page's calls, the backend asked for the card, the shell's loaded libraries
+python shell_rs/app/try_it.py --moved   # the real window: the page's calls, the reader from an unpacked pack, a driver's install asked for
 python shell_rs/try_it.py --moved       # what it costs, beside the backend's own (a minute and a half)
 python tools/measure/nvml_release.py    # that NVIDIA's library stays in a process that let go of it
 ```
 
-The numbers are in [docs/performance.md](../docs/performance.md). The
-chart's data takes the shell 0.14 ms where a call to the backend and back
-takes 1.2 ms. But the sampler as a whole costs more behind the shell than
-it did in the backend: each reading of the card is a call to the backend,
-and that comes to about 1.5% of one core while the Monitor page is open,
-against about 0.15%. What would take that away, and why it is not built
-yet, is in the plan.
+All three read this PC's graphics card, and only read it. Nothing is
+installed: the call for a driver's install goes to the stand-in backend,
+which only says that an installer was started, or was not.
+
+The numbers are in [docs/performance.md](../docs/performance.md). A reading
+of the card takes the shell 0.12 ms through its reader (0.87 ms where it
+has to ask the backend), the reader is there 40 ms after it was started,
+and while the sampler runs the shell and its reader together use 0.18% of
+one core, about what the backend's own sampler takes. The chart's data
+takes the shell 0.13 ms where a call to the backend and back takes 1.1 ms.
 
 ## What is where
 
@@ -758,7 +798,9 @@ yet, is in the plan.
 | `app/build.rs`, `app/app.manifest`, `app/tauri.conf.json` | What the exe carries besides its code: icon, version (from `config.py`), a manifest that asks for no rights, and the backend's pack |
 | `core/src/pack.rs` | The pack: a folder of files as one piece of bytes, made, read, unpacked and held against a folder |
 | `core/src/backend.rs` | Where the backend is unpacked and which folder it is run from: the two ways, the checks, taking old folders away |
-| `core/src/moved/mod.rs` | What has moved from the backend: the door to the PC's readings (real and made-up), the graphics card's reading (asked of the backend), and what a route reads off a call the way Flask reads it |
+| `core/src/moved/mod.rs` | What has moved from the backend: the door to the PC's readings (real and made-up), which call starts a driver's install, and what a route reads off a call the way Flask reads it |
+| `core/src/moved/card.rs` | The graphics card: read by its own reader where one may be asked, by the backend where not; when a reader is started and ended (idle, a driver's install, no reading, the quit) |
+| `core/src/gpu_reader.rs`, `core/src/bin/gpu_reader.rs` | The reader from the shell's side (started with two pipe ends, asked with a limit, ended), and the reader's own program, `VisporaGpuReader.exe` |
 | `core/src/moved/perf.rs` | The performance sampler, moved from `core/perf_monitor.py` |
 | `../backend.spec` | The app built as a folder for the shell to carry (PyInstaller) |
 | `app/try_it.py` | Runs the real window exe against a stand-in backend, out of the way |
@@ -861,14 +903,26 @@ it is told to start, and the only thing to tell it is the stand-in.
   files with what the app draws.
 * **What has moved has not run with administrator rights, or beside the
   real backend.** The sampler was tried in the real window against the
-  stand-in, whose fake machine says what the card says. That its answers
-  are the Python module's is proven on a made-up machine. Beside the real
-  backend the reading is the real `read_live_state()`, which the shell
+  stand-in, with the reader reading this PC's card. That its answers are
+  the Python module's is proven on a made-up machine. Beside the real
+  backend the fallback is the real `read_live_state()`, which the shell
   has never asked for on a PC.
+* **The reader has not run with administrator rights, or from the real
+  folder.** In the trials it has the rights of the person at the PC and
+  is started from a folder in the trial's own data folder (closed to the
+  trial's own account), or from beside the trial tool. It was never
+  started from `C:\ProgramData` or `C:\Windows\Temp`, and never beside
+  the app's own copy of the C runtime: on the development PC Windows has
+  one of its own, which is what the trials' reader found. Whether a
+  driver that is older than 2018 (its library is not in Windows' own
+  folder) is on anybody's PC is not known; there the reader has no
+  reading and the backend's is taken.
 * **No driver's installer was ever started** by a test or a trial, so
   what an installer does about a library that a process holds is not
-  known. The shell holds none. Today's backend does, also after it was
-  asked to let go (the plan, "Item 1, cut into pieces").
+  known. The shell holds none, and its reader is gone before the backend
+  hears of an install. Today's backend holds its own copy, also after it
+  was asked to let go (the plan, "Item 1, cut into pieces"), and so does
+  the backend behind the shell while something in it reads the card.
 * **The one-file exe has never been started.** The build that ships was
   built with the real backend's pack in it (32.8 MB), to know its size,
   and never run. So nobody has seen: the administrator prompt followed by

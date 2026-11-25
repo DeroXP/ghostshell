@@ -26,7 +26,10 @@
 //! (../core/src/pack.rs, which this script uses as the exe does): its list,
 //! every file taken out once with its length and its mark, and the version
 //! it was made for against the app's.  A pack that is damaged, or that is
-//! another version's, stops the build.
+//! another version's, stops the build.  So does a pack without the
+//! graphics card's reader, for the exe that ships: the reader is carried
+//! in the pack (../core/src/gpu_reader.rs), and a pack is given one when
+//! it is made with `--reader`.
 
 use std::path::Path;
 
@@ -52,6 +55,13 @@ fn main() {
             let bytes = std::fs::read(&named).unwrap_or_else(|e| panic!("VISPORA_BACKEND_PACK names {named}: {e}"));
             if let Err(why) = vispora_shell_core::pack::fit_to_carry(&bytes, version) {
                 panic!("VISPORA_BACKEND_PACK names {named}, and this exe cannot carry it: {why}. (See shell_rs/README.md, \"One file\".)");
+            }
+            // (the exe that ships; a trial build carries whatever pack it is given)
+            let ships = std::env::var_os("CARGO_FEATURE_ELEVATED").is_some();
+            let reader = vispora_shell_core::gpu_reader::IN_THE_PACK;
+            if ships && !vispora_shell_core::pack::Pack::read(&bytes).is_ok_and(|pack| pack.has(reader)) {
+                panic!("VISPORA_BACKEND_PACK names {named}, which has no reader for the graphics card in it ({reader}): make the pack with --reader. \
+                        (See shell_rs/README.md, \"One file\".)");
             }
             std::fs::write(&carried, bytes).unwrap_or_else(|e| panic!("{}: {e}", carried.display()));
         }

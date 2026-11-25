@@ -229,7 +229,9 @@ as described, and keep `%APPDATA%\Vispora\shell.log` and `vispora.log`):
    then the window at once, then the first screen filling in. `shell.log`
    has one line about the unpacking: "the background program was unpacked
    into C:\ProgramData\Vispora-backend-kept-<version>-<16 letters>, to
-   stay: 206 files, ... bytes, ... ms".
+   stay: 207 files, ... bytes, ... ms" (the app's 206 files and the
+   graphics card's reader), and one that says that the graphics card has
+   a reader of its own in that folder.
 3. Look in `C:\ProgramData` while it runs: that one folder is there, with
    about 57 MB in it. An ordinary, not elevated, Explorer window or
    terminal must be refused when it tries to open it, and it must not let
@@ -239,14 +241,20 @@ as described, and keep `%APPDATA%\Vispora\shell.log` and `vispora.log`):
 4. Use the app as usual for a while: Game Mode on and off, the tray's
    menu with the mouse, "Clean now" on the cleaner page (the app must go
    on working afterwards), a link from the Drivers page (the browser must
-   not run elevated).
+   not run elevated). Open the Monitor page with Task Manager beside it:
+   while the page is open there is a process `VisporaGpuReader.exe`
+   (about 30 MB), the live charts move, and `shell.log` says "the
+   graphics card's reader was started". About ten seconds after the page
+   is left, that process is gone, and the log says why. (On a PC without
+   an NVIDIA card it comes and goes at once, and the log says that it
+   gave no reading.)
 5. Quit from the tray. Expected: both processes gone within a few
    seconds, the settings put back, the window's folder gone from
    `C:\Windows\Temp`, and the folder in `C:\ProgramData` still there.
 6. Start it again. `shell.log` must now say that the folder was found and
    checked, not unpacked: "the background program is in
    C:\ProgramData\Vispora-backend-kept-... from an earlier start, and is
-   what the exe carries: 206 files, ... bytes, checked in ... ms". No line
+   what the exe carries: 207 files, ... bytes, checked in ... ms". No line
    about unpacking for this start, and no second folder.
 7. Start it a second time while it runs: the first copy's window must come
    to the front, with no prompt.
@@ -345,7 +353,8 @@ request, in this order:
 
 | | Module | What it reads, and when | What it changes | Where it stops |
 | --- | --- | --- | --- | --- |
-| 1 | The performance sampler (`core/perf_monitor.py`) | the graphics card, five times a second, while the Monitor page is open | nothing | **moved**: `shell_rs/core/src/moved/perf.rs`. The card's reading itself is asked of the backend (below) |
+| 1 | The performance sampler (`core/perf_monitor.py`) | the graphics card, five times a second, while the Monitor page is open | nothing | **moved**: `shell_rs/core/src/moved/perf.rs` |
+| | The graphics card's own reader (not a module of the backend: what pieces 1, 2 and 5 read the card with) | the card, while something in the shell wants its readings | nothing | **written**: `VisporaGpuReader`, a small program the shell starts and ends (below). The backend's reading where it is away or has none |
 | 2 | The hardware monitor (`core/hw_monitor.py`) | processor, card, memory, DPC time, ping: once a second while the Monitor page is open | nothing | its benchmark writes a file, and its list of programs starts PowerShell: both stay in Python until they have a reading of their own |
 | 3 | The network monitor (`core/net_monitor.py`) | bytes per program and per network card, once a second while the Network page is open | nothing in its loop | pausing a program is process tuning (item 3 of the plan) and stays; which game is running is the game monitor's to say, and is asked of the backend until piece 7 |
 | 4 | The popup watchdog (`core/popup_killer.py`) | every visible window, once a second, always | closes Windows' own "get an app to open this link" windows | the first piece that changes something: looking and closing are kept apart, and the closing is never run against a PC by a test or a trial |
@@ -356,7 +365,8 @@ request, in this order:
 After piece 7 nothing in the backend runs while the app idles with no page
 open, and item 1's last step can be taken: the backend is started only when
 a page needs it. One thing stands before that step, found with the first
-piece: the graphics card's reading (below).
+piece: the graphics card's reading while a driver is being installed
+(below).
 
 Why the sampler first, though it is the coldest of the seven: it is the
 smallest module that has everything a move needs (a loop of its own, state,
@@ -372,7 +382,7 @@ module stands on was laid down with the least else in the way:
   of its own, which the shell names nowhere. And the graphics card cannot
   be asked through it: the real side refuses every question about the
   card before the helper hears it.
-* **The graphics card's reading is the backend's.** To read the card, a
+* **The graphics card has a reader of its own.** To read the card, a
   program starts NVIDIA's library (`nvml.dll`) in its own process. A
   driver's installer has to replace that file, which is why today's app
   asks its helper to let go of it before it starts one, for fifteen
@@ -380,17 +390,70 @@ module stands on was laid down with the least else in the way:
   (`python tools/measure/nvml_release.py`, on an RTX 5070 Ti with driver
   621.40): once that library has been started in a process, it stays in
   that process whatever is shut down or freed afterwards. Only the end of
-  the process takes it out. The shell lives as long as the app does, so it
-  never opens the library: what has moved asks the backend for the card's
-  reading (`GET /api/gpu/oc/live`, which is
-  `gpu_overclock.read_live_state()` and nothing else: the reading the
-  Python modules take themselves), with the run's secret, as the shell
-  asks for the tray. So a moved module's reading is Python's at all times:
-  through the helper, through `nvidia-smi` on a PC where the helper has no
-  answer, through the fifteen minutes of a driver's install and the half
-  minute the helper waits after a driver stopped answering. Without a
-  backend to ask (it is starting, or has ended and is being started again)
-  there is no reading, and a sample says so; the sampler itself goes on.
+  the process takes it out. The shell lives as long as the app does, so
+  its own process never opens the library. The card is read by a small
+  program of the shell's own, `VisporaGpuReader.exe`
+  (`shell_rs/core/src/bin/gpu_reader.rs`; when it runs is decided in
+  `shell_rs/core/src/moved/card.rs`), which is the native helper asked its
+  one question about the card, in a process that can be ended:
+  * **It runs only while a reading is wanted.** It is started for the first
+    reading somebody asks for, and ended when nobody asked for one for 10
+    seconds. Why 10: longer than the gap between two readings of anything
+    that reads the card regularly (once a second at the slowest), so that
+    it is not ended and started between two of them, and short enough
+    that the library is held for seconds, not minutes, after the Monitor
+    page was left.
+  * **Before a driver's install it is gone.** The install begins with one
+    call of the page (`POST /api/driver/install`), which goes through the
+    shell. The shell ends the reader, waits until Windows says it is gone,
+    and only then passes the call on. If the backend answers that it
+    started the installer, no reader is started for 900 seconds, which is
+    how long the backend keeps off its own copy of the library. If it
+    answers anything else, things are as they were, and the next reading
+    starts a reader again.
+  * **Where it is away or has no reading, the reading is the backend's**
+    (`GET /api/gpu/oc/live`, which is `gpu_overclock.read_live_state()`
+    and nothing else, asked with the run's secret as the shell asks for
+    the tray): during those 900 seconds, on a PC whose card answers only
+    to `nvidia-smi`, on a PC without an NVIDIA card, in a shell whose pack
+    carries no reader. The reader's own answer is the helper's, read the
+    way Python reads it. So either way a moved module's reading is the one
+    Python would have taken, on every PC and at all times.
+  * **A reading never waits for it without a limit.** Its first answer has
+    3 seconds (its program is started and the driver's library loaded: 40
+    ms on a warm disk), every later one 1 second (one takes a tenth of a
+    millisecond). A reader that does not answer in time, answers what
+    cannot be read, or says that it has no reading is ended; that reading
+    is the backend's; and a reader is tried again after 30 seconds, as the
+    helper itself waits after a driver stopped answering, then after 60,
+    and so on up to 8 minutes, so that a PC without an NVIDIA card starts
+    one now and then and not twice a minute for ever.
+  * **It never outlives the shell.** It ends when its input ends, which
+    Windows sees to when the shell is gone, and it is in a job of Windows'
+    that is ended with the shell, also a shell that is ended by force and
+    also a reader that hangs inside the driver. At a quit it is ended
+    first.
+  * **It gets two pipe ends and nothing else of the shell's**: no
+    listening socket, no port, no named pipe, no file, no word on its
+    command line. It is started as nothing else the shell starts is:
+    Windows is given the list of the two handles by name.
+  * **A stranger gets nothing from it.** It reads nothing of its command
+    line, does not look at what comes in on its input (a line is a line,
+    and gets the card's reading for an answer), and takes the one
+    variable of the environment away in which the helper would look for a
+    second place for the library. Started by anybody by hand, it reads the
+    card and does nothing else. The helper's door for the things that
+    change the PC is not named in it.
+  * **It is carried in the pack, and started from where the pack is
+    unpacked.** The shell runs with administrator rights, and so does what
+    it starts. Its own exe is in a folder any program of the person's can
+    write to, and a file under its name can be exchanged while the app
+    runs: so the reader is not the shell's exe started with a word, and
+    is never started by a path beside it. It is one more file of the pack
+    (`_internal\VisporaGpuReader.exe`, beside the app's own copy of the C
+    runtime it needs), unpacked with the backend into the administrators'
+    folder, checked against the exe and held like every file there. The
+    download is still the one `Vispora.exe`; it grows by 0.1 MB.
 * **What the shell takes, and what it passes on.** The shell answers a
   moved call only where it gives the answer Python gives. Anything else of
   the same path is passed on, so the backend answers it as before: another
@@ -404,35 +467,46 @@ module stands on was laid down with the least else in the way:
 * **The same answers**, proven before anything is removed:
   `tests/test_moved_perf.py` asks the Python module (through its routes)
   and the shell's (in the trial tool) the same things on the same made-up
-  machine, and compares every answer: 917 of them, among them the score
+  machine, and compares every answer: 992 of them, among them the score
   for cards that idle, work steadily, jump about, come and go, and the
-  samples of a card that answers only to `nvidia-smi`, or to nothing. The
-  shell's own made-up helper says something else of the card throughout,
-  and is never asked.
+  samples of a card that answers only to `nvidia-smi`, or to nothing; of
+  a reader that is away for a driver's install, that does not answer,
+  that cannot be started. The made-up shell has a reader that says what
+  the backend's helper says, and is told what the backend's call answers;
+  the library in its own process says something else of the card
+  throughout, and is never asked.
 * **Tried for real, and measured**: `python shell_rs/app/try_it.py --moved`
-  (the app's own page in the real window against the stand-in backend: the
-  samples are the stand-in's reading, and Windows' list of the shell's
-  loaded libraries never has the driver's in it) and
-  `python shell_rs/try_it.py --moved` (the numbers, in
+  (the app's own page in the real window against the stand-in backend,
+  with the reader unpacked from a pack and reading this PC's card: the
+  driver's library is in the reader's process and never in the shell's,
+  and no reader runs at the moment the backend hears of a driver's
+  install), the same with the trial tool in `tests/test_moved_perf.py`,
+  and `python shell_rs/try_it.py --moved` (the numbers, in
   [performance.md](performance.md)).
 
-Two things follow from the card's reading, and neither is decided here:
+Two things are left open by the card's reading, and neither is decided
+here:
 
-* **Before item 1's last step, the card needs a reader that is not the
-  backend.** Pieces 2 and 5 read the card as well, and the temperature
-  ceiling (piece 5) reads it every second for as long as the app runs.
-  They take the same reading from the backend, so they see what Python
-  sees and do not go blind while a driver is installed. But while that is
-  so, the backend cannot be "started only when a page needs it". What
-  would free it: a small process of the shell's own that holds the
-  library and does nothing but answer for the card, which the shell ends
-  before a driver's install (the one thing that really takes the file out
-  of use) and starts again afterwards. It would also take away what the
-  sampler costs behind the shell now: each of its readings is a call to
-  the backend, five a second, and that is about 1.5% of one core while
-  the Monitor page is open, where the backend's own sampler takes about
-  a tenth of that ([performance.md](performance.md)). To be decided with
-  the owner before piece 5, not built here.
+* **A reading during a driver's install, once the backend is not always
+  there.** For the 900 seconds the reader is away, a reading is the
+  backend's, which then reads the card with `nvidia-smi` (a program
+  started for every reading: 300 a minute for the sampler, 60 for the
+  temperature ceiling). That is right while there is a backend. Item 1's
+  last step takes the backend away while no page is open, and the
+  temperature ceiling (piece 5) reads the card every second for as long
+  as the app runs and must never be weaker than today, also in those 900
+  seconds. What was found on the way, for piece 5 to decide with:
+  * The 900 seconds are a guess at how long an install takes, made for
+    the backend's helper. Nothing in the app sees the installer end.
+  * The shell cannot start `nvidia-smi` itself without becoming what the
+    port set out to end (a started program for every reading); the
+    backend can be kept, or started, for exactly that time.
+  * A reader that is started again too early holds the file the
+    installer is replacing. A reader that is started late costs nothing
+    but the backend's readings meanwhile.
+  * On a PC whose card answers the helper not at all (only
+    `nvidia-smi` does), the same question is there at all times, not
+    only during an install.
 * **Today's app keeps the library too.** The same measurement, through the
   app's own helper: asked to let go, it shuts the library down and frees
   it, and both copies of the file (`System32` and the driver's own folder)
@@ -442,7 +516,11 @@ Two things follow from the card's reading, and neither is decided here:
   second, so today's backend holds the file from soon after its start,
   through a driver's install as well. Whether NVIDIA's installer minds was
   not tried (no installer is ever started from here). It is a matter of
-  the released app, left as it is here, and the owner's to decide.
+  the released app, left as it is here, and the owner's to decide. Behind
+  the shell the same is true of the backend's own copy for as long as
+  something in the backend reads the card (the temperature ceiling, until
+  piece 5): the reader takes the shell's part of it away, not the
+  backend's.
 
 ## What goes last
 

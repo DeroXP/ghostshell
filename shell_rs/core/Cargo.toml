@@ -20,6 +20,15 @@ doctest = false
 name = "vispora-shell-try"
 path = "src/bin/try.rs"
 
+# The graphics card's reader: a small program the shell starts while
+# somebody wants the card's readings, and ends when nobody does and before a
+# driver's installer is started (src/bin/gpu_reader.rs says why it is a
+# program of its own).  It is carried in the pack beside the backend, and
+# started from the folder the pack is unpacked into.
+[[bin]]
+name = "VisporaGpuReader"
+path = "src/bin/gpu_reader.rs"
+
 # No outside crates, on purpose: this is the part of Vispora.exe that starts
 # a program as administrator and decides which calls reach it.  Its two
 # dependencies are crates of this repository that have no outside crates
@@ -30,7 +39,8 @@ path = "src/bin/try.rs"
 # * the native helper (native/), for the readings that have moved from the
 #   backend into the shell (src/moved/).  It is the code the Python app
 #   loads as a DLL, used here as an ordinary Rust library.  The shell asks
-#   it questions only.
+#   it questions only, and never about the graphics card: that one question
+#   is the reader's (above).
 [dependencies]
 vispora-updater-core = { path = "../../updater_rs/core" }
 vispora-native = { path = "../../native" }

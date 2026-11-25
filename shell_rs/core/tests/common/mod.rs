@@ -96,6 +96,11 @@ pub struct StandIn {
     pub seen: Mutex<Vec<Seen>>,
     /// What it says the graphics card says (the app's /api/gpu/oc/live).
     pub card: Mutex<Json>,
+    /// What it answers the call that starts a graphics driver's installer
+    /// (the app's /api/driver/install; nothing is ever started).
+    pub install_says: Mutex<Json>,
+    /// Called at the moment it hears of that call, before it answers.
+    pub when_asked_to_install: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// What a stand-in says the graphics card says, until it is told otherwise.
@@ -240,6 +245,13 @@ impl StandIn {
                 ("ok", true.into()), ("hidden", false.into()), ("game_monitor", Json::object([("ok", true.into())])),
             ])),
             ("GET", "/api/gpu/oc/live") => json("200 OK", self.card.lock().unwrap().clone()),
+            ("POST", "/api/driver/install") => {
+                let heard = self.when_asked_to_install.lock().unwrap().clone();
+                if let Some(heard) = heard {
+                    heard();
+                }
+                json("200 OK", self.install_says.lock().unwrap().clone())
+            }
             (_, "/api/echo") => json("200 OK", Json::object([
                 ("ok", true.into()), ("method", seen.method.as_str().into()), ("target", seen.target.as_str().into()),
                 ("headers", Json::Object(seen.headers.iter().map(|(n, v)| (n.to_lowercase(), v.as_str().into())).collect())),
@@ -387,6 +399,8 @@ impl Platform for StageDoor {
             was_ended_by_force: Mutex::new(false),
             seen: Mutex::new(Vec::new()),
             card: Mutex::new(a_card()),
+            install_says: Mutex::new(Json::object([("ok", false.into()), ("err", "Driver installer not downloaded yet".into())])),
+            when_asked_to_install: Mutex::new(None),
         });
         self.0.started.lock().unwrap().push(stand_in.clone());
         // It "inherits" the shell's socket: the same one, to accept on.

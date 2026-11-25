@@ -164,19 +164,40 @@ fn listing(folder: &str) -> Result<(Vec<(String, u64)>, Vec<String>), String> {
 /// as a path in the folder.  A file is squeezed `way` where that makes it
 /// smaller, and kept as it is otherwise.
 pub fn make(folder: &str, version: &str, start: &str, way: Way) -> Result<Vec<u8>, String> {
-    let (files, _) = listing(folder)?;
+    make_with(folder, version, start, way, &[])
+}
+
+/// ... and of the files in `more` as well: each a file from somewhere else
+/// (its place on the disk), under a path of its own in the pack, which must
+/// not be one the folder has.  (The graphics card's reader is carried this
+/// way: it is built with the shell, not with the app.)
+pub fn make_with(folder: &str, version: &str, start: &str, way: Way, more: &[(String, String)]) -> Result<Vec<u8>, String> {
+    let (listed, _) = listing(folder)?;
     let start = inside(start).ok_or_else(|| format!("{start} is not a path inside the folder"))?;
-    if !files.iter().any(|(path, _)| path.eq_ignore_ascii_case(&start)) {
+    if !listed.iter().any(|(path, _)| path.eq_ignore_ascii_case(&start)) {
         return Err(format!("{folder} has no {start} to start"));
     }
+    // Each file: its path in the pack, and where it is read from.
+    let mut files: Vec<(String, PathBuf)> = listed.into_iter().map(|(path, _)| (path.clone(), Path::new(folder).join(path))).collect();
+    for (in_the_pack, on_the_disk) in more {
+        // (that its path is one inside the folder is asked of every file, below)
+        if files.iter().any(|(path, _)| path.eq_ignore_ascii_case(in_the_pack)) {
+            return Err(format!("{folder} has a {in_the_pack} of its own"));
+        }
+        if !Path::new(on_the_disk).is_file() {
+            return Err(format!("{on_the_disk} is not there to be carried as {in_the_pack}"));
+        }
+        files.push((in_the_pack.clone(), PathBuf::from(on_the_disk)));
+    }
+    files.sort();
     // (each file by itself, so that they can be brought back side by side)
     let made: Mutex<Vec<Option<(String, usize, String, Way, Vec<u8>)>>> = Mutex::new(vec![None; files.len()]);
-    let numbered: Vec<(usize, &(String, u64))> = files.iter().enumerate().collect();
-    for_each(&numbered, |(at, (path, _))| {
+    let numbered: Vec<(usize, &(String, PathBuf))> = files.iter().enumerate().collect();
+    for_each(&numbered, |(at, (path, on_the_disk))| {
         if inside(path).as_deref() != Some(path.as_str()) {
             return Err(format!("{path} cannot be carried under that name"));
         }
-        let data = std::fs::read(Path::new(folder).join(path)).map_err(|e| format!("{path}: {e}"))?;
+        let data = std::fs::read(on_the_disk).map_err(|e| format!("{path}: {e}"))?;
         let mark = win::sha256_hex(&data);
         let (kept_as, kept) = match way.of_windows() {
             Some(number) if !data.is_empty() => {
@@ -229,6 +250,12 @@ pub fn fit_to_carry(bytes: &[u8], version: &str) -> Result<String, String> {
 }
 
 impl<'a> Pack<'a> {
+    /// Does it hold a file under this path?  (As Windows holds names:
+    /// capital letters or small ones.)
+    pub fn has(&self, path: &str) -> bool {
+        self.files.iter().any(|file| file.path.eq_ignore_ascii_case(path))
+    }
+
     /// Read a pack.  Everything it says is checked here, before anything is
     /// done with it: a pack that names a path outside the folder, or two
     /// files under one name, or more bytes than it has, is not a pack.
@@ -388,6 +415,47 @@ pub(crate) mod tests {
         // The same folder gives the same pack, and so the same name for it.
         assert_eq!(make(&folder, "3.8.1", "VisporaBackend.exe", Way::Lzms).unwrap(), make(&folder, "3.8.1", "VisporaBackend.exe", Way::Lzms).unwrap());
         assert!(make(&folder, "3.8.1", "Other.exe", Way::Lzms).is_err(), "a program to start that is not there");
+        let _ = std::fs::remove_dir_all(&place);
+    }
+
+    #[test]
+    fn a_file_from_somewhere_else_is_carried_under_a_path_of_its_own() {
+        // (the graphics card's reader: built with the shell, not with the app)
+        let place = a_place("carried");
+        let folder = a_backend(&place);
+        let reader = format!("{place}\\built\\VisporaGpuReader.exe");
+        std::fs::create_dir(format!("{place}\\built")).unwrap();
+        std::fs::write(&reader, "MZ the reader. ".repeat(500)).unwrap();
+        let more = [("_internal\\VisporaGpuReader.exe".to_string(), reader.clone())];
+        let bytes = make_with(&folder, "3.8.1", "VisporaBackend.exe", Way::Lzms, &more).unwrap();
+        let pack = Pack::read(&bytes).unwrap();
+        // One file more, in its place in the order, and nothing in the folder was touched.
+        let paths: Vec<&str> = pack.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["VisporaBackend.exe", "_internal\\VisporaGpuReader.exe", "_internal\\certifi\\cacert.pem", "_internal\\empty.txt", "_internal\\noise.bin",
+                           "_internal\\python312.dll"]);
+        assert!(pack.has("_internal\\VisporaGpuReader.exe") && pack.has("_INTERNAL\\visporagpureader.EXE") && !pack.has("VisporaGpuReader.exe"));
+        assert!(!std::path::Path::new(&format!("{folder}\\_internal\\VisporaGpuReader.exe")).exists(), "the file was put into the folder it was not in");
+        let out = format!("{place}\\out");
+        std::fs::create_dir(&out).unwrap();
+        pack.unpack_into(&out).unwrap();
+        assert_eq!(std::fs::read(format!("{out}\\_internal\\VisporaGpuReader.exe")).unwrap(), std::fs::read(&reader).unwrap());
+        assert_eq!(pack.same_as(&out, &[]), Ok(()));
+        // The same files, the same pack; and without the file, another one
+        // (and so another name for the folder that stays).
+        assert_eq!(make_with(&folder, "3.8.1", "VisporaBackend.exe", Way::Lzms, &more).unwrap(), bytes);
+        let without = make(&folder, "3.8.1", "VisporaBackend.exe", Way::Lzms).unwrap();
+        assert!(without != bytes && !Pack::read(&without).unwrap().has("_internal\\VisporaGpuReader.exe"));
+        // Not carried: under a name the folder has, under a path outside
+        // the folder, or a file that is not there.
+        for (in_the_pack, on_the_disk, why) in [("_internal\\python312.dll", reader.as_str(), "has a _internal\\python312.dll of its own"),
+                                                ("_INTERNAL\\PYTHON312.DLL", reader.as_str(), "of its own"),
+                                                ("..\\VisporaGpuReader.exe", reader.as_str(), "cannot be carried under that name"),
+                                                ("C:\\Windows\\VisporaGpuReader.exe", reader.as_str(), "cannot be carried under that name"),
+                                                ("_internal\\VisporaGpuReader.exe", "C:\\nowhere\\VisporaGpuReader.exe", "is not there to be carried"),
+                                                ("_internal\\VisporaGpuReader.exe", place.as_str(), "is not there to be carried")] {
+            let said = make_with(&folder, "3.8.1", "VisporaBackend.exe", Way::Lzms, &[(in_the_pack.to_string(), on_the_disk.to_string())]).unwrap_err();
+            assert!(said.contains(why), "{in_the_pack} from {on_the_disk}: {said}");
+        }
         let _ = std::fs::remove_dir_all(&place);
     }
 

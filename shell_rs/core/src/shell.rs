@@ -244,8 +244,42 @@ impl Shell {
         let moved = crate::moved::Moved::new(door, threads);
         let shell = Arc::downgrade(self);
         moved.asks_the_backend_with(Arc::new(move |path: &str| shell.upgrade()?.ask_backend("GET", path)));
+        let shell = Arc::downgrade(self);
+        moved.card.says_with(Arc::new(move |line: &str| {
+            if let Some(shell) = shell.upgrade() {
+                shell.say(line);
+            }
+        }));
         *self.moved.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(moved.clone());
         moved
+    }
+
+    /// Give the shell the way to start the graphics card's own reader
+    /// (gpu_reader.rs).  From then on a reading of the card that something
+    /// in the shell wants is the reader's, and the backend's only where
+    /// the reader is away or has none.  False where the shell answers
+    /// nothing itself (`reads_with` was not called): then there is nobody
+    /// who wants a reading.
+    pub fn card_is_read_by(&self, readers: Arc<dyn crate::moved::Readers>) -> bool {
+        let moved = self.moved.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        match moved {
+            Some(moved) => {
+                moved.card.reads_with(readers);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Where the graphics card's readings came from so far (the reader,
+    /// the backend, nowhere), where the shell takes any.
+    pub fn card_readings_from(&self) -> Option<crate::moved::From> {
+        self.moved.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().map(|moved| moved.card.from())
+    }
+
+    /// The process of the graphics card's reader, while one runs.
+    pub fn card_reader_pid(&self) -> Option<u32> {
+        self.moved.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_ref().and_then(|moved| moved.card.reader_pid())
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -655,6 +689,13 @@ impl Shell {
     /// The quit itself.  Runs once.
     fn finish(self: &Arc<Self>) {
         let began = Instant::now();
+        // The graphics card's reader goes first, and none is started any
+        // more: it runs from the folder the backend was unpacked into, and
+        // a folder for one run is taken away after the quit.
+        let moved = self.moved.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        if let Some(moved) = moved {
+            moved.card.close();
+        }
         // Out of sight first: to the person at the PC, that is the quit.
         if let Some(window) = self.window() {
             window.hide();

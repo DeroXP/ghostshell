@@ -6,13 +6,14 @@
 //! five calls, the same answers (tests/test_moved_perf.py asks both the same
 //! things on the same made-up machine and compares).
 //!
-//! Each sample is one reading of the card, and the reading is the
-//! backend's (`Card`, in mod.rs, says why the shell does not read the card
-//! itself).  It is the reading the Python sampler takes
-//! (`gpu_overclock.read_live_state()`), so the samples are the ones Python
-//! would have: also on a PC whose card answers only to nvidia-smi, also
-//! while a driver is installed, also while the driver does not answer.
-//! Without a backend to ask there is no reading, and a sample says so.
+//! Each sample is one reading of the card (`Card`, in card.rs).  The
+//! shell's own process does not read the card: the reading is taken by the
+//! card's own reader, a small program that the shell starts for it, and by
+//! the backend wherever that reader is away or has none.  Either way it is
+//! the reading the Python sampler takes (`gpu_overclock.read_live_state()`),
+//! so the samples are the ones Python would have: also on a PC whose card
+//! answers only to nvidia-smi, also while a driver is installed, also while
+//! the driver does not answer.  Where neither has a reading, a sample says so.
 //!
 //! It only reads.  Starting and stopping it starts and stops a thread of
 //! the shell's own and changes nothing on the PC.  It runs only while

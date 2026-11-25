@@ -7,12 +7,17 @@ score.  The shell (shell_rs/core/src/moved/perf.rs) answers its five calls
 itself.  The Python module and its routes are as they were, and answer when
 the app is started as it always was.
 
-The card's reading is not the shell's own.  Reading the card means starting
-NVIDIA's library in the reading process, and once started it never leaves
-that process (tools/measure/nvml_release.py shows it), while a driver's
-installer has to replace the file.  So the shell asks its backend for the
-reading (GET /api/gpu/oc/live: `gpu_overclock.read_live_state()`, the very
-reading the Python sampler takes) and never opens the library.
+The card's reading is not taken in the shell's own process.  Reading the
+card means starting NVIDIA's library in the reading process, and once
+started it never leaves that process (tools/measure/nvml_release.py shows
+it), while a driver's installer has to replace the file.  So the shell never
+opens the library.  The card is read by a small program of the shell's own
+(VisporaGpuReader: the native helper, asked its one question about the
+card), which the shell starts while a reading is wanted and ends before a
+driver's installer is started; and by the backend wherever that reader is
+away or has no reading (GET /api/gpu/oc/live:
+`gpu_overclock.read_live_state()`, the very reading the Python sampler
+takes).  Either way it is the reading Python would have taken.
 
 "The same answers, proven on the same fake machine before anything is
 removed": here both are asked the same things, one after the other, on the
@@ -25,10 +30,12 @@ same made-up machine, and every answer is compared.
     its thread is taken out: one round of its own loop is run where the
     script says "step", and its own end where it was told to stop.
   * The shell's side is the real code, in the trial tool
-    (`vispora-shell-try --moved`), which reads the same script.  Before
-    every sample it is told what the backend's call for the card's reading
-    answers at that moment.  Its own made-up library is made to say
-    something else of the card: the shell must not ask it.
+    (`vispora-shell-try --moved`), which reads the same script.  Its reader
+    is a made-up one that says what the backend's helper says (it is the
+    same helper, in another process); and before every sample the tool is
+    told what the backend's call for the card's reading answers at that
+    moment.  Its own made-up library is made to say something else of the
+    card: the shell's own process must not ask it.
 
 Where the shell does not take a call (it passes it on, so the backend
 answers), Python must have stopped before it touched the sampler, or the
@@ -45,6 +52,7 @@ import random
 import re
 import subprocess
 import threading
+import time
 import types
 import unittest
 
@@ -76,6 +84,7 @@ class Python:
     def __init__(self):
         self.time = 0.0
         self.sampled = 0                            # how many samples its thread has taken
+        self.from_helper = 0                        # ... and how many of them were the helper's reading (the rest: nvidia-smi's, or none)
         self.thread_of = None                       # the stop event of the thread that would be running
         self.smi = None                             # what nvidia-smi prints on this machine (None: it is not there)
         m.CMD_HOOKS.append(self.nvidia_smi)
@@ -145,8 +154,22 @@ class Python:
 
                     def wait(self, _seconds):
                         pass
+                self.from_helper += GO._live_state_from_native() is not None
                 PM._sampler_loop(OneRound())
                 self.sampled += 1
+        elif kind in ("reader", "tend"):
+            pass                                    # (the shell's own reader: Python has none)
+        elif kind == "install":
+            # The call that starts a driver's installer.  Nothing is
+            # started: where the script says that one was, the app tells
+            # its helper to let go, as it does before it starts one.
+            if json.loads(step["body"] or "null") and json.loads(step["body"]).get("ok"):
+                from core import driver_updater
+                m.NATIVE["gpu_release"] = lambda hold_s: {"released": True, "hold_s": hold_s}
+                try:
+                    driver_updater._release_gpu_library()
+                finally:
+                    m.NATIVE.pop("gpu_release", None)
         else:
             before = self.state()
             answer = self.client.open(step["target"], method=step["method"], data=step.get("body", "").encode("utf-8"), headers=self.headers)
@@ -165,24 +188,34 @@ class Python:
 
 
 class Shell:
-    """shell_rs/core/src/moved/, in the trial tool, on its made-up machine."""
+    """shell_rs/core/src/moved/, in the trial tool, on its made-up machine.
+    `reader`: has it a reader of its own for the card (as a shell whose pack
+    carries one), or none (the card's reading is the backend's)?"""
 
-    def __init__(self):
-        self.tool = m.REAL_POPEN([S.TRY, "--moved"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+    def __init__(self, reader=True):
+        self.tool = m.REAL_POPEN([S.TRY, "--moved"] + ([] if reader else ["--no-reader"]), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True, encoding="utf-8")
+
+    def tell(self, step):
+        self.tool.stdin.write(json.dumps(step) + "\n")
+        self.tool.stdin.flush()
+        said = json.loads(self.tool.stdout.readline())
+        assert "error" not in said, said
+        return said
 
     def do(self, step):
         if step["do"] == "smi":
             return None                             # (the fake machine's nvidia-smi is the backend's to start, never the shell's)
         if step["do"] == "answers" and step["question"] == "gpu_live":
-            # What the backend's helper says of the card, the shell's own
-            # library does not say here: it says something else, at all
-            # times, so that a shell that asked it would be found out.
+            # What the backend's helper says of the card, the card's reader
+            # says too: it is the same helper, asked in another process.
+            self.tell({"do": "reader", "says": "none" if step["answer"] is None else step["answer"]})
+            # The library in the shell's own process does not say it: it
+            # says something else, at all times, so that a shell that asked
+            # it would be found out.
             step = dict(step, answer=NOT_THE_CARD)
-        self.tool.stdin.write(json.dumps(step) + "\n")
-        self.tool.stdin.flush()
-        said = json.loads(self.tool.stdout.readline())
-        assert "error" not in said, said
-        return said if step["do"] in ("call", "asked") else None
+        said = self.tell(step)
+        return said if step["do"] in ("call", "asked", "install", "tend") else None
 
     def close(self):
         self.tool.stdin.close()
@@ -203,7 +236,7 @@ def same(shells, pythons):
     return shells == pythons
 
 
-def both(script):
+def both(script, reader=True):
     """Ask the Python module and the shell the same things in the same
     order.  Every answer the shell gives must be Python's; where the shell
     passes a call on, Python must not have touched the sampler.  Returns how
@@ -211,9 +244,12 @@ def both(script):
 
     Before every sample the shell's side is told what the backend's own
     call for the card's reading answers on this machine at that moment.
-    At the end: the shell asked the backend for the card once for every
-    sample Python took, and its own library never."""
-    python, shell = Python(), Shell()
+    At the end: for every sample Python took, the shell took one reading,
+    from its reader or from the backend; the backend was asked for the card
+    exactly where the reader gave none; and the library in the shell's own
+    process was never asked.  What the shell's side counted is kept in
+    `both.counted`."""
+    python, shell = Python(), Shell(reader)
     answered = passed_on = 0
     try:
         for at, step in enumerate(script):
@@ -237,12 +273,25 @@ def both(script):
                 assert same(json.loads(shells["body"]), json.loads(pythons["body"])), \
                     f"{what}:\n  the shell:  {shells['body']}\n  the Python: {pythons['body']}"
         asked = shell.do({"do": "asked"})
-        assert asked["library"] == [], f"the shell asked its own library: {asked['library'][:5]}"
-        assert asked["backend"] == ["/api/gpu/oc/live"] * python.sampled, (len(asked["backend"]), python.sampled, sorted(set(asked["backend"])))
+        assert asked["library"] == [], f"the shell asked the library in its own process: {asked['library'][:5]}"
+        assert set(asked["backend"]) <= {"/api/gpu/oc/live"}, sorted(set(asked["backend"]))
+        took = (asked["from_the_reader"], asked["from_the_backend"], asked["from_nowhere"])
+        assert sum(took) == python.sampled, (took, python.sampled)
+        assert len(asked["backend"]) == took[1] + took[2], "the backend was asked for the card where the reader had a reading, or not asked where it had none"
+        # (never more from the reader than Python took from its helper: a
+        # reader that gave nothing is away for a while, and the backend's
+        # reading is then the helper's in the backend, which is the same)
+        assert took[0] <= python.from_helper and asked["reader"] <= python.sampled, (took, python.from_helper, asked["reader"])
+        if not reader:
+            assert (took[0], asked["readers_started"]) == (0, 0)
+        both.counted = dict(asked, sampled=python.sampled, from_helper=python.from_helper)
         return answered, passed_on
     finally:
         python.close()
         shell.close()
+
+
+both.counted = {}
 
 
 def now(time):
@@ -291,6 +340,15 @@ def test_the_monitor_page_gets_the_same_answers_from_the_shell():
     script += [post("/api/perf/stop", {"consumer": "hwmon-page"}), *EVERYTHING, STEP, *EVERYTHING, now(1100.0), *EVERYTHING]
     answered, passed_on = both(script)
     assert (answered, passed_on) == (sum(1 for step in script if step["do"] == "call"), 0)
+    # Every one of the sixty samples was the reader's: one reader, started
+    # for the first of them, and the backend never asked for the card.
+    counted = both.counted
+    assert (counted["sampled"], counted["from_the_reader"], counted["readers_started"], counted["backend"]) == (60, 60, 1, []), counted
+    # A shell without a reader of its own (its pack carries none): the same
+    # answers, every reading the backend's.
+    answered, passed_on = both(script, reader=False)
+    assert (answered, passed_on) == (sum(1 for step in script if step["do"] == "call"), 0)
+    assert (both.counted["from_the_backend"], len(both.counted["backend"])) == (60, 60)
 
 
 def test_starting_and_stopping_give_the_same_answers():
@@ -542,6 +600,108 @@ def test_a_card_that_answers_only_to_nvidia_smi_gives_the_same_samples():
         python.close()
 
 
+def test_while_a_drivers_installer_runs_the_samples_stay_pythons():
+    """The page asks for a driver's install.  The shell ends its reader
+    before the backend hears of it, and starts none for fifteen minutes; the
+    backend tells its own helper to let go for as long, and Python's sampler
+    reads the card through nvidia-smi meanwhile.  The shell's samples are
+    the backend's reading for that time: the same ones."""
+    if not tool():
+        return
+    smi = lambda temp: {"do": "smi", "says": f"2100, 9501, {temp}, 215.44, 97, 40, 55, 320.00, 2100, 9501, 2200, 9800"}    # noqa: E731
+    started = {"do": "install", "status": 200, "body": json.dumps({"ok": True, "msg": "NVIDIA installer launched."})}
+    refused = {"do": "install", "status": 200, "body": json.dumps({"ok": False, "err": "An install is already in progress"})}
+    s = [now(100.0), card(**A_CARD), post("/api/perf/start", {"consumer": "hwmon-page"})]
+    for round in range(3):
+        s += [now(100.0 + round * 0.2), STEP]
+    s += [get("/api/perf/status"), now(100.6), started,
+          # (from here the backend's helper stays off the library, and nvidia-smi answers)
+          card(), smi(58)]
+    for round in range(1, 21):
+        s += [now(100.6 + round * 0.2), smi(58 + round % 4), STEP]
+    s += [get("/api/perf/status"), get("/api/perf/samples"), get("/api/perf/score")]
+    # Ten minutes in the page asks again and is refused; nothing changes.
+    s += [now(700.0), refused, STEP, now(999.0), STEP, now(1000.5), STEP, get("/api/perf/status")]
+    # The fifteen minutes are over: the helper answers again, in both.
+    s += [now(1000.6), card(**dict(A_CARD, temp_c=64)), STEP, now(1000.8), STEP, get("/api/perf/status"), get("/api/perf/samples?seconds=5")]
+    answered, passed_on = both(s)
+    assert passed_on == 0 and answered == sum(1 for step in s if step["do"] == "call")
+    counted = both.counted
+    # Three readings of the first reader, twenty-three of the backend while
+    # it was away, two of the second reader; and no reader in between.
+    assert (counted["from_the_reader"], counted["from_the_backend"], counted["readers_started"], counted["reader"]) == (5, 23, 2, 5), counted
+    # An install that was not started: the reader is away for the call, and
+    # back for the next sample.
+    not_started = {"do": "install", "status": 200, "body": json.dumps({"ok": False, "err": "Driver installer not downloaded yet"})}
+    s = [now(100.0), card(**A_CARD), post("/api/perf/start", {}), STEP, now(100.2), not_started, STEP, now(100.4), STEP, get("/api/perf/status")]
+    both(s)
+    assert (both.counted["from_the_reader"], both.counted["from_the_backend"], both.counted["readers_started"]) == (3, 0, 2), both.counted
+    # (what the backend would have found at the moment it heard of the call)
+    shell = Shell()
+    try:
+        shell.do(card(**A_CARD))
+        shell.do(post("/api/perf/start", {}))
+        shell.do(STEP)
+        assert shell.do({"do": "asked"})["readers_running"] == [1]
+        assert shell.do(started) == {"status": 200, "readers_when_the_backend_heard": []}
+        assert shell.do({"do": "asked"})["readers_running"] == []
+    finally:
+        shell.close()
+
+
+def test_a_reader_that_gives_nothing_leaves_the_samples_as_python_has_them():
+    """The card is fine and the reader is not: it does not answer in time,
+    answers what cannot be read, cannot be started.  The shell ends it,
+    takes the backend's reading (the same card, read by the backend's
+    helper), and tries a reader again half a minute later.  And a reader
+    nobody asked for ten seconds is ended, and started again when a reading
+    is wanted."""
+    if not tool():
+        return
+    reader = lambda **does: dict({"do": "reader"}, **does)                # noqa: E731
+    s = [now(10.0), card(**A_CARD), post("/api/perf/start", {}), STEP, get("/api/perf/status")]
+    at = 10.0
+    troubles = (reader(says="silent"), reader(says="garbled"), reader(says="none"), reader(says=dict(A_CARD, temp_c=None)))
+    for trouble in troubles:
+        at += 0.2
+        s += [now(at), trouble, STEP, get("/api/perf/status")]
+        # ... it is in order again at once, and not asked for half a minute
+        s += [reader(says=A_CARD)]
+        for later in (0.2, 15.0, 29.8):
+            s += [now(at + later), STEP]
+        at += 30.0
+        s += [now(at), STEP, get("/api/perf/status")]
+    # Nobody asks for ten seconds (the page was left and the sampler
+    # stopped): the reader is ended.
+    s += [post("/api/perf/stop", {}), STEP, now(at + 5.0), {"do": "tend"}, now(at + 10.0), {"do": "tend"}]
+    # The next reading that is wanted starts another: which cannot be
+    # started just then, and can half a minute later.
+    s += [reader(cannot_start=True), now(at + 20.0), post("/api/perf/start", {}), STEP, get("/api/perf/status"), reader(cannot_start=False),
+          now(at + 25.0), STEP, now(at + 50.0), STEP, get("/api/perf/status"), get("/api/perf/samples?seconds=60")]
+    answered, passed_on = both(s)
+    assert passed_on == 0 and answered == sum(1 for step in s if step["do"] == "call")
+    counted = both.counted
+    # One sample of each trouble and three within each pause are the
+    # backend's, and two while no reader could be started; the rest are a
+    # reader's.
+    backends = 4 * len(troubles) + 2
+    assert (counted["from_the_backend"], counted["from_nowhere"], counted["from_the_reader"]) == (backends, 0, counted["sampled"] - backends), counted
+    # A reader for the first sample, one after each trouble, one after the
+    # idle one was ended: and that last one runs, and no other.
+    assert (counted["readers_started"], counted["readers_running"]) == (len(troubles) + 2, [len(troubles) + 2]), counted
+    # (the idle one was there after five seconds, and gone after ten)
+    shell = Shell()
+    try:
+        for step in (now(50.0), card(**A_CARD), post("/api/perf/start", {}), STEP, post("/api/perf/stop", {}), STEP):
+            shell.do(step)
+        shell.do(now(59.9))
+        assert shell.do({"do": "tend"}) == {"still_one": True}
+        shell.do(now(60.0))
+        assert shell.do({"do": "tend"}) == {"still_one": False} and shell.do({"do": "asked"})["readers_running"] == []
+    finally:
+        shell.close()
+
+
 def test_without_any_reading_the_samples_say_so_on_both_sides():
     """No NVIDIA card, no driver, no nvidia-smi: the backend has no reading,
     Python's samples say "no reading", and so do the shell's.  The sampler
@@ -584,7 +744,7 @@ def test_what_has_moved_can_only_read_the_machine():
     the backend, it asks through a way the shell hands it: it opens no
     connection of its own.)"""
     sources = moved_sources()
-    assert set(sources) == {"mod.rs", "perf.rs"}, "a new module has moved: this test and the plan in docs/rust-port.md have to know it"
+    assert set(sources) == {"card.rs", "mod.rs", "perf.rs"}, "a new module has moved: this test and the plan in docs/rust-port.md have to know it"
     everything = {os.path.join(where, name): open(os.path.join(where, name), encoding="utf-8").read()
                   for crate in (S.CORE, os.path.join(os.path.dirname(S.CORE), "app")) for where, _, names in os.walk(os.path.join(crate, "src"))
                   for name in names if name.endswith(".rs")}
@@ -592,8 +752,12 @@ def test_what_has_moved_can_only_read_the_machine():
     def not_its_tests(text):
         return text[:text.index("#[cfg(test)]")] if "#[cfg(test)]" in text else text
 
-    asks = {path: not_its_tests(text).count("vispora_native::") for path, text in everything.items() if "vispora_native::" in not_its_tests(text)}
-    assert list(asks.values()) == [1] and list(asks)[0].endswith(os.path.join("moved", "mod.rs")), asks
+    # The helper is asked in two places, each once: by the shell's door (any
+    # question but one about the card), and by the card's reader, which is a
+    # program of its own (its one question, about the card).
+    asks = {os.path.relpath(path, os.path.dirname(S.CORE)): not_its_tests(text).count("vispora_native::")
+            for path, text in everything.items() if "vispora_native::" in not_its_tests(text)}
+    assert asks == {os.path.join("core", "src", "moved", "mod.rs"): 1, os.path.join("core", "src", "bin", "gpu_reader.rs"): 1}, asks
     for path, text in everything.items():
         assert "vispora_native::act" not in text and "native::act(" not in text, f"{path} names the helper's door for actions"
     door = sources["mod.rs"]
@@ -609,8 +773,19 @@ def test_what_has_moved_can_only_read_the_machine():
     for name, text in sources.items():
         code = text[:text.index("#[cfg(test)]")]
         for word in ("std::process", "Command::new", "std::fs", "File::", "extern \"system\"", "unsafe", "crate::win", "crate::platform", "std::env",
-                     "std::net", "crate::forward"):
+                     "std::net", "crate::forward", "crate::gpu_reader"):
             assert word not in code, f"moved/{name} reaches the machine past its door: {word}"
+    # The reader's program asks its one question and nothing else: the
+    # question is written in it, nothing that comes in is put into it, and
+    # it reads nothing of its command line or its environment.
+    reader = not_its_tests(S.rust("src", "bin", "gpu_reader.rs"))
+    assert 'const THE_QUESTION: &str = "{\\"q\\":\\"gpu_live\\"}";' in reader and "|| vispora_native::answer(THE_QUESTION)" in reader
+    for word in ("std::env::args", "env::var", "format!(", "std::fs", "std::process", "std::net", "unsafe", "extern \"system\"", "vispora_shell_core"):
+        assert word not in reader, f"the reader's program has {word}"
+    assert reader.count("std::env::") == 1 and "std::env::remove_var(A_PLACE_FROM_THE_ENVIRONMENT);" in reader
+    assert 'const A_PLACE_FROM_THE_ENVIRONMENT: &str = "ProgramW6432";' in reader
+    helper = S.repo("native", "src", "gpu.rs")
+    assert re.findall(r'std::env::var\("(\w+)"\)', helper) == ["ProgramW6432"], "the helper looks for the library in another place of the environment's as well"
     # The helper's own list of what a question can be has no action in it.
     native = S.repo("native", "src", "lib.rs")
     questions = native[native.index("fn dispatch(request: &str)"):native.index("fn dispatch_action(request: &str)")]
@@ -639,9 +814,10 @@ def test_the_shell_takes_the_samplers_calls_and_no_others():
     # The router asks what every call is asked first, and only then what has moved.
     router = S.rust("src", "router.rs")
     handle = router[router.index("pub fn handle(self: &Arc<Self>, request: &Request) -> Response {"):router.index("/// Why a call is not from the app's own page")]
-    assert handle.index("if let Some(refusal) = self.stranger(request) {") < handle.index("moved.and_then(|moved| moved.answer(request))") \
-        < handle.index("self.pass_on(request)\n            }")
-    assert handle.count("moved.answer(") == 1
+    assert handle.index("if let Some(refusal) = self.stranger(request) {") < handle.index("moved.as_ref().and_then(|moved| moved.answer(request))") \
+        < handle.index("if let Some(moved) = moved.filter(|_| crate::moved::Moved::starts_a_driver_install(request)) {") \
+        < handle.index("return moved.card.around_a_driver_install(|| self.pass_on(request));") < handle.index("self.pass_on(request)\n            }")
+    assert handle.count("moved.answer(") == 1 and handle.count("around_a_driver_install(") == 1
 
 
 def test_the_backends_sampler_and_its_routes_are_as_they_were():
@@ -705,20 +881,21 @@ def test_the_shell_never_opens_the_drivers_library():
     (nvml.dll) before it starts NVIDIA's installer, and to leave it alone
     for fifteen minutes: the installer has to replace the file
     (core/driver_updater.py).  That reaches the backend's copy of the helper.
-    The shell has a copy of its own, and nobody tells that one anything.
 
-    And telling it would not be enough.  Once NVIDIA's library has been
-    started in a process it stays in that process, whatever is shut down or
-    freed afterwards (tools/measure/nvml_release.py: run it to see).  The
-    shell lives as long as the app does.  So the shell does not open the
-    library, at any time: its door refuses every question about the card
-    before the helper is asked, and the card's reading is the backend's.
+    Letting go is not enough.  Once NVIDIA's library has been started in a
+    process it stays in that process, whatever is shut down or freed
+    afterwards (tools/measure/nvml_release.py: run it to see).  The shell
+    lives as long as the app does.  So the shell does not open the library,
+    at any time: its door refuses every question about the card before the
+    helper is asked.  The card is read by a program of its own, which can be
+    ended, and by the backend.
 
     Here: that the door refuses them, that the helper opens the library for
     those questions and for no others, and that the backend's own letting go
     is as it was.  That the library is not in the shell's process is seen
-    in the shell's own tests (cargo test, on a PC with an NVIDIA card) and
-    in the trial of the window (shell_rs/app/try_it.py --moved)."""
+    in the shell's own tests (cargo test, on a PC with an NVIDIA card), in
+    the test below that runs the trial tool with its reader, and in the
+    trial of the window (shell_rs/app/try_it.py --moved)."""
     app()
     from core import driver_updater as DU
     door = moved_sources()["mod.rs"]
@@ -746,6 +923,8 @@ def test_the_shell_never_opens_the_drivers_library():
                 code = "\n".join(line for line in text.split("#[cfg(test)]\nmod tests")[0].splitlines() if not line.strip().startswith("//"))
                 assert "nvml" not in code.lower(), f"{name} names the driver's library"
                 assert ("LoadLibrary" in code) == (name == "win.rs"), name
+                # (the card's question is written in the reader's program, and nowhere in the shell)
+                assert ("gpu_live" in code) == (os.path.basename(where) == "bin" and name == "gpu_reader.rs"), f"{name} names the card's question"
     win = S.rust("src", "win.rs")
     assert win.count("LoadLibraryExW(") == 2 and "let library = LoadLibraryExW(name.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);" in win
     assert os.path.exists(os.path.join(os.path.dirname(os.path.dirname(S.CORE)), "tools", "measure", "nvml_release.py"))
@@ -766,24 +945,32 @@ def test_the_shell_never_opens_the_drivers_library():
 
 
 def test_the_backends_reading_of_the_card_is_what_its_sampler_reads():
-    """The shell asks the backend for the card's reading with the call the
-    GPU overclock page uses for its live numbers.  That call is
-    `read_live_state()` and nothing else: the very reading the Python
-    sampler takes.  It only reads; nothing of the overclock's own code has
-    moved or is called from the shell."""
+    """Where the card's own reader is away or has no reading, the shell asks
+    the backend for the card's reading with the call the GPU overclock page
+    uses for its live numbers.  That call is `read_live_state()` and nothing
+    else: the very reading the Python sampler takes.  It only reads; nothing
+    of the overclock's own code has moved or is called from the shell."""
     app()
     source = S.repo("app.py")
     assert ('@app.route("/api/gpu/oc/live")\ndef api_gpu_oc_live():\n    """Live GPU stats: clocks, temp, power, utilization. Poll this during stress tests."""\n'
             '    return jsonify(gpu_overclock.read_live_state())') in source
     assert "s = gpu_overclock.read_live_state()" in S.repo("core", "perf_monitor.py")
-    door = moved_sources()["mod.rs"]
-    assert 'pub const THE_BACKENDS_READING: &str = "/api/gpu/oc/live";' in door
-    code = door[:door.index("#[cfg(test)]")]
-    assert code.count('"/api/') == 1 + code.count('"/api/perf/'), "the shell asks the backend something else as well"
-    live = door[door.index("pub fn live(&self) -> Option<Live> {"):door.index("/// Everything that has moved, with the door it reads the machine through.")]
-    assert "let said = ask(THE_BACKENDS_READING)?;" in live and "self.door" not in live, "the card's reading is the backend's, and nothing else's"
+    sources = moved_sources()
+    card_rs = sources["card.rs"]
+    assert 'pub const THE_BACKENDS_READING: &str = "/api/gpu/oc/live";' in card_rs
+    code = "".join(text[:text.index("#[cfg(test)]")] for text in sources.values())
+    assert code.count('"/api/') == 2 + code.count('"/api/perf/'), "the shell names another call of the backend's as well"
+    assert 'pub const THE_DRIVER_INSTALL: &str = "/api/driver/install";' in sources["mod.rs"]
+    backends = card_rs[card_rs.index("fn the_backends(&self) -> Option<Live> {"):card_rs.index("impl State {")]
+    assert "let said = ask(THE_BACKENDS_READING)?;" in backends and card_rs.count("ask(THE_BACKENDS_READING)") == 1
+    # The card is read in two places and no third: the reader, where one may
+    # be asked, and the backend.  Never through the door to the shell's own
+    # library, which is used for the time and nothing else.
+    live = card_rs[card_rs.index("pub fn live(&self) -> Option<Live> {"):card_rs.index("/// The reader to ask now, started if need be")]
+    assert live.index("self.the_reader(now)") < live.index("reader.read(within)") < live.index("let live = self.the_backends();")
+    assert card_rs[:card_rs.index("#[cfg(test)]")].count("door.") == 1 and "self.inner.door.now()" in card_rs, "the card asks the shell's own door for something"
     # (the sampler reads the card through that and through nothing else)
-    perf = moved_sources()["perf.rs"]
+    perf = sources["perf.rs"]
     assert perf[:perf.index("#[cfg(test)]")].count("card.live()") == 1 and "Readings" not in perf[:perf.index("#[cfg(test)]")]
     # How the shell asks: as it asks for the tray, with the run's secret,
     # and only a backend that is up.
@@ -805,3 +992,218 @@ def test_the_backends_reading_of_the_card_is_what_its_sampler_reads():
         assert client.get("/api/gpu/oc/live", headers=python.headers).get_json() == {"ok": False, "err": "No NVIDIA GPU / nvidia-smi missing"}
     finally:
         python.close()
+
+
+# ═════════════════════════════════════════════════════════════════════
+# The card's own reader, and a driver's installer
+# ═════════════════════════════════════════════════════════════════════
+READER = S.built_tool("VisporaGpuReader.exe")
+
+
+def holds(pid, library):
+    """Is a library of this name loaded in the process `pid`, as Windows
+    lists it?  (A read.)"""
+    listed = m.REAL_POPEN(["tasklist", "/m", library, "/fi", "PID eq %d" % pid, "/fo", "csv", "/nh"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).communicate()[0]
+    return '"%d"' % pid in listed
+
+
+def test_the_install_begins_in_one_place_and_both_sides_agree_on_it():
+    """The reader has to be gone before a driver's installer is started.
+    The app starts one in one place, behind one call of the page, and that
+    call goes through the shell: the shell ends its reader before it passes
+    the call on, and keeps none for as long as the backend keeps off its own
+    copy of the library, unless the backend says that nothing was started."""
+    app()
+    from core import driver_updater as DU
+    source, updater = S.repo("app.py"), S.repo("core", "driver_updater.py")
+    # One way in: the route, and the function it calls, which has no other caller.
+    assert '@app.route("/api/driver/install", methods=["POST"])\ndef api_driver_install():\n    return jsonify(driver_updater.install_driver())' in source
+    assert source.count("install_driver(") == 1
+    core = os.path.join(os.path.dirname(os.path.dirname(S.CORE)), "core")
+    called = [(name, line.strip()) for name in sorted(os.listdir(core)) if name.endswith(".py")
+              for line in open(os.path.join(core, name), encoding="utf-8", errors="replace").read().splitlines()
+              if "install_driver(" in line and not line.startswith("def install_driver(") and "`install_driver()`" not in line]
+    assert called == [], f"an installer is started from somewhere else as well, which the shell does not see: {called}"
+    # Nothing but that function starts the installer's program.
+    install = updater[updater.index("def install_driver() -> dict:"):updater.index("def get_status() -> dict:")]
+    assert install.index('return {"ok": False, "err": "An install is already in progress"}') < install.index("_release_gpu_library()") \
+        < install.index('subprocess.Popen(["explorer.exe", path]')
+    assert updater.count("_release_gpu_library()") == 1 + 1, "the app lets go of the library somewhere else as well"
+    # It says "ok" only when it started one: that is what the shell goes by.
+    assert install.count('"ok": True') == 1 and install.rindex('return {"ok": True,') > install.index("_release_gpu_library()")
+    sources = moved_sources()
+    assert f"pub const HOLD_FOR_AN_INSTALL_S: f64 = {float(DU._GPU_LIBRARY_HOLD_S)};" in sources["card.rs"]
+    assert 'request.method == "POST" && as_the_backend_reads_a_path(request.path()) == THE_DRIVER_INSTALL' in sources["mod.rs"]
+    around = sources["card.rs"]
+    around = around[around.index("pub fn around_a_driver_install("):around.index("/// The shell quits: the reader is ended")]
+    # Ended and seen to be gone before the call is passed on; and things as
+    # they were where the backend says that nothing was started.
+    assert around.index("let before = st.away_until.replace(until);") < around.index("(st.reader.take(), before)") < around.index("reader.end()") \
+        < around.index("let answer = pass_on();") \
+        < around.index('let started = answer.status == 200 && answer.to_json().get("ok").is_some_and(Json::truthy);') \
+        < around.index("st.away_until = before;")
+    # The way the web framework reads a path, and so which calls are this
+    # one: the app's own routing, asked with a few ways of writing it.
+    client = A.app.test_client()
+    headers = {"Host": f"127.0.0.1:{config.APP_PORT}", A._API_TOKEN_HEADER: A._API_TOKEN}
+    install_was = A.app.view_functions["api_driver_install"]
+    reached = []
+    A.app.view_functions["api_driver_install"] = lambda: (reached.append(1), A.jsonify({"ok": False, "err": "a test: nothing is started"}))[1]
+    try:
+        for written, is_it in (("/api/driver/install", True), ("/api/driver/install?x=1", True), ("/api/driver/%69nstall", True), ("/api/%64river/install", True),
+                               ("/api/driver/instal%6C", True), ("/api/driver/install/", False), ("/api/driver/Install", False), ("/api/driver/installer", False),
+                               ("/api/driver/install%00", False)):
+            del reached[:]
+            client.post(written, headers=headers, data=b"{}")
+            assert bool(reached) == is_it, f"{written}: the app's own routing {'took' if reached else 'did not take'} it for the install"
+        del reached[:]
+        for method in ("get", "put", "delete", "patch", "head", "options"):
+            getattr(client, method)("/api/driver/install", headers=headers)
+        assert reached == [], "a method that is not POST reached the install"
+    finally:
+        A.app.view_functions["api_driver_install"] = install_was
+
+
+def test_the_trial_tool_with_its_reader_and_a_drivers_install_for_real():
+    """The shell without a window (the trial tool), a real reader beside it
+    (VisporaGpuReader.exe, reading this PC's card: it only reads), and the
+    stand-in backend.  The sampler's readings are the reader's; the shell's
+    own process never has the driver's library in it; and when the page
+    asks for a driver's install, there is no reader at the moment the
+    backend hears of it.  Nothing is installed or started: the stand-in
+    only says that an installer was, or was not."""
+    app()
+    if not (S.TRY and READER):
+        return
+    t = S.Trial(tool_args=["--readings", "real", "--card-reader", READER])
+    try:
+        assert t.ask(do="wait", **{"for": "ready"}, within=90) == {"phase": "ready"}
+        shell_pid = t.first["pid"]
+        said = lambda call: json.loads(call["body"])                        # noqa: E731
+        status = lambda: said(t.call("GET", "/api/perf/status"))            # noqa: E731
+
+        def wait_for(what, within=20):
+            ends = time.time() + within
+            while time.time() < ends:
+                got = what()
+                if got:
+                    return got
+                time.sleep(0.05)
+            return what()
+
+        # The backend's own reading, on its fake machine: 71 degrees.
+        t.call("POST", "/api/stand-in/card", body=json.dumps(dict(A_CARD, temp_c=71)))
+        assert t.ask(do="state")["card_reader_pid"] is None and not holds(shell_pid, "nvml.dll"), "a reader, or the library, before anybody wants a reading"
+        assert said(t.call("POST", "/api/perf/start", body='{"consumer": "trial"}'))["ok"] is True
+        assert wait_for(lambda: status()["sample_count"] >= 4), status()
+        state = t.ask(do="state")
+        if state["card_readings_from"]["reader"] == 0:
+            # This PC's card gives the reader no reading (no NVIDIA card or
+            # driver): the reader was ended, and the samples are the backend's.
+            assert state["card_reader_pid"] is None and status()["last"]["temp"] == 71, state
+            assert any("gave no reading" in line for line in state["history"]), state["history"]
+            assert not holds(shell_pid, "nvml.dll")
+            return
+        reader_pid = state["card_reader_pid"]
+        assert reader_pid and reader_pid != shell_pid and state["card_readings_from"]["backend"] == 0, state
+        # The library is in the reader, and not in the shell.
+        assert holds(reader_pid, "nvml.dll") and not holds(shell_pid, "nvml.dll")
+        assert status()["last"]["ok"] is True
+
+        # The page asks for a driver's install, and the backend starts none.
+        assert said(t.call("POST", "/api/stand-in/driver-install", body='{"starts": false}'))["ok"] is True
+        answer = t.call("POST", "/api/driver/install", body="{}")
+        assert (answer["status"], said(answer)["ok"]) == (200, False), answer
+        seen = said(t.call("POST", "/api/stand-in/driver-install", body='{"starts": true}'))["readers_when_asked"]
+        assert seen == [[]], f"when the backend heard of the install, a reader was running: {seen}"
+        assert S.ended(reader_pid, 5), "the reader that was ended for the install is still there"
+        # ... and the reader is back for the next readings: another one.
+        second = wait_for(lambda: t.ask(do="state")["card_reader_pid"])
+        assert second and second != reader_pid and holds(second, "nvml.dll")
+
+        # The page asks again, and the backend says that it started one.
+        answer = t.call("POST", "/api/driver/install", body="{}")
+        assert (answer["status"], said(answer)["ok"]) == (200, True), answer
+        seen = said(t.call("POST", "/api/stand-in/driver-install", body='{"starts": true}'))["readers_when_asked"]
+        assert seen == [[], []], seen
+        assert S.ended(second, 5)
+        # No reader now, and none comes back; no process of the shell's has
+        # the library; and the sampler goes on, with the backend's reading.
+        before = status()["sample_count"]
+        time.sleep(1.5)
+        state, now = t.ask(do="state"), status()
+        assert state["card_reader_pid"] is None and not holds(shell_pid, "nvml.dll"), state
+        assert now["running"] is True and now["last"] == dict(now["last"], ok=True, temp=71), now
+        assert state["card_readings_from"]["backend"] >= 5 and (now["sample_count"] > before or now["sample_count"] == 300)
+        lines = "\n".join(state["history"])
+        for line in (f"the graphics card's reader was ended first (pid {reader_pid}), and was seen to be gone",
+                     "no graphics driver's installer was started: the graphics card's reader may be started again",
+                     f"the graphics card's reader was ended first (pid {second}), and was seen to be gone",
+                     "a graphics driver's installer was started: no reader for the graphics card for 900 s, the backend is asked meanwhile"):
+            assert line in lines, f"not in the shell's log: {line}\n{lines}"
+    finally:
+        t.close()
+
+
+def test_the_reader_goes_when_nobody_wants_it_and_when_the_shell_is_gone():
+    """Ten seconds after the last reading that was asked for, the reader is
+    ended.  And it never outlives the shell: not a quit, and not a shell
+    that is ended by force (Windows ends the reader's job with it)."""
+    app()
+    if not (S.TRY and READER):
+        return
+    said = lambda call: json.loads(call["body"])                            # noqa: E731
+
+    def a_running_reader(t):
+        """The reader's process once the sampler has taken samples from it
+        (None on a PC whose card gives a reader no reading)."""
+        assert t.ask(do="wait", **{"for": "ready"}, within=90) == {"phase": "ready"}
+        assert said(t.call("POST", "/api/perf/start", body='{"consumer": "trial"}'))["ok"] is True
+        ends = time.time() + 20
+        while time.time() < ends and said(t.call("GET", "/api/perf/status"))["sample_count"] < 3:
+            time.sleep(0.05)
+        state = t.ask(do="state")
+        return state["card_reader_pid"] if state["card_readings_from"]["reader"] else None
+
+    # Nobody wants readings any more: gone after ten seconds, and not before five.
+    t = S.Trial(tool_args=["--readings", "real", "--card-reader", READER])
+    try:
+        reader_pid = a_running_reader(t)
+        if reader_pid is None:
+            return
+        t.call("POST", "/api/perf/stop", body='{"consumer": "trial"}')
+        stopped = time.time()
+        time.sleep(5.0)
+        assert t.ask(do="state")["card_reader_pid"] == reader_pid, "the reader was ended within five seconds of the last reading"
+        assert S.ended(reader_pid, 12), "the reader still runs %.0f s after the last reading was asked for" % (time.time() - stopped)
+        took = time.time() - stopped
+        assert 9.0 <= took <= 14.0, took
+        state = t.ask(do="state")
+        assert state["card_reader_pid"] is None
+        assert f"the graphics card's reader was ended (pid {reader_pid}): nobody asked for a reading for 10 s" in state["history"]
+        # A quit ends the one that runs then.
+        assert said(t.call("POST", "/api/perf/start", body='{"consumer": "trial"}'))["ok"] is True
+        ends = time.time() + 20
+        again = None
+        while time.time() < ends and not again:
+            again = t.ask(do="state")["card_reader_pid"]
+            time.sleep(0.05)
+        assert again and again != reader_pid
+        t.tell(do="quit")
+        assert t.answer(60)["phase"] == "gone"
+        assert S.ended(again, 5), "the reader outlived the shell's quit"
+    finally:
+        t.close()
+
+    # The shell is ended by force, with the sampler running.
+    t = S.Trial(tool_args=["--readings", "real", "--card-reader", READER])
+    try:
+        reader_pid = a_running_reader(t)
+        backend = t.ask(do="state")["backend_pid"]
+        t.process.kill()                                # (the trial tool's own process, and no other)
+        t.process.wait(30)
+        assert S.ended(reader_pid, 5), "the reader outlived a shell that was ended by force"
+        assert S.ended(backend, 30), "the stand-in backend outlived the shell"
+    finally:
+        t.close()

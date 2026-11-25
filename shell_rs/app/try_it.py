@@ -134,6 +134,11 @@ def built(name, crate=None):
 CORE = os.path.normpath(os.path.join(HERE, "..", "core"))
 EXE = built("VisporaShell.exe")
 PACK_TOOL = built("vispora-shell-try.exe", CORE)
+# The graphics card's reader is the core's as well (shell_rs/README.md,
+# "What has moved from the backend").  A pack carries it; the exe starts it
+# from where the pack was unpacked.
+READER = built("VisporaGpuReader.exe", CORE)
+READER_IN_A_FOLDER = os.path.join("_internal", "VisporaGpuReader.exe")
 
 
 def refuse(why):
@@ -433,6 +438,16 @@ class Run:
             time.sleep(0.01)
         return None
 
+    def wait_for_any(self, what, within=90):
+        """As `wait_for`, also when the exe has ended."""
+        ends = time.time() + within
+        while time.time() < ends:
+            got = what()
+            if got:
+                return got
+            time.sleep(0.05)
+        return what()
+
     def page_calls(self):
         """The page's own calls (not the shell's "are you up")."""
         return [call for call in self.calls() if call[3] != "/api/shell/hello"]
@@ -586,9 +601,11 @@ def own_account():
     return found.group(1) if found else "?"
 
 
-def made_up_backend(root, name, more=b""):
+def made_up_backend(root, name, more=b"", reader=False):
     """A small folder that stands for a backend, and the pack of it: (the
-    pack's file, what the pack tool says about it, the folder)."""
+    pack's file, what the pack tool says about it, the folder).  With
+    `reader` the pack also carries the graphics card's reader, as it was
+    built beside the pack tool."""
     folder = os.path.join(root, "made-up-" + name, "VisporaBackend")
     os.makedirs(os.path.join(folder, "_internal", "certifi"))
     for path, holds in (("VisporaBackend.exe", b"MZ not really a program" + more),
@@ -599,7 +616,8 @@ def made_up_backend(root, name, more=b""):
         with open(os.path.join(folder, path), "wb") as f:
             f.write(holds)
     pack = os.path.join(root, "made-up-" + name, "backend.pack")
-    made = subprocess.run([PACK_TOOL, "--pack", folder, pack, "lzms"], capture_output=True, text=True, creationflags=NO_WINDOW)
+    made = subprocess.run([PACK_TOOL, "--pack", folder, pack, "lzms"] + (["--reader", READER] if reader else []), capture_output=True, text=True,
+                          creationflags=NO_WINDOW)
     return pack, (json.loads(made.stdout) if made.returncode == 0 else {}), folder
 
 
@@ -835,6 +853,137 @@ THE_DRIVERS_LIBRARY = "nvml.dll"     # NVIDIA's, which a driver's installer has 
 THE_CARD = "/api/gpu/oc/live"        # the backend's call for the card's reading
 
 
+def image_of(pid):
+    """The program file of the process `pid`, as Windows has it ("" where
+    it cannot be asked: the process is gone)."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    process = kernel32.OpenProcess(0x1000, False, pid)             # PROCESS_QUERY_LIMITED_INFORMATION
+    if not process:
+        return ""
+    try:
+        name, length = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
+        return name.value if kernel32.QueryFullProcessImageNameW(process, 0, name, ctypes.byref(length)) else ""
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def readers_of(run):
+    """The process numbers of the readers this run's shell has started, in order (its log)."""
+    return [int(pid) for pid in re.findall(r"the graphics card's reader was started \(pid (\d+)\)", run.log())]
+
+
+def the_cards_reader(root, check):
+    """The graphics card's own reader: a small program the shell starts
+    while a reading is wanted, from the folder its pack was unpacked into,
+    and ends when nobody wants one, before the backend hears of a driver's
+    install, at the quit, and with a shell that is ended by force.
+
+    It reads this PC's graphics card through the driver's own library, and
+    only reads.  Nothing is installed or started: the stand-in backend only
+    says that an installer was, or was not."""
+    pack, says, source = made_up_backend(root, "with-reader", reader=True)
+    check("a pack was made that carries the graphics card's reader: %r" % ({k: says.get(k) for k in ("files", "reader")},),
+          says.get("files") == 6 and says.get("reader") is True)
+    its_card = {"temp_c": 71, "gpu_util_pct": 50, "mem_util_pct": 20, "core_mhz": 1800, "mem_mhz": 7000, "power_mw": 123450, "fan_pct": 60}
+    library = THE_DRIVERS_LIBRARY
+
+    def asked_for_the_card(run):
+        return len([c for c in run.calls() if c[2:] == ("GET", THE_CARD)])
+
+    def a_reader_runs(run):
+        """The page wants the sampler: the reader that then runs (None where there is none)."""
+        the_page_calls(run, "POST", "/api/stand-in/card", its_card)
+        started = the_page_calls(run, "POST", "/api/perf/start", {"consumer": "trial"})
+        pid = run.wait_for(lambda: readers_of(run)[-1:], 10)
+        time.sleep(1.0)
+        return (pid[0] if pid and started == ["true"] else None)
+
+    # A build that is told nothing keeps its backend's folder, and the reader in it.
+    run = Run(root, "hidden", pack=pack)
+    try:
+        up = first_screen(run)
+        shell_pid = run.process.pid
+        folder = run.unpacked().get("folder", "")
+        reader_exe = os.path.join(folder, READER_IN_A_FOLDER)
+        check("the window is up, the reader was unpacked with the backend, and no reader runs before anybody wants a reading",
+              up and os.path.isfile(reader_exe) and "the graphics card has a reader of its own in that folder" in run.log() and readers_of(run) == [])
+        pid = a_reader_runs(run)
+        last = the_page_calls(run, "GET", "/api/perf/status", tell=THE_LAST_SAMPLE)
+        if pid and "gave no reading" in run.log():
+            # (no NVIDIA card or driver on this PC: the reader says so and is ended)
+            check("this PC's card gives a reader no reading: it was ended, and the samples are the backend's (71 degrees): %r" % (last,),
+                  last and last[2:] == ["true", "71"] and not running(pid) and not holds(shell_pid, library))
+            quit_by_its_window(run)
+            return
+        check("the page wants the sampler: a reader runs, and its program is the one in the unpacked folder: %s" % os.path.basename(image_of(pid or 0)),
+              pid and running(pid) and os.path.normcase(image_of(pid)) == os.path.normcase(reader_exe))
+        check("the graphics driver's library is in the reader's process, and not in the shell's", pid and holds(pid, library) and not holds(shell_pid, library))
+        check("the samples are the reader's (this PC's card), and the backend is not asked for the card: %r" % (last,),
+              last and last[0] == "true" and last[2] == "true" and asked_for_the_card(run) == 0)
+
+        # The page asks for a driver's install; the backend starts none.
+        told = the_page_calls(run, "POST", "/api/driver/install", {})
+        seen = the_page_calls(run, "POST", "/api/stand-in/driver-install", {"starts": True}, tell="JSON.stringify(said.readers_when_asked)")
+        check("the page asks for a driver's install, which the backend does not start: no reader ran when the backend heard of it, and that one is gone: %r" % (seen,),
+              told == ["false"] and seen == ["[[]]"] and pid and not running(pid))
+        second = run.wait_for(lambda: [p for p in readers_of(run) if p != pid][-1:], 10)
+        check("... and another reader is there for the next readings", second and running(second[0]) and holds(second[0], library))
+
+        # The page asks again; the backend says that an installer was started.
+        told = the_page_calls(run, "POST", "/api/driver/install", {})
+        seen = the_page_calls(run, "POST", "/api/stand-in/driver-install", {}, tell="JSON.stringify(said.readers_when_asked)")
+        time.sleep(1.5)
+        last = the_page_calls(run, "GET", "/api/perf/status", tell=THE_LAST_SAMPLE)
+        check("the page asks again and an installer is started: no reader when the backend heard, none since, and no process of the shell's holds the library",
+              told == ["true"] and seen == ["[[],[]]"] and second and not running(second[0]) and len(readers_of(run)) == 2 and not holds(shell_pid, library))
+        check("the sampler goes on with the backend's reading meanwhile (71 degrees on its fake machine): %r" % (last,),
+              last and last[0] == "true" and last[2:] == ["true", "71"] and asked_for_the_card(run) >= 4)
+        check("the shell quits as ever (exit code %r), and the folder that stays is whole, the reader in it" % (quit_by_its_window(run),),
+              run.process.returncode == 0 and same_files(folder, source, but=(READER_IN_A_FOLDER,)))
+    finally:
+        run.end()
+
+    # Unpacked for the run: the page leaves, and the reader goes ten seconds later.
+    run = Run(root, "hidden", pack=pack, keep=False)
+    try:
+        up = first_screen(run)
+        folder = run.unpacked().get("folder", "")
+        pid = a_reader_runs(run)
+        the_page_calls(run, "POST", "/api/perf/stop", {"consumer": "trial"})
+        left = time.time()
+        time.sleep(5.0)
+        still = bool(pid and running(pid))
+        gone = run.wait_for(lambda: pid and not running(pid), 12)
+        took = time.time() - left
+        check("the page leaves: five seconds later the reader is still there, and ten seconds after the last reading it is ended (%.1f s)" % took,
+              up and still and gone and 8.5 <= took <= 14.0 and "nobody asked for a reading for 10 s" in run.log())
+        # ... and is started again when the page comes back, and ended by the quit.
+        again = a_reader_runs(run)
+        check("the page comes back and another reader runs; at the quit it is ended first, and the folder for the run goes (exit code %r)"
+              % (quit_by_its_window(run),),
+              again and again != pid and not running(again) and run.process.returncode == 0 and folder and not os.path.exists(folder)
+              and ("the graphics card's reader was ended (pid %d): the app quits" % again) in run.log())
+    finally:
+        run.end()
+
+    # A shell that is ended by force takes its reader with it.
+    run = Run(root, "hidden", pack=pack, keep=False)
+    try:
+        up = first_screen(run)
+        pid = a_reader_runs(run)
+        was_there = bool(pid and running(pid))
+        run.process.kill()                              # (the trial's own exe, and no other process)
+        run.process.wait(30)
+        gone = run.wait_for_any(lambda: pid and not running(pid), 5)
+        check("a shell that is ended by force leaves no reader behind", up and was_there and gone)
+    finally:
+        run.end()
+
+
 def moved(root, check):
     """What has moved from the backend into the shell: the performance
     sampler's calls are answered by the shell and do not reach the backend.
@@ -920,6 +1069,8 @@ def moved(root, check):
         quit_by_its_window(run)
     finally:
         run.end()
+
+    the_cards_reader(root, check)
 
 
 def first_screen(run):
@@ -1677,10 +1828,13 @@ def main(argv):
         BUILT_FOR_EVERY_START = True
         argv = [word for word in argv if word != "--built-for-every-start"]
     # (the checks of the one file, and its times, make and read packs)
-    needs_the_tool = not argv or argv == ["--one-file"] or argv[:2] == ["--time", "--pack"]
+    needs_the_tool = not argv or argv in (["--one-file"], ["--moved"]) or argv[:2] == ["--time", "--pack"]
     if needs_the_tool and not os.path.isfile(PACK_TOOL):
         refuse("%s is missing: build it first (cargo build --release --manifest-path shell_rs/core/Cargo.toml). "
                "It makes the packs that the exe is given to unpack." % PACK_TOOL)
+    if needs_the_tool and not os.path.isfile(READER):
+        refuse("%s is missing: build it first (cargo build --release --manifest-path shell_rs/core/Cargo.toml). "
+               "It is the graphics card's reader, which a pack carries." % READER)
     root = tempfile.mkdtemp(prefix="vispora-shell-window-trial-")
     ok = False
     try:
