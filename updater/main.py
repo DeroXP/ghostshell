@@ -9,7 +9,8 @@ Two-process architecture:
        3. Exits.
   • VisporaUpdater.exe — this app.  Lives in
     %APPDATA%/Vispora/updater/VisporaUpdater.exe.  Auto-installed
-    by Vispora on first run by downloading from Railway.
+    by Vispora on first run by downloading it from GitHub's releases, or
+    from the update server when GitHub does not answer.
 
 This file is the entry point.  We start Flask on a free port, point a
 pywebview window at it, and let the user (or --auto-confirm) drive the
@@ -31,13 +32,15 @@ import sys
 import threading
 import time
 
+import update_sources
 from updater.paths import INSTALL_INFO, log
 
-# Updater's own version + the Railway server it talks to.  These are the
+# Updater's own version + the update server it talks to.  These are the
 # only two pieces of state hard-coded into the binary — everything else
 # (target dir, channel, etc) comes from args or install_info.json so the
-# updater stays usable across re-locations.
-UPDATER_VERSION  = "1.4.5"
+# updater stays usable across re-locations.  (Where GitHub's releases are
+# is in update_sources.py, which the app shares.)
+UPDATER_VERSION  = "1.5.0"
 SERVER_URL_DEFAULT = "https://vispora.up.railway.app"
 # The release server's previous hostname — dead since the Railway service was
 # renamed on 2026-07-01.  Kept only so a stale --server arg passed by an old
@@ -64,7 +67,10 @@ def parse_args(argv) -> dict:
             [--current-version <v>]
             [--target-version <v>]        version to install (auto if omitted)
             [--auto-confirm]              skip the "click to start" gate
-            [--server <url>]              override the Railway URL
+            [--server <url>]              override the update server's URL
+            [--source auto|github|server] where to look for the build: GitHub
+                                          first and the update server second
+                                          (auto), or one of them only
             [--silent]                    no window — install + exit
     """
     p = argparse.ArgumentParser(prog="VisporaUpdater")
@@ -75,6 +81,7 @@ def parse_args(argv) -> dict:
     p.add_argument("--target-version", default="")
     p.add_argument("--auto-confirm",   action="store_true")
     p.add_argument("--server",         default=SERVER_URL_DEFAULT)
+    p.add_argument("--source",         default="", choices=("",) + update_sources.SOURCE_SETTINGS)
     p.add_argument("--silent",         action="store_true")
     return vars(p.parse_args(argv))
 
@@ -108,6 +115,13 @@ def main():
     current_version = args["current_version"] or info.get("version", "")
     target_version = args["target_version"]
     server_url     = (args["server"] or SERVER_URL_DEFAULT).rstrip("/")
+    # Where to look: what the app said on the command line, else what it
+    # wrote down for an updater that is started by hand, else GitHub first.
+    source         = update_sources.source_setting(args["source"] or info.get("update_source"))
+    # A channel named on the command line that is not the install's own was
+    # picked for this run: then an older build than the installed one is
+    # what was asked for (see installer._find_release).
+    allow_older    = bool(args["channel"] and info.get("channel") and args["channel"] != info.get("channel"))
     # An old install may pass the dead pre-rename Railway host via
     # --server (from its stale saved settings) — migrate it here so the
     # standalone updater still reaches the live server either way.
@@ -157,6 +171,12 @@ def main():
         channel         = channel,
         current_version = current_version,
         target_version  = target_version,
+        # What the app asked for.  target_version is replaced by what is
+        # found; this stays, so that a place that is behind is not installed
+        # from (see installer._find_release).
+        requested_version = target_version,
+        source          = source,
+        allow_older     = allow_older,
         server_url      = server_url,
         auto_confirm    = args["auto_confirm"],
         silent          = args["silent"],

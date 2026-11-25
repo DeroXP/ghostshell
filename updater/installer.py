@@ -19,9 +19,10 @@ UI shows a directory picker.
 
 Steps (run sequentially, with cancellation checks between each):
   1. close        — find + close any running Vispora process
-  2. channel      — hit /version/<channel> for the latest build info
-  3. download     — pull /download/<channel> with streaming + progress
-  4. verify       — SHA-256 against the server-provided hash
+  2. channel      : ask GitHub's releases for the latest build, then the
+                    update server's /version/<channel> if GitHub has none
+  3. download     : pull the build with streaming + progress
+  4. verify       : SHA-256 against the hash that place gave
   5. install      — backup old exe, copy new exe in place
   6. launch       — spawn the new Vispora, exit
 
@@ -57,6 +58,7 @@ import time
 import urllib.request
 from typing import Optional
 
+import update_sources
 from updater import server
 from updater.paths import (APP_NAME, LEGACY_APP_NAME, APP_EXE_NAMES,
                            UPDATER_DIR, INSTALL_INFO, log as _log)
@@ -288,10 +290,11 @@ def _close_app(target_exe: str, timeout_s: int = 30) -> dict:
 
 # ─── Step 2 + 3: Check + download ────────────────────────────────────
 
-def _http_get_json(url: str, timeout: int = 15) -> Optional[dict]:
+def _http_get_json(url: str, timeout: int = 15, headers: Optional[dict] = None):
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": f"{APP_NAME}Updater/{server.get_state_snapshot()['updater_version']}"})
+            "User-Agent": f"{APP_NAME}Updater/{server.get_state_snapshot()['updater_version']}",
+            **(headers or {})})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
     except Exception as e:
@@ -299,24 +302,104 @@ def _http_get_json(url: str, timeout: int = 15) -> Optional[dict]:
         return None
 
 
+def _whole_number(value) -> int:
+    """A size as the server gave it, 0 when it is not a number."""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _check_channel(server_url: str, channel: str) -> dict:
     """Hit /version/<channel> for the latest build metadata."""
     endpoint = f"{server_url.rstrip('/')}/version/{channel}"
     data = _http_get_json(endpoint)
-    if not data:
+    if not data or not isinstance(data, dict):
         return {"ok": False, "err": f"could not reach {endpoint}"}
     if not data.get("available") or not data.get("version"):
         return {"ok": False, "err": f"no release published on '{channel}'"}
     return {
         "ok":           True,
-        "version":      data["version"],
-        "sha256":       data.get("sha256") or "",
-        "size_bytes":   int(data.get("size_bytes") or 0),
+        "source":       "server",
+        "version":      str(data["version"]),
+        "sha256":       str(data.get("sha256") or ""),
+        "size_bytes":   _whole_number(data.get("size_bytes")),
         "download_url": data.get("download_url")
                          or f"{server_url.rstrip('/')}/download/{channel}",
         "notes":        data.get("notes") or "",
         "released_at":  data.get("released_at") or "",
     }
+
+
+def _check_github(channel: str) -> dict:
+    """What GitHub's releases have for `channel`, in the shape of
+    _check_channel (see update_sources.github_app_release for what counts as
+    a release there)."""
+    data = _http_get_json(update_sources.GITHUB_RELEASES_URL, headers=update_sources.GITHUB_HEADERS)
+    if not isinstance(data, list):
+        return {"ok": False, "err": "could not reach GitHub"}
+    offer = update_sources.github_app_release(data, channel)
+    if not offer["available"]:
+        return {"ok": False, "err": f"no release published on '{channel}' on GitHub"}
+    return {
+        "ok":           True,
+        "source":       "github",
+        "version":      offer["version"],
+        "sha256":       offer["sha256"],
+        "size_bytes":   offer["size_bytes"],
+        "download_url": offer["download_url"],
+        "notes":        offer["notes"],
+        "released_at":  offer["released_at"],
+    }
+
+
+def _find_release(st: dict, skip=()) -> dict:
+    """Ask the places releases are published, in their order (GitHub first and
+    the update server second unless told otherwise, see
+    update_sources.source_order), and take the first that has a build for
+    the channel.  `skip`: places already tried (their file could not be
+    downloaded or failed its check).
+
+    A place that only has an older build than the floor is passed over, and
+    if no place reaches the floor nothing is installed.  The floor is the
+    version the app asked for (--target-version): the app found its update in
+    one place, and the other may be behind.  Started by hand, it is the
+    version that is installed, unless another channel was picked for this
+    run: going back from beta to stable is asked for, a downgrade because one
+    place is behind is not."""
+    floor, floor_is = st.get("requested_version") or "", "that was asked for"
+    if not floor and st.get("mode") == "update" and not st.get("allow_older"):
+        floor, floor_is = st.get("current_version") or "", "that is installed"
+    errors = []
+    for source in update_sources.source_order(st.get("source"), st.get("server_url")):
+        if source in skip:
+            continue
+        if source == "github":
+            info = _check_github(st["channel"])
+        else:
+            info = _check_channel(st["server_url"], st["channel"])
+        if not info["ok"]:
+            errors.append(info["err"])
+            continue
+        if floor and update_sources.parse_version(info["version"]) < update_sources.parse_version(floor):
+            errors.append(f"{update_sources.SOURCE_NAMES[source]} has v{info['version']}, "
+                          f"older than the v{floor} {floor_is}")
+            continue
+        return info
+    return {"ok": False, "err": "; ".join(errors) or "nowhere else to look for a release"}
+
+
+def _note_found(st: dict, info: dict, instead_of: str = "") -> str:
+    """Show and record the build that will be installed; returns its version."""
+    version = info["version"]
+    where = update_sources.SOURCE_NAMES[info["source"]]
+    if instead_of:
+        where += f"; the file from {instead_of} could not be used"
+    server.update_step("channel", "done", f"Latest on '{st['channel']}': v{version} (from {where})")
+    with server._state_lock:
+        server._state["target_version"] = version
+        server._state["channel_check"]  = info
+    return version
 
 
 def _download(url: str, dest: str, total_hint: int = 0) -> dict:
@@ -486,6 +569,15 @@ def _update_install_info(target_exe: str, channel: str, version: str) -> None:
             "version":      version,
             "updated_at":   time.time(),
         }
+        try:
+            # Where this install gets its updates is the app's to say (see
+            # core.updater.write_install_info): keep what it wrote.
+            with open(INSTALL_INFO, "r", encoding="utf-8") as f:
+                old = json.load(f)
+            if isinstance(old, dict) and old.get("update_source"):
+                d["update_source"] = old["update_source"]
+        except Exception:
+            pass
         os.makedirs(os.path.dirname(INSTALL_INFO), exist_ok=True)
         with open(INSTALL_INFO, "w", encoding="utf-8") as f:
             json.dump(d, f, indent=2)
@@ -497,6 +589,21 @@ def _update_install_info(target_exe: str, channel: str, version: str) -> None:
 # ─── Orchestrator ────────────────────────────────────────────────────
 
 def run_install_pipeline() -> int:
+    """Run the full sequence (see _run_install_pipeline).  Whatever goes
+    wrong inside it is shown in the window as an error: an exception must not
+    leave a step spinning with the app closed and nothing said."""
+    try:
+        return _run_install_pipeline()
+    except Exception as e:
+        _log(f"pipeline stopped on an unexpected error: {e!r}")
+        for step in server.get_state_snapshot()["steps"]:
+            if step["status"] == "active":
+                server.update_step(step["key"], "error", "stopped unexpectedly")
+        server.set_error(f"The update stopped on an unexpected error: {e}")
+        return 9
+
+
+def _run_install_pipeline() -> int:
     """Run the full sequence.  Returns 0 on success, non-zero on error.
 
     Mode ("install" or "update") changes one thing: the close step is
@@ -513,7 +620,20 @@ def run_install_pipeline() -> int:
         server.set_error("No release channel: please pick stable or beta.")
         return 2
 
-    # ── Step 1: Close the app (skipped in install mode) ────────
+    # ── Step 1: Find the build (GitHub, then the update server) ──
+    # Before anything is closed: when no place has a build to install, an
+    # app that is running keeps running.
+    if _check_cancelled(): return 1
+    server.update_step("channel", "active",
+                       f"Looking for the newest {st['channel']} build…")
+    info = _find_release(st)
+    if not info["ok"]:
+        server.update_step("channel", "error", info["err"])
+        server.set_error(info["err"])
+        return 4
+    target_version = _note_found(st, info)
+
+    # ── Step 2: Close the app (skipped in install mode) ────────
     if _check_cancelled(): return 1
     if mode == "install":
         # Fresh install — there's no running app to close.
@@ -537,62 +657,57 @@ def run_install_pipeline() -> int:
             return 3
         server.update_step("close", "done", r["msg"])
 
-    # ── Step 2: Check release server ────────────────────────────
-    if _check_cancelled(): return 1
-    server.update_step("channel", "active",
-                       f"Fetching /version/{st['channel']}…")
-    info = _check_channel(st["server_url"], st["channel"])
-    if not info["ok"]:
-        server.update_step("channel", "error", info["err"])
-        server.set_error(info["err"])
-        return 4
-    target_version = info["version"]
-    server.update_step("channel", "done",
-                       f"Latest on '{st['channel']}': v{target_version}")
-    with server._state_lock:
-        server._state["target_version"] = target_version
-        server._state["channel_check"]  = info
-
-    # ── Step 3: Download ────────────────────────────────────────
-    if _check_cancelled(): return 1
-    staged = os.path.join(UPDATER_DIR, f"{APP_NAME}-{target_version}.exe")
-    server.update_step("download", "active",
-                       f"Downloading v{target_version}…")
-    dl = _download(info["download_url"], staged,
-                    total_hint=info.get("size_bytes", 0))
-    if not dl["ok"]:
-        server.update_step("download", "error", dl["err"])
-        server.set_error(f"Download failed: {dl['err']}")
-        return 5
-    server.update_step("download", "done",
-                       f"Downloaded {dl['size_bytes'] // (1024*1024)} MB")
-
-    # ── Step 4: Verify SHA-256 ──────────────────────────────────
-    if _check_cancelled(): return 1
-    server.update_step("verify", "active", "Computing SHA-256…")
-    expected = (info.get("sha256") or "").lower()
-    actual   = dl["sha256"].lower()
-    if not expected:
-        # Fail CLOSED, not open — a missing hash is indistinguishable from a
-        # MITM/misconfigured server stripping it, and installing an
-        # unverified binary is exactly the scenario this check exists to
-        # prevent.  Refuse rather than silently skip.
-        err = ("Server did not provide a SHA-256 hash for this build; "
-               "refusing to install an unverified binary.")
-        server.update_step("verify", "error", err)
-        server.set_error(err)
-        try: os.remove(dl["path"])
-        except Exception: pass
-        return 6
-    if actual != expected:
-        err = (f"SHA-256 mismatch: expected {expected[:16]}…, "
-               f"got {actual[:16]}….  Aborting to avoid installing "
-               f"a corrupted or tampered build.")
-        server.update_step("verify", "error", err)
-        server.set_error(err)
-        try: os.remove(dl["path"])
-        except Exception: pass
-        return 6
+    # ── Steps 3 + 4: Download and verify SHA-256 ────────────────
+    # When the file from one place cannot be downloaded or fails its check,
+    # the next place is asked for the build before giving up.
+    tried = set()
+    while True:
+        if _check_cancelled(): return 1
+        staged = os.path.join(UPDATER_DIR, f"{APP_NAME}-{target_version}.exe")
+        server.update_step("download", "active",
+                           f"Downloading v{target_version}…")
+        dl = _download(info["download_url"], staged,
+                        total_hint=info.get("size_bytes", 0))
+        if not dl["ok"]:
+            failed = ("download", 5, dl["err"], f"Download failed: {dl['err']}")
+        else:
+            server.update_step("download", "done",
+                               f"Downloaded {dl['size_bytes'] // (1024*1024)} MB")
+            if _check_cancelled(): return 1
+            server.update_step("verify", "active", "Computing SHA-256…")
+            expected = str(info.get("sha256") or "").lower()
+            actual   = dl["sha256"].lower()
+            failed = None
+            if not expected:
+                # Fail CLOSED, not open: a missing hash is indistinguishable from a
+                # MITM/misconfigured server stripping it, and installing an
+                # unverified binary is exactly the scenario this check exists to
+                # prevent.  Refuse rather than silently skip.
+                err = ("Server did not provide a SHA-256 hash for this build; "
+                       "refusing to install an unverified binary.")
+                failed = ("verify", 6, err, err)
+            elif actual != expected:
+                err = (f"SHA-256 mismatch: expected {expected[:16]}…, "
+                       f"got {actual[:16]}….  Aborting to avoid installing "
+                       f"a corrupted or tampered build.")
+                failed = ("verify", 6, err, err)
+            if failed:
+                try: os.remove(dl["path"])
+                except Exception: pass
+        if failed is None:
+            break
+        step, code, detail, err = failed
+        tried.add(info["source"])
+        other = {"ok": False} if dl.get("err") == "cancelled" else _find_release(st, skip=tried)
+        if not other["ok"] or other["source"] in tried:     # (never the same place twice: no endless retry)
+            server.update_step(step, "error", detail)
+            server.set_error(err)
+            return code
+        _log(f"{err}  Trying {update_sources.SOURCE_NAMES[other['source']]} instead.")
+        gave_up_on = update_sources.SOURCE_NAMES[info["source"]]
+        info = other
+        target_version = _note_found(st, info, instead_of=gave_up_on)
+        server.update_step("verify", "pending", "")
     server.update_step("verify", "done", "SHA-256 OK")
 
     # ── Step 5: Install ────────────────────────────────────────

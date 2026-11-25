@@ -1,13 +1,20 @@
-"""Vispora Auto-Updater (v3+) — checks the Railway-hosted release
-server and self-updates.
+"""Vispora Auto-Updater (v3+): checks where releases are published and
+self-updates.
 
 v3 swap: the data source moved from GitHub releases to a self-hosted
 Flask landing page at UPDATE_SERVER_URL.  Two channels:
   - stable  — confirmed-working builds (currently empty)
   - beta    — newest builds, where v3.x lives
 
+3.8.0: GitHub releases are back as a second place, and the first one asked.
+The update server is the fallback (see update_sources.py for the order and
+for how a release on GitHub is read).  Everything after the check is the
+same whichever place answered: the download is checked against the SHA-256
+that place gave, staged, and installed by the standalone updater.
+
 Settings (controlled by the user via Settings → Updates):
   * channel        — "stable" | "beta"  (default "beta" until first stable ships)
+  * update_source  : "auto" (GitHub, then the update server) | "github" | "server"
   * server_url     — overrideable; defaults to UPDATE_SERVER_URL_DEFAULT
   * auto_check     — check on startup + every 6 hours (default ON)
   * auto_download  — download new build in background once detected (default ON)
@@ -53,6 +60,7 @@ from config import (APP_NAME, LEGACY_APP_NAME, APP_VERSION, APPDATA_DIR,
                     OWN_PROCESS_NAMES, is_dead_update_server)
 from core.utils import get_logger, atomic_write_json
 import hashlib
+import update_sources
 
 log = get_logger("updater")
 
@@ -90,6 +98,9 @@ def write_install_info() -> dict:
             "channel":      _load_settings().get("channel", APP_CHANNEL_DEFAULT),
             "version":      APP_VERSION,
             "updated_at":   time.time(),
+            # Where this install gets its updates, for an updater that is
+            # started by hand (one the app starts is told on its command line).
+            "update_source": update_sources.source_setting(_load_settings().get("update_source")),
         }
         atomic_write_json(INSTALL_INFO_PATH, info)
         return info
@@ -99,7 +110,7 @@ def write_install_info() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Updater binary management — auto-fetch from Railway on first run
+# Updater binary management: auto-fetch on first run (GitHub, else the update server)
 # ═══════════════════════════════════════════════════════════════════════════
 _updater_install_state = {
     "running":    False,
@@ -155,6 +166,124 @@ def _write_installed_updater_version(version: str) -> None:
     atomic_write_json(UPDATER_VERSION_PATH, {"version": version, "downloaded_at": time.time()})
 
 
+# ── Where releases come from: GitHub first, the update server second ──────
+_github_answer = {"at": 0.0, "releases": None}
+_github_lock = threading.Lock()
+GITHUB_ANSWER_KEEP_S = 300      # the app's check and the updater's ask the same thing a moment apart
+
+
+def _forget_github_answer() -> None:
+    with _github_lock:
+        _github_answer.update(at=0.0, releases=None)
+
+
+def _github_releases(fresh: bool = False) -> Optional[list]:
+    """GitHub's list of this app's releases, or None when GitHub did not
+    answer (offline, its hourly limit for this address, an answer that is not
+    a list).  A good answer is kept for five minutes unless `fresh`: without
+    a sign-in GitHub allows 60 requests an hour per address."""
+    now = time.time()
+    with _github_lock:
+        kept = _github_answer["releases"]
+        if not fresh and kept is not None and 0 <= now - _github_answer["at"] < GITHUB_ANSWER_KEEP_S:
+            return kept
+    data = _http_get_json(update_sources.GITHUB_RELEASES_URL, timeout_s=15,
+                          headers=update_sources.GITHUB_HEADERS, want=list)
+    if data is None:
+        return None
+    with _github_lock:
+        _github_answer.update(at=now, releases=data)
+    return data
+
+
+def _places_text(places) -> str:
+    """"GitHub or the update server", for a sentence about who was asked."""
+    return " or ".join(update_sources.SOURCE_NAMES[x] for x in places) or "nobody"
+
+
+def _updater_offers(s: Optional[dict] = None, agent: str = "updater-bootstrap", fresh: bool = False):
+    """The standalone updater as each place offers it, one place at a time in
+    the order of update_sources.source_order(): dicts {"version", "sha256",
+    "download_url", "source"} ("version" may be "" on a server that does not
+    say).  A place that did not answer, has no updater, or gives no SHA-256
+    to check a download against yields nothing.  Lazy: the next place is only
+    asked when the caller goes on.  `fresh`: do not use a kept GitHub answer."""
+    s = s if s is not None else _load_settings()
+    channel = s.get("channel", APP_CHANNEL_DEFAULT)
+    base = (s.get("server_url") or UPDATE_SERVER_URL_DEFAULT).rstrip("/")
+    for source in update_sources.source_order(s.get("update_source"), base):
+        if source == "github":
+            releases = _github_releases(fresh=fresh)
+            offer = update_sources.github_updater(releases, channel) if releases is not None else None
+            if offer and offer["available"]:
+                yield {"version": offer["version"], "sha256": offer["sha256"],
+                       "download_url": offer["download_url"], "source": "github"}
+            continue
+        try:
+            req = urllib.request.Request(base + "/version/updater", headers={
+                "User-Agent": f"{APP_NAME}/{APP_VERSION}-{agent}"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                meta = json.loads(r.read())
+        except Exception as e:
+            log.debug(f"updater version check against the update server failed (probably offline): {e}")
+            continue
+        if not isinstance(meta, dict) or meta.get("available") is False:
+            continue                # the server says it has none
+        sha = str(meta.get("sha256") or "").strip().lower()
+        if not sha:
+            continue                # nothing to check a download against
+        yield {"version": str(meta.get("version") or ""), "sha256": sha,
+               "download_url": base + "/download/updater", "source": "server"}
+
+
+def _updater_offer(s: Optional[dict] = None, agent: str = "updater-bootstrap") -> Optional[dict]:
+    """The standalone updater as the first place that has one offers it (see
+    _updater_offers), or None."""
+    return next(_updater_offers(s, agent), None)
+
+
+def _updater_knows_sources() -> bool:
+    """Can the updater on disk install from GitHub (1.5.0 on)?  One with no
+    recorded version is taken for an older one."""
+    v = _read_installed_updater_version()
+    return (bool(v) and is_updater_installed()
+            and _parse_version(v) >= _parse_version(update_sources.UPDATER_MIN_FOR_SOURCES))
+
+
+def _refresh_updater_now(timeout_s: float = 90.0) -> bool:
+    """Get an updater that can install from GitHub and wait for it (install
+    time, when the one on disk is too old for the update at hand).  True when
+    the updater on disk can do that afterwards.
+
+    Only an updater that is new enough is downloaded: fetching the old one
+    again changes nothing, and the automatic install would do it every two
+    minutes.  When no place has one, that counts as a failed try, so the
+    automatic install backs off (see _updater_retry_wait)."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline and get_updater_install_status()["running"]:
+        time.sleep(0.5)             # a download started at boot: let it finish first
+    if _updater_knows_sources():
+        return True
+    need = _parse_version(update_sources.UPDATER_MIN_FOR_SOURCES)
+    offer = None
+    try:
+        offer = next((o for o in _updater_offers(agent="updater-refresh", fresh=True)
+                      if o["version"] and _parse_version(o["version"]) >= need), None)
+    except Exception as e:
+        log.debug(f"could not look for a newer updater: {e}")
+    with _updater_install_lock:
+        if _updater_install_state["running"]:
+            return False            # somebody else's download is still going: not now
+        if offer is None:
+            _updater_install_state["err"] = "no updater that can install from GitHub is published yet"
+            _updater_install_state["failures"] += 1
+            _updater_install_state["failed_at"] = time.time()
+            return False
+        _updater_install_state.update({"running": True, "downloaded": 0, "total": 0, "err": None})
+    _download_updater_worker(offer["version"], offer)
+    return _updater_knows_sources()
+
+
 def ensure_updater_installed_async() -> dict:
     """Kick off a background download of the updater if it's missing.
     No-op when already installed.  Callable from anywhere — main use
@@ -174,7 +303,7 @@ def ensure_updater_installed_async() -> dict:
 
 def ensure_updater_up_to_date_async() -> dict:
     """v1.2.0 — beefier variant that ALSO refreshes the local updater
-    binary when Railway is hosting a newer version.
+    binary when GitHub or the update server has a newer version.
 
     Boot flow:
       1. If the updater isn't installed → start a download (same as
@@ -214,18 +343,12 @@ def _updater_refresh_worker() -> None:
     failure is logged at debug level and ignored (we have a working
     updater binary on disk; staleness is a soft problem)."""
     try:
-        s = _load_settings()
-        base = (s.get("server_url") or UPDATE_SERVER_URL_DEFAULT).rstrip("/")
-        url = base + "/version/updater"
-        req = urllib.request.Request(url, headers={
-            "User-Agent": f"{APP_NAME}/{APP_VERSION}-updater-refresh"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            remote = json.loads(r.read())
+        offer = _updater_offer(agent="updater-refresh")
     except Exception as e:
         log.debug(f"updater-refresh check failed (probably offline): {e}")
         return
-    remote_ver = (remote or {}).get("version") or ""
-    if not remote_ver or not (remote or {}).get("available"):
+    remote_ver = (offer or {}).get("version") or ""
+    if not remote_ver:
         return
     local_ver = _read_installed_updater_version()
     try:
@@ -248,47 +371,25 @@ def _updater_refresh_worker() -> None:
             return
         _updater_install_state.update({"running": True, "downloaded": 0,
                                          "total": 0, "err": None})
-    # Pass the version string through so the worker writes the sidecar
+    # Pass the version string through so the worker writes the sidecar, and
+    # the offer so it downloads exactly what was compared.
     threading.Thread(target=_download_updater_worker,
-                     args=(remote_ver,),
+                     args=(remote_ver, offer),
                      daemon=True, name="updater-refresh-dl").start()
 
 
-def _download_updater_worker(remote_version: str = "") -> None:
-    """Stream the standalone updater from Railway to UPDATER_EXE.  Hits
-    /download/updater on whatever server_url the user is configured against.
-
-    When `remote_version` is passed (refresh path), we also write the
-    sidecar file recording what version we just put on disk so future
-    boots can compare without re-downloading."""
+def _fetch_updater(offer: dict) -> int:
+    """Stream the updater `offer` describes to UPDATER_EXE and return its
+    size.  Raises when the download fails, is too small to be the updater, or
+    does not match the offer's SHA-256; nothing is put in place then."""
+    url = offer["download_url"]
+    expected_sha = str(offer["sha256"]).lower()
+    if not _is_http_url(url):
+        raise RuntimeError(f"refusing to download the updater from a non-HTTP address: {url!r}")
+    log.info(f"Auto-installing updater from {url}")
+    os.makedirs(UPDATER_DIR, exist_ok=True)
+    tmp = UPDATER_EXE + ".part"
     try:
-        s = _load_settings()
-        base = (s.get("server_url") or UPDATE_SERVER_URL_DEFAULT).rstrip("/")
-        url = base + "/download/updater"
-        log.info(f"Auto-installing updater from {url}")
-
-        # Fetch the expected SHA-256 first so the downloaded binary can be
-        # verified — same fail-closed posture as app-update downloads.  A
-        # deploy landing between this fetch and the download shows up as a
-        # mismatch → clean retry on the next boot.
-        expected_sha = ""
-        try:
-            vreq = urllib.request.Request(base + "/version/updater", headers={
-                "User-Agent": f"{APP_NAME}/{APP_VERSION}-updater-bootstrap"})
-            with urllib.request.urlopen(vreq, timeout=15) as vr:
-                meta = json.loads(vr.read()) or {}
-            expected_sha = (meta.get("sha256") or "").lower()
-            # A first install has no version from a refresh check: record the
-            # one this hash belongs to, or the next boot downloads it again.
-            remote_version = remote_version or str(meta.get("version") or "")
-        except Exception as e:
-            log.debug(f"updater version pre-fetch failed: {e}")
-        if not expected_sha:
-            raise RuntimeError("server did not provide a SHA-256 for the "
-                               "updater; refusing to install an unverified binary")
-
-        os.makedirs(UPDATER_DIR, exist_ok=True)
-        tmp = UPDATER_EXE + ".part"
         req = urllib.request.Request(url, headers={
             "User-Agent": f"{APP_NAME}/{APP_VERSION}-updater-bootstrap"})
         h = hashlib.sha256()
@@ -309,34 +410,78 @@ def _download_updater_worker(remote_version: str = "") -> None:
                         _updater_install_state["downloaded"] = downloaded
         sz = os.path.getsize(tmp)
         if sz < 1024 * 1024:    # <1 MB = clearly wrong
-            os.remove(tmp)
             raise RuntimeError(
-                f"updater download too small ({sz} B): Railway might not "
-                f"have the updater hosted yet, or returned an error page")
+                f"updater download too small ({sz} B): the place it came from "
+                f"might not have the updater yet, or returned an error page")
         if h.hexdigest().lower() != expected_sha:
-            os.remove(tmp)
             raise RuntimeError(
                 f"updater download failed SHA-256 check (expected "
                 f"{expected_sha[:16]}…, got {h.hexdigest()[:16]}…), so refusing "
                 f"to install; will retry next boot")
         os.replace(tmp, UPDATER_EXE)
-        if remote_version:
-            _write_installed_updater_version(remote_version)
-        with _updater_install_lock:
-            _updater_install_state["path"] = UPDATER_EXE
-            _updater_install_state["running"] = False
-            _updater_install_state["failures"] = 0
-        log.info(f"Updater installed at {UPDATER_EXE} ({sz} B)"
-                 + (f", v{remote_version}" if remote_version else ""))
-    except Exception as e:
-        # Clean up a partial .part so a network drop mid-download doesn't
-        # leave stale bytes on disk for the next boot's retry to trip over.
+        return sz
+    finally:
+        # Whatever went wrong, no partial file stays behind for the next
+        # try to trip over.
         try:
-            _part = UPDATER_EXE + ".part"
-            if os.path.exists(_part):
-                os.remove(_part)
+            if os.path.exists(tmp):
+                os.remove(tmp)
         except OSError:
             pass
+
+
+def _download_updater_worker(remote_version: str = "", offer: Optional[dict] = None) -> None:
+    """Put the standalone updater in UPDATER_EXE from the first place that
+    has it: GitHub, or /download/updater on whatever server_url the user is
+    configured against (see _updater_offers).  When a place offers it but the
+    download from there fails, the next place is tried.
+
+    The expected SHA-256 comes with the offer, before the download, so the
+    binary can be verified: same fail-closed posture as app-update downloads.
+    The version that hash belongs to is recorded next to the binary so future
+    boots can compare without re-downloading.  `offer`: what a refresh check
+    found, tried first so the same thing is downloaded that was compared
+    (`remote_version` is its version, for an offer that does not say)."""
+    try:
+        on_disk = _read_installed_updater_version() if is_updater_installed() else ""
+        s = _load_settings()
+        base = (s.get("server_url") or UPDATE_SERVER_URL_DEFAULT).rstrip("/")
+        asked = update_sources.source_order(s.get("update_source"), base)
+        tried, last_err = [], None
+
+        def candidates():
+            if offer:
+                yield offer
+            yield from _updater_offers(s)
+
+        for cand in candidates():
+            if not cand.get("sha256") or cand["source"] in tried:
+                continue
+            version = str(cand.get("version") or "") or (remote_version if cand is offer else "")
+            if (cand is not offer and on_disk and version
+                    and _parse_version(version) <= _parse_version(on_disk)):
+                continue            # a fallback must not put an older updater over the one on disk
+            tried.append(cand["source"])
+            try:
+                sz = _fetch_updater(cand)
+            except Exception as e:
+                last_err = e
+                log.warning(f"Updater download from {update_sources.SOURCE_NAMES[cand['source']]} failed: {e}")
+                continue
+            if version:
+                _write_installed_updater_version(version)
+            with _updater_install_lock:
+                _updater_install_state["path"] = UPDATER_EXE
+                _updater_install_state["running"] = False
+                _updater_install_state["failures"] = 0
+            log.info(f"Updater installed at {UPDATER_EXE} ({sz} B)"
+                     + (f", v{version}" if version else ""))
+            return
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError(f"{_places_text(asked)} gave no updater with a SHA-256; "
+                           "refusing to install an unverified binary")
+    except Exception as e:
         with _updater_install_lock:
             _updater_install_state["err"] = str(e)
             _updater_install_state["running"] = False
@@ -367,6 +512,10 @@ _DEFAULT_SETTINGS = {
     # "beta"     → newest builds, where v3.x lives.  Default for now.
     "channel":    APP_CHANNEL_DEFAULT,
     "server_url": UPDATE_SERVER_URL_DEFAULT,
+    # 3.8.0, where updates come from: "auto" asks GitHub first and the
+    # update server second (the other way round when server_url is somebody's
+    # own server); "github" / "server" ask that one only.
+    "update_source": "auto",
     # beta.11 — LOCAL UPDATE MODE.  When set to an existing folder containing
     # version.json + Vispora.exe, the updater checks THAT folder instead of the
     # HTTP release server: version compare, sha-256, staging, and the headless
@@ -415,9 +564,16 @@ def set_settings(auto_check: Optional[bool] = None,
                  auto_install: Optional[bool] = None,
                  channel: Optional[str] = None,
                  server_url: Optional[str] = None,
-                 local_update_dir: Optional[str] = None) -> dict:
+                 local_update_dir: Optional[str] = None,
+                 update_source: Optional[str] = None) -> dict:
     s = _load_settings()
-    source_before = (s.get("channel"), s.get("server_url"), s.get("local_update_dir"))
+    source_before = (s.get("channel"), s.get("server_url"), s.get("local_update_dir"),
+                     update_sources.source_setting(s.get("update_source")))
+    if update_source is not None:
+        if update_source not in update_sources.SOURCE_SETTINGS:
+            return {"ok": False,
+                    "err": f"update_source must be one of {update_sources.SOURCE_SETTINGS}, got {update_source!r}"}
+        s["update_source"] = update_source
     if auto_check    is not None: s["auto_check"]    = bool(auto_check)
     if auto_download is not None: s["auto_download"] = bool(auto_download)
     if auto_install  is not None: s["auto_install"]  = bool(auto_install)
@@ -439,7 +595,8 @@ def set_settings(auto_check: Optional[bool] = None,
                     "err": f"local_update_dir does not exist or is not a folder: {d}"}
         s["local_update_dir"] = d   # empty string = back to server mode
     _save_settings(s)
-    if (s.get("channel"), s.get("server_url"), s.get("local_update_dir")) != source_before:
+    if (s.get("channel"), s.get("server_url"), s.get("local_update_dir"),
+            update_sources.source_setting(s.get("update_source"))) != source_before:
         # What we know (and may have staged) came from the previous channel /
         # server.  Installing it now could silently downgrade the app, so drop
         # it and let the next check ask the new source.
@@ -447,10 +604,13 @@ def set_settings(auto_check: Optional[bool] = None,
         _update_state["latest_version"] = None
         _update_state["latest_url"] = None
         _update_state["latest_sha256"] = None
+        _update_state["latest_source"] = None
         _forget_staged_download()
+        _forget_github_answer()
     log.info(f"Updater settings saved: check={s['auto_check']} "
              f"download={s['auto_download']} install={s['auto_install']} "
              f"channel={s.get('channel', APP_CHANNEL_DEFAULT)} "
+             f"source={update_sources.source_setting(s.get('update_source'))} "
              f"server={s.get('server_url', UPDATE_SERVER_URL_DEFAULT)} "
              f"local_dir={s.get('local_update_dir') or '(server mode)'}")
     return {"ok": True, "settings": s}
@@ -469,9 +629,13 @@ _update_state = {
     "latest_notes": None,
     "latest_sha256": None,           # v3 — sha256 from server, verified post-download
     "latest_size": 0,                # v3 — bytes
+    "latest_source": None,           # where the last check found it: "github" | "server" | "local"
     "update_available": False,
     "download_complete": False,
     "pending_install_path": None,    # path to the downloaded .exe / .zip ready to apply
+    # What that file is: {"version", "source"}.  A later check that fails
+    # clears latest_*, but the file is still the build it was.
+    "staged": None,
     "install_after_game": False,     # the user asked to install while a game ran: do it when it closes
     "error": None,
 }
@@ -480,58 +644,9 @@ _update_state = {
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
-def _parse_version(v: str) -> tuple:
-    """Parse a version string into a comparable 5-tuple.
-
-    Supported forms:
-        '2.9.8'              → (2, 9, 8, 0, 0)
-        '2.9.8.0'            → (2, 9, 8, 0, 0)   — equal to 2.9.8
-        '2.9.8.1'            → (2, 9, 8, 1, 0)   — newer than 2.9.8.0 ✓
-        '3.0.0'              → (3, 0, 0, 0, 0)
-        '3.0.0-beta.1'       → (3, 0, 0, 0, -101)   — sorts BEFORE 3.0.0
-        '3.0.0-beta.5'       → (3, 0, 0, 0, -105)   — newer than -beta.1
-        '3.0.0-rc.1'         → (3, 0, 0, 0, -11)
-        'v3.0.0-beta.1'      → (3, 0, 0, 0, -101)   (strips leading v)
-
-    The 5th component (prerelease ordinal) is NEGATIVE for prereleases
-    so the natural tuple comparison correctly sorts '3.0.0-beta.1' as
-    older than '3.0.0' and as older than '3.0.0-beta.5'.
-    """
-    v = (v or "").strip().lstrip("vV")
-    if not v:
-        return (0, 0, 0, 0, 0)
-    # Split into core + prerelease tag
-    if "-" in v:
-        core, pre = v.split("-", 1)
-    else:
-        core, pre = v, ""
-    parts = []
-    for p in core.split("."):
-        try:
-            parts.append(int(p))
-        except ValueError:
-            parts.append(0)
-    while len(parts) < 4:
-        parts.append(0)
-    parts = parts[:4]
-    # Prerelease ordinal — alpha < beta < rc < final.  The final release
-    # gets pre_ord=0; any prerelease is negative.
-    pre_ord = 0
-    if pre:
-        # base + n  — higher N within a category sorts NEWER.
-        # Bands are 1000 wide so no realistic prerelease counter (rc.999
-        # etc.) can overflow into a higher category's band.  Ordering:
-        # alpha (-3000) < beta (-2000) < rc (-1000) < final (0).
-        # alpha.5 = -2995 < beta.1 = -1999 < beta.99 = -1901 < rc.1 = -999 < final = 0.
-        kind_map = {"alpha": -3000, "beta": -2000, "rc": -1000}
-        pre_parts = pre.split(".")
-        base = kind_map.get(pre_parts[0].lower(), -500)
-        n = 0
-        if len(pre_parts) > 1:
-            try: n = int(pre_parts[1])
-            except ValueError: n = 0
-        pre_ord = base + n
-    return tuple(parts + [pre_ord])
+# The same reading of a version as the standalone updater uses: it lives in
+# update_sources.py, which both sides import.
+_parse_version = update_sources.parse_version
 
 
 # Both helpers used to shell out to PowerShell's Invoke-WebRequest with the URL
@@ -579,24 +694,76 @@ def _http_download(url: str, dest: str, timeout_s: int = 60) -> bool:
         return False
 
 
-def _http_get_json(url: str, timeout_s: int = 30) -> Optional[dict]:
-    """GET → parsed JSON object, or None on any failure."""
+def _http_get_json(url: str, timeout_s: int = 30, headers: Optional[dict] = None, want: type = dict):
+    """GET → parsed JSON of the kind `want` (an object unless told
+    otherwise), or None on any failure.  `headers` are sent on top of ours."""
     if not _is_http_url(url):
         log.warning(f"  Refusing non-HTTP update server URL: {url!r}")
         return None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}-Updater"})
+        req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}-Updater", **(headers or {})})
         with urllib.request.urlopen(req, timeout=timeout_s) as r:
             data = json.loads(r.read())
     except Exception as e:
-        log.warning(f"  Update server request failed: {e}")
+        log.warning(f"  Update request failed ({url.split('?', 1)[0]}): {e}")
         return None
-    return data if isinstance(data, dict) else None
+    return data if isinstance(data, want) else None
+
+
+def _ask_github(channel: str) -> Optional[dict]:
+    """What GitHub offers `channel` (see update_sources.github_app_release),
+    or None when GitHub did not answer."""
+    releases = _github_releases(fresh=True)
+    if releases is None:
+        return None
+    return update_sources.github_app_release(releases, channel)
+
+
+def _ask_server(server_url: str, channel: str) -> Optional[dict]:
+    """What the update server's /version/<channel> offers, in the same shape
+    as _ask_github, or None when it did not answer."""
+    data = _http_get_json(f"{server_url}/version/{channel}")
+    if data is None:
+        return None
+    version = data.get("version")
+    try:
+        size_bytes = int(data.get("size_bytes") or 0)
+    except (TypeError, ValueError):
+        size_bytes = 0
+    return {"available": bool(data.get("available")) and bool(version),
+            "version": str(version or ""), "sha256": str(data.get("sha256") or ""),
+            "size_bytes": size_bytes, "download_url": str(data.get("download_url") or ""),
+            "notes": str(data.get("notes") or ""), "source": "server"}
+
+
+def _stamp_last_check() -> None:
+    """Record when the last check finished.  The settings are read again
+    first: a check takes a while, and a setting the user changed meanwhile
+    must not be written over with what it was when the check began."""
+    s = _load_settings()
+    s["last_check_ts"] = time.time()
+    _save_settings(s)
+
+
+def _where_from(s: dict) -> tuple:
+    """The settings that decide where updates come from."""
+    return (s.get("channel", APP_CHANNEL_DEFAULT), s.get("server_url", UPDATE_SERVER_URL_DEFAULT),
+            (s.get("local_update_dir") or "").strip(), update_sources.source_setting(s.get("update_source")))
+
+
+def _could_not_reach(places, server_url: str) -> str:
+    """The error line for places that did not answer."""
+    if list(places) == ["server"]:
+        return f"Could not reach update server ({server_url})"
+    if list(places) == ["github"]:
+        return "Could not reach GitHub"
+    return f"Could not reach GitHub or the update server ({server_url})"
 
 
 def _forget_staged_download() -> None:
     _update_state["download_complete"] = False
     _update_state["pending_install_path"] = None
+    _update_state["staged"] = None
     _update_state["progress"] = 0
 
 
@@ -657,13 +824,13 @@ def _check_local_update(local_dir: str, s: dict) -> dict:
     _update_state["latest_version"]   = latest_ver_s.lstrip("vV")
     _update_state["latest_notes"]     = notes
     _update_state["latest_url"]       = "local:" + exe_path
+    _update_state["latest_source"]    = "local"
     _update_state["latest_sha256"]    = sha256
     _update_state["latest_size"]      = size_bytes
     _update_state["update_available"] = is_newer
     _keep_staged_download_only_for(_update_state["latest_version"] if is_newer else None)
 
-    s["last_check_ts"] = time.time()
-    _save_settings(s)
+    _stamp_last_check()
 
     if is_newer:
         log.info(f"  Local update available: v{APP_VERSION} -> v{latest_ver_s} "
@@ -685,8 +852,9 @@ def check_for_update() -> dict:
     """Hit the release source and update _update_state with the result.
 
     beta.11 — when settings.local_update_dir is set, the "release source" is
-    that folder on disk (see _check_local_update); otherwise it's the HTTP
-    release server's /version/<channel> endpoint as before.
+    that folder on disk (see _check_local_update).  Otherwise GitHub's
+    releases are asked first and the update server's /version/<channel>
+    second (update_sources.source_order has the exceptions).
 
     Returns the standard {ok, update_available, current, latest, ...}
     payload that the UI consumes.
@@ -705,6 +873,7 @@ def check_for_update() -> dict:
     _update_state["latest_url"]       = None
     _update_state["latest_sha256"]    = None
     _update_state["latest_size"]      = 0
+    _update_state["latest_source"]    = None
     _update_state["update_available"] = False
 
     try:
@@ -717,22 +886,49 @@ def check_for_update() -> dict:
 
         channel    = s.get("channel",    APP_CHANNEL_DEFAULT)
         server_url = s.get("server_url", UPDATE_SERVER_URL_DEFAULT).rstrip("/")
-        endpoint   = f"{server_url}/version/{channel}"
+        order      = update_sources.source_order(s.get("update_source"), server_url)
 
-        data = _http_get_json(endpoint)
-        if data is None or not isinstance(data, dict):
-            _update_state["error"] = f"Could not reach update server ({server_url})"
-            log.warning(f"  update check failed against {endpoint}")
+        # Ask each place in turn.  The first that has a release for this
+        # channel is the answer.  One that answers "nothing published" is
+        # remembered while the next is asked; one that does not answer at all
+        # (offline, GitHub's hourly limit) is passed over.
+        info, silent = None, []
+        for source in order:
+            answer = _ask_github(channel) if source == "github" else _ask_server(server_url, channel)
+            if answer is None:
+                silent.append(source)
+                continue
+            if info is None or answer["available"]:
+                info = answer
+            if info["available"]:
+                break
+        if silent:
+            log.info("  no answer from " + " or ".join(update_sources.SOURCE_NAMES[x] for x in silent)
+                     + (f"; using {update_sources.SOURCE_NAMES[info['source']]}" if info else ""))
+
+        if _where_from(_load_settings()) != _where_from(s):
+            # The channel, the source or the server was changed while the
+            # places were being asked.  What came back answers the old
+            # question: drop it and let the next check ask the new one.
+            log.info("  update settings changed during the check; result dropped")
+            return {"ok": False, "err": "The update settings changed during the check. Check again."}
+
+        if info is None or (silent and not info["available"]):
+            # Nobody answered, or the only answer was "nothing here" while
+            # another place could not be reached: that is not "up to date",
+            # and what is staged is still the newest we know of.
+            _update_state["error"] = _could_not_reach(silent, server_url)
+            log.warning(f"  update check failed: {_update_state['error']}")
             return {"ok": False, "err": _update_state["error"]}
 
-        available    = bool(data.get("available"))
-        latest_ver_s = data.get("version")
-        notes        = (data.get("notes") or "")[:1500]
-        sha256       = data.get("sha256") or ""
-        download_url = data.get("download_url") or ""
-        size_bytes   = int(data.get("size_bytes") or 0)
+        source       = info["source"]
+        latest_ver_s = info.get("version") or ""
+        notes        = (info.get("notes") or "")[:1500]
+        sha256       = info.get("sha256") or ""
+        download_url = info.get("download_url") or ""
+        size_bytes   = int(info.get("size_bytes") or 0)
 
-        if not available or not latest_ver_s:
+        if not info["available"] or not latest_ver_s:
             log.info(f"  No release published on '{channel}' channel")
             _keep_staged_download_only_for(None)
             _update_state["update_available"] = False
@@ -742,12 +938,11 @@ def check_for_update() -> dict:
             _update_state["latest_sha256"]    = None
             _update_state["latest_size"]      = 0
             # Persist last-check ts regardless of result
-            s["last_check_ts"] = time.time()
-            _save_settings(s)
+            _stamp_last_check()
             return {
                 "ok": True, "update_available": False,
                 "current": APP_VERSION, "latest": None,
-                "channel": channel, "server_url": server_url,
+                "channel": channel, "server_url": server_url, "source": source,
                 "message": f"No release published on the {channel} channel yet.",
             }
 
@@ -760,15 +955,16 @@ def check_for_update() -> dict:
         _update_state["latest_url"]       = download_url
         _update_state["latest_sha256"]    = sha256
         _update_state["latest_size"]      = size_bytes
+        _update_state["latest_source"]    = source
         _update_state["update_available"] = is_newer
         _keep_staged_download_only_for(_update_state["latest_version"] if is_newer else None)
 
         # Persist last-check timestamp
-        s["last_check_ts"] = time.time()
-        _save_settings(s)
+        _stamp_last_check()
 
+        where = update_sources.SOURCE_NAMES[source]
         if is_newer:
-            log.info(f"  Update available on '{channel}': "
+            log.info(f"  Update available on '{channel}' from {where}: "
                      f"v{APP_VERSION} -> v{latest_ver_s}")
             return {
                 "ok": True, "update_available": True,
@@ -777,13 +973,13 @@ def check_for_update() -> dict:
                 "download_url": download_url,
                 "sha256": sha256,
                 "size_bytes": size_bytes,
-                "channel": channel, "server_url": server_url,
+                "channel": channel, "server_url": server_url, "source": source,
             }
-        log.info(f"  Already up to date on '{channel}' (v{APP_VERSION})")
+        log.info(f"  Already up to date on '{channel}' (v{APP_VERSION}, asked {where})")
         return {
             "ok": True, "update_available": False,
             "current": APP_VERSION, "latest": latest_ver_s,
-            "channel": channel, "server_url": server_url,
+            "channel": channel, "server_url": server_url, "source": source,
         }
     finally:
         _update_state["checking"] = False
@@ -882,6 +1078,57 @@ def download_update() -> dict:
     # replaced what the server offers since it was cached.
     cached = os.path.exists(dest) and os.path.getsize(dest) > 1024
 
+    source = _update_state.get("latest_source")
+    err = _stage(url, _update_state.get("latest_sha256") or "", dest, cached)
+    if err and source in update_sources.SOURCES:
+        # The place that has the release could not deliver the file (its file
+        # host blocked or failing, a broken transfer).  If the other place
+        # has this same version, take it from there, checked against that
+        # place's own SHA-256.
+        other = _same_build_elsewhere(version, source)
+        if other:
+            log.info(f"  {err}  Trying {update_sources.SOURCE_NAMES[other['source']]} for v{version}.")
+            _update_state["latest_url"]    = other["download_url"]
+            _update_state["latest_sha256"] = other["sha256"]
+            _update_state["latest_size"]   = other["size_bytes"]
+            _update_state["latest_source"] = source = other["source"]
+            err = _stage(other["download_url"], other["sha256"], dest, False)
+    if err:
+        _update_state["progress"] = 0
+        _update_state["error"] = err
+        return {"ok": False, "err": err}
+
+    _update_state["progress"] = 100
+    _update_state["download_complete"] = True
+    _update_state["pending_install_path"] = dest
+    _update_state["staged"] = {"version": version, "source": source}
+    size_mb = os.path.getsize(dest) / (1024 * 1024)
+    log.info(f"  Downloaded {size_mb:.1f} MB, ready to install")
+    return {"ok": True, "path": dest, "size_mb": round(size_mb, 1), "cached": cached}
+
+
+def _same_build_elsewhere(version: str, tried: str) -> Optional[dict]:
+    """The build `version` as another place than `tried` offers it (the
+    answer of _ask_github / _ask_server), or None when no other place is
+    asked with these settings, answers, or has exactly that version with a
+    SHA-256."""
+    s = _load_settings()
+    channel = s.get("channel", APP_CHANNEL_DEFAULT)
+    server_url = s.get("server_url", UPDATE_SERVER_URL_DEFAULT).rstrip("/")
+    for source in update_sources.source_order(s.get("update_source"), server_url):
+        if source == tried:
+            continue
+        answer = _ask_github(channel) if source == "github" else _ask_server(server_url, channel)
+        if (answer and answer["available"] and answer.get("sha256") and answer.get("download_url")
+                and _parse_version(answer["version"]) == _parse_version(version)):
+            return answer
+    return None
+
+
+def _stage(url: str, expected_sha: str, dest: str, cached: bool) -> Optional[str]:
+    """Bring the build at `url` to `dest` (`cached`: it is there already) and
+    check it against `expected_sha`.  None when it is in place and verified;
+    otherwise the error line, with nothing left at `dest`."""
     _update_state["downloading"] = True
     _update_state["progress"] = 0
     _update_state["download_complete"] = False
@@ -909,26 +1156,25 @@ def download_update() -> dict:
         _update_state["downloading"] = False
 
     if not ok:
-        _update_state["progress"] = 0
-        _update_state["error"] = "Download failed"
-        return {"ok": False, "err": "Download failed"}
+        return "Download failed"
 
-    # v3 — verify SHA-256 against the server-provided hash.  Belt-and-
-    # suspenders: catches CDN corruption + MITM rewriting + truncated
-    # downloads.  Fail CLOSED if the server didn't supply one — a missing
-    # hash is indistinguishable from a MITM/misconfigured server stripping
-    # it, and installing an unverified binary is exactly what this check
-    # exists to prevent.  (The live release server always includes
-    # sha256; there is no legacy-server case left to accommodate.)
-    expected_sha = _update_state.get("latest_sha256") or ""
-    if not expected_sha:
-        err = ("Server did not provide a SHA-256 hash for this build; "
-               "refusing to install an unverified binary.")
+    def refuse(err):
         log.warning(err)
-        _update_state["error"] = err
-        try: os.remove(dest)
-        except OSError: pass
-        return {"ok": False, "err": err}
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        return err
+
+    # v3: verify SHA-256 against the hash the release's place gave.  Belt-
+    # and-suspenders: catches CDN corruption + MITM rewriting + truncated
+    # downloads.  Fail CLOSED if none was supplied: a missing hash is
+    # indistinguishable from a MITM/misconfigured server stripping it, and
+    # installing an unverified binary is exactly what this check exists to
+    # prevent.  (The live release server and GitHub always include one.)
+    if not expected_sha:
+        return refuse("Server did not provide a SHA-256 hash for this build; "
+                      "refusing to install an unverified binary.")
     try:
         h = hashlib.sha256()
         with open(dest, "rb") as f:
@@ -936,27 +1182,13 @@ def download_update() -> dict:
                 h.update(chunk)
         actual_sha = h.hexdigest()
     except Exception as e:
-        _update_state["error"] = f"Hash check failed: {e}"
-        try: os.remove(dest)
-        except OSError: pass
-        return {"ok": False, "err": _update_state["error"]}
-    if actual_sha.lower() != expected_sha.lower():
-        err = (f"Downloaded file failed SHA-256 check: "
-               f"expected {expected_sha[:16]}…, got {actual_sha[:16]}…. "
-               "File may be corrupted; download will retry on next check.")
-        log.warning(err)
-        _update_state["error"] = err
-        try: os.remove(dest)
-        except OSError: pass
-        return {"ok": False, "err": err}
-    log.info(f"  SHA-256 verified")
-
-    _update_state["progress"] = 100
-    _update_state["download_complete"] = True
-    _update_state["pending_install_path"] = dest
-    size_mb = os.path.getsize(dest) / (1024 * 1024)
-    log.info(f"  Downloaded {size_mb:.1f} MB, ready to install")
-    return {"ok": True, "path": dest, "size_mb": round(size_mb, 1), "cached": cached}
+        return refuse(f"Hash check failed: {e}")
+    if actual_sha.lower() != str(expected_sha).lower():
+        return refuse(f"Downloaded file failed SHA-256 check: "
+                      f"expected {str(expected_sha)[:16]}…, got {actual_sha[:16]}…. "
+                      "File may be corrupted; download will retry on next check.")
+    log.info("  SHA-256 verified")
+    return None
 
 
 def _game_running() -> str:
@@ -992,7 +1224,25 @@ def on_game_closed() -> None:
     threading.Thread(target=later, daemon=True, name="updater-after-game").start()
 
 
+_install_lock = threading.Lock()
+
+
 def install_update_now(force: bool = False) -> dict:
+    """Install the staged update (see _install_update_now), one call at a
+    time: starting it can take a while when a newer updater has to be fetched
+    first, and a second click in that time must not start a second updater
+    on the same files."""
+    if _update_state.get("installing"):
+        return {"ok": False, "err": "The update is already being installed."}
+    if not _install_lock.acquire(blocking=False):
+        return {"ok": False, "err": "The install is already being started. Give it a moment."}
+    try:
+        return _install_update_now(force)
+    finally:
+        _install_lock.release()
+
+
+def _install_update_now(force: bool = False) -> dict:
     """Spawn the swap-and-restart batch, then exit the app.
 
     NOTE: the app process must die for the batch to overwrite the .exe.
@@ -1119,7 +1369,7 @@ def _apply_exe_update_async(new_exe: str) -> dict:
     # manually triggered an install before that finished, do it now
     # (blocking — only takes a few seconds).
     if not is_updater_installed():
-        log.info("  Updater not installed, fetching from Railway now")
+        log.info("  Updater not installed, fetching it now")
         ensure_updater_installed_async()
         # Wait up to 60s for the download to complete
         deadline = time.time() + 60
@@ -1135,6 +1385,42 @@ def _apply_exe_update_async(new_exe: str) -> dict:
                            f"Try restarting {APP_NAME} with internet "
                            f"available."}
 
+    # What is being installed is what was staged: a check that failed since
+    # then has cleared latest_*, but the file is still the build it was, from
+    # the place it came from.
+    staged = _update_state.get("staged") or {}
+    target_version = staged.get("version") or _update_state.get("latest_version") or ""
+    found_on = staged.get("source") or _update_state.get("latest_source") or "server"
+    s = _load_settings()
+    channel    = s.get("channel", APP_CHANNEL_DEFAULT)
+    server_url = (s.get("server_url") or UPDATE_SERVER_URL_DEFAULT).rstrip("/")
+
+    # An updater from before 1.5.0 only knows the update server.  Handed an
+    # update that was found on GitHub it would close the app, ask the server,
+    # and stop there with the app closed if the server does not have it.  So
+    # fetch the current updater first, and do not start an install the
+    # updater on disk cannot finish.
+    tell_source = _updater_knows_sources()
+    if not tell_source and found_on == "github":
+        log.info("  The updater on disk predates GitHub updates, looking for the current one first")
+        tell_source = _refresh_updater_now()
+    if not tell_source and found_on == "github":
+        # No newer updater to be had.  The old one can still do it when the
+        # update server has this build too.
+        on_server = None
+        if "server" in update_sources.source_order(s.get("update_source"), server_url):
+            on_server = _ask_server(server_url, channel)
+        if not (on_server and on_server["available"] and on_server.get("sha256") and target_version
+                and _parse_version(on_server["version"]) >= _parse_version(target_version)):
+            err = get_updater_install_status().get("err") or "no newer updater could be downloaded"
+            log.warning(f"  Install not started: the updater on disk cannot install from GitHub ({err})")
+            return {"ok": False,
+                    "err": "This update is on GitHub, and the updater on this PC is too old to "
+                           f"install from there ({err}). "
+                           f"Try again in a few minutes, or get {APP_NAME} from "
+                           f"{update_sources.GITHUB_RELEASES_PAGE}."}
+        log.info("  The update server has this build too: the updater on disk installs it from there")
+
     # Refresh install_info.json so the updater has the latest current
     # state (path, channel, version)
     write_install_info()
@@ -1142,12 +1428,10 @@ def _apply_exe_update_async(new_exe: str) -> dict:
     # Record the version transition for the post-install toast
     s = _load_settings()
     s["previous_version"]        = APP_VERSION
-    s["pending_install_version"] = _update_state.get("latest_version") or ""
+    s["pending_install_version"] = target_version
     _save_settings(s)
 
     current_exe = sys.executable
-    channel    = s.get("channel", APP_CHANNEL_DEFAULT)
-    server_url = (s.get("server_url") or UPDATE_SERVER_URL_DEFAULT).rstrip("/")
 
     args = [
         UPDATER_EXE,
@@ -1155,10 +1439,13 @@ def _apply_exe_update_async(new_exe: str) -> dict:
         "--target-dir",       os.path.dirname(current_exe),
         "--channel",          channel,
         "--current-version",  APP_VERSION,
-        "--target-version",   _update_state.get("latest_version") or "",
+        "--target-version",   target_version,
         "--server",           server_url,
         "--auto-confirm",
     ]
+    if tell_source:
+        # (An older updater would stop at an argument it does not know.)
+        args += ["--source", update_sources.source_setting(s.get("update_source"))]
     log.info(f"  Spawning: {' '.join(args)}")
 
     try:
@@ -1405,6 +1692,16 @@ def get_update_status() -> dict:
         # end doesn't have to hardcode the list.
         "valid_channels":    list(VALID_CHANNELS),
         "default_server_url": UPDATE_SERVER_URL_DEFAULT,
+        # Where the last check found what it found ("github" | "server" |
+        # "local", None before the first check), and the places that are
+        # asked, in order, with the settings as they are.
+        "source":            _update_state.get("latest_source"),
+        "source_order":      (["local"] if (s.get("local_update_dir") or "").strip() else
+                              list(update_sources.source_order(
+                                  s.get("update_source"),
+                                  s.get("server_url") or UPDATE_SERVER_URL_DEFAULT))),
+        "valid_sources":     list(update_sources.SOURCE_SETTINGS),
+        "releases_page":     update_sources.GITHUB_RELEASES_PAGE,
         # v3 — install-safety state.  `install_blocked_reason` is empty
         # when auto-install would fire right now.
         "install_safe":              safety["safe"],
@@ -1548,7 +1845,9 @@ def _try_auto_install(quiet: bool = False) -> dict:
     # Server mode installs through the standalone updater.  While it is not
     # on disk and its download keeps failing, don't fetch it again every
     # couple of minutes.  (Install now from the UI still tries at once.)
-    if not (s.get("local_update_dir") or "").strip() and not is_updater_installed():
+    staged_on = (_update_state.get("staged") or {}).get("source") or _update_state.get("latest_source")
+    updater_missing = not is_updater_installed() or (staged_on == "github" and not _updater_knows_sources())
+    if not (s.get("local_update_dir") or "").strip() and updater_missing:
         wait = _updater_retry_wait()
         if wait > 0:
             reason = f"the updater download keeps failing; next try in {int(wait)}s"

@@ -28,6 +28,15 @@ _state = {
     "channel":           "",
     "current_version":   "",
     "target_version":    "",
+    # The version the app asked for when it started us ("" when started by
+    # hand), and where to look for it: "auto" (GitHub, then the update
+    # server), "github" or "server".
+    "requested_version": "",
+    "source":            "auto",
+    # True once another channel was picked for this run (in the window or on
+    # the command line): then a build older than the installed one is what
+    # was asked for, not a place that is behind.
+    "allow_older":       False,
     "server_url":        "",
     "auto_confirm":      False,
     "silent":            False,
@@ -55,10 +64,11 @@ _state_lock = threading.Lock()
 _install_thread: Optional[threading.Thread] = None
 
 
-# Standard 5-step pipeline.  Order MUST match the UI's renderer.
+# The pipeline's steps, in the order they run and are shown.  The build is
+# looked for first: with nothing to install, nothing is closed.
 PIPELINE_STEPS = [
+    {"key": "channel",   "label": "Looking for the newest build"},
     {"key": "close",     "label": "Closing Vispora"},
-    {"key": "channel",   "label": "Checking release server"},
     {"key": "download",  "label": "Downloading new version"},
     {"key": "verify",    "label": "Verifying integrity"},
     {"key": "install",   "label": "Installing"},
@@ -69,6 +79,9 @@ PIPELINE_STEPS = [
 def init_state(**kwargs) -> None:
     """Called by main.py before Flask starts.  Seeds the install
     context — target dir, channel, etc."""
+    kwargs.setdefault("requested_version", "")
+    kwargs.setdefault("source", "auto")
+    kwargs.setdefault("allow_older", False)
     with _state_lock:
         _state.update(kwargs)
         _state["steps"] = [
@@ -213,6 +226,11 @@ def api_set_channel():
     if ch not in ("stable", "beta"):
         return jsonify({"ok": False, "err": "channel must be 'stable' or 'beta'"})
     with _state_lock:
+        if ch != _state["channel"]:
+            # The version the app asked for was this install's channel's.
+            # Picking another channel here means "install what that one has".
+            _state["requested_version"] = ""
+            _state["allow_older"] = True
         _state["channel"] = ch
     return jsonify({"ok": True, "channel": ch})
 

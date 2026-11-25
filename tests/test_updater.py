@@ -29,8 +29,10 @@ import updater.paths as P                           # noqa: E402
 import updater.server as SV                         # noqa: E402
 import updater.installer as I                       # noqa: E402
 import updater.main as UM                           # noqa: E402
+import update_sources as SRC                        # noqa: E402
 
 SERVER = "https://vispora.up.railway.app"
+GITHUB = SRC.GITHUB_RELEASES_URL                    # asked first; these tests publish nothing there
 OLD = b"old build " * 20000
 NEW = b"new build " * 20000                         # (anything under 100 KB is taken for an error page)
 
@@ -150,9 +152,10 @@ def test_updater_is_sandboxed():
 
 
 def test_updater_talks_to_the_same_server_as_the_app():
-    assert UM.SERVER_URL_DEFAULT == config.UPDATE_SERVER_URL_DEFAULT == SERVER
+    assert UM.SERVER_URL_DEFAULT == config.UPDATE_SERVER_URL_DEFAULT == SRC.SERVER_URL_DEFAULT == SERVER
     assert config.is_dead_update_server("https://" + UM._DEAD_SERVER_HOST)
-    assert [int(x) for x in UM.UPDATER_VERSION.split(".")] >= [1, 4, 4]
+    assert [int(x) for x in UM.UPDATER_VERSION.split(".")] >= [1, 5, 0], "1.5.0 is the first that knows GitHub"
+    assert SRC.parse_version(UM.UPDATER_VERSION) >= SRC.parse_version(SRC.UPDATER_MIN_FOR_SOURCES)
 
 
 def test_an_existing_exe_keeps_its_filename():
@@ -257,14 +260,15 @@ def test_update_replaces_the_exe_in_place_and_keeps_one_backup():
     info = json.load(open(P.INSTALL_INFO, encoding="utf-8"))
     assert (info["install_path"], info["channel"], info["version"]) == (target, "stable", "3.6.1")
     assert not [f for f in os.listdir(P.UPDATER_DIR) if f.endswith(".part")], "no download left behind"
-    assert NET.calls == [f"{SERVER}/version/stable", f"{SERVER}/download/stable"]
+    assert NET.calls == [GITHUB, f"{SERVER}/version/stable", f"{SERVER}/download/stable"], \
+        "GitHub is asked first; it has nothing here, so the update server is asked"
 
 
 def test_beta_channel_is_asked_for_the_beta_build():
     target = setup(channel="beta")
     NET.publish(channel="beta", version="3.7.0-beta.1")
     assert I.run_install_pipeline() == 0
-    assert NET.calls[0] == f"{SERVER}/version/beta" and read(target) == NEW
+    assert NET.calls[:2] == [GITHUB, f"{SERVER}/version/beta"] and read(target) == NEW
     assert json.load(open(P.INSTALL_INFO, encoding="utf-8"))["version"] == "3.7.0-beta.1"
 
 
@@ -400,7 +404,7 @@ def test_an_old_install_passing_the_retired_server_is_pointed_at_the_live_one():
     code = _run_main("--silent", "--target-dir", os.path.dirname(target), "--channel", "stable",
                      "--server", "https://ghostshell-site.up.railway.app/")
     assert code == 0 and read(target) == NEW
-    assert NET.calls[0] == f"{SERVER}/version/stable", "the old hostname has been dead since July"
+    assert NET.calls[:2] == [GITHUB, f"{SERVER}/version/stable"], "the old hostname has been dead since July"
     assert SV.get_state_snapshot()["target_exe"] == target, "the exe in that folder, under the name it has"
 
 
@@ -411,12 +415,13 @@ def test_without_arguments_the_apps_record_says_what_to_update():
         json.dump({"install_path": target, "install_dir": os.path.dirname(target), "channel": "beta",
                    "version": "3.6.0"}, f)
     assert _run_main("--silent") == 0
-    assert read(target) == NEW and NET.calls[0] == f"{SERVER}/version/beta"
+    assert read(target) == NEW and NET.calls[:2] == [GITHUB, f"{SERVER}/version/beta"]
 
 
 def test_command_line_defaults():
     args = UM.parse_args([])
     assert args["server"] == SERVER and args["channel"] == "" and not args["silent"] and not args["auto_confirm"]
+    assert args["source"] == "", "not said: the app's record or GitHub first"
     assert UM.parse_args(["--auto-confirm", "--channel", "beta"])["auto_confirm"] is True
 
 
@@ -429,7 +434,8 @@ def test_window_page_and_status():
     page = c.get("/")
     assert page.status_code == 200 and b"Vispora" in page.data and b"GhostShell" not in page.data
     status = c.get("/api/status").get_json()
-    assert [s["key"] for s in status["steps"]] == ["close", "channel", "download", "verify", "install", "launch"]
+    assert [s["key"] for s in status["steps"]] == ["channel", "close", "download", "verify", "install", "launch"], \
+        "the build is looked for before anything is closed"
     assert status["updater_version"] == UM.UPDATER_VERSION and status["mode"] == "update"
     for asset in ("/static/app.js", "/static/style.css"):
         assert c.get(asset).status_code == 200, asset
