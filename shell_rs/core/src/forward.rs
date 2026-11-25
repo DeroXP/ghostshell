@@ -13,7 +13,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::http::{Request, Response};
 
@@ -25,12 +25,16 @@ pub struct Limits {
     /// calls do real work before they answer, and the page has limits of
     /// its own where it wants them.
     pub silence: Duration,
+    /// The longest the whole exchange may take, where there is such a
+    /// limit.  Silence alone is no limit: an answer that arrives a byte at
+    /// a time is never silent.
+    pub whole: Option<Duration>,
     pub body: usize,
 }
 
 impl Default for Limits {
     fn default() -> Limits {
-        Limits { connect: Duration::from_secs(2), silence: Duration::from_secs(30 * 60), body: 256 * 1024 * 1024 }
+        Limits { connect: Duration::from_secs(2), silence: Duration::from_secs(30 * 60), whole: None, body: 256 * 1024 * 1024 }
     }
 }
 
@@ -62,8 +66,21 @@ fn mistake_in(request: &Request) -> Option<&'static str> {
     None
 }
 
+/// How often a wait for the backend's answer looks up to ask whether it is
+/// still worth waiting.
+const LOOK_UP_EVERY: Duration = Duration::from_millis(250);
+
 /// Send `request` to the backend on 127.0.0.1:`port` and read its answer.
 pub fn send(port: u16, request: &Request, limits: &Limits) -> Result<Response, String> {
+    send_while(port, request, limits, &|| true)
+}
+
+/// The same, for as long as `worth_waiting` says so.  The port is the
+/// shell's own listening socket: a call to it is taken in whether or not a
+/// backend is there to answer, so "nobody is there" does not show as a
+/// refused connection.  Whoever knows that the backend is gone for good
+/// says so here, and the wait ends.
+pub fn send_while(port: u16, request: &Request, limits: &Limits, worth_waiting: &dyn Fn() -> bool) -> Result<Response, String> {
     if let Some(why) = mistake_in(request) {
         return Err(format!("not passed on: {why}"));
     }
@@ -71,8 +88,8 @@ pub fn send(port: u16, request: &Request, limits: &Limits) -> Result<Response, S
     let mut stream =
         TcpStream::connect_timeout(&address, limits.connect).map_err(|e| format!("the backend does not answer on port {port}: {e}"))?;
     let _ = stream.set_nodelay(true);
-    stream.set_read_timeout(Some(limits.silence)).map_err(|e| e.to_string())?;
     stream.set_write_timeout(Some(limits.silence)).map_err(|e| e.to_string())?;
+    let began = Instant::now();
 
     let mut head = format!("{} {} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n", request.method, request.target);
     for (name, value) in &request.headers {
@@ -86,31 +103,73 @@ pub fn send(port: u16, request: &Request, limits: &Limits) -> Result<Response, S
     head.push_str("\r\n");
     let sent = stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(&request.body)).and_then(|()| stream.flush());
     sent.map_err(|e| format!("the call could not be handed to the backend: {e}"))?;
-    Answer { stream, read: Vec::new(), at: 0, most: limits.body }.read(request.method == "HEAD")
+    let answer = Answer {
+        stream,
+        read: Vec::new(),
+        at: 0,
+        most: limits.body,
+        silence: limits.silence,
+        over_at: limits.whole.map(|whole| began + whole),
+        heard_at: Instant::now(),
+        worth_waiting,
+    };
+    answer.read(request.method == "HEAD")
 }
 
 /// The backend's answer, as it comes in.
-struct Answer {
+struct Answer<'a> {
     stream: TcpStream,
     read: Vec<u8>,
     at: usize,
     most: usize,
+    silence: Duration,
+    /// When the whole exchange is over, if it has a limit.
+    over_at: Option<Instant>,
+    /// When the backend was last heard from.
+    heard_at: Instant,
+    worth_waiting: &'a dyn Fn() -> bool,
 }
 
-impl Answer {
+impl Answer<'_> {
     /// More from the backend.  False at the end.
     fn more(&mut self) -> Result<bool, String> {
         let mut piece = [0u8; 16 * 1024];
-        match self.stream.read(&mut piece) {
-            Ok(0) => Ok(false),
-            Ok(n) => {
-                self.read.extend_from_slice(&piece[..n]);
-                if self.read.len() > self.most + MOST_HEADERS {
-                    return Err("the backend's answer is far too large".into());
-                }
-                Ok(true)
+        loop {
+            // Wait a short while at a time, and look up in between.
+            let now = Instant::now();
+            let mut wait = LOOK_UP_EVERY.min(self.silence.saturating_sub(now - self.heard_at));
+            if let Some(over_at) = self.over_at {
+                wait = wait.min(over_at.saturating_duration_since(now));
             }
-            Err(e) => Err(format!("the backend stopped answering: {e}")),
+            // (a wait of no length would be read by Windows as "for ever")
+            let _ = self.stream.set_read_timeout(Some(wait.max(Duration::from_millis(1))));
+            match self.stream.read(&mut piece) {
+                Ok(0) => return Ok(false),
+                Ok(n) => {
+                    self.heard_at = Instant::now();
+                    self.read.extend_from_slice(&piece[..n]);
+                    if self.read.len() > self.most + MOST_HEADERS {
+                        return Err("the backend's answer is far too large".into());
+                    }
+                    if self.over_at.is_some_and(|over_at| Instant::now() >= over_at) {
+                        return Err("the backend took too long over its answer".into());
+                    }
+                    return Ok(true);
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    let now = Instant::now();
+                    if self.over_at.is_some_and(|over_at| now >= over_at) {
+                        return Err("the backend took too long over its answer".into());
+                    }
+                    if now - self.heard_at >= self.silence {
+                        return Err("the backend stopped answering".into());
+                    }
+                    if !(self.worth_waiting)() {
+                        return Err("the backend is gone".into());
+                    }
+                }
+                Err(e) => return Err(format!("the backend stopped answering: {e}")),
+            }
         }
     }
 
@@ -147,26 +206,33 @@ impl Answer {
     }
 
     fn read(mut self, head_only: bool) -> Result<Response, String> {
-        // "HTTP/1.1 200 OK"
-        let first = self.line(MOST_HEADERS)?;
-        let mut words = first.splitn(3, ' ');
-        let status = match (words.next(), words.next().and_then(|code| code.parse::<u16>().ok())) {
-            (Some(version), Some(code)) if version.starts_with("HTTP/1.") && (100..=599).contains(&code) => code,
-            _ => return Err("the backend's answer does not start like one".into()),
+        let (status, all) = loop {
+            // "HTTP/1.1 200 OK"
+            let first = self.line(MOST_HEADERS)?;
+            let mut words = first.splitn(3, ' ');
+            let status = match (words.next(), words.next().and_then(|code| code.parse::<u16>().ok())) {
+                (Some(version), Some(code)) if version.starts_with("HTTP/1.") && (100..=599).contains(&code) => code,
+                _ => return Err("the backend's answer does not start like one".into()),
+            };
+            let mut all: Vec<(String, String)> = Vec::new();
+            loop {
+                let line = self.line(MOST_HEADERS)?;
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    all.push((name.trim().to_string(), value.trim().to_string()));
+                }
+                if self.at > 4 * MOST_HEADERS {
+                    return Err("the backend's answer has far too many headers".into());
+                }
+            }
+            // "100 Continue" and its like say that the answer is still to
+            // come: it is the next one that counts.
+            if !(100..200).contains(&status) || status == 101 {
+                break (status, all);
+            }
         };
-        let mut all: Vec<(String, String)> = Vec::new();
-        loop {
-            let line = self.line(MOST_HEADERS)?;
-            if line.is_empty() {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                all.push((name.trim().to_string(), value.trim().to_string()));
-            }
-            if self.at > MOST_HEADERS {
-                return Err("the backend's answer has far too many headers".into());
-            }
-        }
         let of = |wanted: &str| all.iter().find(|(name, _)| name.eq_ignore_ascii_case(wanted)).map(|(_, value)| value.as_str());
         let body = if head_only || status < 200 || status == 204 || status == 304 {
             Vec::new()
@@ -199,7 +265,7 @@ impl Answer {
                 while !self.line(MOST_HEADERS)?.is_empty() {}
                 return Ok(body);
             }
-            if body.len() + size > self.most {
+            if body.len().checked_add(size).map_or(true, |all| all > self.most) {
                 return Err("the backend's answer is far too large".into());
             }
             body.extend(self.exactly(size)?);

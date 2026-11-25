@@ -55,12 +55,23 @@ def _ui_url() -> str:
 # variable that says where to listen, which secret the shell's calls will
 # carry, and which process the shell is:
 #
-#     VISPORA_SHELL={"port": 49213, "token": "...", "shell_pid": 1234}
+#     VISPORA_SHELL={"port": 49213, "listen": 812, "token": "...",
+#                    "shell_pid": 1234, "shell_started": 134088...}
+#
+# "listen" is a socket the shell has made and is already listening on: this
+# process inherits it and serves on it.  The backend never opens a port of
+# its own behind the shell.  A port that is let go of for the backend to
+# take can be taken by anybody in between, and whoever listens there is
+# sent the secret with the next call; and a listener the web server makes
+# for itself can be joined by a second one on the same port (it asks
+# Windows for a shareable address).  The shell's socket is not shareable and
+# is kept by the shell for as long as it lives.
 #
 # No release starts the app this way yet.  Started as it always was, none of
 # this is used.
 _SHELL_HANDOFF_VAR = "VISPORA_SHELL"
 _behind_shell = None            # the hand-over, when this process is a shell's backend
+_shell_listener = None          # the socket the shell made for this process to serve on
 
 
 class ShellHandoffError(ValueError):
@@ -82,6 +93,7 @@ def _take_shell_handoff(argv=None, environ=None):
     try:
         given = json.loads(raw or "")
         port, token, pid = given["port"], given["token"], given["shell_pid"]
+        listen, started = given["listen"], given["shell_started"]
     except (ValueError, TypeError, KeyError):
         raise ShellHandoffError("--backend needs the shell's hand-over, and none was given that can be read")
 
@@ -93,15 +105,41 @@ def _take_shell_handoff(argv=None, environ=None):
     if not (isinstance(token, str) and len(token) >= 32
             and all(c.isascii() and (c.isalnum() or c in "-_") for c in token)):
         raise ShellHandoffError("the shell's hand-over carries no usable secret")
-    if not (whole(pid) and pid > 0):
+    if not (whole(pid) and pid > 0 and whole(started) and started > 0):
         raise ShellHandoffError("the shell's hand-over does not say which process the shell is")
-    return {"port": port, "token": token, "shell_pid": pid}
+    if not (whole(listen) and listen > 0):
+        raise ShellHandoffError("the shell's hand-over names no socket to serve on")
+    return {"port": port, "listen": listen, "token": token, "shell_pid": pid, "shell_started": started}
+
+
+def _adopt_shell_listener(handle: int, port: int):
+    """The socket the shell made, as a Python socket.  It has to be what the
+    hand-over says it is: listening, on 127.0.0.1, on that port."""
+    import socket
+    try:
+        sock = socket.socket(fileno=handle)
+    except (OSError, ValueError) as e:
+        raise ShellHandoffError(f"the socket the shell handed over cannot be used: {e}")
+    try:
+        # (not for the programs this process starts)
+        sock.set_inheritable(False)
+        listening = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+        if sock.type != socket.SOCK_STREAM or sock.getsockname() != ("127.0.0.1", port) or not listening:
+            raise ShellHandoffError("the socket the shell handed over is not listening on 127.0.0.1 where it said")
+    except OSError as e:
+        sock.detach()
+        raise ShellHandoffError(f"the socket the shell handed over cannot be used: {e}")
+    except ShellHandoffError:
+        sock.detach()                               # (not this process's to close)
+        raise
+    return sock
 
 
 def _serve_for_the_shell(handoff) -> None:
     """Become the backend the hand-over describes: listen where the shell
     said, and answer only calls that carry the shell's secret."""
-    global _behind_shell, _API_TOKEN, _LOCAL_HOSTS, _LOCAL_ORIGINS, _TOKEN_EXEMPT_PATHS
+    global _behind_shell, _shell_listener, _API_TOKEN, _LOCAL_HOSTS, _LOCAL_ORIGINS, _TOKEN_EXEMPT_PATHS
+    _shell_listener = _adopt_shell_listener(handoff["listen"], handoff["port"])
     config.APP_PORT = handoff["port"]
     # (the shell asks for 127.0.0.1 and nothing else)
     _LOCAL_HOSTS = frozenset({f"127.0.0.1:{config.APP_PORT}"})
@@ -114,9 +152,16 @@ def _serve_for_the_shell(handoff) -> None:
     _behind_shell = dict(handoff)
 
 
-def _wait_for_process_to_end(pid: int) -> str:
+def _wait_for_process_to_end(pid: int, started: int = None) -> str:
     """Wait until the process `pid` has ended.  "ended", or why it cannot be
-    waited for."""
+    waited for.
+
+    `started` is when that process was started, as Windows counts it (the
+    shell hands it over with its id).  A process id is given out again once
+    its process has ended: if the shell is gone before this is called, the
+    number may already belong to another program, which would then be
+    waited for in the shell's place.  A process with that id and another
+    start time is not the shell, and the shell has ended."""
     if sys.platform != "win32":
         return "cannot be watched (not on Windows)"
     import ctypes
@@ -126,14 +171,22 @@ def _wait_for_process_to_end(pid: int) -> str:
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(ctypes.c_ulonglong)] * 4
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    SYNCHRONIZE, INFINITE, ERROR_INVALID_PARAMETER = 0x00100000, 0xFFFFFFFF, 87
-    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+    SYNCHRONIZE, QUERY_LIMITED, INFINITE, ERROR_INVALID_PARAMETER = 0x00100000, 0x1000, 0xFFFFFFFF, 87
+    handle = kernel32.OpenProcess(SYNCHRONIZE | QUERY_LIMITED, False, pid)
     if not handle:
         err = ctypes.get_last_error()
         # (no process has that id any more: it ended before it could be watched)
         return "ended" if err == ERROR_INVALID_PARAMETER else f"cannot be watched (Windows error {err})"
     try:
+        if started is not None:
+            times = [ctypes.c_ulonglong() for _ in range(4)]
+            if not kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+                return f"cannot be watched (Windows error {ctypes.get_last_error()})"
+            if times[0].value != started:
+                return "ended"                          # that id is somebody else's by now
         if kernel32.WaitForSingleObject(handle, INFINITE) != 0:
             return f"cannot be watched (Windows error {ctypes.get_last_error()})"
         return "ended"
@@ -151,7 +204,7 @@ def _leave_with_the_shell(wait=None, leave=None) -> str:
     having said quit, the system is put back as every quit puts it back,
     and this process ends too."""
     pid = _behind_shell["shell_pid"]
-    outcome = (wait or _wait_for_process_to_end)(pid)
+    outcome = (wait or _wait_for_process_to_end)(pid, _behind_shell.get("shell_started"))
     if outcome != "ended":
         log.warning(f"The shell (pid {pid}) {outcome}: staying until it says quit")
         return outcome
@@ -3582,6 +3635,12 @@ def api_boot_prep_run():
 # ═══════════════════════════════════════════════════════════════════════════
 def start_flask():
     try:
+        if _shell_listener is not None:
+            # Behind the shell: on the socket the shell made, and on no port
+            # of this process's own (see "Running behind the shell").
+            from werkzeug.serving import make_server
+            make_server("127.0.0.1", config.APP_PORT, app, threaded=True, fd=_shell_listener.fileno()).serve_forever()
+            return
         app.run(host="127.0.0.1", port=config.APP_PORT, debug=False, threaded=True, use_reloader=False)
     except BaseException as e:
         # A port Werkzeug cannot bind (in use, or reserved by Hyper-V / WSL)

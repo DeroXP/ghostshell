@@ -128,9 +128,9 @@ def test_the_shell_and_the_app_agree_on_the_hand_over():
     # What the shell hands over is what the app reads, and all of it.
     start = shell[shell.index("let handoff = Json::object(["):shell.index(".to_string();", shell.index("let handoff = Json::object(["))]
     handed = re.findall(r'\("(\w+)", ', start)
-    taken = a._take_shell_handoff(["Vispora.exe", "--backend"],
-                                  {a._SHELL_HANDOFF_VAR: json.dumps({"port": 50000, "token": "x" * 43, "shell_pid": 9})})
-    assert sorted(handed) == sorted(taken) == ["port", "shell_pid", "token"]
+    taken = a._take_shell_handoff(["Vispora.exe", "--backend"], {a._SHELL_HANDOFF_VAR: json.dumps(
+        {"port": 50000, "listen": 812, "token": "x" * 43, "shell_pid": 9, "shell_started": 134088000000000000})})
+    assert sorted(handed) == sorted(taken) == ["listen", "port", "shell_pid", "shell_started", "token"]
     # The secret the shell makes is one the app takes: 43 of these letters.
     assert 'b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"' in token
     # The win.rs door puts it in the environment and nowhere else.
@@ -167,6 +167,39 @@ def test_the_calls_the_shell_makes_and_answers_are_the_apps():
     assert '"same-origin"' in guard and '"none"' in guard
 
 
+def test_the_port_is_never_free_for_somebody_else_to_listen_on():
+    """Every call carries the secret, and a call goes to whoever listens on
+    the port.  The first version of the shell asked Windows for a free port,
+    let go of it for the backend to take, and asked "are you up", with the
+    secret, of whoever was there meanwhile.  Now the shell makes the
+    listening socket itself, not shareable, keeps it for as long as it
+    lives, and the backend inherits it."""
+    platform, win, shell = rust("src", "platform.rs"), rust("src", "win.rs"), rust("src", "shell.rs")
+    for name in os.listdir(os.path.join(CORE, "src")):
+        if name.endswith(".rs"):
+            assert "free_port" not in rust("src", name), f"{name}: a port that is let go of is anybody's"
+    assert "fn listen(&self) -> Result<Box<dyn Listening>, String>;" in platform
+    # Not shareable, and that is said before the address is taken.
+    made = win[win.index("fn listen(&self) -> Result<Box<dyn Listening>, String> {"):win.index("fn start(&self")]
+    assert made.index("SO_EXCLUSIVEADDRUSE") < made.index("bind_local(made.socket, 0)") < made.index("listen(made.socket,")
+    assert "HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT" in made, "the backend finds it among the handles it inherits"
+    assert "host: [127, 0, 0, 1]" in win
+    # Made with the shell, before anything is started or asked, and kept in it.
+    new = shell[shell.index("pub fn new(settings: Settings"):shell.index("fn state(&self)")]
+    assert "let listening = platform.listen()?;" in new and "listening," in new
+    assert "listening: Box<dyn Listening>," in shell
+    # Handed over, and every call the shell makes goes to that socket's port.
+    assert '("listen", self.listening.handle().into()),' in shell
+    assert "forward::send(self.listening.port(), &ask, &limits)" in shell, "the first question"
+    assert "Phase::Ready => return Ok(self.listening.port())," in shell, "what is passed on"
+    assert shell.count("forward::send(") == 2 and "(self.listening.port(), st.was_ready)" in shell, "and the quit"
+    # The app's side: it serves on that socket and opens no port of its own.
+    a = app()
+    assert "fd=_shell_listener.fileno()" in repo("app.py")
+    assert "SO_ACCEPTCONN" in repo("app.py") and '("127.0.0.1", port)' in repo("app.py")
+    assert a._shell_listener is None, "an ordinary start has no such socket"
+
+
 def test_the_backend_is_only_ever_asked_on_this_pc():
     forward = rust("src", "forward.rs")
     assert forward.count("TcpStream::connect") == 1
@@ -174,7 +207,8 @@ def test_the_backend_is_only_ever_asked_on_this_pc():
     assert "TcpStream::connect_timeout(&address, limits.connect)" in forward
     for name in os.listdir(os.path.join(CORE, "src")):
         if name.endswith(".rs") and name != "forward.rs":
-            assert "TcpStream" not in rust("src", name), f"{name} opens a connection of its own"
+            shipped = rust("src", name).split("#[cfg(test)]")[0]        # (not the file's own tests)
+            assert "TcpStream" not in shipped, f"{name} opens a connection of its own"
     # What the browser says about where a call came from is not passed on.
     passed = forward[forward.index("const PASSED_ON"):forward.index("];", forward.index("const PASSED_ON"))]
     assert re.findall(r'"([a-z-]+)"', passed) == ["content-type", "accept", "accept-language", "x-vispora-token"]
@@ -250,6 +284,27 @@ class Trial:
                 self.process.kill()
 
 
+def can_be_listened_on(port):
+    """Can a socket of this (other) program listen on 127.0.0.1:`port`?
+    Tried the plain way, and the way that gets a second listener onto a port
+    whose first listener asked for a shareable address, as a web server's
+    own listener does on Windows."""
+    import socket
+    got = []
+    for sharing in (False, True):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if sharing:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", port))
+            got.append(True)
+        except OSError:
+            got.append(False)
+        finally:
+            s.close()
+    return tuple(got)
+
+
 def ended(pid, within=30):
     """Has the process `pid` ended, at the latest `within` seconds from now?"""
     done = []
@@ -272,6 +327,10 @@ def test_the_shell_and_the_backend_together():
         assert t.ask(do="wait", **{"for": "ready"}, within=90) == {"phase": "ready"}
         state = t.ask(do="state")
         backend = state["backend_pid"]
+        # The port is the shell's own socket, which the backend inherited:
+        # nobody else can listen there, whichever way they ask.
+        port = state["port"]
+        assert port >= 1024 and can_be_listened_on(port) == (False, False), "another listener got onto the shell's port"
         assert state["starts"] == 1 and isinstance(backend, int) and backend not in (os.getpid(), t.first["pid"])
         assert 0 < state["ready_ms"] < 90_000
         ours = a.app.test_client()
@@ -326,6 +385,7 @@ def test_the_shell_and_the_backend_together():
         assert token not in said, "the secret is in no line the shell says"
         assert t.process.wait(30) == 0
         assert ended(backend), "the backend outlived the shell's quit"
+        assert can_be_listened_on(port) == (True, True), "the port is anybody's again once the shell has ended"
         with open(notes, encoding="utf-8") as f:
             assert f.read() == "put back: user quit\n"
     finally:

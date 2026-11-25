@@ -21,7 +21,7 @@ use crate::forward;
 use crate::http::{Request, Response};
 use crate::json::Json;
 use crate::page;
-use crate::shell::Shell;
+use crate::shell::{Phase, Shell};
 use crate::token;
 
 /// The calls that are the shell's own, all of them made with POST.
@@ -80,14 +80,17 @@ impl Shell {
                 Response::json(200, &Json::object([("ok", true.into()), ("msg", "Goodbye".into())]))
             }
             "/api/window/close-and-game-mode" => {
-                // Two things: the window goes out of sight, which is the
-                // shell's, and the game monitor is switched on, which is the
-                // backend's.  The backend's answer says whether the window
-                // was hidden; it has none, so that part is set right here.
-                let hidden = window.is_some_and(|w| w.hide());
+                // Two things: the game monitor is switched on, which is
+                // the backend's, and the window goes out of sight, which is
+                // the shell's.  In that order, as app.py does it: a window
+                // that is gone while the monitor was not switched on (the
+                // backend still starting, or stopped) would look like it had
+                // worked.  The backend's answer says whether the window was
+                // hidden; it has none, so that part is set right here.
                 let mut answer = self.pass_on(request);
                 let mut said = answer.to_json();
-                if said.is_object() {
+                if answer.status == 200 && said["ok"].truthy() {
+                    let hidden = window.is_some_and(|w| w.hide());
                     said.set("hidden", hidden.into());
                     answer.body = said.to_string().into_bytes();
                 }
@@ -120,7 +123,9 @@ impl Shell {
             Ok(port) => port,
             Err((status, why)) => return Response::refused(status, &why),
         };
-        match forward::send(port, request, &self.settings.forward) {
+        // (not waited for once the backend is gone for good, or the shell is closing)
+        let worth_waiting = || matches!(self.phase(), Phase::Ready | Phase::Starting);
+        match forward::send_while(port, request, &self.settings.forward, &worth_waiting) {
             Ok(answer) => answer,
             Err(why) => {
                 self.say(&format!("{} {} was not answered: {why}", request.method, request.path()));

@@ -6,6 +6,8 @@ hand-over in one environment variable.  No release starts the app this way
 yet.  What is checked here is the app's side of that arrangement:
 
   * the hand-over: read, checked, and taken out of the environment;
+  * the backend serves on the socket the shell made and hands over, and on
+    no port of its own;
   * behind the shell, only the shell's address and secret are answered;
   * the backend leaves when the shell is gone, after putting the system
     back, and does not mistake "cannot be watched" for "gone";
@@ -16,11 +18,16 @@ The other side, and the two together, are in tests/test_shell_rs.py.
 import sandbox as m
 
 import contextlib
+import ctypes
 import inspect
 import json
+import socket
 import sys
+import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 
 import config
 
@@ -33,6 +40,8 @@ except ImportError as e:                            # Flask (or another dependen
 PORT = 49213
 TOKEN = "s3cret-" + "t" * 36 + "_AZaz09"
 SHELL_PID = 4321
+SHELL_STARTED = 134088000000000000              # when that process was started, as Windows counts it
+LISTEN = 812                                     # the number the shell's socket is handed over under
 
 
 def app():
@@ -42,21 +51,36 @@ def app():
 
 
 def environment(**changes):
-    given = {"port": PORT, "token": TOKEN, "shell_pid": SHELL_PID}
+    given = {"port": PORT, "listen": LISTEN, "token": TOKEN, "shell_pid": SHELL_PID, "shell_started": SHELL_STARTED}
     given.update(changes)
     return {app()._SHELL_HANDOFF_VAR: json.dumps(given)}
 
 
+def a_listening_socket(address="127.0.0.1", listening=True):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind((address, 0))
+    if listening:
+        sock.listen(16)
+    return sock, sock.getsockname()[1]
+
+
 @contextlib.contextmanager
 def behind_the_shell(pid=SHELL_PID):
-    """The app module as a shell's backend, and as it was again afterwards."""
+    """The app module as a shell's backend, and as it was again afterwards.
+    Gives the port of the socket "the shell" made for it."""
     a = app()
-    before = (a._behind_shell, a._API_TOKEN, a._LOCAL_HOSTS, a._LOCAL_ORIGINS, a._TOKEN_EXEMPT_PATHS, config.APP_PORT)
-    a._serve_for_the_shell({"port": PORT, "token": TOKEN, "shell_pid": pid})
+    before = (a._behind_shell, a._shell_listener, a._API_TOKEN, a._LOCAL_HOSTS, a._LOCAL_ORIGINS,
+              a._TOKEN_EXEMPT_PATHS, config.APP_PORT)
+    made, port = a_listening_socket()
+    a._serve_for_the_shell({"port": port, "listen": made.fileno(), "token": TOKEN, "shell_pid": pid,
+                            "shell_started": SHELL_STARTED})
     try:
-        yield a
+        yield port
     finally:
-        (a._behind_shell, a._API_TOKEN, a._LOCAL_HOSTS, a._LOCAL_ORIGINS, a._TOKEN_EXEMPT_PATHS, config.APP_PORT) = before
+        a._shell_listener.detach()                  # (the same socket as `made`, which closes it)
+        made.close()
+        (a._behind_shell, a._shell_listener, a._API_TOKEN, a._LOCAL_HOSTS, a._LOCAL_ORIGINS,
+         a._TOKEN_EXEMPT_PATHS, config.APP_PORT) = before
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -78,7 +102,8 @@ def test_the_hand_over_is_read_and_taken_out_of_the_environment():
     a = app()
     env = {**environment(), "PATH": "x"}
     got = a._take_shell_handoff(["Vispora.exe", "--backend", "--from-autostart"], env)
-    assert got == {"port": PORT, "token": TOKEN, "shell_pid": SHELL_PID}
+    assert got == {"port": PORT, "listen": LISTEN, "token": TOKEN, "shell_pid": SHELL_PID,
+                   "shell_started": SHELL_STARTED}
     assert env == {"PATH": "x"}, "the secret is not inherited by the programs the app starts"
 
 
@@ -87,11 +112,15 @@ def test_a_hand_over_that_cannot_be_used_is_refused():
     argv = ["Vispora.exe", "--backend"]
     bad = [{}, {a._SHELL_HANDOFF_VAR: ""}, {a._SHELL_HANDOFF_VAR: "not json"}, {a._SHELL_HANDOFF_VAR: "[]"},
            {a._SHELL_HANDOFF_VAR: json.dumps({"port": PORT, "token": TOKEN})},
-           {a._SHELL_HANDOFF_VAR: json.dumps({"port": PORT, "shell_pid": 1})}]
+           {a._SHELL_HANDOFF_VAR: json.dumps({"port": PORT, "shell_pid": 1})},
+           # (the hand-over of the first version of the shell: no socket, no start time)
+           {a._SHELL_HANDOFF_VAR: json.dumps({"port": PORT, "token": TOKEN, "shell_pid": SHELL_PID})}]
     bad += [environment(port=p) for p in (80, 1023, 65536, 0, -1, str(PORT), True, PORT + 0.5, None)]
     bad += [environment(token=t) for t in ("short", "x" * 31, "x" * 40 + "!", "x" * 40 + " ", "é" * 40, 12345, None,
                                            ["x" * 40])]
     bad += [environment(shell_pid=p) for p in (0, -5, "4321", True, 1.5, None)]
+    bad += [environment(shell_started=s) for s in (0, -1, "134088000000000000", True, 1.5, None)]
+    bad += [environment(listen=h) for h in (0, -1, "812", True, 8.5, None)]
     for env in bad:
         try:
             a._take_shell_handoff(argv, env)
@@ -101,7 +130,7 @@ def test_a_hand_over_that_cannot_be_used_is_refused():
             raise AssertionError(f"taken as a hand-over: {env}")
     # ... and the edges of what is taken.
     for good in (environment(port=1024), environment(port=65535), environment(token="A" * 32),
-                 environment(shell_pid=1)):
+                 environment(shell_pid=1), environment(shell_started=1), environment(listen=4)):
         assert a._take_shell_handoff(argv, good) is not None
 
 
@@ -111,7 +140,7 @@ def test_a_hand_over_that_cannot_be_used_is_refused():
 def test_behind_the_shell_only_the_shells_address_and_secret_are_answered():
     a = app()
     own_token, own_host = a._API_TOKEN, f"127.0.0.1:{config.APP_PORT}"
-    with behind_the_shell():
+    with behind_the_shell() as PORT:
         c = a.app.test_client()
         host = {"Host": f"127.0.0.1:{PORT}"}
         hello = c.get("/api/shell/hello", headers={**host, a._API_TOKEN_HEADER: TOKEN})
@@ -162,12 +191,12 @@ def test_the_backend_leaves_when_the_shell_is_gone():
     a._restore_system_before_exit = restore
     try:
         with behind_the_shell(pid=777):
-            outcome = a._leave_with_the_shell(wait=lambda pid: seen.append(("wait", pid)) or "ended",
+            outcome = a._leave_with_the_shell(wait=lambda pid, started: seen.append(("wait", pid, started)) or "ended",
                                               leave=lambda code: seen.append(("leave", code)))
     finally:
         a._restore_system_before_exit = real_restore
     assert outcome == "ended"
-    assert seen == [("wait", 777), ("restore", "shell gone"), ("leave", 0)], \
+    assert seen == [("wait", 777, SHELL_STARTED), ("restore", "shell gone"), ("leave", 0)], \
         "the system is put back before the process goes, as on every quit"
 
 
@@ -178,7 +207,7 @@ def test_a_shell_that_cannot_be_watched_is_not_taken_for_one_that_is_gone():
     a._restore_system_before_exit = lambda reason: seen.append(("restore", reason))
     try:
         with behind_the_shell():
-            outcome = a._leave_with_the_shell(wait=lambda pid: "cannot be watched (Windows error 5)",
+            outcome = a._leave_with_the_shell(wait=lambda pid, started: "cannot be watched (Windows error 5)",
                                               leave=lambda code: seen.append(("leave", code)))
     finally:
         a._restore_system_before_exit = real_restore
@@ -200,6 +229,101 @@ def test_waiting_for_a_process_really_waits_for_it():
     assert a._wait_for_process_to_end(child.pid) == "ended"
     assert a._wait_for_process_to_end(0x7FFFFFF0) == "ended"
     assert time.time() - started < 5
+
+
+def _started(process):
+    """When a process this test started was started, as Windows counts it."""
+    times = [ctypes.c_ulonglong() for _ in range(4)]
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessTimes.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(ctypes.c_ulonglong)] * 4
+    assert kernel32.GetProcessTimes(int(process._handle), *[ctypes.byref(t) for t in times])
+    return times[0].value
+
+
+def test_a_process_that_only_has_the_shells_number_is_not_the_shell():
+    """A process id is given out again once its process has ended.  If the
+    shell is gone before the backend looks, the number may be another
+    program's by then, and the backend would wait for that one to end.  The
+    shell hands its start time over with its id; the two together are its."""
+    a = app()
+    if sys.platform != "win32":
+        return
+    child = m.REAL_POPEN([sys.executable, "-c", "import time; time.sleep(1.5)"])
+    try:
+        started = _started(child)
+        assert started > 130000000000000000
+        # The right number and another start time: somebody else.  Said at
+        # once, while that process is still running.
+        began = time.time()
+        assert a._wait_for_process_to_end(child.pid, started + 10_000_000) == "ended"
+        assert a._wait_for_process_to_end(child.pid, 1) == "ended"
+        assert time.time() - began < 1.0 and child.poll() is None
+        # The right number and the right start time: waited for.
+        assert a._wait_for_process_to_end(child.pid, started) == "ended"
+        assert child.wait(5) == 0 and time.time() - began > 0.8
+    finally:
+        child.kill()
+
+
+# ═════════════════════════════════════════════════════════════════════
+# The socket the shell hands over
+# ═════════════════════════════════════════════════════════════════════
+def test_the_handed_over_socket_has_to_be_what_the_hand_over_says():
+    a = app()
+    made, port = a_listening_socket()
+    try:
+        adopted = a._adopt_shell_listener(made.fileno(), port)
+        assert adopted.fileno() == made.fileno() and adopted.getsockname() == ("127.0.0.1", port)
+        assert adopted.get_inheritable() is False, "not for the programs the backend starts"
+        adopted.detach()
+        refused = []
+        # Another port than it says; a socket that is not listening; one on
+        # every address of the PC; and a number that is no socket at all.
+        idle, idle_port = a_listening_socket(listening=False)
+        # (bound, not listening: listening on every address would have Windows ask the person at the PC about it)
+        wide, wide_port = a_listening_socket(address="0.0.0.0", listening=False)
+        for handle, said_port in ((made.fileno(), port + 1), (idle.fileno(), idle_port), (wide.fileno(), wide_port),
+                                  (0x7FFFFFF0, port)):
+            try:
+                a._adopt_shell_listener(handle, said_port)
+            except a.ShellHandoffError as e:
+                refused.append(str(e))
+        assert len(refused) == 4, refused
+        assert all("the socket the shell handed over" in why for why in refused), refused
+        # A refusal leaves the socket as it was: it is not this function's to close.
+        assert made.getsockname() == ("127.0.0.1", port) and idle.getsockname()[1] == idle_port
+        idle.close()
+        wide.close()
+    finally:
+        made.close()
+
+
+def test_behind_the_shell_the_backend_serves_on_the_shells_socket_and_no_other():
+    """The backend never opens a port of its own behind the shell: a port
+    that is let go of for it to take can be taken by somebody else in
+    between, who is then sent the secret with the next call."""
+    a = app()
+    src = inspect.getsource(a.start_flask)
+    behind, alone = src.index("if _shell_listener is not None:"), src.index("app.run(host=")
+    assert behind < src.index("fd=_shell_listener.fileno()") < src.index("            return\n") < alone
+    assert "_shell_listener = _adopt_shell_listener(handoff[\"listen\"], handoff[\"port\"])" in \
+        inspect.getsource(a._serve_for_the_shell)
+    # For real, in this process: the app's server on a socket made here.
+    with behind_the_shell() as port:
+        threading.Thread(target=a.start_flask, daemon=True, name="served-on-the-shells-socket").start()
+
+        def ask(token):
+            request = urllib.request.Request(f"http://127.0.0.1:{port}/api/shell/hello",
+                                             headers={a._API_TOKEN_HEADER: token})
+            try:
+                with urllib.request.urlopen(request, timeout=20) as answer:
+                    return answer.status, json.loads(answer.read())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+
+        status, said = ask(TOKEN)
+        assert status == 200 and said["behind_shell"] is True and said["version"] == config.APP_VERSION
+        assert ask("x" * len(TOKEN)) == (403, {"ok": False, "err": "missing or wrong session token"})
 
 
 def test_main_leaves_to_the_shell_what_is_the_shells():

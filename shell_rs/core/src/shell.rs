@@ -1,9 +1,18 @@
 //! The backend's start and stop, and quitting.
 //!
 //! The backend is the Python app, started as a program of its own with
-//! `--backend` and a hand-over in its environment: the port to listen on,
-//! the run's secret, and the shell's process id (app.py, "Running behind the
-//! shell").  From then on:
+//! `--backend` and a hand-over in its environment: the socket to serve on,
+//! the run's secret, and who the shell is (app.py, "Running behind the
+//! shell").
+//!
+//! The socket is the shell's.  It is made when the shell is, it cannot be
+//! listened on by anybody else, and the shell keeps it until it ends; each
+//! backend inherits it.  So every call the shell makes, the first "are you
+//! up" included, goes to a port that only this shell's backends can answer
+//! on.  That is what lets a call carry the run's secret: there is no moment
+//! in which somebody else could be listening there.
+//!
+//! From the start of a backend on:
 //!
 //! * It is **starting** until it answers `/api/shell/hello` with the version
 //!   this shell was built with.  Calls from the page that have to be passed
@@ -28,7 +37,7 @@ use std::time::{Duration, Instant};
 use crate::forward;
 use crate::http::Request;
 use crate::json::Json;
-use crate::platform::{Child, Command, Platform, Window};
+use crate::platform::{Child, Command, Listening, Platform, Window};
 use crate::token::{self, Token};
 
 /// What the shell is told when it is made.
@@ -45,6 +54,8 @@ pub struct Settings {
     pub origin: String,
     /// How long a backend may take to answer for the first time.
     pub ready_within: Duration,
+    /// How long one "are you up" may take, all of it.
+    pub hello_within: Duration,
     /// How long a call from the page waits for a backend that is not up yet.
     pub calls_wait: Duration,
     /// How long a backend that has been up may take to put the system back
@@ -52,8 +63,10 @@ pub struct Settings {
     pub quit_within: Duration,
     /// The same for a backend that never came up: it has little to put back.
     pub quit_unready_within: Duration,
-    /// How often a backend that stopped is started again within
-    /// `restarts_within`, and how long the shell waits before each.
+    /// How often a backend that stopped is started again: that many times
+    /// within `restarts_within` for one that had been up, that many times
+    /// in a row for one that never came up (however long each try took).
+    /// And how long the shell waits before each.
     pub restarts: usize,
     pub restarts_within: Duration,
     pub restart_pause: Duration,
@@ -73,6 +86,7 @@ impl Settings {
             // Python, Flask and the app's modules load in a second or two;
             // a cold disk and a virus scanner can make that many.
             ready_within: Duration::from_secs(90),
+            hello_within: Duration::from_secs(2),
             calls_wait: Duration::from_secs(30),
             // Quitting undoes game mode, hands the graphics card back and
             // waits for FFmpeg and PresentMon to stop.  Nobody has timed it
@@ -106,8 +120,12 @@ pub enum Phase {
 
 struct State {
     phase: Phase,
-    port: u16,
     child: Option<Box<dyn Child>>,
+    /// A backend is being started right now: its process may exist already
+    /// and is not in `child` yet.  A quit waits for this to be over.
+    launching: bool,
+    /// How many backends in a row never came up.
+    never_up_in_a_row: usize,
     /// Has a backend been up in this run?
     was_ready: bool,
     /// When backends were started.
@@ -126,6 +144,9 @@ pub struct Shell {
     pub settings: Settings,
     token: Token,
     platform: Box<dyn Platform>,
+    /// The socket every backend serves on (platform.rs), for as long as the
+    /// shell lives.
+    listening: Box<dyn Listening>,
     state: Mutex<State>,
     /// Rung whenever `state.phase` changes, for everybody who waits for one.
     changed: Condvar,
@@ -145,21 +166,27 @@ enum Watched {
     Left,
     /// It is another build than this shell.
     Wrong(String),
-    /// It ended, or never came up.
+    /// It ended after having been up.
     Stopped(String),
+    /// It never came up: it ended first, or did not answer in time.
+    NeverUp(String),
 }
 
 impl Shell {
     pub fn new(settings: Settings, platform: Box<dyn Platform>) -> Result<Arc<Shell>, String> {
         let token = Token::random(|bytes| platform.random(bytes))?;
+        // Before anything is started, and before anybody is asked anything.
+        let listening = platform.listen()?;
         Ok(Arc::new(Shell {
             settings,
             token,
             platform,
+            listening,
             state: Mutex::new(State {
                 phase: Phase::Starting,
-                port: 0,
                 child: None,
+                launching: false,
+                never_up_in_a_row: 0,
                 was_ready: false,
                 starts: Vec::new(),
                 ready_took: None,
@@ -196,6 +223,11 @@ impl Shell {
 
     pub fn phase(&self) -> Phase {
         self.state().phase.clone()
+    }
+
+    /// The port of the shell's own listening socket, on 127.0.0.1.
+    pub fn port(&self) -> u16 {
+        self.listening.port()
     }
 
     /// The backend's process id, while there is one.
@@ -256,7 +288,7 @@ impl Shell {
         let mut st = self.state();
         loop {
             match &st.phase {
-                Phase::Ready => return Ok(st.port),
+                Phase::Ready => return Ok(self.listening.port()),
                 Phase::Down(why) => return Err((503, why.clone())),
                 Phase::Quitting | Phase::Gone => return Err((503, "Vispora is closing.".to_string())),
                 Phase::Starting => {}
@@ -305,6 +337,17 @@ impl Shell {
                     return;
                 }
                 Watched::Stopped(what) => what,
+                Watched::NeverUp(what) => {
+                    // Counted by tries, not by the clock: a try that fails
+                    // slowly is still a try that failed.
+                    let tries = self.state().never_up_in_a_row;
+                    if tries > self.settings.restarts {
+                        self.say(&format!("the backend did not come up ({what}), {tries} times in a row: not started again"));
+                        self.give_up("Vispora's background program does not start. Close Vispora and open it again.".to_string());
+                        return;
+                    }
+                    what
+                }
             };
             let recent = {
                 let st = self.state();
@@ -337,34 +380,44 @@ impl Shell {
     /// Start one backend.  False when the shell is quitting and none is
     /// wanted any more.
     fn start_backend(&self) -> Result<bool, String> {
-        if matches!(self.state().phase, Phase::Quitting | Phase::Gone) {
-            return Ok(false);
+        {
+            let mut st = self.state();
+            if matches!(st.phase, Phase::Quitting | Phase::Gone) {
+                return Ok(false);
+            }
+            // From here until the new process is in `child`, a quit waits:
+            // it must not be over while a backend is being started that it
+            // has not seen.
+            st.launching = true;
         }
-        let port = self.platform.free_port()?;
+        let port = self.listening.port();
         let handoff = Json::object([
             ("port", (port as u32).into()),
+            ("listen", self.listening.handle().into()),
             ("token", self.token.as_str().into()),
             ("shell_pid", self.platform.own_pid().into()),
+            ("shell_started", self.platform.own_start().into()),
         ])
         .to_string();
-        let mut child = self.platform.start(&self.settings.backend, &handoff)?;
-        let pid = child.id();
+        let started = self.platform.start(&self.settings.backend, &handoff);
         let mut st = self.state();
-        if matches!(st.phase, Phase::Quitting | Phase::Gone) {
-            // The quit came while it was being started, and has not seen it.
-            drop(st);
-            child.kill();
-            return Ok(false);
-        }
-        st.phase = Phase::Starting;
-        st.port = port;
+        st.launching = false;
+        self.changed.notify_all();
+        let child = started?;
+        let pid = child.id();
+        // In `child` whatever has happened meanwhile: if a quit has begun,
+        // it is waiting for exactly this, and deals with the new backend as
+        // with any other (tells it, waits, ends it).
         st.child = Some(child);
         st.starts.push(Instant::now());
         st.ready_took = None;
-        self.changed.notify_all();
+        let wanted = !matches!(st.phase, Phase::Quitting | Phase::Gone);
+        if wanted {
+            st.phase = Phase::Starting;
+        }
         drop(st);
         self.say(&format!("backend started (pid {pid}, port {port})"));
-        Ok(true)
+        Ok(wanted)
     }
 
     /// Look at the backend until it stops, or until the shell quits.
@@ -372,23 +425,24 @@ impl Shell {
         let started = Instant::now();
         let mut ready = false;
         loop {
-            let port = {
+            {
                 let mut st = self.state();
                 if matches!(st.phase, Phase::Quitting | Phase::Gone) {
                     return Watched::Quitting;
                 }
                 if let Some(code) = st.child.as_mut().and_then(|child| child.exit_code()) {
                     st.child = None;
-                    if ready {
-                        st.phase = Phase::Starting;
-                        self.changed.notify_all();
+                    if !ready {
+                        st.never_up_in_a_row += 1;
+                        return Watched::NeverUp(format!("it ended with exit code {code} before it answered"));
                     }
-                    return if ready && code == 0 { Watched::Left } else { Watched::Stopped(format!("exit code {code}")) };
+                    st.phase = Phase::Starting;
+                    self.changed.notify_all();
+                    return if code == 0 { Watched::Left } else { Watched::Stopped(format!("exit code {code}")) };
                 }
-                st.port
-            };
+            }
             if !ready {
-                match self.hello(port) {
+                match self.hello() {
                     Some(version) if version == self.settings.version => {
                         let mut st = self.state();
                         if matches!(st.phase, Phase::Quitting | Phase::Gone) {
@@ -396,6 +450,7 @@ impl Shell {
                         }
                         st.phase = Phase::Ready;
                         st.was_ready = true;
+                        st.never_up_in_a_row = 0;
                         st.ready_took = Some(started.elapsed());
                         self.changed.notify_all();
                         drop(st);
@@ -411,7 +466,8 @@ impl Shell {
                     }
                     None if started.elapsed() > self.settings.ready_within => {
                         self.end_backend();
-                        return Watched::Stopped(format!("it did not answer within {} s", self.settings.ready_within.as_secs()));
+                        self.state().never_up_in_a_row += 1;
+                        return Watched::NeverUp(format!("it did not answer within {} s", self.settings.ready_within.as_secs()));
                     }
                     None => {}
                 }
@@ -421,11 +477,20 @@ impl Shell {
     }
 
     /// Ask the backend whether it is up.  Its version when it is.
-    fn hello(&self, port: u16) -> Option<String> {
+    ///
+    /// Asked on the shell's own socket, so whoever answers is a backend this
+    /// shell started.  While none is accepting yet, the question waits in
+    /// the socket's queue and is given up on after `hello_within`, all in
+    /// all: an answer that trickles in is not waited for either.
+    fn hello(&self) -> Option<String> {
         let ask = Request::new("GET", "/api/shell/hello").with_header(token::HEADER, self.token.as_str());
-        // (a port nobody listens on yet is found out at once on this PC's own address)
-        let limits = forward::Limits { connect: Duration::from_millis(100), silence: Duration::from_secs(5), body: 64 * 1024 };
-        let answer = forward::send(port, &ask, &limits).ok()?;
+        let limits = forward::Limits {
+            connect: Duration::from_millis(250),
+            silence: self.settings.hello_within,
+            whole: Some(self.settings.hello_within),
+            body: 64 * 1024,
+        };
+        let answer = forward::send(self.listening.port(), &ask, &limits).ok()?;
         let said = answer.to_json();
         if answer.status != 200 || !said["ok"].truthy() {
             return None;
@@ -482,12 +547,20 @@ impl Shell {
         if let Some(window) = self.window() {
             window.hide();
         }
+        // A backend that is being started this very moment is waited for:
+        // its process may exist already, and a quit that did not see it
+        // would be over, and the shell's process gone, with a backend left
+        // behind that is just beginning its start-up work.
         let (port, was_ready) = {
-            let st = self.state();
-            (st.port, st.was_ready)
+            let patience = began + self.settings.quit_within;
+            let mut st = self.state();
+            while st.launching && Instant::now() < patience {
+                st = self.changed.wait_timeout(st, Duration::from_millis(50)).unwrap_or_else(|poisoned| poisoned.into_inner()).0;
+            }
+            (self.listening.port(), st.was_ready)
         };
         let limit = if was_ready { self.settings.quit_within } else { self.settings.quit_unready_within };
-        let give_up = began + limit;
+        let give_up = Instant::now().max(began) + limit;
 
         // Tell the backend, on a thread of its own: its answer only comes
         // when it has put the system back, and the wait below is for its
@@ -499,7 +572,12 @@ impl Shell {
                     .with_header(token::HEADER, me.token.as_str())
                     .with_header("Content-Type", "application/json")
                     .with_body("{}");
-                let limits = forward::Limits { connect: Duration::from_millis(250), silence: limit + Duration::from_secs(1), body: 64 * 1024 };
+                let limits = forward::Limits {
+                    connect: Duration::from_millis(250),
+                    silence: limit + Duration::from_secs(1),
+                    whole: Some(limit + Duration::from_secs(1)),
+                    body: 64 * 1024,
+                };
                 while Instant::now() < give_up && me.state().child.is_some() {
                     match forward::send(port, &ask, &limits) {
                         Ok(answer) => {

@@ -466,7 +466,7 @@ numbers say something about a real PC and which do not:
 | The shell's process is up | (does not exist) | 12 ms | Real: it is the shell's own exe. Without the window, which will add to it |
 | The page can be handed to a window | after the unpacking (0.3 to 2.9 s) and Python and Flask (0.5 s and more) | **14 ms** after the shell's process started | Real for the shell. It does not wait for the backend: the page is compiled in |
 | A window on screen | 1 s (1 to 5) after the first log line, by hand | not measured | There is no window yet. The next piece |
-| The backend answers | (the same process) | 0.8 s after the shell started it | A trial's. Python 3.14 from source on the fake machine: no unpacking, no start-up work. A real backend does more |
+| The backend answers | (the same process) | 0.6 s after the shell started it | A trial's. Python 3.14 from source on the fake machine: no unpacking, no start-up work. A real backend does more |
 | A call the page makes | straight to Flask | 0.8 ms through the shell and back (1.0 ms for the slowest in twenty) | Real for the way through the shell; the route asked is the cheapest one |
 | A call the shell answers itself | (goes to Flask) | under 0.05 ms | Real |
 | Quit, until both processes are gone | not measured (see Quitting) | 0.1 s | A trial's: on the fake machine a quit has nothing to undo. What is real: the fixed half second before the old exit is not waited behind the shell |

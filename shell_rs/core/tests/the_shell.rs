@@ -33,14 +33,15 @@ fn the_backend_is_started_with_a_hand_over_and_asked_whether_it_is_up() {
     assert_eq!(rig.stage.count(), 1);
     let backend = rig.stage.last();
     assert_eq!(backend.command, rig.shell.settings.backend);
-    // The hand-over: where to listen, the secret, and who the shell is.
+    // The hand-over: the socket to serve on, the secret, and who the shell is.
     let given = Json::parse(&backend.handoff).unwrap();
     let Json::Object(fields) = &given else { panic!("{given}") };
     let mut names: Vec<&str> = fields.iter().map(|(name, _)| name.as_str()).collect();
     names.sort();
-    assert_eq!(names, ["port", "shell_pid", "token"]);
-    assert_eq!(given["shell_pid"].as_int(), Some(4242));
-    assert!(backend.port >= 1024);
+    assert_eq!(names, ["listen", "port", "shell_pid", "shell_started", "token"]);
+    assert_eq!((given["shell_pid"].as_int(), given["shell_started"].as_int()), (Some(4242), Some(SHELL_STARTED as i128)));
+    assert_eq!((given["listen"].as_int(), given["port"].as_int()), (Some(HANDLE as i128), Some(rig.shell.port() as i128)));
+    assert!(backend.port >= 1024 && backend.port == rig.stage.port());
     assert_eq!(backend.token, rig.shell.token().as_str());
     assert_eq!(backend.token.len(), 43);
     assert_eq!(rig.shell.fragment(), format!("#t={}", backend.token));
@@ -93,7 +94,7 @@ fn a_backend_that_never_comes_up_is_ended_started_again_and_then_given_up_on() {
     let rig = Rig::with(vec![Behaviour { never_up: true, ..Behaviour::default() }], settings);
     rig.shell.start();
     let phase = rig.shell.wait_for(Duration::from_secs(10), down);
-    assert_eq!(phase, Phase::Down("Vispora's background program keeps stopping. Close Vispora and open it again.".into()));
+    assert_eq!(phase, Phase::Down("Vispora's background program does not start. Close Vispora and open it again.".into()));
     // The first start and two more (settings.restarts), each ended.
     assert_eq!(rig.stage.count(), 3);
     for n in 0..3 {
@@ -103,9 +104,10 @@ fn a_backend_that_never_comes_up_is_ended_started_again_and_then_given_up_on() {
     let began = Instant::now();
     let answer = rig.call("GET", "/api/echo");
     assert_eq!(answer.status, 503);
-    assert!(answer.to_json()["err"].as_str().unwrap().starts_with("Vispora's background program keeps stopping."));
+    assert!(answer.to_json()["err"].as_str().unwrap().starts_with("Vispora's background program does not start."));
     assert!(began.elapsed() < Duration::from_millis(500));
-    assert!(rig.shell.history().join("\n").contains("it did not answer within 0 s"), "{:?}", rig.shell.history());
+    let history = rig.shell.history().join("\n");
+    assert!(history.contains("the backend did not come up (it did not answer within 0 s), 3 times in a row"), "{history}");
     // ... and it can still be quit.
     assert_eq!(rig.shell.quit_and_wait("test"), 0);
     assert_eq!(rig.shell.phase(), Phase::Gone);
@@ -399,9 +401,168 @@ fn a_backend_that_dies_during_the_quit_is_not_started_again() {
 fn a_shell_that_was_never_started_can_be_quit() {
     let rig = Rig::with(vec![], settings());
     assert_eq!(rig.shell.quit_and_wait("nothing to do"), 0);
-    assert_eq!((rig.shell.phase(), rig.stage.count(), rig.exits()), (Phase::Gone, 0, vec![0]));
+    assert_eq!((rig.shell.phase(), rig.stage.count()), (Phase::Gone, 0));
+    assert!(wait(|| rig.exits() == [0], 5.0), "{:?}", rig.exits());
     // Starting it after that starts nothing.
     rig.shell.start();
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!((rig.shell.phase(), rig.stage.count()), (Phase::Gone, 0));
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// From the review of the first version
+// ═════════════════════════════════════════════════════════════════════
+
+#[test]
+fn the_socket_is_the_shells_from_before_the_first_backend_to_after_the_last() {
+    // Every call carries the secret, and a call goes to whoever listens.
+    // So the port must never be free for somebody else to listen on: not
+    // before a backend is up, not while one is started again, not after.
+    let dies = Behaviour { ends_after: Some((Duration::from_millis(300), 3)), ..Behaviour::default() };
+    let rig = Rig::with(vec![dies, Behaviour::default()], settings());
+    let taken = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_err();
+    // Made with the shell, before anything is started or asked.
+    assert_eq!((rig.stage.listens.load(Ordering::SeqCst), rig.stage.count()), (1, 0));
+    let port = rig.shell.port();
+    assert_eq!(port, rig.stage.port());
+    assert!(taken(port), "the port was free before the first backend");
+    rig.shell.start();
+    assert_eq!(rig.wait_ready(), Phase::Ready);
+    assert!(taken(port));
+    // The first backend dies and a second is started: on the same socket.
+    assert!(wait(|| rig.stage.count() == 2 && !rig.stage.backend(0).alive(), 10.0));
+    assert!(taken(port), "the port was free while the backend was being started again");
+    assert_eq!(rig.wait_ready(), Phase::Ready);
+    assert_eq!(rig.stage.listens.load(Ordering::SeqCst), 1, "one socket for the shell's whole life");
+    let (first, second) = (rig.stage.backend(0), rig.stage.backend(1));
+    assert_eq!((first.port, first.listen), (port, HANDLE as i128));
+    assert_eq!((second.port, second.listen), (port, HANDLE as i128));
+    assert_eq!(rig.call("GET", "/api/echo").status, 200);
+    // Whatever either of them was ever asked, it was asked on that socket.
+    for backend in [&first, &second] {
+        let seen = backend.seen.lock().unwrap();
+        assert!(!seen.is_empty() && seen.iter().all(|call| call.header("Host") == Some(&format!("127.0.0.1:{port}"))));
+    }
+    assert_eq!(rig.shell.quit_and_wait("test"), 0);
+    assert!(taken(port), "the port was free while the shell still existed");
+}
+
+#[test]
+fn a_backend_that_never_comes_up_is_given_up_on_however_long_each_try_takes() {
+    // The proportions of the real limits: one try (ready_within, 90 s) is
+    // so long that there are never more than a few inside the time the
+    // restarts are counted in (restarts_within, 300 s).  Counted by the
+    // clock alone, a backend that never comes up would be started for ever.
+    let mut settings = settings();
+    settings.ready_within = Duration::from_millis(300);
+    settings.hello_within = Duration::from_millis(100);
+    settings.restarts_within = Duration::from_millis(350);
+    settings.restarts = 2;
+    let rig = Rig::with(vec![Behaviour { never_up: true, ..Behaviour::default() }], settings);
+    let began = Instant::now();
+    rig.shell.start();
+    let phase = rig.shell.wait_for(Duration::from_secs(8), down);
+    assert_eq!(phase, Phase::Down("Vispora's background program does not start. Close Vispora and open it again.".into()),
+               "after {:?}: {:?}", began.elapsed(), rig.shell.history());
+    assert_eq!(rig.stage.count(), 3, "the first try and two more");
+    assert!(began.elapsed() < Duration::from_secs(4), "{:?}", began.elapsed());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(rig.stage.count(), 3, "and no fourth");
+    // One that comes up in between starts the count again.
+    let up_once = Behaviour { ends_after: Some((Duration::from_millis(150), 3)), ..Behaviour::default() };
+    let never = Behaviour { never_up: true, ..Behaviour::default() };
+    let mut settings = self::settings();
+    settings.ready_within = Duration::from_millis(200);
+    settings.hello_within = Duration::from_millis(100);
+    settings.restarts_within = Duration::from_millis(100);
+    settings.restarts = 1;
+    let rig = Rig::with(vec![never.clone(), up_once, never], settings);
+    rig.shell.start();
+    assert!(down(&rig.shell.wait_for(Duration::from_secs(8), down)), "{:?}", rig.shell.history());
+    assert_eq!(rig.stage.count(), 4, "never up, up and died, never up, never up: {:?}", rig.shell.history());
+}
+
+#[test]
+fn a_quit_waits_for_a_backend_that_is_being_started() {
+    // The quit comes while the backend's process is being made: it exists
+    // already, or is about to, and the shell does not have it yet.  A quit
+    // that did not wait would be over, and the shell's process gone, with a
+    // backend left behind that is just beginning its start-up work.
+    let rig = Rig::with(vec![Behaviour::default()], settings());
+    // What the exit hook saw: how many backends there were, how many alive.
+    let at_exit: Arc<Mutex<Vec<(usize, usize)>>> = Arc::default();
+    let (seen, stage) = (at_exit.clone(), rig.stage.clone());
+    *rig.shell.exit_hook.lock().unwrap() = Some(Arc::new(move |_code| {
+        let started = stage.started.lock().unwrap();
+        seen.lock().unwrap().push((started.len(), started.iter().filter(|backend| backend.alive()).count()));
+    }));
+    rig.stage.start_is_held.store(true, Ordering::SeqCst);
+    rig.shell.start();
+    assert!(wait(|| rig.stage.starts_begun.load(Ordering::SeqCst) == 1, 5.0));
+    rig.shell.quit("changed my mind");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(at_exit.lock().unwrap().is_empty(), "the quit was over while a backend was being started");
+    assert_eq!(rig.shell.phase(), Phase::Quitting);
+    rig.stage.start_is_held.store(false, Ordering::SeqCst);
+    assert_eq!(rig.shell.wait_for(Duration::from_secs(10), |phase| *phase == Phase::Gone), Phase::Gone);
+    assert!(wait(|| at_exit.lock().unwrap().len() == 1, 5.0));
+    assert_eq!(*at_exit.lock().unwrap(), [(1, 0)], "the backend that was started in between was dealt with before the shell went");
+    // Dealt with as any other: told to quit, which it did.
+    let backend = rig.stage.last();
+    assert_eq!(backend.times_asked("/api/window/quit"), 1);
+    assert!(!*backend.was_ended_by_force.lock().unwrap());
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!((rig.stage.count(), rig.shell.phase()), (1, Phase::Gone));
+}
+
+#[test]
+fn an_answer_that_trickles_in_does_not_hold_the_start_up() {
+    // "Are you up" answered a byte at a time is never silent, and would be
+    // waited for long past the time a backend is given to come up.
+    let mut settings = settings();
+    settings.ready_within = Duration::from_millis(500);
+    settings.hello_within = Duration::from_millis(150);
+    settings.restarts = 0;
+    let trickles = Behaviour { drips_hello: Some(Duration::from_millis(40)), ..Behaviour::default() };
+    let rig = Rig::with(vec![trickles], settings);
+    let began = Instant::now();
+    rig.shell.start();
+    let phase = rig.shell.wait_for(Duration::from_secs(8), down);
+    assert!(down(&phase), "{phase:?}");
+    assert!(began.elapsed() < Duration::from_secs(3), "the start-up was held for {:?}", began.elapsed());
+    assert_eq!(rig.stage.count(), 1);
+}
+
+#[test]
+fn the_window_is_not_hidden_when_the_game_monitor_was_not_switched_on() {
+    let mut settings = settings();
+    settings.calls_wait = Duration::from_millis(150);
+    let rig = Rig::with(vec![Behaviour { never_up: true, ..Behaviour::default() }], settings);
+    rig.shell.start();
+    let answer = rig.call("POST", "/api/window/close-and-game-mode");
+    assert_eq!(answer.status, 503);
+    assert_eq!(answer.to_json()["err"].as_str(), Some("Vispora is still starting. Try again in a moment."));
+    assert_eq!(rig.pane.hidden.load(Ordering::SeqCst), 0, "the window went although nothing was switched on");
+}
+
+#[test]
+fn a_call_is_not_waited_for_once_the_backend_is_gone_for_good() {
+    // The shell's socket takes a call in whether or not a backend is there
+    // to answer.  A call made just as the backend dies must not sit in the
+    // queue until the long limit on silence: when the shell has given up on
+    // the backend, the wait is over.
+    let mut settings = settings();
+    settings.restarts = 0;
+    settings.forward.silence = Duration::from_secs(60);
+    let rig = Rig::with(vec![Behaviour::default(), Behaviour { never_up: true, ..Behaviour::default() }], settings);
+    rig.shell.start();
+    assert_eq!(rig.wait_ready(), Phase::Ready);
+    let (shell, request) = (rig.shell.clone(), rig.asking("GET", "/api/slow?15000"));
+    let began = Instant::now();
+    let call = std::thread::spawn(move || shell.handle(&request));
+    assert!(wait(|| rig.stage.last().times_asked("/api/slow?15000") == 1, 5.0));
+    rig.stage.last().end(3);
+    let answer = call.join().unwrap();
+    assert_eq!(answer.status, 502);
+    assert!(began.elapsed() < Duration::from_secs(10), "{:?}", began.elapsed());
 }

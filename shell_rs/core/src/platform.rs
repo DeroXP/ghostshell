@@ -1,6 +1,7 @@
 //! The shell's doors to the outside, so that the tests can stand in for
-//! them: starting the backend, and the window.  (Calls to the backend are
-//! real connections to 127.0.0.1 in the tests too: forward.rs.)
+//! them: starting the backend, the socket the backend serves on, and the
+//! window.  (Calls to the backend are real connections to 127.0.0.1 in the
+//! tests too: forward.rs.)
 
 /// How the backend is started.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,18 +26,41 @@ pub trait Child: Send {
     fn kill(&mut self);
 }
 
+/// The socket the backend serves on.
+///
+/// The shell makes it, before any backend exists, and keeps it for as long
+/// as the shell lives.  Every backend the shell starts inherits it and
+/// accepts the shell's calls on it; the backend never opens a port of its
+/// own.  So the port is never free and never anybody else's: not in the
+/// moment before a backend is up, not while one is being started again, not
+/// after one has died.  That matters because every call carries the run's
+/// secret, and a call goes to whoever is listening.
+pub trait Listening: Send + Sync {
+    /// The port on 127.0.0.1.
+    fn port(&self) -> u16;
+    /// The number a program started by this one finds the socket under.
+    fn handle(&self) -> u64;
+}
+
 pub trait Platform: Send + Sync {
+    /// A socket listening on 127.0.0.1, on a port Windows picks, that no
+    /// other program can listen on as well and that a program started with
+    /// `start` inherits.
+    fn listen(&self) -> Result<Box<dyn Listening>, String>;
     /// Start the backend, with `handoff` in its environment under
     /// HANDOFF_VARIABLE and nowhere else (not on its command line, which
     /// other programs can read).
     fn start(&self, command: &Command, handoff: &str) -> Result<Box<dyn Child>, String>;
-    /// A port on 127.0.0.1 that nothing listens on right now.
-    fn free_port(&self) -> Result<u16, String>;
     /// Random bytes, for the run's secret.
     fn random(&self, bytes: &mut [u8]) -> Result<(), String>;
     /// This process's id, which the backend watches: when the shell is gone,
     /// the backend puts the system back and goes too.
     fn own_pid(&self) -> u32;
+    /// When this process was started, as Windows counts it.  Handed over
+    /// with the id: an id is given out again once its process has ended,
+    /// and the two together tell the shell from whoever has its number
+    /// later.
+    fn own_start(&self) -> u64;
 }
 
 /// The window, as far as the page's calls reach it.  Each answer says

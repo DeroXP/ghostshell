@@ -183,8 +183,10 @@ touched until then.
 Decided while writing the core (the reasons are in
 [shell_rs/README.md](../shell_rs/README.md)):
 
-* The backend listens on a port the shell picks, not on the fixed 5987. A
-  port that was taken or reserved used to leave the window blank.
+* The backend serves on a socket the shell makes and keeps, not on the
+  fixed port 5987 and not on a port of its own. A port that was taken or
+  reserved used to leave the window blank; and a port that is free for a
+  moment is somebody else's to listen on, who is then sent the secret.
 * The secret that tells the app's own page from a stranger is made by the
   shell and handed to both sides. The backend gets it in its environment
   and takes it out again at once.
