@@ -108,13 +108,28 @@ WINDOW_FOLDER = re.compile(r"^Vispora-window-[0-9a-f]{32}$")
 WRITTEN_DOWN_AFTER_S = 12
 
 
-def built(name):
-    outside = os.path.join(os.environ.get("CARGO_TARGET_DIR") or HERE, "release", name)
-    return outside if os.path.isfile(outside) else os.path.join(HERE, "target", "release", name)
+def built(name, crate=None):
+    """Where cargo put `name`: in the folder CARGO_TARGET_DIR names (the
+    build output is kept out of the repository, see README.md), or in the
+    target folder of the crate it belongs to (`crate`; this one's own if
+    none is named).  Where it would be in the crate's own folder, if it is
+    nowhere: that is the place to name when saying that it is missing."""
+    folders = [os.path.join(crate or HERE, "target")]
+    if os.environ.get("CARGO_TARGET_DIR"):
+        folders.insert(0, os.environ["CARGO_TARGET_DIR"])
+    for folder in folders:
+        path = os.path.join(folder, "release", name)
+        if os.path.isfile(path):
+            return path
+    return path
 
 
+# The exe is this crate's.  The trial tool, which also makes packs
+# (shell_rs/README.md, "One file"), is the core's: built with the core, and
+# where each crate builds into its own folder, it is in the core's.
+CORE = os.path.normpath(os.path.join(HERE, "..", "core"))
 EXE = built("VisporaShell.exe")
-PACK_TOOL = built("vispora-shell-try.exe")      # (it also makes packs: shell_rs/README.md, "One file")
+PACK_TOOL = built("vispora-shell-try.exe", CORE)
 
 
 def refuse(why):
@@ -210,7 +225,7 @@ class Run:
         if keep is not None:
             told["keep"] = keep
         self.env["VISPORA_SHELL_TRY"] = json.dumps(told)
-        self.debug_port = self.planted_profile = self.left_behind = self.not_marked = None
+        self.debug_port = self.planted_profile = self.left_behind = self.not_marked = self.somebody_elses = None
         if planted:
             # What a program without rights could do before the app starts:
             # settings for WebView2 in the person's environment (a way in for
@@ -223,14 +238,24 @@ class Run:
             # One as a run that was ended from outside leaves it: with its
             # mark, which nobody holds any more.  And one without a mark,
             # made a moment ago: a folder that is being made looks like that.
+            # Both made as the shell makes its own (whose they are, and who
+            # gets in).  And one with the same name and the same mark that
+            # somebody else made, as any program may in that place.
             self.left_behind = os.path.join(self.data, "Vispora-window-" + "0" * 32)
             self.not_marked = os.path.join(self.data, "Vispora-window-" + "1" * 32)
-            for folder in (self.left_behind, self.not_marked):
+            self.somebody_elses = os.path.join(self.data, "Vispora-window-" + "2" * 32)
+            os.makedirs(self.data, exist_ok=True)
+            for folder in (self.left_behind, self.not_marked, self.somebody_elses):
+                if folder == self.somebody_elses:
+                    os.mkdir(folder)
+                else:
+                    make_closed_folder(folder)
                 os.makedirs(os.path.join(folder, "EBWebView", "Default", "Service Worker"))
                 with open(os.path.join(folder, "EBWebView", "Default", "Service Worker", "planted.js"), "w") as f:
                     f.write("// what an earlier run left, or somebody put there")
-            with open(os.path.join(self.left_behind, "in-use"), "w"):
-                pass
+            for folder in (self.left_behind, self.somebody_elses):
+                with open(os.path.join(folder, "in-use"), "w"):
+                    pass
         if plant:
             plant(self)
         self.began = time.time()
@@ -287,10 +312,11 @@ class Run:
     def tidied(self):
         """What each start that shares this run's folders found among the
         window's old folders, oldest first: (entries looked at, milliseconds,
-        removed, left alone)."""
+        removed, left alone, somebody else's and not touched)."""
         return [tuple(int(n) for n in found) for found in re.findall(
             r"the window's old folders: (\d+) entries looked at in (\d+) ms, "
-            r"(\d+) left behind by earlier runs and removed, (\d+) in use and left alone", self.log())]
+            r"(\d+) left behind by earlier runs and removed, (\d+) in use and left alone, "
+            r"(\d+) not this program's making and not touched", self.log())]
 
     def unpacked(self):
         """What the shell last said about unpacking its backend: which way
@@ -507,6 +533,31 @@ def find_window(pid, shown=True):
 
     user32.EnumWindows(each, 0)
     return found[0] if found else None
+
+
+def make_closed_folder(path):
+    """Make the folder `path` as the shell makes its own in a trial: this
+    account's, open to this account and to Windows itself, and to nobody
+    else, with nothing taken over from the folder above."""
+    who = own_account()
+    described = "O:%sD:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)" % (who, who)
+
+    class Attributes(ctypes.Structure):
+        _fields_ = [("length", wintypes.DWORD), ("descriptor", ctypes.c_void_p), ("inherit", wintypes.BOOL)]
+
+    advapi, kernel = ctypes.WinDLL("advapi32", use_last_error=True), ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    kernel.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(Attributes)]
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    descriptor = ctypes.c_void_p()
+    if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(described, 1, ctypes.byref(descriptor), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    attributes = Attributes(ctypes.sizeof(Attributes), descriptor, 0)
+    made, error = kernel.CreateDirectoryW(path, ctypes.byref(attributes)), ctypes.get_last_error()
+    kernel.LocalFree(descriptor)
+    if not made:
+        raise ctypes.WinError(error)
 
 
 def who_gets_in(folder, note):
@@ -781,7 +832,7 @@ def every_check(root, check):
         folder = run.window_folder()
         check("the window has a folder of this run's own, and WebView2 is in it: %s" % (folder and os.path.basename(folder)),
               folder and os.path.isdir(os.path.join(folder, "EBWebView")) and os.path.dirname(folder) == run.data
-              and WINDOW_FOLDER.match(os.path.basename(folder)) and folder not in (run.left_behind, run.not_marked))
+              and WINDOW_FOLDER.match(os.path.basename(folder)) and folder not in (run.left_behind, run.not_marked, run.somebody_elses))
         # The window's old folders are looked at once the window is there.
         tidied = run.wait_for(run.tidied, 20)
         check("a folder as a run that was ended from outside leaves it was removed, not used: %r" % (tidied,),
@@ -790,6 +841,10 @@ def every_check(root, check):
               tidied and tidied[0][3] == 2
               and os.path.isfile(os.path.join(run.not_marked, "EBWebView", "Default", "Service Worker", "planted.js"))
               and os.listdir(run.not_marked) == ["EBWebView"])
+        check("one with the same name and the same mark that somebody else made was not touched, and not used",
+              tidied and tidied[0][4] == 1 and sorted(os.listdir(run.somebody_elses)) == ["EBWebView", "in-use"]
+              and os.path.isfile(os.path.join(run.somebody_elses, "EBWebView", "Default", "Service Worker", "planted.js"))
+              and who_gets_in(run.somebody_elses, os.path.join(run.root, "somebody-who.txt")) != who_gets_in(run.not_marked, os.path.join(run.root, "ours-who.txt")))
         check("this run's folder is marked as in use: nobody else can open the mark", folder and not can_open(os.path.join(folder, "in-use")))
 
         gets_in = who_gets_in(folder, os.path.join(run.root, "who-gets-in.txt")) if folder else ""
@@ -868,7 +923,8 @@ def every_check(root, check):
         log = run.log()
         check("the secret is in no line of the log", "#t=" not in log and "token" not in log.lower() and secret not in log)
         left = [os.path.relpath(where, run.root) for where, folders, _ in os.walk(run.root)
-                if ("EBWebView" in folders or os.path.basename(where).startswith("Vispora-window-")) and where != run.not_marked]
+                if ("EBWebView" in folders or os.path.basename(where).startswith("Vispora-window-"))
+                and where not in (run.not_marked, run.somebody_elses)]
         check("the window's folder is gone after the run, and nothing of WebView2 is left anywhere else: %r" % (left,),
               folder and not os.path.exists(folder) and not left)
         found, read, _ = files_with(run.root, secret, but=(run.secret_file,))
@@ -1069,11 +1125,38 @@ def one_file(root, check):
         check("a run that Windows ended (exit code %r) leaves its backend's folder behind, with nobody holding its mark" % (ended(run),),
               os.path.isdir(left) and can_open(os.path.join(left, "in-use")))
         time.sleep(3)                               # (WebView2's programs let go of the window's folder)
+        # A backend that outlived its shell: a program is still running in
+        # the folder, under the backend's name, when the next start comes.
+        # (The trial's own tool, told to be there and do nothing.  A file
+        # beside it that comes first when the folder is read: taking a
+        # folder away stops at what Windows will not let go, not before.)
+        its_program, comes_first = os.path.join(left, "VisporaBackend.exe"), os.path.join(left, "0-comes-first.txt")
+        shutil.copyfile(PACK_TOOL, its_program)
+        with open(comes_first, "w") as f:
+            f.write("still needed")
+        outlived = subprocess.Popen([its_program, "--only-be-there"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        try:
+            meanwhile = Run(root, "hidden", pack=pack, keep=False, beside=run)
+            try:
+                first_screen(meanwhile)
+                tidied = meanwhile.wait_for(lambda: len(meanwhile.tidied()) >= 2 and meanwhile.tidied(), 20)
+                check("a start while a program still runs in that folder leaves the folder whole, and takes the window's away: %r"
+                      % (tidied and tidied[-1],),
+                      tidied and tidied[-1][2] == 1 and not os.path.exists(window_left) and outlived.poll() is None
+                      and os.path.isfile(comes_first) and os.path.isfile(os.path.join(left, "in-use"))
+                      and os.path.isfile(os.path.join(left, "_internal", "python312.dll")))
+                quit_by_its_window(meanwhile)
+            finally:
+                meanwhile.end()
+        finally:
+            outlived.stdin.close()
+            outlived.wait(20)
         after = Run(root, "hidden", pack=pack, keep=False, beside=run)
         first_screen(after)
-        tidied = after.wait_for(lambda: len(after.tidied()) >= 2 and after.tidied(), 20)
-        check("the next start takes it away, and the window's folder with it: %r" % (tidied and tidied[-1],),
-              tidied and tidied[-1][2] == 2 and not os.path.exists(left) and not os.path.exists(window_left))
+        tidied = after.wait_for(lambda: len(after.tidied()) >= 3 and after.tidied(), 20)
+        check("once that program has ended, the next start takes the folder away: %r" % (tidied and tidied[-1],),
+              tidied and tidied[-1][2] == 1 and not os.path.exists(left))
         check("and has a backend folder of its own", after.unpacked().get("folder") not in ("", None, left) and os.path.isdir(after.unpacked()["folder"]))
         quit_by_its_window(after)
     finally:
@@ -1115,20 +1198,19 @@ def one_file(root, check):
     check("the next start finds the folder, holds it against the exe and uses it: nothing is unpacked (checked in %s ms)" % got.get("ms"),
           up and got.get("kind") == "kept-found" and got.get("folder") == kept)
 
-    # A folder that does not pass is never used, and never put right.
-    program = os.path.join(kept, "VisporaBackend.exe")
+    # The shell's own folder, and no longer what the exe carries (a virus
+    # scanner took a file away, say): never put right in place.  It is
+    # taken away whole and made again, and the backend is run from that.
+    program, too_many = os.path.join(kept, "VisporaBackend.exe"), os.path.join(kept, "_internal", "left-from-before.txt")
     with open(program, "r+b") as f:
         f.write(b"XX")                              # (two other letters, the same length)
+    with open(too_many, "w") as f:
+        f.write("not the exe's")
     up, got, log, _ = later("a start with a changed program in the folder")
-    check("a folder whose program was changed is not used: the backend is unpacked for that run instead",
-          up and got.get("kind") == "run" and "the folder that stays is not used: VisporaBackend.exe is not what the exe carries" in log
-          and not os.path.exists(got.get("folder", kept)))
-    try:
-        with open(program, "rb") as f:
-            begins = f.read(2)
-    except OSError:
-        begins = None                               # (it was taken away)
-    check("and the changed folder is left as it is: not put right, not taken away", begins == b"XX")
+    check("the shell's own folder whose program was changed is taken away whole and made again: %s" % got.get("kind"),
+          up and got.get("kind") == "kept-new" and got.get("folder") == kept
+          and "did not hold what the exe carries" in log and "taken away to be made again" in log)
+    check("what is in it now is what the exe carries, and nothing from before", same_files(kept, source) and not os.path.exists(too_many))
 
     # Another version: its folder stays, the other one's goes.
     newer, says_newer, source_newer = made_up_backend(root, "newer", more=b", in another version")
@@ -1149,15 +1231,35 @@ def one_file(root, check):
         check("a start of another version meanwhile makes its own folder and leaves that one as it is: %r" % (others,),
               up and got.get("kind") == "kept-new" and got.get("folder") == kept and others == [("0", "1", "0")]
               and same_files(kept_newer, source_newer))
+        # The folder a copy runs from is no longer what the exe carries.
+        # While that copy runs, nobody takes the folder away under it: a
+        # second copy of the version unpacks for its run instead.
+        its_program = os.path.join(kept_newer, "VisporaBackend.exe")
+        with open(its_program, "r+b") as f:
+            f.write(b"XX")
+        up, got, log, _ = later("a second copy of that version meanwhile", pack=newer)
+        try:
+            with open(its_program, "rb") as f:
+                begins = f.read(2)
+        except OSError:
+            begins = None                           # (it was taken away)
+        check("a folder that a copy runs from and that is not what the exe carries any more is left as it is: "
+              "a second copy unpacks for its run instead",
+              up and got.get("kind") == "run" and "could not be taken away to be made again (a copy of the app is using it)" in log
+              and begins == b"XX")
         check("the open copy's page goes on working, and it quits as ever (exit code %r)" % (quit_by_its_window(open_copy),),
               open_copy.process.returncode == 0)
         check("once it is gone, its folder can be given another name again", can_be_renamed(kept_newer))
     finally:
         open_copy.end()
     # A build that keeps none takes away what a build that kept one left.
+    # (The first version's folder went already: the second copy of the
+    # other version took it away, as any start does with a version that is
+    # not its own and that nobody is using.)
+    check("the first version's folder was taken away by that second copy's start", not os.path.exists(kept))
     up, got, log, others = later("a start of a build that keeps none", keep=False, pack=newer)
-    check("a build that keeps no folder takes away the ones earlier builds kept: %r" % (others,),
-          up and got.get("kind") == "run" and others == [("2", "0", "0")] and not os.path.exists(kept_newer)
+    check("a build that keeps no folder takes away the one an earlier build kept: %r" % (others,),
+          up and got.get("kind") == "run" and others == [("1", "0", "0")] and not os.path.exists(kept_newer)
           and not os.path.exists(kept))
 
     # Somebody made a folder of that name first, with the right files in it.
@@ -1264,7 +1366,7 @@ def times(root, runs=5):
     finally:
         run.end()
     if tidied and folder and not os.path.exists(folder):
-        entries, took, removed, _ = tidied[-1]
+        entries, took, removed = tidied[-1][:3]
         print("\n  One earlier run's folder (%d files) taken away at the next start, with %d other\n"
               "  files beside it: %d ms for %d entries looked at and %d folder removed (the shell's\n"
               "  clock).  It is done on a thread of its own once the window is there: the window was\n"
@@ -1383,6 +1485,11 @@ def main(argv):
         if b"VISPORA_SHELL_TRY" not in f.read():
             refuse("VisporaShell.exe is the build that is meant to ship (it asks for administrator rights). "
                    "Build it with --no-default-features first.")
+    # (the checks of the one file, and its times, make and read packs)
+    needs_the_tool = not argv or argv == ["--one-file"] or argv[:2] == ["--time", "--pack"]
+    if needs_the_tool and not os.path.isfile(PACK_TOOL):
+        refuse("%s is missing: build it first (cargo build --release --manifest-path shell_rs/core/Cargo.toml). "
+               "It makes the packs that the exe is given to unpack." % PACK_TOOL)
     root = tempfile.mkdtemp(prefix="vispora-shell-window-trial-")
     ok = False
     try:

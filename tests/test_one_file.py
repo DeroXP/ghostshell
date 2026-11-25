@@ -135,7 +135,7 @@ def test_the_exe_carries_its_backend_and_one_switch_says_how_it_is_kept():
     # Carried in the exe itself: read from the program as it was started,
     # not from a file beside it or from the exe's file on disk.
     assert 'static CARRIED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/backend.pack"));' in main
-    assert 'std::env::var("VISPORA_BACKEND_PACK")' in build and 'bytes.starts_with(b"VSPPACK1")' in build
+    assert 'std::env::var("VISPORA_BACKEND_PACK")' in build
     assert "current_exe().ok().and_then(|exe| exe.parent()" not in main, "the backend is not looked for beside the exe any more"
     # A build without one has nothing to start, and says so.
     assert "if trial.is_none() && carried.is_empty() {" in main and "Vispora's files are incomplete" in main
@@ -192,11 +192,14 @@ def test_the_backend_is_unpacked_only_where_a_program_without_rights_cannot_writ
     kept = backend[backend.index("fn kept("):backend.index("/// Take away the folders that stay")]
     check = kept[kept.index("let check = |folder: &str| -> Result<std::fs::File, String> {"):kept.index("if std::fs::symlink_metadata(&folder).is_ok() {")]
     assert check.index("let held = win::hold_own_folder(folder, open_to)?;") < check.index("pack.same_as(folder, &[])?;") < check.index("Ok(held)")
-    # Every way a folder that stays comes to be used ends in that check:
-    # one that was there, one another start made meanwhile, and one that
-    # was just made here.
-    assert kept.count("let held = check(&folder)?;") == 3 and kept.count("Ok((folder, held))") == 3
-    assert "hold_own_folder(&folder" not in kept, "a folder is held without being held against the exe"
+    # Every way a folder that stays comes to be used: one that was there
+    # (held, then held against the exe), and by the check above one that
+    # another start made meanwhile and one that was just made here.
+    found = kept[kept.index("if std::fs::symlink_metadata(&folder).is_ok() {"):kept.index("// Made under another name")]
+    assert found.index("let held = win::hold_own_folder(&folder, open_to)?;") < found.index("match pack.same_as(&folder, &[]) {") \
+        < found.index("return Ok((folder, held));")
+    assert kept.count("let held = check(&folder)?;") == 2 and kept.count("Ok((folder, held))") == 3
+    assert kept.count("hold_own_folder(") == 2, "a folder is held somewhere without being held against the exe"
     assert kept.index("win::move_without_replacing(&making, &folder)") < kept.rindex("let held = check(&folder)?;")
     held = win[win.index("pub fn hold_own_folder("):win.index("/// What became of asking for a folder in order to take it away.")]
     # Held: opened as what is under the name itself (a link as the link it
@@ -212,11 +215,21 @@ def test_the_backend_is_unpacked_only_where_a_program_without_rights_cannot_writ
     # after a backend that died, is from the folder that was checked.
     assert "*slot.kept_held.lock().unwrap_or_else(|p| p.into_inner()) = ready.held;" in main
     assert "kept_held.lock().unwrap_or_else(|p| p.into_inner()).take()" not in main, "the folder is let go of before the app ends"
-    # One that does not pass is never used and never put right: the error
-    # goes up, and the backend is unpacked for this run instead.
+    # One that does not pass is never used and never put right in place.
+    # Somebody else's: the error goes up before anything in it is looked
+    # at, and the backend is unpacked for this run instead.  The shell's
+    # own that is not what the exe carries: let go of, taken away whole if
+    # no copy is using it (asked of the folder itself), and made again.
     assert 'said.push(format!("the folder that stays is not used: {why}. Unpacked for this run instead."))' in ways
-    for word in ("remove_dir_all(&folder)", "remove_file", "set_permissions", "icacls"):
-        assert word not in kept, f"a folder under the name is touched: {word}"
+    again = found[found.index("Err(why) => {"):]
+    assert again.index("drop(held);") < again.index("take_away(&folder, open_to)") and "taken away to be made again" in again
+    for word in ("remove_dir_all(&folder)", "remove_file", "set_permissions", "icacls", "unpack_into(&folder)"):
+        assert word not in kept, f"a folder under the name is touched in place: {word}"
+    taken = backend[backend.index("fn take_away("):backend.index("/// Was this made so long ago")]
+    asked = taken.index("match win::open_to_remove(path, open_to) {")
+    assert asked < taken.index("win::programs_let_go(std::path::Path::new(path))") < taken.index("std::fs::remove_dir_all(path)") < taken.index("drop(going);")
+    assert "win::ToRemove::NotOurs => Err(NotTaken::NotOurs)," in taken and "win::ToRemove::InUse => Err(NotTaken::InUse)," in taken
+    assert backend[:backend.index("#[cfg(test)]")].count("std::fs::remove_dir_all(") == 2, "a folder is taken away in a place of its own"
     # Made whole under another name, and never given a name that is taken.
     assert 'let making = format!("{folder}.{}{BEING_MADE}"' in kept and "win::move_without_replacing(&making, &folder)" in kept
     assert 'const BEING_MADE: &str = ".making";' in backend
@@ -231,10 +244,12 @@ def test_the_backend_is_unpacked_only_where_a_program_without_rights_cannot_writ
     assert '#[link(name = "cabinet")]' not in win and "const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;" in win
     # The trial tries all of it for real.
     trial = S.app_crate("try_it.py")
-    for said in ("(unpacked at every start)", "(unpacked once per version)", "is not used: the backend is unpacked for that run instead",
+    for said in ("(unpacked at every start)", "(unpacked once per version)", "is taken away whole and made again",
                  "that somebody else made is not used, though the right files are in it", "takes the other one's away",
                  "A run that Windows ended leaves its folder", "its folder cannot be given another name",
-                 "meanwhile makes its own folder and leaves that one as it is", "that somebody else made is not taken away either"):
+                 "meanwhile makes its own folder and leaves that one as it is", "that somebody else made is not taken away either",
+                 "a second copy unpacks for its run instead", "while a program still runs in that folder leaves the folder whole",
+                 "that somebody else made was not touched, and not used"):
         assert said in trial, said
 
 
@@ -321,23 +336,36 @@ def test_an_update_leaves_no_unpacked_backend_of_the_version_before():
     in the trial; here, that the shell does it at every start."""
     main, backend, win = S.app_crate("src", "main.rs"), S.rust("src", "backend.rs"), S.rust("src", "win.rs")
     run = main[main.index("fn run("):]
-    assert "let tidied = win::remove_private_folders(&tidy_in);" in run
+    assert "let tidied = win::remove_private_folders(&tidy_in, open_to);" in run
     hook = main[main.index("fn the_backend_made_ready("):main.index("/// Open the window, start the backend")]
-    assert "backend::remove_other_kept(&kept_in, but.as_deref(), &start, open_to);" in hook
+    assert "backend::remove_other_kept(&kept_in, but.as_deref(), open_to);" in hook
     assert "if let Some(kept_in) = places.kept.clone() {" in hook, "also by a build that keeps none"
-    others = backend[backend.index("pub fn remove_other_kept("):backend.index("#[cfg(test)]")]
+    others = backend[backend.index("pub fn remove_other_kept("):backend.index("/// Why a folder was not taken away.")]
     # Only a folder of this program's own making, and only one that no copy
     # of the app (of the version before, in another session) is using.  A
     # copy holds its folder, and a folder that is held cannot be asked for;
     # a folder that somebody else made under the name is never touched.
-    asked = others.index("match win::open_to_remove(&path.to_string_lossy(), open_to) {")
-    assert asked < others.index("std::fs::remove_file(path.join(start))") < others.index("std::fs::remove_dir_all(&path)") < others.index("drop(going);")
-    assert "win::ToRemove::NotOurs => others.not_ours += 1," in others and "win::ToRemove::InUse => others.in_use += 1," in others
-    assert others.count("std::fs::remove_") == 2, "something is taken away that was not asked for first"
+    # (take_away, read above, is the one place a folder that stays goes.)
+    asked = others.index("match take_away(&entry.path().to_string_lossy(), open_to) {")
+    assert "Err(NotTaken::NotOurs) => others.not_ours += 1," in others and "Err(NotTaken::InUse) => others.in_use += 1," in others
+    assert "std::fs::remove_" not in others, "something is taken away that was not asked for first"
     # One that a copy in another session may be unpacking into right now is
     # not asked for at all, until it is too old to be that.
     being_made = others.index("if name.ends_with(BEING_MADE) && !made_long_ago(&entry) {")
-    assert being_made < asked and "is_some_and(|age| age >= win::MARK_EXPECTED_WITHIN)" in others
+    assert being_made < asked and "is_some_and(|age| age >= win::MARK_EXPECTED_WITHIN)" in backend
+    # One run's folders: the same rule.  Whose a folder is comes first,
+    # asked of the folder once it is open; in somebody else's nothing is
+    # opened, the mark included; in one of this program's own the mark,
+    # then its programs (a backend that outlived its shell cannot be
+    # deleted, and its folder is then left whole), then the rest.
+    tidy = win[win.index("pub fn remove_private_folders("):win.index("/// Open what is under the mark's name in `folder`")]
+    opened = tidy.index("match open_to_remove(&path.to_string_lossy(), open_to) {")
+    assert opened < tidy.index("if left_behind(&path, &found) && programs_let_go(&path) && std::fs::remove_dir_all(&path).is_ok() {") < tidy.index("drop(going);")
+    assert "ToRemove::NotOurs => tidied.not_ours += 1," in tidy and "ToRemove::InUse => tidied.left += 1," in tidy
+    assert tidy.count("left_behind(") == 1 and win[:win.index("#[cfg(test)]")].count("left_behind(") == 2, "the mark is asked for somewhere else as well"
+    programs = win[win.index("pub fn programs_let_go("):win.index("/// Remove what earlier runs left behind")]
+    assert '.ends_with(".exe")' in programs and "Err(_) => return false," in programs
+    assert "found.is_file() || found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0" in programs
     going = win[win.index("pub fn open_to_remove("):win.index("// Squeezing, and the mark of what a file holds")]
     assert "Ok(held) if own_folder_behind(&held, path, open_to).is_ok() => ToRemove::Ours(held)," in going
     assert "Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => ToRemove::InUse," in going
@@ -371,18 +399,28 @@ def test_cleaning_windows_temp_leaves_the_folders_the_app_is_running_from():
     for other in ("Vispora", "vispora-window-1", "MEI1", "Temp", "", None, 5):
         assert not utils.is_running_programs_folder(other), other
 
-    run, window = "Vispora-backend-run-" + "ab" * 16, "Vispora-window-" + "cd" * 16
+    run, window, other = "Vispora-backend-run-" + "ab" * 16, "Vispora-window-" + "cd" * 16, "_MEI424242"
     holds = {"junk.tmp": "x" * 10, os.path.join("somebody", "old.log"): "y" * 5,
              os.path.join(run, "in-use"): "", os.path.join(run, "VisporaBackend.exe"): "MZ" * 50,
              os.path.join(run, "_internal", "base_library.zip"): "python" * 20,
-             os.path.join(run, "_internal", "empty-folder", "keep.txt"): "k",
-             os.path.join(window, "in-use"): "", os.path.join(window, "EBWebView", "Default", "Cookies"): "c" * 30}
+             os.path.join(run, "_internal", "a-folder", "keep.txt"): "k",
+             os.path.join(window, "in-use"): "", os.path.join(window, "EBWebView", "Default", "Cookies"): "c" * 30,
+             os.path.join(other, "base_library.zip"): "somebody else's program" * 3}
+    # Folders with nothing in them, inside a running program's folder: a
+    # program makes those too (a cache it has not written to yet), and one
+    # that is taken away is missed when the program comes to use it.  The
+    # cleaner takes empty folders away everywhere else.
+    empty = [os.path.join(run, "_internal", "empty"), os.path.join(run, "empty-at-the-top"),
+             os.path.join(window, "EBWebView", "Default", "Cache", "Cache_Data"), os.path.join(other, "empty"),
+             os.path.join("somebody", "empty")]
     temp = os.path.join(m.ROOT, "one-file", "windows-temp")
     for rel, text in holds.items():
         os.makedirs(os.path.dirname(os.path.join(temp, rel)), exist_ok=True)
         with open(os.path.join(temp, rel), "w") as f:
             f.write(text)
-    the_apps = sorted(rel for rel in holds if rel.startswith("Vispora-"))
+    for rel in empty:
+        os.makedirs(os.path.join(temp, rel))
+    the_apps = sorted(rel for rel in holds if rel.startswith(("Vispora-", "_MEI")))
 
     def there():
         return sorted(os.path.relpath(os.path.join(at, name), temp) for at, _, names in os.walk(temp) for name in names)
@@ -398,11 +436,14 @@ def test_cleaning_windows_temp_leaves_the_folders_the_app_is_running_from():
     assert CL._measure_dir(temp) == 15 and CL._count_files(temp) == 2
     assert CL.clean_location(temp)["files"] == 2
     assert there() == the_apps, "the cleaner took files of the running app"
-    assert not os.path.exists(os.path.join(temp, "somebody")), "an ordinary folder is still cleaned, and taken away"
-    for folder in (run, os.path.join(run, "_internal", "empty-folder"), window):
-        assert os.path.isdir(os.path.join(temp, folder)), folder
+    assert not os.path.exists(os.path.join(temp, "somebody")), "an ordinary folder is still cleaned, and taken away, with the empty one in it"
+    for folder in (run, os.path.join(run, "_internal", "a-folder"), window, other) + tuple(empty[:-1]):
+        assert os.path.isdir(os.path.join(temp, folder)), f"the cleaner took a folder of a running program away: {folder}"
     # Asked to clean one of those folders itself: nothing.
-    assert CL._safe_rmtree(os.path.join(temp, run)) == (0, 0) and there() == the_apps
+    for folder in (run, window, other):
+        assert CL._safe_rmtree(os.path.join(temp, folder)) == (0, 0) and there() == the_apps
+    for folder in empty[:-1]:
+        assert os.path.isdir(os.path.join(temp, folder)), folder
 
 
 def test_the_disk_analyzer_protects_the_folder_of_the_exe_a_person_starts():
@@ -432,3 +473,105 @@ def test_the_disk_analyzer_protects_the_folder_of_the_exe_a_person_starts():
     source = S.repo("app.py")
     assert "\nfrom core import disk_analyzer" not in source and "\nimport core.disk_analyzer" not in source
     assert source.count("        from core import disk_analyzer\n") >= 4
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Building it, and trying it
+# ═════════════════════════════════════════════════════════════════════
+def test_the_pack_is_read_whole_when_the_exe_is_built():
+    """A damaged pack, or the pack of another version, is to stop the build,
+    not to be found on a person's PC.  The build script asks the code that
+    reads the pack there (shell_rs/core: fit_to_carry, which has its own
+    test with cargo), with the app's version from config.py.  For that the
+    core is a build dependency of the window's crate as well: a crate of
+    this repository, in the lock file already."""
+    build, manifest, lock = S.app_crate("build.rs"), S.app_crate("Cargo.toml"), S.app_crate("Cargo.lock")
+    read = build[build.index("Some(named) => {"):build.index("None => std::fs::write(&carried, b\"\")")]
+    asked = read.index("if let Err(why) = vispora_shell_core::pack::fit_to_carry(&bytes, version) {")
+    assert read.index("std::fs::read(&named)") < asked < read.index("and this exe cannot carry it: {why}") < read.index("std::fs::write(&carried, bytes)")
+    assert "starts_with(b\"VSPPACK1\")" not in build, "the pack's first bytes are all that is looked at"
+    # (the version is the one the exe is given: config.py's)
+    assert build.index('strip_prefix("APP_VERSION")') < build.index("fit_to_carry(&bytes, version)")
+    fits = S.rust("src", "pack.rs")
+    fits = fits[fits.index("pub fn fit_to_carry("):fits.index("impl<'a> Pack<'a> {")]
+    assert fits.index("let pack = Pack::read(bytes)?;") < fits.index("if pack.version != version {") \
+        < fits.index("for_each(&pack.files, |file| pack.bytes_of(file).map(drop))?;")
+    # No new crate: the core by its path, twice, and the lock file's entry as it was.
+    assert manifest.count('vispora-shell-core = { path = "../core" }') == 2
+    built_with = manifest[manifest.index("[build-dependencies]"):manifest.index("[profile.release]")]
+    assert re.findall(r"^([\w-]+) = ", built_with, re.M) == ["tauri-build", "vispora-shell-core"]
+    entry = lock[lock.index('name = "vispora-shell"\n'):]
+    assert entry[:entry.index("]")].split("dependencies = [")[1].split() == ['"tauri",', '"tauri-build",', '"vispora-shell-core",']
+
+
+def the_trial():
+    """shell_rs/app/try_it.py, as a module.  Loading it starts nothing."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "shell_rs", "app", "try_it.py")
+    spec = importlib.util.spec_from_file_location("the_window_trial", path)
+    trial = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(trial)
+    return trial
+
+
+def test_the_trial_finds_the_pack_tool_where_the_core_is_built_and_says_when_it_is_missing():
+    """The trial of the window needs two things cargo built: the window's exe
+    (its own crate's) and the trial tool, which makes packs (the core's).
+    With each crate building into its own target folder the tool is in the
+    core's, where the tests look for it too.  And a tool that is missing is
+    said in words before anything is started, as a missing exe is."""
+    import contextlib
+    import io
+    T = the_trial()
+    here, core = os.path.join(m.ROOT, "one-file", "crates", "app"), os.path.join(m.ROOT, "one-file", "crates", "core")
+    elsewhere = os.path.join(m.ROOT, "one-file", "crates", "kept-out-of-the-repository")
+    for folder in (here, core, elsewhere):
+        os.makedirs(os.path.join(folder, "target", "release"), exist_ok=True)
+    os.makedirs(os.path.join(elsewhere, "release"), exist_ok=True)
+
+    def put(*where):
+        with open(os.path.join(*where), "wb") as f:
+            f.write(b"MZ made up, with VISPORA_SHELL_TRY in it: never started")
+        return os.path.join(*where)
+
+    saved = (T.HERE, T.CORE, T.EXE, T.PACK_TOOL, os.environ.pop("CARGO_TARGET_DIR", None))
+    try:
+        T.HERE, T.CORE = here, core
+        # Each crate builds into its own folder: the exe in the window's, the tool in the core's.
+        exe, tool = put(here, "target", "release", "VisporaShell.exe"), put(core, "target", "release", "vispora-shell-try.exe")
+        assert T.built("VisporaShell.exe") == exe and T.built("vispora-shell-try.exe", T.CORE) == tool
+        assert not os.path.isfile(T.built("vispora-shell-try.exe")), "the tool is not the window's crate's"
+        # One folder for everything that is built: both are there, and that comes first.
+        os.environ["CARGO_TARGET_DIR"] = elsewhere
+        assert T.built("VisporaShell.exe") == exe and T.built("vispora-shell-try.exe", T.CORE) == tool, "not there yet: the crates' own"
+        both = put(elsewhere, "release", "VisporaShell.exe"), put(elsewhere, "release", "vispora-shell-try.exe")
+        assert (T.built("VisporaShell.exe"), T.built("vispora-shell-try.exe", T.CORE)) == both
+        source = S.app_crate("try_it.py")
+        assert 'CORE = os.path.normpath(os.path.join(HERE, "..", "core"))' in source
+        assert 'PACK_TOOL = built("vispora-shell-try.exe", CORE)' in source
+
+        # The tool is missing: every way of running the trial that makes or
+        # reads a pack says so and starts nothing; the others do not ask for it.
+        os.remove(both[1])
+        os.remove(tool)
+        T.EXE, T.PACK_TOOL = T.built("VisporaShell.exe"), T.built("vispora-shell-try.exe", T.CORE)
+        started = []
+        T.checks = T.times = T.unpacking_times = T.picture = lambda *a, **k: started.append(a) or True
+        for argv in ([], ["--one-file"], ["--time", "--pack", "some.pack"], ["--time", "--pack", "some.pack", "--carried-by", "some.exe"]):
+            said = io.StringIO()
+            with contextlib.redirect_stdout(said):
+                try:
+                    T.main(list(argv))
+                    code = "came back"
+                except SystemExit as stopped:
+                    code = stopped.code
+            assert code == 2 and not started, (argv, code, started)
+            assert said.getvalue().startswith("Not started: " + tool + " is missing: build it first (cargo build --release --manifest-path "
+                                              "shell_rs/core/Cargo.toml)."), said.getvalue()
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert T.main(["--time"]) == 0 and T.main(["--picture", "x.png"]) == 0 and len(started) == 2, "the times of the window need no pack"
+    finally:
+        T.HERE, T.CORE, T.EXE, T.PACK_TOOL = saved[:4]
+        os.environ.pop("CARGO_TARGET_DIR", None)
+        if saved[4] is not None:
+            os.environ["CARGO_TARGET_DIR"] = saved[4]

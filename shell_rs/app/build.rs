@@ -21,6 +21,12 @@
 //! Built without one, the exe carries nothing: a trial build is given its
 //! pack by the trial, and the build that ships says that its files are
 //! incomplete.
+//!
+//! The pack is read whole here, by the code that reads it on a person's PC
+//! (../core/src/pack.rs, which this script uses as the exe does): its list,
+//! every file taken out once with its length and its mark, and the version
+//! it was made for against the app's.  A pack that is damaged, or that is
+//! another version's, stops the build.
 
 use std::path::Path;
 
@@ -44,7 +50,9 @@ fn main() {
         Some(named) => {
             println!("cargo:rerun-if-changed={named}");
             let bytes = std::fs::read(&named).unwrap_or_else(|e| panic!("VISPORA_BACKEND_PACK names {named}: {e}"));
-            assert!(bytes.starts_with(b"VSPPACK1"), "{named} is not a pack (see shell_rs/README.md, \"One file\")");
+            if let Err(why) = vispora_shell_core::pack::fit_to_carry(&bytes, version) {
+                panic!("VISPORA_BACKEND_PACK names {named}, and this exe cannot carry it: {why}. (See shell_rs/README.md, \"One file\".)");
+            }
             std::fs::write(&carried, bytes).unwrap_or_else(|e| panic!("{}: {e}", carried.display()));
         }
         None => std::fs::write(&carried, b"").unwrap_or_else(|e| panic!("{}: {e}", carried.display())),

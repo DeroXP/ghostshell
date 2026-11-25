@@ -15,8 +15,17 @@
 //!   between the check and the start (or a later start, after a backend
 //!   that died);
 //! * a folder with the right name that does not pass is never used, and
-//!   never put right in place: it is left as it is, and the backend is
-//!   unpacked somewhere else for this run;
+//!   never put right in place;
+//! * one that is not this program's own making is never touched at all:
+//!   it is left as it is, and the backend is unpacked somewhere else for
+//!   this run;
+//! * one that IS this program's own making (by owner and access list) and
+//!   does not hold what the exe carries is taken away whole and made
+//!   again, if no copy of the app is using it.  That is the same act, on
+//!   the same evidence, as taking away another version's folder.  It is
+//!   not left: nothing but the log would ever say that this version now
+//!   unpacks at every start, and a virus scanner that took one file away
+//!   would be enough to cause it;
 //! * only folders of this program's own making are ever taken away.
 //!
 //! There are two ways, and which one a build uses is one switch:
@@ -135,10 +144,25 @@ fn kept(pack: &Pack, kept_in: &str, open_to: OpenTo, said: &mut Vec<String>) -> 
         Ok(held)
     };
     if std::fs::symlink_metadata(&folder).is_ok() {
-        let held = check(&folder)?;
-        said.push(format!("the background program is in {folder} from an earlier start, and is what the exe carries: {} files, {} bytes, checked in {} ms",
-                          pack.files.len(), pack.size(), began.elapsed().as_millis()));
-        return Ok((folder, held));
+        // Whose it is.  One that is not this program's own making is the
+        // end of it: not used, not touched.
+        let held = win::hold_own_folder(&folder, open_to)?;
+        match pack.same_as(&folder, &[]) {
+            Ok(()) => {
+                said.push(format!("the background program is in {folder} from an earlier start, and is what the exe carries: {} files, {} bytes, checked in {} ms",
+                                  pack.files.len(), pack.size(), began.elapsed().as_millis()));
+                return Ok((folder, held));
+            }
+            // This program's own making, and not what the exe carries.  It
+            // is never put right in place.  It is taken away whole, if no
+            // copy is using it, and made again below like one that was
+            // never there.
+            Err(why) => {
+                drop(held);
+                take_away(&folder, open_to).map_err(|kept| format!("{why}, and it could not be taken away to be made again ({kept})"))?;
+                said.push(format!("the folder that stays did not hold what the exe carries ({why}): it was this program's own, nobody was using it, and it was taken away to be made again"));
+            }
+        }
     }
     // Made under another name and given its own when it is whole: a start
     // that is cut short never leaves half a folder under the name.
@@ -178,12 +202,12 @@ fn kept(pack: &Pack, kept_in: &str, open_to: OpenTo, said: &mut Vec<String>) -> 
 ///
 /// Two more cases.  A backend whose shell is gone, and that has not ended
 /// yet: nobody holds its folder, but a program that is running cannot be
-/// deleted, so the folder's program is tried first, and a folder whose
+/// deleted, so the folder's programs are tried first, and a folder whose
 /// program Windows will not delete is left as it is.  And a folder that a
 /// copy in another session is unpacking into at this very moment: it looks
 /// like one that a start was cut short in, and is left alone until it is
 /// old enough to be the second (as a window's folder without its mark is).
-pub fn remove_other_kept(kept_in: &str, but: Option<&str>, start: &str, open_to: OpenTo) -> Others {
+pub fn remove_other_kept(kept_in: &str, but: Option<&str>, open_to: OpenTo) -> Others {
     let mut others = Others::default();
     let Ok(entries) = std::fs::read_dir(kept_in) else { return others };
     for entry in entries.flatten() {
@@ -195,25 +219,51 @@ pub fn remove_other_kept(kept_in: &str, but: Option<&str>, start: &str, open_to:
             others.in_use += 1;
             continue;
         }
-        let path = entry.path();
-        match win::open_to_remove(&path.to_string_lossy(), open_to) {
-            win::ToRemove::NotOurs => others.not_ours += 1,
-            win::ToRemove::InUse => others.in_use += 1,
-            win::ToRemove::Ours(going) => {
-                let running = match std::fs::remove_file(path.join(start)) {
-                    Ok(()) => false,
-                    Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-                };
-                if !running && std::fs::remove_dir_all(&path).is_ok() {
-                    others.removed += 1;
-                } else {
-                    others.in_use += 1;
-                }
-                drop(going);
-            }
+        match take_away(&entry.path().to_string_lossy(), open_to) {
+            Ok(()) => others.removed += 1,
+            Err(NotTaken::NotOurs) => others.not_ours += 1,
+            Err(NotTaken::InUse) => others.in_use += 1,
         }
     }
     others
+}
+
+/// Why a folder was not taken away.
+#[derive(Debug, PartialEq)]
+enum NotTaken {
+    /// Not of this program's making: never touched.
+    NotOurs,
+    /// A copy of the app holds it, or a program in it is still running.
+    InUse,
+}
+
+impl std::fmt::Display for NotTaken {
+    fn fmt(&self, to: &mut std::fmt::Formatter) -> std::fmt::Result {
+        to.write_str(match self {
+            NotTaken::NotOurs => "it is not this program's folder",
+            NotTaken::InUse => "a copy of the app is using it",
+        })
+    }
+}
+
+/// Take the folder `path` away, whole: if it is of this program's own
+/// making, no copy of the app holds it, and no program in it is running.
+/// Whose it is, is asked of the folder that was opened, which stays open
+/// until it is gone (win::open_to_remove).
+fn take_away(path: &str, open_to: OpenTo) -> Result<(), NotTaken> {
+    match win::open_to_remove(path, open_to) {
+        win::ToRemove::NotOurs => Err(NotTaken::NotOurs),
+        win::ToRemove::InUse => Err(NotTaken::InUse),
+        win::ToRemove::Ours(going) => {
+            let gone = win::programs_let_go(std::path::Path::new(path)) && std::fs::remove_dir_all(path).is_ok();
+            drop(going);
+            if gone {
+                Ok(())
+            } else {
+                Err(NotTaken::InUse)
+            }
+        }
+    }
 }
 
 /// Was this made so long ago that no start can still be making it?
@@ -274,7 +324,7 @@ mod tests {
         // and takes away what a run that was ended left behind.
         let left = second.folder.clone();
         drop(second);
-        let tidied = win::remove_private_folders(&format!("{place}\\runs"));
+        let tidied = win::remove_private_folders(&format!("{place}\\runs"), OpenTo::ThisAccount);
         assert_eq!((tidied.removed, tidied.left), (1, 1));
         assert!(!there(&left) && there(&first.program));
         // At the quit it goes.
@@ -323,52 +373,114 @@ mod tests {
         assert!(std::fs::rename(&first.folder, &elsewhere).is_err(), "it could be given another name while it was in use");
         drop(first);
         assert!(std::fs::rename(&again.folder, &elsewhere).is_err(), "it could be given another name while the second copy used it");
-        assert_eq!(remove_other_kept(&format!("{place}\\kept"), None, &pack.start, OpenTo::ThisAccount), Others { removed: 0, in_use: 1, not_ours: 0 });
+        assert_eq!(remove_other_kept(&format!("{place}\\kept"), None, OpenTo::ThisAccount), Others { removed: 0, in_use: 1, not_ours: 0 });
         assert_eq!(pack.same_as(&again.folder, &[]), Ok(()), "a folder in use was touched");
         drop(again);
         tidy(&place);
     }
 
+    /// A start that does not use the folder that stays: it unpacks for the
+    /// run, says why, and runs what the exe carries.
+    fn used_instead(pack: &Pack, place: &str, why: &str) {
+        let ready = make_ready(pack, Way::OncePerVersion, &places(place)).unwrap();
+        assert!(ready.folder.starts_with(&format!("{place}\\runs\\")) && ready.kept.is_none() && ready.held.is_none(), "{why}: {} was used", ready.folder);
+        assert!(ready.said.iter().any(|line| line.starts_with("the folder that stays is not used: ") && line.contains(why)), "{why}: {:?}", ready.said);
+        assert_eq!(std::fs::read(&ready.program).unwrap(), b"MZ not really a program", "what is run is the exe's");
+        assert!(ready.own.unwrap().remove());
+    }
+
     #[test]
-    fn a_folder_that_does_not_pass_is_never_used_and_never_put_right() {
-        let place = a_place("does-not-pass");
+    fn a_folder_that_somebody_else_made_is_never_used_and_never_touched() {
+        let place = a_place("somebody-elses");
         let bytes = make(&a_backend(&place), "3.8.1", "VisporaBackend.exe", Squeezed::Mszip).unwrap();
         let pack = Pack::read(&bytes).unwrap();
         let folder = format!("{place}\\kept\\{}", kept_name(&pack));
-        let used_instead = |why: &str| {
-            let ready = make_ready(&pack, Way::OncePerVersion, &places(&place)).unwrap();
-            assert!(ready.folder.starts_with(&format!("{place}\\runs\\")) && ready.kept.is_none(), "{why}: {} was used", ready.folder);
-            assert!(ready.said.iter().any(|line| line.starts_with("the folder that stays is not used: ") && line.contains(why)), "{why}: {:?}", ready.said);
-            assert_eq!(std::fs::read(&ready.program).unwrap(), b"MZ not really a program", "what is run is the exe's");
-            assert!(ready.own.unwrap().remove());
-        };
         // Somebody made a folder of that name first: with the right files
-        // in it, even.  It is not this program's making.
+        // in it, even.  It is not this program's making, at this start and
+        // at every later one.
         std::fs::create_dir_all(&folder).unwrap();
         pack.unpack_into(&folder).unwrap();
-        used_instead("is not this program's folder");
-        assert_eq!(pack.same_as(&folder, &[]), Ok(()), "it was touched");
-        assert!(win::is_closed_to_all_but(&folder, OpenTo::ThisAccount).is_err(), "it was made the program's own in place");
-        std::fs::remove_dir_all(&folder).unwrap();
-        // This program's own making, and then: another program in place of
-        // the backend's, a file too many, a file gone.
-        make_ready(&pack, Way::OncePerVersion, &places(&place)).unwrap();
+        for _ in 0..2 {
+            used_instead(&pack, &place, "is not this program's folder");
+            assert_eq!(pack.same_as(&folder, &[]), Ok(()), "it was touched");
+            assert!(win::is_closed_to_all_but(&folder, OpenTo::ThisAccount).is_err(), "it was made the program's own in place");
+        }
+        // With the wrong files in it: the same.  It is not taken away to be
+        // made again, as one of this program's own would be.
         let program = format!("{folder}\\VisporaBackend.exe");
         std::fs::write(&program, b"MZ somebody else's program").unwrap();
-        used_instead("VisporaBackend.exe is not as long as the exe's");
-        assert_eq!(std::fs::read(&program).unwrap(), b"MZ somebody else's program", "it was put right in place");
-        std::fs::write(&program, b"MZ not really a program").unwrap();
         std::fs::write(format!("{folder}\\_internal\\version.dll"), b"planted").unwrap();
-        used_instead("_internal\\version.dll is in the folder and is not the exe's");
+        used_instead(&pack, &place, "is not this program's folder");
+        assert_eq!(std::fs::read(&program).unwrap(), b"MZ somebody else's program", "somebody else's folder was touched");
         assert!(there(&format!("{folder}\\_internal\\version.dll")));
-        std::fs::remove_file(format!("{folder}\\_internal\\version.dll")).unwrap();
-        std::fs::remove_file(format!("{folder}\\_internal\\empty.txt")).unwrap();
-        used_instead("_internal\\empty.txt is missing from the folder");
         // No place for a folder that stays: for this run, then.
         let nowhere = Places { kept: None, ..places(&place) };
         let ready = make_ready(&pack, Way::OncePerVersion, &nowhere).unwrap();
         assert!(ready.own.is_some() && ready.said[0].starts_with("there is no place for a folder that stays"));
         ready.own.unwrap().remove();
+        tidy(&place);
+    }
+
+    #[test]
+    fn a_folder_of_this_programs_own_that_is_not_what_the_exe_carries_is_made_again() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let place = a_place("made-again");
+        let bytes = make(&a_backend(&place), "3.8.1", "VisporaBackend.exe", Squeezed::Mszip).unwrap();
+        let pack = Pack::read(&bytes).unwrap();
+        let folder = format!("{place}\\kept\\{}", kept_name(&pack));
+        let program = format!("{folder}\\VisporaBackend.exe");
+        let nothing_for_the_run = || std::fs::read_dir(format!("{place}\\runs")).map_or(true, |mut d| d.next().is_none());
+        // (a virus scanner taking one file away is the likeliest of these)
+        let spoiled = [
+            ("another program in place of the backend's", "VisporaBackend.exe is not as long as the exe's"),
+            ("a file too many", "_internal\\version.dll is in the folder and is not the exe's"),
+            ("a file gone", "_internal\\empty.txt is missing from the folder"),
+        ];
+        for (what, why) in spoiled {
+            // This program's own making, by a start whose copy has ended.
+            drop(make_ready(&pack, Way::OncePerVersion, &places(&place)).unwrap());
+            match what {
+                "a file too many" => std::fs::write(format!("{folder}\\_internal\\version.dll"), b"planted").unwrap(),
+                "a file gone" => std::fs::remove_file(format!("{folder}\\_internal\\empty.txt")).unwrap(),
+                _ => std::fs::write(&program, b"MZ somebody else's program").unwrap(),
+            }
+            // The next start: it is taken away whole and made again, and
+            // that is what the backend is run from.  Never put right in
+            // place: what was in it is gone with it.
+            let ready = make_ready(&pack, Way::OncePerVersion, &places(&place)).unwrap();
+            assert_eq!((ready.folder.as_str(), ready.held.is_some(), ready.own.is_none()), (folder.as_str(), true, true), "{what}");
+            let said = ready.said.join("\n");
+            assert!(said.contains("did not hold what the exe carries") && said.contains(why) && said.contains("taken away to be made again"), "{what}: {said}");
+            assert!(said.contains("to stay: 5 files"), "{what}: {said}");
+            assert_eq!(pack.same_as(&folder, &[]), Ok(()), "{what}");
+            assert_eq!(win::is_closed_to_all_but(&folder, OpenTo::ThisAccount), Ok(()));
+            assert!(nothing_for_the_run(), "{what}: it was unpacked for the run as well");
+            // ... and the start after that finds it as it should be.
+            drop(ready);
+            let again = make_ready(&pack, Way::OncePerVersion, &places(&place)).unwrap();
+            assert!(again.said.iter().any(|line| line.contains("from an earlier start, and is what the exe carries")), "{:?}", again.said);
+        }
+
+        // A copy is running from it (the folder was right when that copy
+        // started): the folder is left exactly as it is, and this start
+        // unpacks for the run.
+        let a_copy = make_ready(&pack, Way::OncePerVersion, &places(&place)).unwrap();
+        std::fs::write(&program, b"MZ somebody else's program").unwrap();
+        used_instead(&pack, &place, "could not be taken away to be made again (a copy of the app is using it)");
+        assert_eq!(std::fs::read(&program).unwrap(), b"MZ somebody else's program", "a folder that a copy holds was touched");
+        drop(a_copy);
+        // A backend whose shell is gone still runs in it (as Windows holds
+        // a program that is running): left as it is, too, with what comes
+        // before the program when the folder is read.
+        std::fs::write(format!("{folder}\\0-comes-first.txt"), b"still needed").unwrap();
+        let running = std::fs::OpenOptions::new().read(true).share_mode(1).open(&program).unwrap();
+        used_instead(&pack, &place, "could not be taken away to be made again (a copy of the app is using it)");
+        assert!(there(&format!("{folder}\\0-comes-first.txt")) && there(&format!("{folder}\\_internal\\python312.dll")), "a folder whose program runs was taken apart");
+        // Once it has ended, the next start makes the folder again.
+        drop(running);
+        let ready = make_ready(&pack, Way::OncePerVersion, &places(&place)).unwrap();
+        assert_eq!((ready.folder.as_str(), pack.same_as(&folder, &[])), (folder.as_str(), Ok(())));
+        drop(ready);
         tidy(&place);
     }
 
@@ -383,7 +495,7 @@ mod tests {
         let new = packed("3.8.1");
         let (old, older, oldest, new) = (Pack::read(&old).unwrap(), Pack::read(&older).unwrap(), Pack::read(&oldest).unwrap(), Pack::read(&new).unwrap());
         let kept_in = format!("{place}\\kept");
-        let others = |but: Option<&str>| remove_other_kept(&kept_in, but, &new.start, OpenTo::ThisAccount);
+        let others = |but: Option<&str>| remove_other_kept(&kept_in, but, OpenTo::ThisAccount);
         // Three versions before this one.  One whose copy has ended.  One
         // whose copy is running: it holds its folder.  And one whose shell
         // is gone and whose backend has not ended yet: nobody holds the

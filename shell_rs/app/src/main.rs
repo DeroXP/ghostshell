@@ -262,9 +262,9 @@ fn the_backend_made_ready(shell: &Arc<Shell>, carried: &'static [u8], places: ba
         // pack's own is never among them, whether it was used or not: one
         // that did not pass is left exactly as it is.
         if let Some(kept_in) = places.kept.clone() {
-            let (shell, but, start, open_to) = (shell.clone(), keeps.then(|| backend::kept_name(&pack)), pack.start.clone(), places.open_to);
+            let (shell, but, open_to) = (shell.clone(), keeps.then(|| backend::kept_name(&pack)), places.open_to);
             std::thread::spawn(move || {
-                let others = backend::remove_other_kept(&kept_in, but.as_deref(), &start, open_to);
+                let others = backend::remove_other_kept(&kept_in, but.as_deref(), open_to);
                 if others != backend::Others::default() {
                     shell.say(&format!("folders of the background program from other versions: {} taken away, {} left because a copy of the app is using them, \
                                         {} left because they are not this program's making", others.removed, others.in_use, others.not_ours));
@@ -423,14 +423,16 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
     // What earlier runs left behind is taken away now that the window is
     // there, on a thread of its own: never in the window's way.  (A folder
     // that is in use, this run's own or a copy's in another session, is
-    // not touched: see win::remove_private_folders.)
+    // not touched, and neither is one that somebody else made: see
+    // win::remove_private_folders.)
     let (tidying, tidy_in) = (shell.clone(), folder_in.clone());
     std::thread::spawn(move || {
         let began = std::time::Instant::now();
-        let tidied = win::remove_private_folders(&tidy_in);
+        let tidied = win::remove_private_folders(&tidy_in, open_to);
         tidying.say(&format!(
-            "the window's old folders: {} entries looked at in {} ms, {} left behind by earlier runs and removed, {} in use and left alone",
-            tidied.entries, began.elapsed().as_millis(), tidied.removed, tidied.left
+            "the window's old folders: {} entries looked at in {} ms, {} left behind by earlier runs and removed, {} in use and left alone, \
+             {} not this program's making and not touched",
+            tidied.entries, began.elapsed().as_millis(), tidied.removed, tidied.left, tidied.not_ours
         ));
     });
 

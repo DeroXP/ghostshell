@@ -36,6 +36,10 @@ tauri = { version = "=2.12.7", default-features = false, features = ["wry", "cus
 
 [build-dependencies]
 tauri-build = { version = "=2.7.6", default-features = false, features = ["config-json"] }
+# The shell's own core, for the build script as well: it reads the pack
+# whole before the exe is made (build.rs).  A crate of this repository
+# without outside crates, and in the lock file already.
+vispora-shell-core = { path = "../core" }
 
 [profile.release]
 opt-level = "s"
