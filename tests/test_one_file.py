@@ -139,9 +139,25 @@ def test_the_exe_carries_its_backend_and_one_switch_says_how_it_is_kept():
     assert "current_exe().ok().and_then(|exe| exe.parent()" not in main, "the backend is not looked for beside the exe any more"
     # A build without one has nothing to start, and says so.
     assert "if trial.is_none() && carried.is_empty() {" in main and "Vispora's files are incomplete" in main
-    # One switch, off until the owner has chosen.
-    assert 'const KEEPS_ITS_BACKEND: bool = cfg!(feature = "keep-backend");' in main
-    assert re.search(r'^keep-backend = \[\]$', manifest, re.M) and re.search(r'^default = \["elevated"\]$', manifest, re.M)
+    # One switch.  The owner chose to keep the backend, once per version:
+    # that is what a build does that is told nothing, so the build that
+    # ships.  The other way is the one a build has to be made for.
+    assert 'const KEEPS_ITS_BACKEND: bool = !cfg!(feature = "unpack-at-every-start");' in main
+    features = manifest[manifest.index("[features]"):manifest.index("[dependencies]")]
+    assert re.findall(r'^([\w-]+) = (.*)$', features, re.M) == [("default", '["elevated"]'), ("elevated", "[]"), ("unpack-at-every-start", "[]")], features
+    assert "keep-backend" not in manifest + main, "the switch has one name"
+    assert main.count("KEEPS_ITS_BACKEND") == 2 and main.count('feature = "unpack-at-every-start"') == 1
+    # A trial says which way it wants, whatever the build; told nothing, it is the build's way.
+    assert "let keeps = trial.and_then(|trial| trial.keep).unwrap_or(KEEPS_ITS_BACKEND);" in main
+    trial = S.app_crate("try_it.py")
+    assert 'told_nothing = Run(root, "hidden", pack=pack)' in trial and 'if keep is not None:\n            told["keep"] = keep' in trial
+    # The papers say the same: which way is the one that ships, what stays
+    # on the PC with it, and how the other way is built.
+    readme, plan = S.repo("shell_rs", "README.md"), S.repo("docs", "rust-port.md")
+    assert "| Build | `--features unpack-at-every-start` | what a build does that is told nothing: **the build that ships** |" in readme
+    assert "### What stays on the PC" in readme and "Vispora-backend-kept-<version>-" in readme
+    for paper in (readme, plan, S.repo("docs", "performance.md")):
+        assert "keep-backend" not in paper and "until the owner has chosen" not in paper and "the owner chooses" not in paper
     assert "let way = if keeps { backend::Way::OncePerVersion } else { backend::Way::EveryStart };" in main
     # Unpacked on the thread that starts the backend, after the window is
     # made: the window does not wait for it.

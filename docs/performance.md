@@ -490,7 +490,9 @@ of files that are nothing of the app's.)
 
 The shell's exe carries the app's files and unpacks them before it starts
 the backend ("One file" in [shell_rs/README.md](../shell_rs/README.md)).
-There are two ways of keeping what was unpacked, and the owner chooses.
+There are two ways of keeping what was unpacked. The owner chose (b),
+once per version, on 2026-11-25: it is what the build that ships does, and
+(a) is still built and measured beside it.
 Measured with `python shell_rs/app/try_it.py --time --pack <pack>
 --carried-by <exe>`: a trial build of the shell that carries the real
 backend's pack in itself, three starts each way, the middle value.

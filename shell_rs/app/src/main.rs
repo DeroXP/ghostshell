@@ -43,8 +43,10 @@ const ASKS_FOR_RIGHTS: bool = cfg!(feature = "elevated");
 /// (core/src/pack.rs).  Put in when the exe is built (build.rs); nothing in
 /// a build that was made without one.
 static CARRIED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/backend.pack"));
-/// Which of the two ways the backend is kept on the PC (Cargo.toml).
-const KEEPS_ITS_BACKEND: bool = cfg!(feature = "keep-backend");
+/// Which of the two ways the backend is kept on the PC (Cargo.toml): once
+/// per version, in a folder that stays, unless the build was made for the
+/// other way.
+const KEEPS_ITS_BACKEND: bool = !cfg!(feature = "unpack-at-every-start");
 /// Started with this, the shell answers nothing of what has moved from the
 /// backend itself (core/src/moved/): every call is the backend's, as it
 /// was before anything moved.

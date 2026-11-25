@@ -36,7 +36,9 @@
 //!   and used again at later starts.  Folders of other versions are taken
 //!   away.  Files stay on the PC when the exe is deleted.
 //!
-//! Both are measured in shell_rs/app/try_it.py; the choice is the owner's.
+//! Both are measured in shell_rs/app/try_it.py.  The owner chose
+//! `OncePerVersion` (2026-11-25): it is what the build that ships does, and
+//! `EveryStart` is the way a build has to be made for (shell_rs/app/Cargo.toml).
 
 use std::time::Instant;
 

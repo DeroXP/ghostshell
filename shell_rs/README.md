@@ -14,7 +14,7 @@ are as they were. The pieces:
 | `core/` | The shell without a window: which request is answered where, the backend's start and stop, quitting with a time limit, and whether this is the one copy | written, tested, tried against a stand-in backend |
 | `app/` | The window (Tauri, as for the updater), on the app's own page | written, tried for real against a stand-in backend |
 | the tray | The tray icon and its menu, and what the entry for starting at sign-in names | written, tried for real against a stand-in backend |
-| one file | The exe carrying the backend and unpacking it before it starts it, in one of two ways that the owner still has to choose between | written, tried for real with the real backend's files and a stand-in started in their place |
+| one file | The exe carrying the backend and unpacking it before it starts it: once per version, into a folder that stays (the owner's choice of two ways) | written, tried for real with the real backend's files and a stand-in started in their place |
 | what has moved | Modules of the backend that the shell now does itself (step 4 of the plan): so far the performance sampler | written, proven to give Python's answers on a made-up machine, tried for real in the window against the stand-in backend (the card's reading is the backend's: the shell never opens the driver's library) |
 
 ## How the two sides work together
@@ -437,11 +437,16 @@ of its own run with them. The rules (`core/src/backend.rs`):
 
 ### Two ways of keeping it, and one switch
 
-Which of the two a build uses is one switch, and the choice is the owner's:
+There are two ways, and one switch says which of them a build uses. **The
+owner chose (b) on 2026-11-25: unpacked once per version, and kept.** So
+(b) is what a build does that is told nothing, and what the build that
+ships does. (a) is still there, built and tested, for a build that is made
+for it. A trial says which way a run goes through its own setting, whatever
+the exe was built for.
 
 | | (a) Unpacked at every start | (b) Unpacked once per version |
 | --- | --- | --- |
-| Build | the default | `--features keep-backend` |
+| Build | `--features unpack-at-every-start` | what a build does that is told nothing: **the build that ships** |
 | Where | a new folder in Windows' own Temp folder, `Vispora-backend-run-<32 letters>` | `ProgramData\Vispora-backend-kept-<version>-<16 letters of the pack's mark>` |
 | At the quit | the folder is taken away | the folder stays |
 | At the next start | unpacked again | checked against the exe, then used |
@@ -483,6 +488,46 @@ virus scanner adds. In (a) the scanner sees 206 freshly written files at
 every start, as it does with today's app; in (b) only at the first start
 of a version, and the check reads files it has seen before. Neither has
 been measured.
+
+### What stays on the PC
+
+With the way the owner chose, the app's unpacked files stay on the PC
+between starts. In plain words, for whoever uses the app or helps somebody
+with it:
+
+* **Where, and how much.** One folder,
+  `C:\ProgramData\Vispora-backend-kept-<version>-<16 letters>` (on the
+  drive Windows is on), with about 57 MB in 206 files. It is made at the
+  first start of a version. It is the administrators' own: a program
+  without administrator rights cannot open it, and an ordinary Explorer
+  window is refused too.
+* **It stays when `Vispora.exe` is deleted.** The app has no installer, and
+  so nothing that uninstalls it: deleting the exe is how it is removed, and
+  this folder is then left behind (as the app's own data in
+  `%APPDATA%\Vispora` always was).
+* **An older version's folder goes by itself**, at the first start of a
+  newer version: after an update there is one folder, the new one. Only if
+  a copy of the old version is still running at that moment is its folder
+  left, until a later start.
+* **Taking it away by hand.** Quit Vispora first (the tray's "Quit"):
+  Windows does not let the folder go while the app runs from it. Then
+  delete the folder. Explorer asks for administrator rights for that. Or,
+  from a terminal that was started as administrator:
+
+  ```powershell
+  Remove-Item -Recurse -Force "C:\ProgramData\Vispora-backend-kept-*"
+  ```
+
+  Nothing else has to be undone. If Vispora is started again afterwards, it
+  unpacks the folder again (about a tenth of a second) and goes on as
+  before. Nobody has done this by hand on a real PC yet: nothing here was
+  ever run with administrator rights.
+* **If something changes a file in it** (a virus scanner that takes one
+  away, say), the next start notices, takes the whole folder away, unpacks
+  it again, and says so in `%APPDATA%\Vispora\shell.log`.
+* **A build that was made for the other way** leaves nothing: its folder is
+  in Windows' own Temp folder for the length of a run, and it also takes
+  away what a build that kept a folder left in `C:\ProgramData`.
 
 ### What else changes behind the shell, for the one file
 
@@ -531,7 +576,7 @@ been measured.
 
 ```
 cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
-python shell_rs/app/try_it.py                  # 119 checks; the window is never shown
+python shell_rs/app/try_it.py                  # 121 checks; the window is never shown
 python shell_rs/app/try_it.py --time           # the times
 python shell_rs/app/try_it.py --time --pack P  # ... and what unpacking the pack P costs, both ways
 python shell_rs/app/try_it.py --time --pack P --carried-by E

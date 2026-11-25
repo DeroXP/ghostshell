@@ -4,6 +4,9 @@
 
     python shell_rs/app/try_it.py                  the checks; the window is never shown
     python shell_rs/app/try_it.py --one-file       only the checks of the exe carrying its backend
+    python shell_rs/app/try_it.py --one-file --built-for-every-start
+                                                   the same, for a trial build that was made with
+                                                   --features unpack-at-every-start
     python shell_rs/app/try_it.py --moved          only the checks of what has moved from the backend into the shell
     python shell_rs/app/try_it.py --time           the times, five runs
     python shell_rs/app/try_it.py --time --pack P  ... and what unpacking the pack P costs, both ways
@@ -1248,12 +1251,41 @@ def quit_by_its_window(run):
     return ended(run)
 
 
+# Was the trial build made for the other way (--features
+# unpack-at-every-start)?  Said on the command line: --built-for-every-start.
+BUILT_FOR_EVERY_START = False
+
+
 def one_file(root, check):
     """The exe carries its backend and unpacks it before it starts it: both
-    ways of keeping it, and what is done with a folder that does not pass."""
+    ways of keeping it, and what is done with a folder that does not pass.
+    Each run says which way it wants, but for the first: that one says
+    nothing, and gets the way the build was made for."""
     pack, says, source = made_up_backend(root, "first")
     check("a pack was made of a made-up backend: %r" % (says,), says.get("files") == 5 and says.get("start") == "VisporaBackend.exe")
     mine = "D:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)" % own_account()
+
+    # A build that is told nothing.  The owner's choice is what a build is
+    # unless it was made for the other way: unpacked once per version, into
+    # a folder that stays.
+    told_nothing = Run(root, "hidden", pack=pack)
+    try:
+        up = first_screen(told_nothing)
+        got = told_nothing.unpacked()
+        folder = got.get("folder", "")
+        if BUILT_FOR_EVERY_START:
+            check("told nothing, a build made with --features unpack-at-every-start unpacks for the run: %r" % (got.get("kind"),),
+                  up and got.get("kind") == "run" and re.match(r"^Vispora-backend-run-[0-9a-f]{32}$", os.path.basename(folder)))
+            check("... and at its quit the folder goes (exit code %r)" % (quit_by_its_window(told_nothing),),
+                  told_nothing.process.returncode == 0 and folder and not os.path.exists(folder))
+        else:
+            check("told nothing, the build keeps its backend: unpacked into a folder that stays (a build made with --features "
+                  "unpack-at-every-start is tried with --built-for-every-start): %r" % (got.get("kind"),),
+                  up and got.get("kind") == "kept-new" and os.path.basename(folder) == says.get("kept_as"))
+            check("... and after its quit the folder is still there (exit code %r)" % (quit_by_its_window(told_nothing),),
+                  told_nothing.process.returncode == 0 and os.path.isdir(folder) and same_files(folder, source))
+    finally:
+        told_nothing.end()
 
     # Unpacked at every start, into a folder for that run.
     run = Run(root, "hidden", pack=pack, keep=False)
@@ -1640,6 +1672,10 @@ def main(argv):
         if b"VISPORA_SHELL_TRY" not in f.read():
             refuse("VisporaShell.exe is the build that is meant to ship (it asks for administrator rights). "
                    "Build it with --no-default-features first.")
+    if "--built-for-every-start" in argv:
+        global BUILT_FOR_EVERY_START
+        BUILT_FOR_EVERY_START = True
+        argv = [word for word in argv if word != "--built-for-every-start"]
     # (the checks of the one file, and its times, make and read packs)
     needs_the_tool = not argv or argv == ["--one-file"] or argv[:2] == ["--time", "--pack"]
     if needs_the_tool and not os.path.isfile(PACK_TOOL):
