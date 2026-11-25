@@ -30,7 +30,7 @@ use tauri::{RunEvent, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use vispora_shell_core::http::Request;
 use vispora_shell_core::instance::{self, Begin, Held};
 use vispora_shell_core::json::Json;
-use vispora_shell_core::moved::{self, Moved};
+use vispora_shell_core::moved;
 use vispora_shell_core::platform::{Command, Window};
 use vispora_shell_core::pack::Pack;
 use vispora_shell_core::trouble::Trouble;
@@ -282,8 +282,9 @@ fn the_backend_made_ready(shell: &Arc<Shell>, carried: &'static [u8], places: ba
             std::thread::spawn(move || {
                 let others = backend::remove_other_kept(&kept_in, but.as_deref(), open_to);
                 if others != backend::Others::default() {
-                    shell.say(&format!("folders of the background program from other versions: {} taken away, {} left because a copy of the app is using them, \
-                                        {} left because they are not this program's making", others.removed, others.in_use, others.not_ours));
+                    shell.say(&format!("folders of the background program from other versions: {} taken away, {} left because they could not be taken away now \
+                                        (held open, or something in them is in use), {} left because they are not this program's making",
+                                       others.removed, others.left, others.not_ours));
                 }
             });
         }
@@ -335,14 +336,14 @@ fn run(settings: Settings, folders: &paths::Paths, held: Option<Box<dyn Held>>, 
     if !ignored.is_empty() {
         shell.say(&format!("settings for WebView2 were in the environment and were not used: {}", ignored.join(", ")));
     }
-    // What has moved from the backend is answered by the shell itself, from
-    // readings of this PC that it takes itself (core/src/moved/: they only
-    // read).  The backend's own routes are as they were, and answer
-    // whatever the shell does not take.
+    // What has moved from the backend is answered by the shell itself
+    // (core/src/moved/: it only reads, and the graphics card's reading is
+    // asked of the backend).  The backend's own routes are as they were,
+    // and answer whatever the shell does not take.
     if all_to_backend {
         shell.say("every call is the backend's: the shell answers nothing of what has moved itself");
     } else {
-        *shell.moved.lock().unwrap_or_else(|p| p.into_inner()) = Some(Moved::new(Arc::new(moved::Real), true));
+        shell.reads_with(Arc::new(moved::Real), true);
     }
 
     // The window's own folder, new at every start and gone after it (see

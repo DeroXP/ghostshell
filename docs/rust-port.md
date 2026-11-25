@@ -324,7 +324,7 @@ request, in this order:
 
 | | Module | What it reads, and when | What it changes | Where it stops |
 | --- | --- | --- | --- | --- |
-| 1 | The performance sampler (`core/perf_monitor.py`) | the graphics card, five times a second, while the Monitor page is open | nothing | **moved**: `shell_rs/core/src/moved/perf.rs` |
+| 1 | The performance sampler (`core/perf_monitor.py`) | the graphics card, five times a second, while the Monitor page is open | nothing | **moved**: `shell_rs/core/src/moved/perf.rs`. The card's reading itself is asked of the backend (below) |
 | 2 | The hardware monitor (`core/hw_monitor.py`) | processor, card, memory, DPC time, ping: once a second while the Monitor page is open | nothing | its benchmark writes a file, and its list of programs starts PowerShell: both stay in Python until they have a reading of their own |
 | 3 | The network monitor (`core/net_monitor.py`) | bytes per program and per network card, once a second while the Network page is open | nothing in its loop | pausing a program is process tuning (item 3 of the plan) and stays; which game is running is the game monitor's to say, and is asked of the backend until piece 7 |
 | 4 | The popup watchdog (`core/popup_killer.py`) | every visible window, once a second, always | closes Windows' own "get an app to open this link" windows | the first piece that changes something: looking and closing are kept apart, and the closing is never run against a PC by a test or a trial |
@@ -334,7 +334,8 @@ request, in this order:
 
 After piece 7 nothing in the backend runs while the app idles with no page
 open, and item 1's last step can be taken: the backend is started only when
-a page needs it.
+a page needs it. One thing stands before that step, found with the first
+piece: the graphics card's reading (below).
 
 Why the sampler first, though it is the coldest of the seven: it is the
 smallest module that has everything a move needs (a loop of its own, state,
@@ -347,25 +348,80 @@ module stands on was laid down with the least else in the way:
   Rust library: the code the Python app loads as a DLL) and a made-up side
   (a table and a clock set by hand). Nothing that changes the PC can be
   reached through it: the helper's two actions are behind another function
-  of its own, which the shell names nowhere.
+  of its own, which the shell names nowhere. And the graphics card cannot
+  be asked through it: the real side refuses every question about the
+  card before the helper hears it.
+* **The graphics card's reading is the backend's.** To read the card, a
+  program starts NVIDIA's library (`nvml.dll`) in its own process. A
+  driver's installer has to replace that file, which is why today's app
+  asks its helper to let go of it before it starts one, for fifteen
+  minutes (`core/driver_updater.py`). Measured on the way
+  (`python tools/measure/nvml_release.py`, on an RTX 5070 Ti with driver
+  621.40): once that library has been started in a process, it stays in
+  that process whatever is shut down or freed afterwards. Only the end of
+  the process takes it out. The shell lives as long as the app does, so it
+  never opens the library: what has moved asks the backend for the card's
+  reading (`GET /api/gpu/oc/live`, which is
+  `gpu_overclock.read_live_state()` and nothing else: the reading the
+  Python modules take themselves), with the run's secret, as the shell
+  asks for the tray. So a moved module's reading is Python's at all times:
+  through the helper, through `nvidia-smi` on a PC where the helper has no
+  answer, through the fifteen minutes of a driver's install and the half
+  minute the helper waits after a driver stopped answering. Without a
+  backend to ask (it is starting, or has ended and is being started again)
+  there is no reading, and a sample says so; the sampler itself goes on.
 * **What the shell takes, and what it passes on.** The shell answers a
   moved call only where it gives the answer Python gives. Anything else of
-  the same path (another method, a body Python stops at before it does
-  anything) is passed on, so the backend answers it as before.
+  the same path is passed on, so the backend answers it as before: another
+  method, a body Python stops at before it does anything, and a number
+  that Python may read and the shell cannot (more digits than the shell
+  counts with, the digits of another script, a blank that is not a plain
+  one).
 * **The old way stays.** The Python module and its routes are not changed.
-  They answer when the app is started as it always was; behind the shell
-  when it is started with `--all-to-backend`; and on a PC whose card gives
-  the shell no reading (Python then asks `nvidia-smi`, which the shell does
-  not start: such a PC keeps the backend's sampler).
+  They answer when the app is started as it always was, and behind the
+  shell when it is started with `--all-to-backend`.
 * **The same answers**, proven before anything is removed:
   `tests/test_moved_perf.py` asks the Python module (through its routes)
   and the shell's (in the trial tool) the same things on the same made-up
-  machine, and compares every answer: 860 of them, among them the score
-  for cards that idle, work steadily, jump about, come and go.
+  machine, and compares every answer: 917 of them, among them the score
+  for cards that idle, work steadily, jump about, come and go, and the
+  samples of a card that answers only to `nvidia-smi`, or to nothing. The
+  shell's own made-up helper says something else of the card throughout,
+  and is never asked.
 * **Tried for real, and measured**: `python shell_rs/app/try_it.py --moved`
-  (the app's own page in the real window, with this PC's card read by the
-  shell) and `python shell_rs/try_it.py --moved` (the numbers, in
+  (the app's own page in the real window against the stand-in backend: the
+  samples are the stand-in's reading, and Windows' list of the shell's
+  loaded libraries never has the driver's in it) and
+  `python shell_rs/try_it.py --moved` (the numbers, in
   [performance.md](performance.md)).
+
+Two things follow from the card's reading, and neither is decided here:
+
+* **Before item 1's last step, the card needs a reader that is not the
+  backend.** Pieces 2 and 5 read the card as well, and the temperature
+  ceiling (piece 5) reads it every second for as long as the app runs.
+  They take the same reading from the backend, so they see what Python
+  sees and do not go blind while a driver is installed. But while that is
+  so, the backend cannot be "started only when a page needs it". What
+  would free it: a small process of the shell's own that holds the
+  library and does nothing but answer for the card, which the shell ends
+  before a driver's install (the one thing that really takes the file out
+  of use) and starts again afterwards. It would also take away what the
+  sampler costs behind the shell now: each of its readings is a call to
+  the backend, five a second, and that is about 1.5% of one core while
+  the Monitor page is open, where the backend's own sampler takes about
+  a tenth of that ([performance.md](performance.md)). To be decided with
+  the owner before piece 5, not built here.
+* **Today's app keeps the library too.** The same measurement, through the
+  app's own helper: asked to let go, it shuts the library down and frees
+  it, and both copies of the file (`System32` and the driver's own folder)
+  are still loaded in the process afterwards. The helper has read the card
+  for the app since 3.8.1 (before that, `nvidia-smi` was started for every
+  reading, and ended). The temperature ceiling reads the card every
+  second, so today's backend holds the file from soon after its start,
+  through a driver's install as well. Whether NVIDIA's installer minds was
+  not tried (no installer is ever started from here). It is a matter of
+  the released app, left as it is here, and the owner's to decide.
 
 ## What goes last
 

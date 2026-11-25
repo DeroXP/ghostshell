@@ -90,8 +90,11 @@ pub struct Ready {
 pub struct Others {
     /// Taken away.
     pub removed: usize,
-    /// Left as they are: a copy of the app is using them.
-    pub in_use: usize,
+    /// Left as they are, for now: held open (as by a copy of the app that
+    /// runs from one), being made at this moment, or with something in
+    /// them that Windows would not let go of.  Which program it is that
+    /// holds a folder or a file in it is not known here.
+    pub left: usize,
     /// Left as they are: of the name, but not of this program's making.
     pub not_ours: usize,
 }
@@ -216,32 +219,39 @@ pub fn remove_other_kept(kept_in: &str, but: Option<&str>, open_to: OpenTo) -> O
             continue;
         }
         if name.ends_with(BEING_MADE) && !made_long_ago(&entry) {
-            others.in_use += 1;
+            others.left += 1;
             continue;
         }
         match take_away(&entry.path().to_string_lossy(), open_to) {
             Ok(()) => others.removed += 1,
             Err(NotTaken::NotOurs) => others.not_ours += 1,
-            Err(NotTaken::InUse) => others.in_use += 1,
+            Err(NotTaken::Held | NotTaken::WouldNotGo) => others.left += 1,
         }
     }
     others
 }
 
-/// Why a folder was not taken away.
+/// Why a folder was not taken away: what is known, and no more.  (Who
+/// holds a folder, or a file in it, Windows does not say: a copy of the
+/// app that runs from it, a backend that has not ended yet, or a virus
+/// scanner that is reading a file.)
 #[derive(Debug, PartialEq)]
 enum NotTaken {
     /// Not of this program's making: never touched.
     NotOurs,
-    /// A copy of the app holds it, or a program in it is still running.
-    InUse,
+    /// Some program holds the folder open.  Nothing in it was touched.
+    Held,
+    /// Windows would not let go of something in it: a program in it that
+    /// is running, or a file that some program holds.
+    WouldNotGo,
 }
 
 impl std::fmt::Display for NotTaken {
     fn fmt(&self, to: &mut std::fmt::Formatter) -> std::fmt::Result {
         to.write_str(match self {
             NotTaken::NotOurs => "it is not this program's folder",
-            NotTaken::InUse => "a copy of the app is using it",
+            NotTaken::Held => "a program holds the folder open",
+            NotTaken::WouldNotGo => "Windows would not let go of something in it",
         })
     }
 }
@@ -253,14 +263,14 @@ impl std::fmt::Display for NotTaken {
 fn take_away(path: &str, open_to: OpenTo) -> Result<(), NotTaken> {
     match win::open_to_remove(path, open_to) {
         win::ToRemove::NotOurs => Err(NotTaken::NotOurs),
-        win::ToRemove::InUse => Err(NotTaken::InUse),
+        win::ToRemove::InUse => Err(NotTaken::Held),
         win::ToRemove::Ours(going) => {
             let gone = win::programs_let_go(std::path::Path::new(path)) && std::fs::remove_dir_all(path).is_ok();
             drop(going);
             if gone {
                 Ok(())
             } else {
-                Err(NotTaken::InUse)
+                Err(NotTaken::WouldNotGo)
             }
         }
     }
@@ -373,7 +383,7 @@ mod tests {
         assert!(std::fs::rename(&first.folder, &elsewhere).is_err(), "it could be given another name while it was in use");
         drop(first);
         assert!(std::fs::rename(&again.folder, &elsewhere).is_err(), "it could be given another name while the second copy used it");
-        assert_eq!(remove_other_kept(&format!("{place}\\kept"), None, OpenTo::ThisAccount), Others { removed: 0, in_use: 1, not_ours: 0 });
+        assert_eq!(remove_other_kept(&format!("{place}\\kept"), None, OpenTo::ThisAccount), Others { removed: 0, left: 1, not_ours: 0 });
         assert_eq!(pack.same_as(&again.folder, &[]), Ok(()), "a folder in use was touched");
         drop(again);
         tidy(&place);
@@ -466,7 +476,7 @@ mod tests {
         // unpacks for the run.
         let a_copy = make_ready(&pack, Way::OncePerVersion, &places(&place)).unwrap();
         std::fs::write(&program, b"MZ somebody else's program").unwrap();
-        used_instead(&pack, &place, "could not be taken away to be made again (a copy of the app is using it)");
+        used_instead(&pack, &place, "could not be taken away to be made again (a program holds the folder open)");
         assert_eq!(std::fs::read(&program).unwrap(), b"MZ somebody else's program", "a folder that a copy holds was touched");
         drop(a_copy);
         // A backend whose shell is gone still runs in it (as Windows holds
@@ -474,7 +484,7 @@ mod tests {
         // before the program when the folder is read.
         std::fs::write(format!("{folder}\\0-comes-first.txt"), b"still needed").unwrap();
         let running = std::fs::OpenOptions::new().read(true).share_mode(1).open(&program).unwrap();
-        used_instead(&pack, &place, "could not be taken away to be made again (a copy of the app is using it)");
+        used_instead(&pack, &place, "could not be taken away to be made again (Windows would not let go of something in it)");
         assert!(there(&format!("{folder}\\0-comes-first.txt")) && there(&format!("{folder}\\_internal\\python312.dll")), "a folder whose program runs was taken apart");
         // Once it has ended, the next start makes the folder again.
         drop(running);
@@ -532,7 +542,7 @@ mod tests {
         std::fs::create_dir(format!("{kept_in}\\Something-else")).unwrap();
 
         let now = make_ready(&new, Way::OncePerVersion, &places(&place)).unwrap();
-        assert_eq!(others(now.kept.as_deref()), Others { removed: 2, in_use: 3, not_ours: 1 });
+        assert_eq!(others(now.kept.as_deref()), Others { removed: 2, left: 3, not_ours: 1 });
         assert!(!there(&was) && !there(&half_made), "an earlier version's folder, and one a start was cut short in");
         assert!(there(&format!("{kept_in}\\{being_made}\\VisporaBackend.exe")), "a folder that may be being made was taken away");
         assert_eq!(older.same_as(&in_use.folder, &[]), Ok(()), "a folder that a copy holds was touched");
@@ -542,14 +552,14 @@ mod tests {
         assert_eq!(new.same_as(&now.folder, &[]), Ok(()));
         // Once those have ended, the next start takes their folders too.
         drop((in_use, running));
-        assert_eq!(others(now.kept.as_deref()), Others { removed: 2, in_use: 1, not_ours: 1 });
+        assert_eq!(others(now.kept.as_deref()), Others { removed: 2, left: 1, not_ours: 1 });
         assert_eq!(kept_folders(&place), ["Something-else".to_string(), kept_name(&new), being_made.clone(), theirs.clone()]);
         // A build that keeps none takes away what a build that kept one
         // left: not under a copy that is using it, and then.
-        assert_eq!(others(None), Others { removed: 0, in_use: 2, not_ours: 1 });
+        assert_eq!(others(None), Others { removed: 0, left: 2, not_ours: 1 });
         assert_eq!(new.same_as(&now.folder, &[]), Ok(()));
         drop(now);
-        assert_eq!(others(None), Others { removed: 1, in_use: 1, not_ours: 1 });
+        assert_eq!(others(None), Others { removed: 1, left: 1, not_ours: 1 });
         assert_eq!(kept_folders(&place), ["Something-else".to_string(), being_made, theirs]);
         tidy(&place);
     }

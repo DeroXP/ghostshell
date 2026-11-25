@@ -15,7 +15,7 @@ are as they were. The pieces:
 | `app/` | The window (Tauri, as for the updater), on the app's own page | written, tried for real against a stand-in backend |
 | the tray | The tray icon and its menu, and what the entry for starting at sign-in names | written, tried for real against a stand-in backend |
 | one file | The exe carrying the backend and unpacking it before it starts it, in one of two ways that the owner still has to choose between | written, tried for real with the real backend's files and a stand-in started in their place |
-| what has moved | Modules of the backend that the shell now does itself (step 4 of the plan): so far the performance sampler | written, proven to give Python's answers on a made-up machine, tried for real with this PC's graphics card read by the shell |
+| what has moved | Modules of the backend that the shell now does itself (step 4 of the plan): so far the performance sampler | written, proven to give Python's answers on a made-up machine, tried for real in the window against the stand-in backend (the card's reading is the backend's: the shell never opens the driver's library) |
 
 ## How the two sides work together
 
@@ -531,7 +531,7 @@ been measured.
 
 ```
 cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
-python shell_rs/app/try_it.py                  # 110 checks; the window is never shown
+python shell_rs/app/try_it.py                  # 119 checks; the window is never shown
 python shell_rs/app/try_it.py --time           # the times
 python shell_rs/app/try_it.py --time --pack P  # ... and what unpacking the pack P costs, both ways
 python shell_rs/app/try_it.py --time --pack P --carried-by E
@@ -630,13 +630,14 @@ folder is tried, that it works in one for administrators only is not.
 
 Step 4 of [docs/rust-port.md](../docs/rust-port.md) moves the backend into
 the shell one module at a time. A module that has moved is in
-`core/src/moved/`: the shell answers its calls itself, from readings it
-takes itself, and they do not reach the backend. The order, and why, is in
-the plan ("Item 1, cut into pieces").
+`core/src/moved/`: the shell answers its calls itself, and they do not
+reach the backend. The order, and why, is in the plan ("Item 1, cut into
+pieces").
 
 So far: **the performance sampler** (`core/src/moved/perf.rs`, which is
-`core/perf_monitor.py`): the graphics card read five times a second while
-the Monitor page is open, for its live charts and its stability score.
+`core/perf_monitor.py`): the graphics card's reading taken five times a
+second while the Monitor page is open, for its live charts and its
+stability score.
 
 The rules every module there keeps:
 
@@ -649,38 +650,59 @@ The rules every module there keeps:
   (`tests/test_moved_perf.py` holds that, and that nothing in the folder
   starts a program, writes a file or calls Windows itself). What changes
   the PC will get a door of its own when the first such module moves.
+* **The shell does not open the graphics driver's library.** To read the
+  card, a program starts NVIDIA's library (`nvml.dll`) in its own process,
+  and a library that was started stays in its process until the process
+  ends, whatever is shut down or freed
+  (`python tools/measure/nvml_release.py` shows it on a PC with an NVIDIA
+  card). A driver's installer has to replace that file, and the shell
+  lives as long as the app. So `Real` refuses every question about the
+  card before the helper hears it, and a module that needs the card's
+  reading asks the backend for it (`Card`, in `core/src/moved/mod.rs`):
+  `GET /api/gpu/oc/live`, which is the reading the Python modules take
+  themselves, asked with the run's secret as the shell asks for the tray.
+  The backend reads the card as it always did: through its own copy of
+  the helper, or with `nvidia-smi` where the helper has no answer or was
+  told to let go. Without a backend to ask (it is starting, or has ended
+  and is being started again) there is no reading, and a sample says so.
 * **A real side and a made-up side.** `Real` asks the helper. `Fake`
-  answers from a table and tells a time that is set by hand: the tests'
-  machine, and the trial tool's (`vispora-shell-try --moved`).
+  answers from a table and tells a time that is set by hand, and
+  `FakeBackend` says what the card says: the tests' machine, and the trial
+  tool's (`vispora-shell-try --moved`).
 * **The same answers as Python, or the call is not taken.** The shell
   answers a moved call only where it gives the answer the Python route
   gives; `tests/test_moved_perf.py` asks both the same things on the same
   made-up machine and compares every answer. Anything else of a moved path
   is passed on, and the backend answers it as before: another method, a
-  body that is no JSON, JSON that Python cannot use. Python stops at those
-  before it touches the module, so its answer is the answer.
+  body that is no JSON, JSON that Python cannot use (Python stops at those
+  before it touches the module, so its answer is the answer), and a number
+  that Python may read and the shell cannot (more digits than the shell
+  counts with, the digits of another script, a blank that is not a plain
+  one: no page of the app sends such a number).
 * **The old way stays.** The Python module and its routes are not changed.
   They answer when the app is started as it always was. Behind the shell
   they answer every call when the shell is started with
   `--all-to-backend` (for telling apart, on a PC, whether something is the
-  shell's doing or the backend's), and they answer the sampler's calls on
-  a PC whose card gives the shell no reading: Python then asks
-  `nvidia-smi`, which the shell does not start. Whether the card answers
-  is asked once, at the sampler's first call, so there is one sampler for
-  a run, in one place.
+  shell's doing or the backend's).
 * **Asked what every call is asked first.** A moved call needs the run's
   secret and the app's own page like any other; only then is it answered.
-  It is answered without the backend and without waiting for it.
+  It is answered without the backend and without waiting for it. (A
+  sample of the card needs the backend; an answer about the samples does
+  not.)
 
 ```
-python shell_rs/app/try_it.py --moved   # the real window: the page's calls, this PC's card
+python shell_rs/app/try_it.py --moved   # the real window: the page's calls, the backend asked for the card, the shell's loaded libraries
 python shell_rs/try_it.py --moved       # what it costs, beside the backend's own (a minute and a half)
+python tools/measure/nvml_release.py    # that NVIDIA's library stays in a process that let go of it
 ```
 
-The numbers are in [docs/performance.md](../docs/performance.md): a reading
-of the card takes the shell 0.09 ms, the chart's data 0.09 ms where a call
-to the backend and back takes 1 ms, and the shell's process uses 0.05 to
-0.2% of one core while the sampler runs.
+The numbers are in [docs/performance.md](../docs/performance.md). The
+chart's data takes the shell 0.14 ms where a call to the backend and back
+takes 1.2 ms. But the sampler as a whole costs more behind the shell than
+it did in the backend: each reading of the card is a call to the backend,
+and that comes to about 1.5% of one core while the Monitor page is open,
+against about 0.15%. What would take that away, and why it is not built
+yet, is in the plan.
 
 ## What is where
 
@@ -691,7 +713,7 @@ to the backend and back takes 1 ms, and the shell's process uses 0.05 to
 | `app/build.rs`, `app/app.manifest`, `app/tauri.conf.json` | What the exe carries besides its code: icon, version (from `config.py`), a manifest that asks for no rights, and the backend's pack |
 | `core/src/pack.rs` | The pack: a folder of files as one piece of bytes, made, read, unpacked and held against a folder |
 | `core/src/backend.rs` | Where the backend is unpacked and which folder it is run from: the two ways, the checks, taking old folders away |
-| `core/src/moved/mod.rs` | What has moved from the backend: the door to the PC's readings (real and made-up), and what a route reads off a call the way Flask reads it |
+| `core/src/moved/mod.rs` | What has moved from the backend: the door to the PC's readings (real and made-up), the graphics card's reading (asked of the backend), and what a route reads off a call the way Flask reads it |
 | `core/src/moved/perf.rs` | The performance sampler, moved from `core/perf_monitor.py` |
 | `../backend.spec` | The app built as a folder for the shell to carry (PyInstaller) |
 | `app/try_it.py` | Runs the real window exe against a stand-in backend, out of the way |
@@ -794,10 +816,14 @@ it is told to start, and the only thing to tell it is the stand-in.
   files with what the app draws.
 * **What has moved has not run with administrator rights, or beside the
   real backend.** The sampler was tried in the real window against the
-  stand-in, reading this PC's card. That its answers are the Python
-  module's is proven on a made-up machine, not on a PC: one reading of a
-  real card can differ by a degree between the helper and `nvidia-smi`
-  (docs/performance.md, step 1), and the shell has no `nvidia-smi` way.
+  stand-in, whose fake machine says what the card says. That its answers
+  are the Python module's is proven on a made-up machine. Beside the real
+  backend the reading is the real `read_live_state()`, which the shell
+  has never asked for on a PC.
+* **No driver's installer was ever started** by a test or a trial, so
+  what an installer does about a library that a process holds is not
+  known. The shell holds none. Today's backend does, also after it was
+  asked to let go (the plan, "Item 1, cut into pieces").
 * **The one-file exe has never been started.** The build that ships was
   built with the real backend's pack in it (32.8 MB), to know its size,
   and never run. So nobody has seen: the administrator prompt followed by

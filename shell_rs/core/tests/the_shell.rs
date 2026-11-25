@@ -682,14 +682,18 @@ fn a_call_is_not_waited_for_once_the_backend_is_gone_for_good() {
 // What has moved from the backend into the shell
 // ═════════════════════════════════════════════════════════════════════
 
-/// A shell that reads a made-up machine: a card that answers.
+/// A shell that reads a made-up machine.  (Its library would say what a
+/// card says, with a temperature the backend never says: the shell does
+/// not ask it for the card.)
 fn with_a_machine(rig: &Rig) -> Arc<vispora_shell_core::moved::Fake> {
     let machine = vispora_shell_core::moved::Fake::new();
-    machine.answers("gpu_live", Some(Json::object([("temp_c", 61.into()), ("gpu_util_pct", 97.into()), ("core_mhz", 2100.into())])));
+    machine.answers("gpu_live", Some(Json::object([("temp_c", 13.into()), ("gpu_util_pct", 97.into()), ("core_mhz", 2100.into())])));
     machine.at(1000.0);
-    *rig.shell.moved.lock().unwrap() = Some(vispora_shell_core::moved::Moved::new(machine.clone(), false));
+    rig.shell.reads_with(machine.clone(), false);
     machine
 }
+
+const THE_CARD: &str = "/api/gpu/oc/live";
 
 #[test]
 fn a_call_that_has_moved_is_answered_by_the_shell_and_does_not_reach_the_backend() {
@@ -709,7 +713,7 @@ fn a_call_that_has_moved_is_answered_by_the_shell_and_does_not_reach_the_backend
     assert_eq!(text(&post("/api/perf/stop", r#"{"consumer": "hwmon-page"}"#)), r#"{"ok":true,"stopped":true}"#);
     assert!(began.elapsed() < Duration::from_millis(300) && rig.shell.phase() == Phase::Starting, "a call that has moved waited for the backend");
     assert_eq!(rig.wait_ready(), Phase::Ready);
-    assert!(rig.stage.last().calls().iter().all(|seen| !seen.target.starts_with("/api/perf/")), "a call that has moved reached the backend");
+    assert!(rig.stage.last().calls().is_empty(), "a call that has moved reached the backend: {:?}", rig.stage.last().calls());
     // Every other call is the backend's, as before.
     assert_eq!(rig.call("GET", "/api/echo").status, 200);
     assert_eq!(rig.stage.last().times_asked("/api/echo"), 1);
@@ -733,14 +737,106 @@ fn a_call_that_has_moved_is_asked_what_every_call_is_asked() {
 }
 
 #[test]
+fn the_cards_reading_is_asked_of_the_backend_with_the_runs_secret() {
+    // (a backend that takes a while to come up, and after it one that never does)
+    let rig = Rig::with(vec![Behaviour { up_after: Duration::from_millis(300), ..Behaviour::default() }, Behaviour { never_up: true, ..Behaviour::default() }],
+                        settings());
+    let machine = with_a_machine(&rig);
+    let moved = rig.shell.moved.lock().unwrap().clone().unwrap();
+    rig.shell.start();
+    let post = |target: &str, body: &str| rig.shell.handle(&rig.asking("POST", target).with_body(body));
+    let last = || rig.call("GET", "/api/perf/status").to_json()["last"].to_string();
+    post("/api/perf/start", "{}");
+    // No backend yet: there is no reading, and a sample says so at once.
+    let began = Instant::now();
+    moved.perf.step(&moved.card);
+    assert_eq!(last(), r#"{"ts":1000.0,"ok":false,"core":0,"mem":0,"temp":0,"power":0.0,"util":0,"memutil":0,"fan":0}"#);
+    assert!(began.elapsed() < Duration::from_millis(200) && rig.shell.phase() == Phase::Starting, "a sample waited for the backend");
+    assert_eq!(rig.wait_ready(), Phase::Ready);
+    let backend = rig.stage.last();
+    assert_eq!(backend.times_asked(THE_CARD), 0);
+    // The backend is up: every sample is one reading of the backend's.
+    machine.at(1000.2);
+    moved.perf.step(&moved.card);
+    assert_eq!(last(), r#"{"ts":1000.2,"ok":true,"core":1800,"mem":7000,"temp":71,"power":123.45,"util":88,"memutil":33,"fan":60}"#);
+    *backend.card.lock().unwrap() = Json::parse(r#"{"ok": true, "core_mhz": 2100, "temp_c": 64, "power_w": 250.5, "gpu_util_pct": 99}"#).unwrap();
+    machine.at(1000.4);
+    moved.perf.step(&moved.card);
+    assert_eq!(last(), r#"{"ts":1000.4,"ok":true,"core":2100,"mem":0,"temp":64,"power":250.5,"util":99,"memutil":0,"fan":0}"#);
+    let seen = backend.calls();
+    assert_eq!(seen.iter().map(|seen| (seen.method.as_str(), seen.target.as_str())).collect::<Vec<_>>(), [("GET", THE_CARD), ("GET", THE_CARD)]);
+    for call in &seen {
+        // As the shell's own calls for the tray: with the secret, and with
+        // nothing a page would add.
+        assert_eq!(call.header(token::HEADER), Some(rig.shell.token().as_str()));
+        assert!(call.header("Origin").is_none() && call.header("Cookie").is_none() && call.body.is_empty());
+    }
+    // The backend has no reading either (no NVIDIA card): a sample says so.
+    *backend.card.lock().unwrap() = Json::parse(r#"{"ok": false, "err": "No NVIDIA GPU / nvidia-smi missing"}"#).unwrap();
+    moved.perf.step(&moved.card);
+    assert!(last().contains(r#""ok":false,"core":0,"mem":0,"temp":0"#), "{}", last());
+    // The shell's own library was not asked for the card at any time.
+    assert!(machine.asked().is_empty(), "{:?}", machine.asked());
+    // The page's own call for the card's reading stays what it was: the backend's.
+    let asked = backend.times_asked(THE_CARD);
+    assert_eq!(rig.call("GET", THE_CARD).to_json()["err"].as_str(), Some("No NVIDIA GPU / nvidia-smi missing"));
+    assert_eq!(backend.times_asked(THE_CARD), asked + 1);
+    // The reading comes back, and then the backend is gone (the one
+    // started in its place is not up): no reading, and no waiting for one.
+    *backend.card.lock().unwrap() = a_card();
+    moved.perf.step(&moved.card);
+    assert!(last().contains(r#""ok":true,"core":1800"#), "{}", last());
+    let asked = backend.times_asked(THE_CARD);
+    backend.end(1);
+    assert_ne!(rig.shell.wait_for(Duration::from_secs(10), |phase| *phase != Phase::Ready), Phase::Ready);
+    let began = Instant::now();
+    moved.perf.step(&moved.card);
+    assert!(last().contains(r#""ok":false,"core":0"#) && began.elapsed() < Duration::from_millis(200), "{} after {:?}", last(), began.elapsed());
+    assert_eq!(backend.times_asked(THE_CARD), asked, "a backend that is gone was asked");
+}
+
+#[test]
+fn with_its_thread_the_sampler_asks_the_backend_five_times_a_second_and_only_while_it_runs() {
+    let rig = Rig::ready();
+    let machine = vispora_shell_core::moved::Fake::new();
+    let moved = rig.shell.reads_with(machine.clone(), true);
+    let backend = rig.stage.last();
+    let post = |target: &str, body: &str| text(&rig.shell.handle(&rig.asking("POST", target).with_body(body)));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(backend.times_asked(THE_CARD), 0, "the card is read before anybody wants the sampler");
+    assert_eq!(post("/api/perf/start", r#"{"consumer": "hwmon-page"}"#), r#"{"ok":true,"consumers":["hwmon-page"]}"#);
+    let began = Instant::now();
+    while backend.times_asked(THE_CARD) < 4 && began.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let took = began.elapsed();
+    assert!(backend.times_asked(THE_CARD) >= 4 && took >= Duration::from_millis(500) && took < Duration::from_millis(2500), "four samples in {took:?}");
+    let status = rig.call("GET", "/api/perf/status").to_json();
+    assert_eq!((status["last"]["ok"].truthy(), status["last"]["temp"].as_int(), &status["last"]["power"]), (true, Some(71), &Json::Float(123.45)));
+    assert_eq!(post("/api/perf/stop", r#"{"consumer": "hwmon-page"}"#), r#"{"ok":true,"stopped":true}"#);
+    let told = Instant::now();
+    while moved.perf.is_running() && told.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let asked = backend.times_asked(THE_CARD);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(backend.times_asked(THE_CARD), asked, "the backend was asked for the card after the sampler stopped");
+    assert!(backend.calls().iter().all(|seen| seen.target == THE_CARD), "{:?}", backend.calls());
+    assert!(machine.asked().is_empty(), "{:?}", machine.asked());
+}
+
+#[test]
 fn what_the_shell_does_not_take_of_a_moved_path_is_the_backends() {
     let rig = Rig::ready();
     with_a_machine(&rig);
     let backend = rig.stage.last();
-    // Another method, a body Python stops at, a path the sampler does not have.
+    // Another method, a body Python stops at, a path the sampler does not
+    // have, a number of seconds that Python may read and the shell cannot.
+    let long = format!("/api/perf/samples?seconds={}", "9".repeat(60));
     let not_taken = [rig.asking("POST", "/api/perf/status"), rig.asking("GET", "/api/perf/start"),
                      rig.asking("POST", "/api/perf/start").with_body("not json"), rig.asking("POST", "/api/perf/stop").with_body("[1]"),
-                     rig.asking("POST", "/api/perf/start").with_body(r#"{"consumer": []}"#), rig.asking("GET", "/api/perf/other")];
+                     rig.asking("POST", "/api/perf/start").with_body(r#"{"consumer": []}"#), rig.asking("GET", "/api/perf/other"),
+                     rig.asking("GET", &long), rig.asking("GET", "/api/perf/score?seconds=%D9%A1%D9%A2")];
     for (n, request) in not_taken.iter().enumerate() {
         rig.shell.handle(request);
         let seen = backend.calls();
@@ -762,9 +858,5 @@ fn without_a_door_to_the_machine_every_call_is_the_backends_as_before() {
     }
     rig.shell.handle(&rig.asking("POST", "/api/perf/start").with_body(r#"{"consumer": "hwmon-page"}"#));
     assert_eq!(rig.stage.last().times_asked("/api/perf/start"), 1);
-    // And with a door, when the card gives the shell no reading: the same.
-    let machine = with_a_machine(&rig);
-    machine.answers("gpu_live", None);
-    rig.call("GET", "/api/perf/score");
-    assert_eq!(rig.stage.last().times_asked("/api/perf/score"), 2);
+    assert_eq!(rig.stage.last().times_asked(THE_CARD), 0, "a shell that has taken nothing over asked the backend for the card");
 }

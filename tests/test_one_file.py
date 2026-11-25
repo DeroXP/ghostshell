@@ -228,7 +228,13 @@ def test_the_backend_is_unpacked_only_where_a_program_without_rights_cannot_writ
     taken = backend[backend.index("fn take_away("):backend.index("/// Was this made so long ago")]
     asked = taken.index("match win::open_to_remove(path, open_to) {")
     assert asked < taken.index("win::programs_let_go(std::path::Path::new(path))") < taken.index("std::fs::remove_dir_all(path)") < taken.index("drop(going);")
-    assert "win::ToRemove::NotOurs => Err(NotTaken::NotOurs)," in taken and "win::ToRemove::InUse => Err(NotTaken::InUse)," in taken
+    assert "win::ToRemove::NotOurs => Err(NotTaken::NotOurs)," in taken and "win::ToRemove::InUse => Err(NotTaken::Held)," in taken
+    # What is said of a folder that was not taken away is what is known:
+    # that a program holds it open, or that Windows would not let go of
+    # something in it.  Not which program.
+    said = backend[backend.index("impl std::fmt::Display for NotTaken {"):backend.index("fn take_away(")]
+    assert '"a program holds the folder open"' in said and '"Windows would not let go of something in it"' in said
+    assert "a copy of the app is using" not in backend[:backend.index("#[cfg(test)]")] and "a copy of the app is using" not in main
     assert backend[:backend.index("#[cfg(test)]")].count("std::fs::remove_dir_all(") == 2, "a folder is taken away in a place of its own"
     # Made whole under another name, and never given a name that is taken.
     assert 'let making = format!("{folder}.{}{BEING_MADE}"' in kept and "win::move_without_replacing(&making, &folder)" in kept
@@ -340,14 +346,14 @@ def test_an_update_leaves_no_unpacked_backend_of_the_version_before():
     hook = main[main.index("fn the_backend_made_ready("):main.index("/// Open the window, start the backend")]
     assert "backend::remove_other_kept(&kept_in, but.as_deref(), open_to);" in hook
     assert "if let Some(kept_in) = places.kept.clone() {" in hook, "also by a build that keeps none"
-    others = backend[backend.index("pub fn remove_other_kept("):backend.index("/// Why a folder was not taken away.")]
+    others = backend[backend.index("pub fn remove_other_kept("):backend.index("/// Why a folder was not taken away")]
     # Only a folder of this program's own making, and only one that no copy
     # of the app (of the version before, in another session) is using.  A
     # copy holds its folder, and a folder that is held cannot be asked for;
     # a folder that somebody else made under the name is never touched.
     # (take_away, read above, is the one place a folder that stays goes.)
     asked = others.index("match take_away(&entry.path().to_string_lossy(), open_to) {")
-    assert "Err(NotTaken::NotOurs) => others.not_ours += 1," in others and "Err(NotTaken::InUse) => others.in_use += 1," in others
+    assert "Err(NotTaken::NotOurs) => others.not_ours += 1," in others and "Err(NotTaken::Held | NotTaken::WouldNotGo) => others.left += 1," in others
     assert "std::fs::remove_" not in others, "something is taken away that was not asked for first"
     # One that a copy in another session may be unpacking into right now is
     # not asked for at all, until it is too old to be that.

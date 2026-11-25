@@ -235,6 +235,19 @@ impl Shell {
         }))
     }
 
+    /// Give the shell its door to the machine: from now on it answers what
+    /// has moved from the backend itself (moved/), from what it reads
+    /// through `door`.  What it does not read itself (the graphics card:
+    /// moved/mod.rs says why) it asks of its backend, as it asks it for
+    /// the tray.
+    pub fn reads_with(self: &Arc<Self>, door: Arc<dyn crate::moved::Readings>, threads: bool) -> Arc<crate::moved::Moved> {
+        let moved = crate::moved::Moved::new(door, threads);
+        let shell = Arc::downgrade(self);
+        moved.asks_the_backend_with(Arc::new(move |path: &str| shell.upgrade()?.ask_backend("GET", path)));
+        *self.moved.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(moved.clone());
+        moved
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }

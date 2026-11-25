@@ -6,8 +6,8 @@
 //!                       [--ready-within <seconds>] [--quit-within <seconds>] [--calls-wait <seconds>]
 //!
 //! With `--readings real` the shell answers the calls that have moved from
-//! the backend itself, from readings of this PC (src/moved/: they only
-//! read).  Without it every call is the backend's.
+//! the backend itself (src/moved/: they only read; the graphics card's
+//! reading is asked of the backend).  Without it every call is the backend's.
 //!
 //! It starts the backend it is told to start (and only that: there is no
 //! default), then reads one JSON object per line from standard input and
@@ -19,9 +19,10 @@
 //!     {"do": "wait", "for": "ready", "within": 30}      ready | down | gone
 //!     {"do": "state"}        where the shell is, its backend's process id, what it has said
 //!     {"do": "token"}        the run's secret (this is a trial tool)
-//!     {"do": "reading", "question": "gpu_live", "times": 1000}
-//!         ask this PC's native helper a question that many times (it only
-//!         reads): how long one took, and what the last one said
+//!     {"do": "card", "times": 1000}
+//!         read the graphics card that many times the way what has moved
+//!         reads it (with --readings real: it asks the backend): how long
+//!         one took, and what the last one said
 //!     {"do": "start_other", "program": "...", "arguments": ["..."]}
 //!         start another program the way the shell starts everything but its backend
 //!     {"do": "quit"}         quit as the app would, answer, and end
@@ -167,19 +168,21 @@ fn answer(shell: &Arc<Shell>, asked: &Json) -> Result<Json, String> {
             Ok(Json::object([("ok", started.is_ok().into()), ("err", started.err().unwrap_or_default().into())]))
         }
         Some("token") => Ok(Json::object([("token", shell.token().as_str().into())])),
-        Some("reading") => {
-            use vispora_shell_core::moved::Readings as _;
-            let question = asked["question"].as_str().ok_or("\"question\" is missing")?;
+        Some("card") => {
+            let moved = shell.moved.lock().unwrap_or_else(|p| p.into_inner()).clone().ok_or("this run was started without --readings real")?;
             let times = asked["times"].as_int().unwrap_or(1).clamp(1, 100_000) as usize;
             let (mut took, mut last) = (Vec::with_capacity(times), None);
             for _ in 0..times {
                 let began = Instant::now();
-                last = moved::Real.ask(question);
+                last = moved.card.live();
                 took.push(began.elapsed().as_secs_f64() * 1000.0);
             }
             took.sort_by(|a, b| a.total_cmp(b));
-            Ok(Json::object([("ms", took[took.len() / 2].into()), ("slowest_ms", took[took.len() - 1].into()), ("first_ms", Json::Null),
-                             ("answer", last.unwrap_or(Json::Null))]))
+            let last = last.map_or(Json::Null, |live| Json::object([
+                ("core_mhz", Json::Int(live.core_mhz)), ("mem_mhz", Json::Int(live.mem_mhz)), ("temp_c", Json::Int(live.temp_c)), ("power_w", live.power_w.into()),
+                ("gpu_util_pct", Json::Int(live.gpu_util_pct)), ("mem_util_pct", Json::Int(live.mem_util_pct)), ("fan_pct", Json::Int(live.fan_pct)),
+            ]));
+            Ok(Json::object([("ms", took[took.len() / 2].into()), ("slowest_ms", took[took.len() - 1].into()), ("reading", last)]))
         }
         _ => Err("unknown \"do\"".into()),
     }
@@ -249,15 +252,18 @@ fn main() {
     //
     //     {"do": "now", "time": 1000.0}                        what time it is
     //     {"do": "answers", "question": "gpu_live", "answer": {...}}   what the library says (null: nothing)
+    //     {"do": "backend_says", "answer": {...}}   what the backend says the card says (null: it does not answer)
     //     {"do": "step"}                  what the sampling thread does in one round
+    //     {"do": "asked"}                 what the library and the backend were asked so far
     //     {"do": "call", "method": "GET", "target": "/api/perf/score", "body": "..."}
     //         the shell's own answer ({"status", "body"}), or {"passed_on": true}
     //
-    // Nothing of the PC is read: the machine is the table and the clock.
+    // Nothing of the PC is read: the machine is the table and the clock,
+    // and the backend is what it is told to say.
     if arguments == ["--moved"] {
-        let machine = moved::Fake::new();
-        let door: Arc<dyn moved::Readings> = machine.clone();
-        let moved = Moved::new(door.clone(), false);
+        let (machine, backend) = (moved::Fake::new(), moved::FakeBackend::new());
+        let moved = Moved::new(machine.clone(), false);
+        moved.asks_the_backend_with(backend.asker());
         let out = std::io::stdout();
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
@@ -280,8 +286,16 @@ fn main() {
                         machine.answers(asked["question"].as_str().unwrap_or(""), answer);
                         Json::object([("ok", true.into())])
                     }
+                    Some("backend_says") => {
+                        backend.says(asked.get("answer").filter(|answer| **answer != Json::Null).cloned());
+                        Json::object([("ok", true.into())])
+                    }
+                    Some("asked") => Json::object([
+                        ("library", Json::Array(machine.asked().into_iter().map(Into::into).collect())),
+                        ("backend", Json::Array(backend.asked().into_iter().map(Into::into).collect())),
+                    ]),
                     Some("step") => {
-                        moved.perf.step(&*door);
+                        moved.perf.step(&moved.card);
                         Json::object([("ok", true.into())])
                     }
                     Some("call") => {
@@ -312,13 +326,6 @@ fn main() {
         }
         return;
     }
-    // What this PC's native helper answers to one question (it only
-    // reads): for a trial that has to know what the shell will be told.
-    if arguments.len() == 2 && arguments[0] == "--reads" {
-        use vispora_shell_core::moved::Readings as _;
-        println!("{}", moved::Real.ask(&arguments[1]).unwrap_or(Json::Null));
-        return;
-    }
     if arguments == ["--where"] {
         println!("{}", Json::object([
             ("windows", win::windows_folder().unwrap_or_default().into()),
@@ -342,7 +349,7 @@ fn main() {
         }
     };
     if arguments.windows(2).any(|pair| pair[0] == "--readings" && pair[1] == "real") {
-        *shell.moved.lock().unwrap_or_else(|p| p.into_inner()) = Some(Moved::new(Arc::new(moved::Real), true));
+        shell.reads_with(Arc::new(moved::Real), true);
     }
     let out = std::io::stdout();
     let say = |value: Json| {

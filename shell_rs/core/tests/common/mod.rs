@@ -94,6 +94,14 @@ pub struct StandIn {
     ended: Mutex<Option<i32>>,
     pub was_ended_by_force: Mutex<bool>,
     pub seen: Mutex<Vec<Seen>>,
+    /// What it says the graphics card says (the app's /api/gpu/oc/live).
+    pub card: Mutex<Json>,
+}
+
+/// What a stand-in says the graphics card says, until it is told otherwise.
+pub fn a_card() -> Json {
+    Json::parse(r#"{"ok": true, "core_mhz": 1800, "mem_mhz": 7000, "temp_c": 71, "power_w": 123.45, "power_limit_w": 300.0, "gpu_util_pct": 88,
+                    "mem_util_pct": 33, "fan_pct": 60, "core_app_mhz": 1800, "mem_app_mhz": 7000, "core_max_mhz": 2200, "mem_max_mhz": 9800}"#).unwrap()
 }
 
 impl StandIn {
@@ -231,6 +239,7 @@ impl StandIn {
             ("POST", "/api/window/close-and-game-mode") => json("200 OK", Json::object([
                 ("ok", true.into()), ("hidden", false.into()), ("game_monitor", Json::object([("ok", true.into())])),
             ])),
+            ("GET", "/api/gpu/oc/live") => json("200 OK", self.card.lock().unwrap().clone()),
             (_, "/api/echo") => json("200 OK", Json::object([
                 ("ok", true.into()), ("method", seen.method.as_str().into()), ("target", seen.target.as_str().into()),
                 ("headers", Json::Object(seen.headers.iter().map(|(n, v)| (n.to_lowercase(), v.as_str().into())).collect())),
@@ -377,6 +386,7 @@ impl Platform for StageDoor {
             ended: Mutex::new(None),
             was_ended_by_force: Mutex::new(false),
             seen: Mutex::new(Vec::new()),
+            card: Mutex::new(a_card()),
         });
         self.0.started.lock().unwrap().push(stand_in.clone());
         // It "inherits" the shell's socket: the same one, to accept on.

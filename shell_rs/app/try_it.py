@@ -793,48 +793,127 @@ THE_SAMPLER = """(function () {
 })();"""
 
 
+# The page makes a call and says what came of it in a call of its own, which
+# the stand-in backend writes down: /api/trial/<name>/<what was told>.
+A_CALL = """(function () {
+    window.pywebview.api.get_api_token().then(function (token) {
+        var with_it = { 'X-Vispora-Token': token, 'Content-Type': 'application/json' };
+        fetch(%(path)s, { method: %(method)s, headers: with_it, body: %(body)s })
+            .then(function (answer) { return answer.json(); })
+            .then(function (said) { return fetch('/api/trial/' + %(name)s + '/' + [%(tell)s].join('/'), { headers: with_it }); });
+    });
+})();"""
+THE_LAST_SAMPLE = "said.running, said.sample_count, said.last ? said.last.ok : 'nothing', said.last ? said.last.temp : 'nothing'"
+
+
+def the_page_calls(run, method, path, body=None, tell="said.ok"):
+    """Have the app's page make a call, and give back what it told of the
+    answer (text, one for each thing asked for), or None."""
+    the_page_calls.made += 1
+    name = "call-%d" % the_page_calls.made
+    run.in_the_page(A_CALL % {"path": json.dumps(path), "method": json.dumps(method), "name": json.dumps(name), "tell": tell,
+                              "body": "null" if body is None else json.dumps(json.dumps(body))})
+    told = run.wait_for(lambda: [c[3] for c in run.calls() if c[3].startswith("/api/trial/%s/" % name)], 20)
+    return told[-1].split("/")[4:] if told else None
+
+
+the_page_calls.made = 0
+
+
+def holds(pid, library):
+    """Is a library of this name loaded in the process `pid`?  As Windows
+    lists it."""
+    listed = subprocess.run(["tasklist", "/m", library, "/fi", "PID eq %d" % pid, "/fo", "csv", "/nh"], capture_output=True, text=True,
+                            creationflags=NO_WINDOW).stdout
+    return '"%d"' % pid in listed
+
+
+THE_DRIVERS_LIBRARY = "nvml.dll"     # NVIDIA's, which a driver's installer has to be able to replace
+THE_CARD = "/api/gpu/oc/live"        # the backend's call for the card's reading
+
+
 def moved(root, check):
     """What has moved from the backend into the shell: the performance
-    sampler's calls are answered by the shell, from this PC's graphics card
-    (the shell only reads it), and do not reach the backend."""
-    card = subprocess.run([PACK_TOOL, "--reads", "gpu_live"], capture_output=True, text=True, creationflags=NO_WINDOW)
-    card = json.loads(card.stdout or "null") if card.returncode == 0 else None
-    answers = isinstance(card, dict) and card.get("temp_c") is not None
+    sampler's calls are answered by the shell and do not reach the backend.
+    Each of its samples is the backend's reading of the card (here: what the
+    stand-in backend's fake machine says), and the shell's own process never
+    opens the graphics driver's library, whatever the page asks for.
+
+    Nothing of this PC's card is read by the trial, and nothing is installed
+    or started: the call that would start a driver's installer goes to the
+    stand-in backend, on whose fake machine there is no installer."""
+    its_card = {"temp_c": 71, "gpu_util_pct": 50, "mem_util_pct": 20, "core_mhz": 1800, "mem_mhz": 7000, "power_mw": 123450, "fan_pct": 60}
 
     def the_page_uses_the_sampler(run):
-        up = first_screen(run)
         run.in_the_page(THE_SAMPLER)
         done = run.wait_for(lambda: [c for c in run.calls() if c[3] == "/api/trial/sampler-done"], 30)
         calls = run.calls()
         told = [c[3].split("/")[4:] for c in calls if c[3].startswith("/api/trial/sampler/")]
         score = [c[3].split("/")[4:] for c in calls if c[3].startswith("/api/trial/score/")]
         reached = [c[3] for c in calls if c[3].startswith("/api/perf/")]
-        return bool(up and done), (told[0] if told else None), (score[0] if score else None), reached
+        return bool(done), (told[0] if told else None), (score[0] if score else None), reached
+
+    def asked_for_the_card(run):
+        return len([c for c in run.calls() if c[2:] == ("GET", THE_CARD)])
 
     run = Run(root, "hidden")
     try:
+        up = first_screen(run)
+        pid = run.process.pid
+        sees = holds(pid, "kernel32.dll") and not holds(pid, "no-such-library.dll")
+        before = holds(pid, THE_DRIVERS_LIBRARY)
+        check("the window is up; the list of the shell's loaded libraries can be read, and the graphics driver's library is not in it", up and sees and not before)
+        time.sleep(1.0)
+        check("nobody wants the sampler yet: the backend was not asked for the card", asked_for_the_card(run) == 0)
+
+        # The Monitor page: start, a second and a half, status, score, stop.
+        the_page_calls(run, "POST", "/api/stand-in/card", its_card)
         done, told, score, reached = the_page_uses_the_sampler(run)
-        if answers:
-            check("the performance sampler's calls are answered by the shell, from this PC's card (%s degrees just now): %r, score %r"
-                  % (card.get("temp_c"), told, score),
-                  done and told and told[0] == "running" and 4 <= int(told[1]) <= 12 and told[2] == "a-reading"
-                  and score and score[0] in ("no-data", "idle", "healthy", "warn", "unstable"))
-            check("and none of them reached the backend", done and reached == [])
-        else:
-            check("this PC's card gives the shell no reading, so the sampler's calls are the backend's, all of them: %r" % (reached,),
-                  done and told and reached == ["/api/perf/start", "/api/perf/status", "/api/perf/score", "/api/perf/stop"])
-            check("and the backend's sampler answers as it always did: %r" % (told,), done and told and told[0] == "running")
+        asked = asked_for_the_card(run)
+        check("the performance sampler's calls are answered by the shell: %r, score %r" % (told, score),
+              done and told and told[0] == "running" and 4 <= int(told[1]) <= 12 and told[2] == "a-reading"
+              and score and score[0] in ("no-data", "idle", "healthy", "warn", "unstable"))
+        check("none of them reached the backend, which was asked for the card's reading instead, once for a sample (%d times)" % asked,
+              done and reached == [] and told and int(told[1]) <= asked <= int(told[1]) + 3)
+        time.sleep(1.0)
+        check("after the page said it leaves, the backend is not asked for the card any more", asked_for_the_card(run) == asked)
+        last = the_page_calls(run, "GET", "/api/perf/status", tell=THE_LAST_SAMPLE)
+        check("the samples are the backend's reading (71 degrees on its fake machine, not this PC's card): %r" % (last,),
+              last and last[0] == "false" and last[2:] == ["true", "71"])
+        check("the shell's process still does not hold the graphics driver's library", not holds(pid, THE_DRIVERS_LIBRARY))
+
+        # The sampler runs, and the page asks for a driver's install.
+        started = the_page_calls(run, "POST", "/api/perf/start", {"consumer": "trial"})
+        the_page_calls(run, "POST", "/api/stand-in/card", dict(its_card, temp_c=64))
+        told = the_page_calls(run, "POST", "/api/driver/install", {}, tell="said.ok, (said.err || '').indexOf('not downloaded') >= 0")
+        install = [c for c in run.calls() if c[2:] == ("POST", "/api/driver/install")]
+        check("the call for a driver's install is the backend's as ever (on the fake machine it says there is no installer): %r" % (told,),
+              started == ["true"] and told == ["false", "true"] and len(install) == 1 and install[0][1] == 200)
+        time.sleep(1.2)
+        last = the_page_calls(run, "GET", "/api/perf/status", tell=THE_LAST_SAMPLE)
+        check("the sampler goes on meanwhile with the backend's reading (64 degrees now): %r" % (last,),
+              last and last[0] == "true" and last[2:] == ["true", "64"] and asked_for_the_card(run) >= asked + 4)
+        # The backend has no reading (as with no NVIDIA card at all).
+        the_page_calls(run, "POST", "/api/stand-in/card", {})
+        time.sleep(0.8)
+        last = the_page_calls(run, "GET", "/api/perf/status", tell=THE_LAST_SAMPLE)
+        check("where the backend has no reading, a sample says so, and the sampler stays the shell's: %r" % (last,),
+              last and last[0] == "true" and last[2:] == ["false", "0"] and not [c for c in run.calls() if c[3].startswith("/api/perf/")])
+        the_page_calls(run, "POST", "/api/perf/stop", {"consumer": "trial"})
+        check("at no time did the shell's process hold the graphics driver's library", not holds(pid, THE_DRIVERS_LIBRARY) and holds(pid, "kernel32.dll"))
         check("the shell quits as ever with a sampler that ran (exit code %r)" % (quit_by_its_window(run),), run.process.returncode == 0)
     finally:
         run.end()
 
     run = Run(root, "hidden", moved=False)
     try:
+        up = first_screen(run)
         done, told, score, reached = the_page_uses_the_sampler(run)
         check("told to leave every call to the backend, the shell passes the sampler's on, and says so in its log: %r" % (reached,),
-              done and reached == ["/api/perf/start", "/api/perf/status", "/api/perf/score", "/api/perf/stop"]
+              up and done and reached == ["/api/perf/start", "/api/perf/status", "/api/perf/score", "/api/perf/stop"]
               and "every call is the backend's" in run.log())
-        check("the backend's own sampler is as it was: %r" % (told,), done and told and told[0] == "running" and told[2] in ("no-reading", "nothing"))
+        check("the backend's own sampler is as it was, and the shell does not ask for the card: %r" % (told,),
+              done and told and told[0] == "running" and told[2] in ("no-reading", "nothing") and asked_for_the_card(run) == 0)
         quit_by_its_window(run)
     finally:
         run.end()
@@ -1149,8 +1228,8 @@ def every_check(root, check):
 # What a start says it did with the folders that stay and are not its own:
 # taken away, left because a copy is using them, left because they are not
 # the program's making.
-OTHER_VERSIONS = (r"from other versions: (\d+) taken away, (\d+) left because a copy of the app is using them, "
-                  r"(\d+) left because they are not this program's making")
+OTHER_VERSIONS = (r"from other versions: (\d+) taken away, (\d+) left because they could not be taken away now "
+                  r"\(held open, or something in them is in use\), (\d+) left because they are not this program's making")
 
 
 def can_be_renamed(folder):
@@ -1321,7 +1400,7 @@ def one_file(root, check):
             begins = None                           # (it was taken away)
         check("a folder that a copy runs from and that is not what the exe carries any more is left as it is: "
               "a second copy unpacks for its run instead",
-              up and got.get("kind") == "run" and "could not be taken away to be made again (a copy of the app is using it)" in log
+              up and got.get("kind") == "run" and "could not be taken away to be made again (a program holds the folder open)" in log
               and begins == b"XX")
         check("the open copy's page goes on working, and it quits as ever (exit code %r)" % (quit_by_its_window(open_copy),),
               open_copy.process.returncode == 0)
@@ -1562,7 +1641,7 @@ def main(argv):
             refuse("VisporaShell.exe is the build that is meant to ship (it asks for administrator rights). "
                    "Build it with --no-default-features first.")
     # (the checks of the one file, and its times, make and read packs)
-    needs_the_tool = not argv or argv in (["--one-file"], ["--moved"]) or argv[:2] == ["--time", "--pack"]
+    needs_the_tool = not argv or argv == ["--one-file"] or argv[:2] == ["--time", "--pack"]
     if needs_the_tool and not os.path.isfile(PACK_TOOL):
         refuse("%s is missing: build it first (cargo build --release --manifest-path shell_rs/core/Cargo.toml). "
                "It makes the packs that the exe is given to unpack." % PACK_TOOL)
