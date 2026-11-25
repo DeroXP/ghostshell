@@ -56,6 +56,56 @@ fn fill(template: &str, version: &str, appdata_dir: &str) -> String {
     out
 }
 
+/// What the window runs before the page's own script.
+///
+/// The page was written for pywebview's window and asks it three things
+/// through `window.pywebview.api`: the run's secret (when the one in its
+/// address got lost), to minimize, and to hide.  Here those become calls to
+/// the shell, which owns the window, so that static/js/app.js does not have
+/// to change.  Two more things pywebview did for the page: the parts marked
+/// `pywebview-drag-region` move the window (only the marked parts
+/// themselves, not the buttons inside them), and a right click does not
+/// open the browser's menu.
+///
+/// The window gives this to its own page only; it is never served.
+pub fn shim(token: &crate::token::Token) -> String {
+    SHIM.replace("%TOKEN%", token.as_str())
+}
+
+const SHIM: &str = r#"(function () {
+    if (window.pywebview && window.pywebview.api) { return; }
+    var token = "%TOKEN%";
+    var hidden = false;
+    function ask(path) {
+        return fetch(path, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Vispora-Token': token },
+            body: '{}'
+        }).then(function (answer) { return answer.json(); })
+          .then(function (said) { return !!(said && said.ok); });
+    }
+    window.pywebview = { api: {
+        get_api_token: function () { return Promise.resolve(token); },
+        minimize: function () { return ask('/api/window/minimize'); },
+        close_to_tray: function () {
+            return ask('/api/window/close').then(function (done) { if (done) { hidden = true; } return done; });
+        },
+        show: function () {
+            return ask('/api/window/show').then(function (done) { if (done) { hidden = false; } return done; });
+        },
+        is_hidden: function () { return Promise.resolve(hidden); }
+    } };
+    function mark() {
+        var style = document.createElement('style');
+        style.textContent = '.pywebview-drag-region { -webkit-app-region: drag; } ' +
+            '.pywebview-drag-region *:not(.pywebview-drag-region) { -webkit-app-region: no-drag; }';
+        (document.head || document.documentElement).appendChild(style);
+    }
+    if (document.head) { mark(); } else { document.addEventListener('DOMContentLoaded', mark); }
+    document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+})();
+"#;
+
 /// One of the page's files by its path: the kind of file and its bytes.
 pub fn file(path: &str) -> Option<(&'static str, &'static [u8])> {
     match path {
@@ -84,6 +134,23 @@ mod tests {
         assert!(!page.contains("{{") && !page.contains("{%"), "the template uses something the shell does not fill in");
         assert!(page.starts_with("<!DOCTYPE html>") && !page.contains('\r') && !page.ends_with('\n'));
         assert!(page.contains("/static/js/app.js") && page.contains("/static/css/style.css"));
+    }
+
+    #[test]
+    fn the_window_stands_in_for_what_the_page_asked_pywebview_for() {
+        let token = crate::token::Token::from_text("abcdefghijklmnopqrstuvwxyz0123456789-_ABCDEFG").unwrap();
+        let script = shim(&token);
+        assert!(script.contains("var token = \"abcdefghijklmnopqrstuvwxyz0123456789-_ABCDEFG\";") && !script.contains("%TOKEN%"));
+        for name in ["get_api_token", "minimize", "close_to_tray", "show", "is_hidden"] {
+            assert!(script.contains(&format!("        {name}: function")), "{name}");
+        }
+        for path in ["/api/window/minimize", "/api/window/close", "/api/window/show"] {
+            assert!(script.contains(&format!("ask('{path}')")), "{path}");
+        }
+        assert!(script.contains("'X-Vispora-Token': token"), "the shell's own calls carry the secret too");
+        assert!(script.contains(".pywebview-drag-region *:not(.pywebview-drag-region) { -webkit-app-region: no-drag; }"));
+        // It leaves a pywebview that is really there alone.
+        assert!(script.contains("if (window.pywebview && window.pywebview.api) { return; }"));
     }
 
     #[test]

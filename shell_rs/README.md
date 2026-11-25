@@ -7,12 +7,13 @@ quitting. It is the second part of step 3 of
 [docs/rust-port.md](../docs/rust-port.md).
 
 **Nothing in a release uses it yet.** `build.spec` and what a release carries
-are as they were. What is here is the first of three pieces:
+are as they were. The pieces:
 
 | Piece | What | State |
 | --- | --- | --- |
-| `core/` | The shell without a window: which request is answered where, the backend's start and stop, quitting with a time limit | written, tested, tried against a stand-in backend |
-| the window | The window (Tauri, as for the updater), the tray, telling a second copy from the first, autostart | not started |
+| `core/` | The shell without a window: which request is answered where, the backend's start and stop, quitting with a time limit, and whether this is the one copy | written, tested, tried against a stand-in backend |
+| `app/` | The window (Tauri, as for the updater), on the app's own page | written, tried for real against a stand-in backend |
+| the tray | The tray icon and its menu, and autostart pointing at the shell | not started |
 | one file | `Vispora.exe` carrying the backend and unpacking it once per version | not started |
 
 ## How the two sides work together
@@ -110,10 +111,79 @@ What the backend does not do behind the shell: tell a second copy from the
 first, ask for administrator rights, open a window, show a tray icon. Those
 are the shell's (the next piece). Everything else a start does, it does.
 
+## The window
+
+`app/` is the window around `core/`: Tauri on WebView2, the versions the
+updater's window pinned, and no crate the updater's window did not already
+bring (a test compares the two lock files). Plain `cargo build`, as there.
+
+* **The page is the app's own**, not changed. `static/js/app.js` was written
+  for pywebview's window and asks it three things through
+  `window.pywebview.api` (the run's secret, minimize, hide). The window
+  gives its page a few lines of script before the page's own
+  (`core/src/page.rs`), which turn those into calls to the shell. The same
+  lines make the parts of the page marked `pywebview-drag-region` move the
+  window, and only those parts themselves, as pywebview did it.
+* **The page cannot reach Tauri's commands**: none are registered and it is
+  given no permission for the built-in ones. The window stays on the app's
+  own page; a link the page opens goes to the browser.
+* **Is a copy running already?** That is looked at first, before anything
+  asks for administrator rights (`core/src/instance.rs`). A second start
+  asks the first copy for its window and leaves. Today's exe carries a
+  manifest that asks for administrator rights, so Windows' prompt comes
+  before the app can look; the shell's exe asks for nothing in its manifest
+  and asks itself, after it has looked. "Is a copy running" is the name the
+  Python app has always held (a mutex), so an old copy and a new one see
+  each other; "show your window" is a second name (an event) that the
+  running copy listens on. Windows' own calls for both.
+* **WebView2 is asked for before a window is made**, and a missing one is
+  said in a plain Windows message.
+* **Closing the window from outside** (Alt+F4, the taskbar, signing out)
+  quits the app: the process does not end before the backend has put the
+  system back and ended.
+* **What the shell starts besides its backend** (a browser for a link) is
+  started the way Explorer would start it, not as a child of the shell: it
+  inherits none of the shell's handles, and so not the listening socket,
+  which only the backend is meant to get.
+* **`--from-autostart`** starts the window out of sight and is passed on to
+  the backend, as today.
+
+The exe is `VisporaShell.exe` for now. It gets the app's name in the
+one-file piece; until then no exe named after the app is ever started in a
+trial, because the app itself is running on the PC the trials are made on.
+
+### Trying the window
+
+```
+cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
+python shell_rs/app/try_it.py                  # 13 checks; the window is never shown
+python shell_rs/app/try_it.py --time           # the times
+python shell_rs/app/try_it.py --picture x.png  # a picture of the window
+python shell_rs/app/try_it.py --show           # the window, to look at and click
+```
+
+`--no-default-features` makes the trial build: it never asks for
+administrator rights, takes its backend from the trial (the app on the fake
+machine, as a real process) and knows itself by names of the trial's own, so
+that it never takes the installed Vispora for its first copy. Without a
+trial to tell it these things it says so and ends. The build that is meant
+to ship is made without that flag:
+
+```
+cargo build --release --locked --manifest-path shell_rs/app/Cargo.toml
+```
+
+It has nothing to start yet (the backend is packed in the one-file piece)
+and says that its files are incomplete.
+
 ## What is where
 
 | File | What it does |
 | --- | --- |
+| `app/src/main.rs` | The window: first copy, WebView2, the page, the requests, the quit |
+| `app/build.rs`, `app/app.manifest`, `app/tauri.conf.json` | What the exe carries besides its code: icon, version (from `config.py`), a manifest that asks for no rights |
+| `app/try_it.py` | Runs the real window exe against a stand-in backend, out of the way |
+| `core/src/instance.rs` | Is this the one copy, and does it have the rights it needs: the order of a start |
 | `core/src/router.rs` | Which request is answered where, and which is refused |
 | `core/src/shell.rs` | Starting the backend, noticing that it stopped, starting it again, quitting |
 | `core/src/forward.rs` | Passing a call on to the backend and reading its answer |
@@ -185,8 +255,27 @@ it is told to start, and the only thing to tell it is the stand-in.
 
 ## What has not been done yet
 
-* No window, no tray, no single-instance check, no autostart: the next
-  piece.
+* **No tray icon.** A window that was hidden (Hide to Tray, or a start at
+  sign-in) is brought back by starting the app again. The tray needs calls
+  the backend does not have yet (its menu acts on the app directly today)
+  and its three icons; it is the next piece, with autostart pointing at the
+  shell's exe.
+* **The administrator prompt and a second start beside a copy that has
+  administrator rights** have not been seen: the trials run without them.
+  The event a second start rings is made so that a program without those
+  rights may ring it; that part is untried.
+* **Old network filter software.** On a PC where such software (a layered
+  service provider) sits between programs and Windows' sockets, a socket
+  that a program inherits may not be usable in it. The backend then refuses
+  the hand-over, the shell gives up after three tries, and the page is told
+  that the background program does not start and where the reason is
+  written down (`vispora.log`). If that ever shows up for real, handing the
+  socket over with `WSADuplicateSocket` and `socket.fromshare` is the
+  documented way.
+* **The graphics switches for the window.** Today the backend picks
+  WebView2's switches for the PC's graphics card before it opens its
+  window. The shell's window opens before the backend is up, and uses
+  WebView2's defaults for now.
 * **Ending a backend ends one process.** That is right for a backend that
   is one process. If the backend is ever packed so that the program the
   shell starts is only an unpacker for the real one, a forced end would

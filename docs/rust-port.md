@@ -164,7 +164,7 @@ routing), the Python backend (every route not yet moved), and the step 1
 library, which the shell uses as an ordinary Rust crate and Python still loads
 as a DLL.
 
-Where the shell stands. It is cut into three pieces, each a pull request of
+Where the shell stands. It is cut into four pieces, each a pull request of
 its own. `main` stays releasable after each, because no release uses any of
 it before the last one is in and the owner says so; `build.spec` is not
 touched until then.
@@ -175,9 +175,14 @@ touched until then.
    window or tray, on a port the shell picks, leaving when the shell does.
    Tested against a stand-in, and tried for real against the app on the
    fake machine of the tests. No outside crates.
-2. **The window.** Tauri, as for the updater; the tray, telling a second
-   copy from the first, autostart; the shim for `window.pywebview.api`.
-3. **One file.** `Vispora.exe` carrying the backend, and unpacking it once
+2. **The window (written).** `shell_rs/app`: Tauri, as for the updater, on
+   the app's own page; the few lines that stand in for
+   `window.pywebview.api`; telling a second copy from the first, before
+   anything asks for administrator rights; a start at sign-in out of sight.
+   Tried for real against the app on the fake machine.
+3. **The tray.** Its icon and menu, which need calls the backend does not
+   have yet, and autostart pointing at the shell.
+4. **One file.** `Vispora.exe` carrying the backend, and unpacking it once
    per version.
 
 Decided while writing the core (the reasons are in

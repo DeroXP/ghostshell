@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use common::*;
 use vispora_shell_core::http::Request;
 use vispora_shell_core::json::Json;
-use vispora_shell_core::shell::Phase;
+use vispora_shell_core::shell::{Phase, NEVER_UP};
 use vispora_shell_core::token;
 
 fn down(phase: &Phase) -> bool {
@@ -94,7 +94,7 @@ fn a_backend_that_never_comes_up_is_ended_started_again_and_then_given_up_on() {
     let rig = Rig::with(vec![Behaviour { never_up: true, ..Behaviour::default() }], settings);
     rig.shell.start();
     let phase = rig.shell.wait_for(Duration::from_secs(10), down);
-    assert_eq!(phase, Phase::Down("Vispora's background program does not start. Close Vispora and open it again.".into()));
+    assert_eq!(phase, Phase::Down(NEVER_UP.into()));
     // The first start and two more (settings.restarts), each ended.
     assert_eq!(rig.stage.count(), 3);
     for n in 0..3 {
@@ -462,7 +462,7 @@ fn a_backend_that_never_comes_up_is_given_up_on_however_long_each_try_takes() {
     let began = Instant::now();
     rig.shell.start();
     let phase = rig.shell.wait_for(Duration::from_secs(8), down);
-    assert_eq!(phase, Phase::Down("Vispora's background program does not start. Close Vispora and open it again.".into()),
+    assert_eq!(phase, Phase::Down(NEVER_UP.into()),
                "after {:?}: {:?}", began.elapsed(), rig.shell.history());
     assert_eq!(rig.stage.count(), 3, "the first try and two more");
     assert!(began.elapsed() < Duration::from_secs(4), "{:?}", began.elapsed());

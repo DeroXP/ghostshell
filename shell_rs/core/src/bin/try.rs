@@ -15,6 +15,8 @@
 //!     {"do": "wait", "for": "ready", "within": 30}      ready | down | gone
 //!     {"do": "state"}        where the shell is, its backend's process id, what it has said
 //!     {"do": "token"}        the run's secret (this is a trial tool)
+//!     {"do": "start_other", "target": "...", "parameters": "..."}
+//!         start another program the way the shell starts a browser for a link
 //!     {"do": "quit"}         quit as the app would, answer, and end
 //!     {"do": "crash"}        end at once without quitting, as a shell that died would
 //!
@@ -52,6 +54,7 @@ fn state_of(shell: &Shell) -> Json {
         ("phase", text_of(&shell.phase()).into()),
         ("backend_pid", shell.backend_pid().map_or(Json::Null, Into::into)),
         ("port", (shell.port() as u32).into()),
+        ("listen", shell.listening_handle().into()),
         ("starts", (shell.starts() as u32).into()),
         ("ready_ms", millis(ready)),
         ("quit_ms", millis(quit)),
@@ -137,6 +140,13 @@ fn answer(shell: &Arc<Shell>, asked: &Json) -> Result<Json, String> {
             Ok(Json::object([("phase", text_of(&phase).into())]))
         }
         Some("state") => Ok(state_of(shell)),
+        // Start another program the way the shell starts everything that
+        // is not its backend (a browser for a link, say): see win::start_other.
+        Some("start_other") => {
+            let target = asked["target"].as_str().ok_or("\"target\" is missing")?;
+            let started = win::start_other(target, asked["parameters"].as_str().unwrap_or(""));
+            Ok(Json::object([("ok", started.is_ok().into()), ("err", started.err().unwrap_or_default().into())]))
+        }
         Some("token") => Ok(Json::object([("token", shell.token().as_str().into())])),
         _ => Err("unknown \"do\"".into()),
     }

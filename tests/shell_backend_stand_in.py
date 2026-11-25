@@ -27,7 +27,9 @@ nothing is left behind by a trial that went wrong.
 
 With VISPORA_STAND_IN_NOTES=<file> in its environment it writes a line there
 each time it puts the (fake) system back, with the reason: that is how a test
-sees that a backend restored before it went.
+sees that a backend restored before it went.  With VISPORA_STAND_IN_CALLS=<file>
+it writes a line for every call it answers (the time, the status, the
+method and the path): that is how a trial sees what the window's page asked.
 """
 import sandbox as m                                 # noqa: F401  (first: the fake machine)
 
@@ -68,6 +70,14 @@ def main():
                 f.write(f"put back: {reason}\n")
 
         A._restore_system_before_exit = noted
+    calls = os.environ.get("VISPORA_STAND_IN_CALLS")
+    if calls:
+        def note(answer):
+            with open(calls, "a", encoding="utf-8") as f:
+                f.write(f"{time.time():.3f} {answer.status_code} {A.request.method} {A.request.path}\n")
+            return answer
+
+        A.app.after_request(note)
     if "--die-with" in sys.argv:
         return int(_value("--die-with", "1"))
     time.sleep(float(_value("--slow-start", "0")))

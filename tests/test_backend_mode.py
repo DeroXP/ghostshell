@@ -272,9 +272,14 @@ def test_the_handed_over_socket_has_to_be_what_the_hand_over_says():
     a = app()
     made, port = a_listening_socket()
     try:
+        # As it arrives from the shell: inheritable, which is how the backend
+        # got it.  The backend must not hand it on to the programs it starts.
+        made.set_inheritable(True)
+        assert made.get_inheritable() is True
         adopted = a._adopt_shell_listener(made.fileno(), port)
         assert adopted.fileno() == made.fileno() and adopted.getsockname() == ("127.0.0.1", port)
-        assert adopted.get_inheritable() is False, "not for the programs the backend starts"
+        assert adopted.get_inheritable() is False and made.get_inheritable() is False, \
+            "the programs the backend starts would get the shell's socket"
         adopted.detach()
         refused = []
         # Another port than it says; a socket that is not listening; one on
