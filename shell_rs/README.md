@@ -204,8 +204,16 @@ two lock files and knows the 4 by name. Plain `cargo build`, as there.
   only if that file is there and nobody holds it. A folder without the file
   is being made at this moment (the folder comes first, the file a moment
   later) and is left alone until it is ten minutes old. Only folders that
-  begin as the window's folders begin are looked at, never a link to
-  somewhere else. All of this is done once the window is there, on a
+  begin as one run's folders begin are looked at, never a link to
+  somewhere else, and **only folders of the shell's own making**: whose a
+  folder is, is asked of the folder once it is open, before anything in
+  it is looked at. A folder with such a name that somebody else made (any
+  program may make one in that place) is not touched, and nothing in it
+  is opened, its mark included. In one of the shell's own, the programs at
+  its top go first: a backend that outlived its shell (the shell was ended
+  by force) cannot be deleted while it runs, and its folder is then left
+  whole, because taking a folder away stops at the first thing Windows
+  will not let go, and not before. All of this is done once the window is there, on a
   thread of its own, and by name first: the place holds thousands of files
   that are nothing of the app's, and nothing is asked of Windows about
   those. (In a trial: one earlier run's folder of 129 files taken away with
@@ -354,6 +362,13 @@ cargo build --release --locked --manifest-path shell_rs/app/Cargo.toml
   carries nothing: the trial build is made that way and is given a pack by
   the trial; the build that ships, made that way, says that its files are
   incomplete and ends.
+* **The pack is read whole when the exe is built.** The build script asks
+  the code that reads the pack on a person's PC (`core/src/pack.rs`,
+  `fit_to_carry`; the core is a build dependency of the window's crate for
+  this, by its path, with nothing new in the lock file): the list, every
+  file taken out once with its length and its mark, and the version the
+  pack was made for against `config.py`'s. A damaged pack, or another
+  version's, stops the build and says why.
 
 The exe that comes out is `VisporaShell.exe`. A release would carry it
 under the app's name. That has not been done, and no exe named after the
@@ -393,9 +408,19 @@ of its own run with them. The rules (`core/src/backend.rs`):
     every start of the backend runs from, also a start after a backend
     that died.
 * **A folder with the right name that does not pass is never used, and
-  never put right.** It is left exactly as it is, the log says why, and the
-  backend is unpacked for this run instead. (Putting it right would mean
-  writing as administrator into something somebody else may own.)
+  never put right in place.** What becomes of it depends on whose it is:
+  * **Not the shell's own making** (the owner or the access list is not
+    the shell's): it is left exactly as it is, nothing in it is looked at,
+    the log says why, and the backend is unpacked for this run instead.
+    (Anything else would mean writing as administrator into something
+    somebody else may own.)
+  * **The shell's own making, but not what the exe carries** (a virus
+    scanner took a file away, say): it is taken away whole and made again,
+    if no copy of the app holds it and no program in it is running. That
+    is the same act, on the same evidence, as taking away another
+    version's folder. Left as it was, that version would unpack at every
+    start from then on, and only `shell.log` would ever say so. If a copy
+    is using it, it is left as it is and this start unpacks for the run.
 * **A folder that stays is made whole under another name** and given its
   own only then, never onto something that is there, and is then checked
   and held like one that was found. A start that is cut short leaves no
@@ -405,7 +430,9 @@ of its own run with them. The rules (`core/src/backend.rs`):
 * **Only folders of the shell's own making are ever taken away**, and only
   ones that no copy of the app is using: a copy holds its folder, and
   Windows refuses to hand out a held folder for removal. A folder of the
-  right kind of name that somebody else made is not touched.
+  right kind of name that somebody else made is not touched. The same
+  goes for one run's folders (the window's, and the backend's that is
+  unpacked at every start): see "The window".
 
 ### Two ways of keeping it, and one switch
 
@@ -503,7 +530,7 @@ been measured.
 
 ```
 cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
-python shell_rs/app/try_it.py                  # 101 checks; the window is never shown
+python shell_rs/app/try_it.py                  # 105 checks; the window is never shown
 python shell_rs/app/try_it.py --time           # the times
 python shell_rs/app/try_it.py --time --pack P  # ... and what unpacking the pack P costs, both ways
 python shell_rs/app/try_it.py --time --pack P --carried-by E
@@ -544,7 +571,8 @@ at what another program on the PC could get at, with the real window:
   debugger's port, a profile folder) and must not be used;
 * a folder as a run that was ended from outside leaves it must be removed
   and not used; one without the in-use file, made a moment ago, must be
-  left alone and not used;
+  left alone and not used; and one with the same name and the same file
+  that somebody else made must not be touched and not used;
 * a second copy is started that shares the place for the folders, as a
   second person's copy does: its start must leave the first copy's folder
   alone, and the first copy's page must go on working;
@@ -563,16 +591,20 @@ at what another program on the PC could get at, with the real window:
 * the backend is unpacked both ways from a made-up pack of five files: the
   folder for one run must hold exactly what the exe carries and the run's
   mark, be closed like the window's, and be gone after the quit; one that a
-  run left behind (Windows ended it) must be taken away by the next start;
-  the folder that stays must be found, checked and used by the next start
-  without unpacking, must not be renamable while a copy runs from it, and
-  must be left alone by another version's start for as long; a folder
-  whose program was changed, and a folder of the right name that somebody
-  else made with the right files in it, must not be used and must be left
-  as they are; another version's start must take the old folder away, and
-  a build that keeps none must take away what was kept; and a pack that
-  cannot be read must end the app with words of its own and nothing left
-  behind.
+  run left behind (Windows ended it) must be left whole by a start that
+  comes while a program is still running in it (the trial's own tool,
+  under the backend's name, with a file beside it that comes first when
+  the folder is read), and taken away by the next start once that program
+  has ended; the folder that stays must be found, checked and used by the
+  next start without unpacking, must not be renamable while a copy runs
+  from it, and must be left alone by another version's start for as long;
+  the shell's own folder whose program was changed must be taken away
+  whole and made again, and left as it is while a copy runs from it; a
+  folder of the right name that somebody else made with the right files
+  in it must not be used and must be left as it is; another version's
+  start must take the old folder away, and a build that keeps none must
+  take away what was kept; and a pack that cannot be read must end the app
+  with words of its own and nothing left behind.
 
 The tray is tried without a mouse, and for real. Its menu is read as
 Windows has it (the words, the ticks, what is greyed) and compared with
@@ -808,6 +840,11 @@ it is told to start, and the only thing to tell it is the stand-in.
   The old backend ends on its own when it sees the shell gone, after it has
   put the system back. Whether that and the new backend's start-up work
   can get in each other's way has not been tried.
+* **A folder of one run's name that somebody else made stays, too.** A
+  start does not touch it. A program without rights can so leave folders
+  with the shell's names in Windows' own folder for temporary files, as it
+  can leave any other folder there; they cost the tidy-up one question
+  each, and the app's own cleaner leaves them alone by their names.
 * **A folder of the right name that somebody else made stays for ever.**
   The shell neither uses nor removes it. A program without rights can so
   keep a build that unpacks once per version from ever doing that: every

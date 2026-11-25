@@ -649,16 +649,20 @@ impl OwnFolder {
     }
 }
 
-/// What a start found among the window's folders (remove_private_folders).
+/// What a start found among the folders of one run (remove_private_folders).
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Tidied {
     /// How many entries of the folder above were looked at, by name alone.
     pub entries: usize,
     /// Folders that earlier runs left behind, and that are gone now.
     pub removed: usize,
-    /// Folders of the window's kind that were left alone: in use by a copy
-    /// in another session, or too new to tell.
+    /// Folders of this program's making that were left alone: in use by a
+    /// copy in another session, too new to tell, or with a program in them
+    /// that is still running.
     pub left: usize,
+    /// Folders with the name that are not of this program's making.
+    /// Nothing in them was opened, and they were not touched.
+    pub not_ours: usize,
 }
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -1094,17 +1098,60 @@ fn remove_private_folder(path: &str) -> bool {
     false
 }
 
+/// Take away the programs at the top of `folder`, which has to be one of
+/// this program's own making: that is where a run's own program is (a
+/// backend's folder has one, a window's has none).  False if Windows will
+/// not let one of them go.
+///
+/// A program that is running cannot be deleted, whoever started it and
+/// whether or not anybody still holds the folder: a backend whose shell
+/// was ended by force goes on for a moment, putting the system back.  Its
+/// folder is then to be left exactly as it is.  The programs come first
+/// because taking a folder away stops at the first thing Windows will not
+/// let go, and by then whatever came before it in the folder is gone.
+///
+/// Only for a folder of this program's making, held by the caller
+/// (open_to_remove): what is deleted here is named by its path, and in a
+/// folder that is somebody else's the path can be made to lead elsewhere.
+pub fn programs_let_go(folder: &std::path::Path) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    let Ok(entries) = std::fs::read_dir(folder) else { return true };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().to_lowercase().ends_with(".exe") {
+            continue;
+        }
+        let Ok(found) = entry.metadata() else { continue };
+        if !found.is_file() || found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// Remove what earlier runs left behind in `parent` (a run that was ended
-/// from outside does not get to clean up).  Only real folders that begin as
-/// the window's folders begin; never one that is in use; never anything
-/// that is a link to somewhere else.
+/// from outside does not get to clean up).  Only folders of this program's
+/// own making (`open_to` says whose those are) that begin as one run's
+/// folders begin; never one that is in use; never one whose program is
+/// still running.
+///
+/// A folder with such a name that somebody else made is not touched, and
+/// nothing in it is opened, its mark included: the place lets programs
+/// without rights make folders of their own, and what is in those, and
+/// where their names lead by now, is theirs to decide.  Whose a folder is,
+/// is asked of the folder itself once it is open (open_to_remove), and it
+/// stays open while it is taken away.
 ///
 /// `parent` can hold thousands of files that are nothing of the app's
 /// (Windows' own folder for temporary files does).  So the name is looked
 /// at first, and nothing more is asked about an entry that does not begin
-/// as the window's folders begin; what is then asked is what the listing
-/// itself already said, at no further cost.
-pub fn remove_private_folders(parent: &str) -> Tidied {
+/// as one run's folders begin; what is then asked first is what the
+/// listing itself already said, at no further cost.
+pub fn remove_private_folders(parent: &str, open_to: OpenTo) -> Tidied {
     use std::os::windows::fs::MetadataExt as _;
     let mut tidied = Tidied::default();
     let Ok(entries) = std::fs::read_dir(parent) else { return tidied };
@@ -1120,10 +1167,17 @@ pub fn remove_private_folders(parent: &str) -> Tidied {
             continue;
         }
         let path = entry.path();
-        if left_behind(&path, &found) && std::fs::remove_dir_all(&path).is_ok() {
-            tidied.removed += 1;
-        } else {
-            tidied.left += 1;
+        match open_to_remove(&path.to_string_lossy(), open_to) {
+            ToRemove::NotOurs => tidied.not_ours += 1,
+            ToRemove::InUse => tidied.left += 1,
+            ToRemove::Ours(going) => {
+                if left_behind(&path, &found) && programs_let_go(&path) && std::fs::remove_dir_all(&path).is_ok() {
+                    tidied.removed += 1;
+                } else {
+                    tidied.left += 1;
+                }
+                drop(going);
+            }
         }
     }
     tidied
@@ -1131,12 +1185,12 @@ pub fn remove_private_folders(parent: &str) -> Tidied {
 
 /// Open what is under the mark's name in `folder`, for this program alone.
 ///
-/// The folder may be anybody's: the place the folders are in lets programs
-/// without rights make folders of their own, with whatever they like under
-/// that name.  So a link there is not followed (what is opened is the link
-/// itself), and whoever is at the other end of what is opened is not handed
-/// this program's rights (a pipe's owner could otherwise act as this
-/// program).
+/// Only a folder of this program's own making is asked for its mark
+/// (remove_private_folders).  All the same, a link there is not followed
+/// (what is opened is the link itself), and whoever is at the other end of
+/// what is opened is not handed this program's rights (a pipe's owner
+/// could otherwise act as this program): what is opened here is opened
+/// with administrator rights, and is not taken on trust.
 fn open_mark(folder: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt as _;
     let nobody_else = 0;
@@ -1346,7 +1400,7 @@ mod tests {
         // New, it is left alone; old, it is removed.
         let (being_made, never_marked) = (format!("{parent}\\{WINDOW_FOLDER_PREFIX}being-made"), format!("{parent}\\{WINDOW_FOLDER_PREFIX}never-marked"));
         for folder in [&being_made, &never_marked] {
-            std::fs::create_dir(folder).unwrap();
+            make_closed_folder(folder, OpenTo::ThisAccount).unwrap();
             std::fs::write(format!("{folder}\\planted.js"), b"x").unwrap();
         }
         let long_ago = std::time::SystemTime::now() - MARK_EXPECTED_WITHIN - std::time::Duration::from_secs(60);
@@ -1371,7 +1425,7 @@ mod tests {
         // to remove, and nothing is opened through a link.
         let odd = |name: &str| {
             let folder = format!("{parent}\\{WINDOW_FOLDER_PREFIX}{name}");
-            std::fs::create_dir(&folder).unwrap();
+            make_closed_folder(&folder, OpenTo::ThisAccount).unwrap();
             std::fs::write(format!("{folder}\\kept.txt"), b"x").unwrap();
             folder
         };
@@ -1397,9 +1451,23 @@ mod tests {
         }
         assert!(is_a_plain_file(&open_mark(std::path::Path::new(&left)).unwrap()), "a real mark is a plain file");
 
-        let tidied = remove_private_folders(&parent);
-        assert_eq!(tidied, Tidied { entries: 11, removed: 2, left: 6 }, "the two that no run is using, and only those");
+        // And one with the window's name that somebody else made, with
+        // everything about it that makes one of this program's own go: a
+        // mark that nobody holds, and old enough.  It is not this start's.
+        let somebody_elses = format!("{parent}\\{WINDOW_FOLDER_PREFIX}somebody-elses");
+        std::fs::create_dir(&somebody_elses).unwrap();
+        std::fs::write(format!("{somebody_elses}\\{IN_USE_MARK}"), b"").unwrap();
+        std::fs::write(format!("{somebody_elses}\\theirs.txt"), b"theirs").unwrap();
+        let folder = std::fs::OpenOptions::new().write(true).custom_flags(backup_semantics).open(&somebody_elses).unwrap();
+        folder.set_times(std::fs::FileTimes::new().set_created(long_ago)).unwrap();
+        drop(folder);
+
+        let tidied = remove_private_folders(&parent, OpenTo::ThisAccount);
+        assert_eq!(tidied, Tidied { entries: 12, removed: 2, left: 6, not_ours: 1 }, "the two that no run is using, and only those");
         assert!(!there(&left) && !there(&never_marked));
+        assert!(there(&format!("{somebody_elses}\\theirs.txt")) && there(&format!("{somebody_elses}\\{IN_USE_MARK}")), "somebody else's folder was touched");
+        // (asked for somebody else's folders, this account's are not it)
+        assert_eq!(remove_private_folders(&parent, OpenTo::Administrators), Tidied { entries: 10, removed: 0, left: 0, not_ours: 7 });
         for folder in [&a_folder, &a_link_to_a_folder, &a_link_to_a_file, &leads_elsewhere] {
             assert!(there(&format!("{folder}\\kept.txt")), "{folder} was taken away, with something that is no mark under the mark's name");
         }
@@ -1411,13 +1479,53 @@ mod tests {
         let was = theirs.path.clone();
         drop(_open);
         assert!(theirs.remove() && !there(&was));
-        assert_eq!(remove_private_folders(&parent), Tidied { entries: 8, removed: 0, left: 5 });
+        assert_eq!(remove_private_folders(&parent, OpenTo::ThisAccount), Tidied { entries: 9, removed: 0, left: 5, not_ours: 1 });
         let _ = std::fs::remove_file(format!("{leads_elsewhere}\\{IN_USE_MARK}"));
         let _ = std::fs::remove_dir(format!("{a_link_to_a_folder}\\{IN_USE_MARK}"));
         let _ = std::fs::remove_file(format!("{a_link_to_a_file}\\{IN_USE_MARK}"));
         let _ = std::fs::remove_dir(&link);
         tidy(&parent);
         tidy(&elsewhere);
+    }
+
+    #[test]
+    fn a_backend_that_outlived_its_shell_keeps_its_folder_whole() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // The shell was ended by force.  Nobody holds the folder's mark any
+        // more, and the backend is still running in it for a moment, putting
+        // the system back.  The next start must not take the folder apart
+        // under it: not the mark, and not what comes before the program
+        // when the folder is read (taking a folder away stops at the first
+        // thing Windows will not let go, and not before).
+        let parent = a_place("outlived");
+        let folder = private_folder_named(&parent, BACKEND_FOLDER_PREFIX, OpenTo::ThisAccount).unwrap();
+        let OwnFolder { path, in_use } = folder;
+        std::fs::create_dir(format!("{path}\\_internal")).unwrap();
+        let (first, program, library) = (format!("{path}\\0-comes-first.txt"), format!("{path}\\VisporaBackend.exe"), format!("{path}\\_internal\\python312.dll"));
+        for (file, holds) in [(&first, &b"still needed"[..]), (&program, b"MZ"), (&library, b"a library")] {
+            std::fs::write(file, holds).unwrap();
+        }
+        drop(in_use);
+        // (as Windows holds the program of a process that is running: it
+        // can be read, and not deleted)
+        let running = std::fs::OpenOptions::new().read(true).share_mode(1).open(&program).unwrap();
+        assert!(!programs_let_go(std::path::Path::new(&path)));
+        assert_eq!(remove_private_folders(&parent, OpenTo::ThisAccount), Tidied { entries: 1, removed: 0, left: 1, not_ours: 0 });
+        for file in [&first, &program, &library, &format!("{path}\\{IN_USE_MARK}")] {
+            assert!(there(file), "{file} was taken away under a backend that is still running");
+        }
+        // It has ended: the next start takes the folder away.
+        drop(running);
+        assert_eq!(remove_private_folders(&parent, OpenTo::ThisAccount), Tidied { entries: 1, removed: 1, left: 0, not_ours: 0 });
+        assert!(!there(&path));
+        // What is no program of the run's is not gone at first: a folder
+        // and a link under a program's name are left to the taking away.
+        let other = format!("{parent}\\elsewhere");
+        std::fs::create_dir_all(format!("{other}\\a-folder.exe")).unwrap();
+        std::fs::write(format!("{other}\\not-a-program.txt"), b"x").unwrap();
+        assert!(programs_let_go(std::path::Path::new(&other)));
+        assert!(there(&format!("{other}\\a-folder.exe")) && there(&format!("{other}\\not-a-program.txt")));
+        tidy(&parent);
     }
 
     #[test]

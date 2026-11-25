@@ -352,7 +352,9 @@ def test_the_window_brings_no_crate_but_tauris_own_and_its_tray():
         "the window and the tray icon, and nothing else"
     assert "plugin" not in manifest, "a feature of Tauri's own, not a plugin crate"
     wanted = manifest[manifest.index("[dependencies]"):manifest.index("[profile.release]")]
-    assert sorted(re.findall(r"^([\w-]+) = ", wanted, re.M)) == ["tauri", "tauri-build", "vispora-shell-core"]
+    # (the core twice: for the exe, and for the script that builds it, which
+    # reads the pack the exe is to carry before the exe is made)
+    assert sorted(re.findall(r"^([\w-]+) = ", wanted, re.M)) == ["tauri", "tauri-build", "vispora-shell-core", "vispora-shell-core"]
 
     def outside(lock):
         packages = re.split(r"\n\[\[package\]\]\n", lock)[1:]
@@ -599,8 +601,8 @@ def test_a_start_never_takes_away_a_folder_that_is_in_use_and_never_keeps_the_wi
     assert "is_some_and(|age| age >= MARK_EXPECTED_WITHIN)" in left
     # The mark is opened for this program alone, without following a link,
     # and without handing this program's rights to whatever is at the other
-    # end: the folder it is in may be anybody's (the place lets programs
-    # without rights make folders of their own).
+    # end.  (Only a folder of this program's own making is asked for its
+    # mark at all: tests/test_one_file.py has that.)
     opened = left[:left.index("/// Only a plain file is a mark")]
     for said in (".share_mode(nobody_else)", ".custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)", ".security_qos_flags(SECURITY_IDENTIFICATION)",
                  ".open(folder.join(IN_USE_MARK))"):
@@ -611,7 +613,7 @@ def test_a_start_never_takes_away_a_folder_that_is_in_use_and_never_keeps_the_wi
     # In the window's program: on a thread of its own, after the window is made.
     run = main[main.index("fn run("):]
     window_made = run.index(".map_err(no_window)?;", run.index("WebviewWindowBuilder::new("))
-    tidied = run.index("let tidied = win::remove_private_folders(&tidy_in);")
+    tidied = run.index("let tidied = win::remove_private_folders(&tidy_in, open_to);")
     assert window_made < run.index("std::thread::spawn(move || {", window_made) < tidied < run.index("shell.start();")
     assert run.count("remove_private_folders(") == 1
     # The trial tries both for real.

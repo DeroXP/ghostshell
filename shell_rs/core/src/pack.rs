@@ -209,6 +209,25 @@ pub fn make(folder: &str, version: &str, start: &str, way: Way) -> Result<Vec<u8
     Ok(pack)
 }
 
+/// Can an exe of the app's version `version` carry what `bytes` holds?
+/// What it holds, in a line, or why not.
+///
+/// The pack is read whole: its list, and every file taken out of it once,
+/// each with its length and its mark.  And it has to have been made for
+/// this version of the app.  Asked when the exe is built
+/// (shell_rs/app/build.rs), so that a pack that is damaged, or the pack of
+/// another version, stops the build, and is not found on a person's PC,
+/// where the app would only say that it cannot get its background program
+/// ready.
+pub fn fit_to_carry(bytes: &[u8], version: &str) -> Result<String, String> {
+    let pack = Pack::read(bytes)?;
+    if pack.version != version {
+        return Err(format!("it was made for version {} of the app, and this is version {version}", pack.version));
+    }
+    for_each(&pack.files, |file| pack.bytes_of(file).map(drop))?;
+    Ok(format!("{} files, {} bytes unpacked, {} bytes carried, for version {}", pack.files.len(), pack.size(), bytes.len(), pack.version))
+}
+
 impl<'a> Pack<'a> {
     /// Read a pack.  Everything it says is checked here, before anything is
     /// done with it: a pack that names a path outside the folder, or two
@@ -474,6 +493,18 @@ pub(crate) mod tests {
         let out = format!("{place}\\other-byte");
         std::fs::create_dir(&out).unwrap();
         assert!(pack.unpack_into(&out).is_err() && !Path::new(&format!("{out}\\a.exe")).exists(), "it was written out");
+
+        // What an exe may carry is asked when it is built: a pack that is
+        // whole, and made for the version the exe is built for.
+        assert_eq!(fit_to_carry(&good, "3.8.1").unwrap(), format!("5 files, 162223 bytes unpacked, {} bytes carried, for version 3.8.1", good.len()));
+        assert_eq!(fit_to_carry(&good, "3.8.2").unwrap_err(), "it was made for version 3.8.1 of the app, and this is version 3.8.2");
+        for (what, damaged) in [("cut short", &good[..good.len() - 1]), ("a byte of a squeezed file is another", &spoiled[..]), ("not a pack", &b"VSPPACK1 and no more"[..])] {
+            assert!(fit_to_carry(damaged, "3.8.1").is_err(), "{what}");
+        }
+        // (one that reads as a pack and whose list is right: only taking
+        // every file out tells that a file kept as it is holds another byte)
+        assert!(Pack::read(&other_byte).is_ok());
+        assert_eq!(fit_to_carry(&other_byte, "1").unwrap_err(), "a.exe did not come out of the exe as it went in");
         let _ = std::fs::remove_dir_all(&place);
     }
 }

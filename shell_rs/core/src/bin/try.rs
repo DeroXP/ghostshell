@@ -218,6 +218,16 @@ fn main() {
         }
         return;
     }
+    // Be there and do nothing, until the input ends.  For the trial that
+    // needs a program running under the backend's name in the folder a run
+    // left behind: a backend that outlived its shell.
+    if arguments == ["--only-be-there"] {
+        let mut line = String::new();
+        while std::io::stdin().read_line(&mut line).is_ok_and(|read| read > 0) {
+            line.clear();
+        }
+        return;
+    }
     if arguments == ["--where"] {
         println!("{}", Json::object([
             ("windows", win::windows_folder().unwrap_or_default().into()),
