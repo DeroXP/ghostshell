@@ -101,11 +101,44 @@ itself and the unpacking before it, which is step 3.
 
 This is the step that changes what the app is made of.
 
-**The updater first.** `updater/` is a second, small program (Flask and
-pywebview, its own exe). It is self-contained, so it is rewritten whole, as a
-small Tauri app. It is the practice run for the shell: same window technology,
-a tenth of the surface, and it has to change anyway because the app's files on
-disk are about to change.
+**The updater first (written, not released).** `updater/` is a second, small
+program (Flask and pywebview, its own exe). It is self-contained, so it is
+rewritten whole, as a small Tauri app: `updater_rs/`. It is the practice run
+for the shell: same window technology, a tenth of the surface, and it has to
+change anyway because the app's files on disk are about to change.
+
+What came of it (the details are in
+[updater_rs/README.md](../updater_rs/README.md)):
+
+* Two crates. `updater_rs/core` is everything the updater does, with no
+  outside crates, tested case for case against the Python updater's tests.
+  `updater_rs/app` is the window around it: Tauri 2.12.7, pinned, its lock
+  file committed.
+* One exe of 5.6 MB where the Python one is 14.5 MB. Same command line, same
+  administrator prompt, same window; version 2.0.0, so the app keeps it over
+  any Python updater once a release carries it.
+* What Tauri costs: 219 crates from crates.io are compiled into the exe (418
+  are in the lock file, which also covers other systems). 31 of them run a
+  program of their own while building and 19 are extensions to the compiler.
+* The Python updater stays in the repository, and stays the one that is
+  built and shipped, until a release carries the Rust one and it has worked
+  on a real PC. Nobody has run the Rust exe with administrator rights yet.
+
+What the practice run showed, for the shell:
+
+* The page did not have to change. Its `fetch('/api/...')` calls are answered
+  inside the process, through a custom protocol, with no server and no open
+  port. That is the shell's router in small: answer in Rust where a handler
+  exists, pass the rest on.
+* A title bar drawn by the page moves the window by its style sheet alone
+  (`-webkit-app-region`), with no script.
+* Where WebView2 is missing, opening the window does not fail, it waits for
+  ever. The shell has to ask for WebView2 first, as the updater now does,
+  and say what is wrong in a plain Windows message.
+* No Tauri command line tool, no Node and no installer builder were needed:
+  `cargo build` makes the one exe.
+* A window can be tested without showing it: the updater's real exe is run
+  against a made-up install by `updater_rs/app/try_it.py`.
 
 **Then the shell.** `Vispora.exe` becomes a Rust program (Tauri on WebView2)
 that:

@@ -1,0 +1,36 @@
+[package]
+name = "vispora-updater"
+# The same number as updater_rs/core (the updater's version is the core's;
+# tests/test_updater_rs.py checks that the two agree).
+version = "2.0.0"
+edition = "2021"
+description = "Vispora's standalone updater: the window around updater_rs/core, and the exe that ships"
+license = "MIT"
+publish = false
+
+# The exe is VisporaUpdater.exe; a release carries it as VisporaUpdater-<version>.exe.
+[[bin]]
+name = "VisporaUpdater"
+path = "src/main.rs"
+
+[features]
+default = ["elevated"]
+# The exe asks Windows for administrator rights when it starts (its manifest
+# says so), as the Python updater did: it has to write into Program Files.
+# Without this feature the exe runs with the rights of whoever starts it,
+# which is only for trying it in a sandbox folder (see try_it.py).
+elevated = []
+
+[dependencies]
+vispora-updater-core = { path = "../core" }
+tauri = { version = "=2.12.7", default-features = false, features = ["wry", "custom-protocol"] }
+
+[build-dependencies]
+tauri-build = { version = "=2.7.6", default-features = false, features = ["config-json"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"

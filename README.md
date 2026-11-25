@@ -64,6 +64,19 @@ is not; a library left over from before such a change stops the build. A
 build without it works the same, only slower: the app then asks PowerShell and
 `nvidia-smi` as before. See [native/README.md](native/README.md).
 
+The updater exists twice for now. `updater_helper.spec` builds the Python one
+(version 1.5.0), which is the one releases carry. Its replacement in Rust is
+in `updater_rs/` (version 2.0.0), has not been released yet, and is built with
+
+```bash
+cargo build --release --locked --manifest-path updater_rs/app/Cargo.toml
+```
+
+into `updater_rs/app/target/release/VisporaUpdater.exe`. The first time, that
+build downloads Tauri and the crates it needs from crates.io; which ones, in
+which versions, is fixed by `updater_rs/app/Cargo.lock`. See
+[updater_rs/README.md](updater_rs/README.md).
+
 Release binaries are not kept in this repo. They are published in two places,
 and an installed copy asks them in this order:
 
@@ -107,6 +120,12 @@ few read-only questions (the process list, the processor's clock, the active
 power plan) and has it trim that test's own memory. The Rust side has tests of
 its own: `cargo test --release --manifest-path native/Cargo.toml`.
 
+The Rust updater has the Python updater's cases as its own tests, against a
+fake network and fake processes:
+`cargo test --release --manifest-path updater_rs/core/Cargo.toml`. Its real
+exe can be tried against a made-up install in a temporary folder with
+`python updater_rs/app/try_it.py`; read the top of that file first.
+
 ## Layout
 
 | Path | What lives there |
@@ -118,6 +137,7 @@ its own: `cargo test --release --manifest-path native/Cargo.toml`.
 | `native/` | The native helper: a Rust library for the readings the app takes all the time and the ones a start waits for (see `native/README.md`) |
 | `static/`, `templates/` | The UI (plain JS/CSS, no build step) |
 | `updater/` | The standalone updater app (its own Flask + pywebview window) |
+| `updater_rs/` | The same updater rewritten in Rust, not released yet: `core/` does the work with no outside crates, `app/` is its window (Tauri). See `updater_rs/README.md` |
 | `tests/` | The test suite and the fake machine it runs on (see [Test](#test)) |
 | `cloud/` | Optional FastAPI licensing / trial backend (see `cloud/README.md`) |
 | `docs/` | Where the app's time goes (`performance.md`) and the order of the move to Rust (`rust-port.md`) |
