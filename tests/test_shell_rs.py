@@ -310,6 +310,21 @@ def app_crate(*path):
         return f.read()
 
 
+def registry_source(crate, *path):
+    """A file of an outside crate, in the version the lock file pins, where
+    cargo keeps what it downloaded.  None on a PC that never built the window."""
+    version = re.search(r'name = "%s"\nversion = "([^"]+)"' % re.escape(crate), app_crate("Cargo.lock")).group(1)
+    # (the person's own folder: the sandbox points USERPROFILE somewhere else)
+    home = os.environ.get("HOMEDRIVE", "") + os.environ.get("HOMEPATH", "")
+    kept = os.path.join(os.environ.get("CARGO_HOME") or os.path.join(home, ".cargo"), "registry", "src")
+    for index in (os.listdir(kept) if os.path.isdir(kept) else []):
+        found = os.path.join(kept, index, f"{crate}-{version}", *path)
+        if os.path.isfile(found):
+            with open(found, encoding="utf-8") as f:
+                return f.read()
+    return None
+
+
 # ═════════════════════════════════════════════════════════════════════
 # The window (shell_rs/app)
 # ═════════════════════════════════════════════════════════════════════
@@ -363,6 +378,37 @@ def test_the_window_is_the_python_apps_window():
     assert main.index("app.run_return(") < main.index('shell.quit_and_wait("the window was closed")')
 
 
+def test_signing_out_does_not_skip_the_quit():
+    """When Windows signs the person out, shuts down or replaces the app's
+    files, the window's loop is told so and the process is ended inside that
+    very call: nothing written after the loop is reached.  The loop's last
+    word (Exit) still is, so the quit is there."""
+    main = app_crate("src", "main.rs")
+    loop = main[main.index("let code = app.run_return("):main.index('let quit = shell.quit_and_wait("the window was closed");')]
+    assert ("if let RunEvent::Exit = event {\n"
+            "            *over.lock().unwrap_or_else(|p| p.into_inner()) = true;\n"
+            "            at_the_end.quit_and_wait(\"the window is gone\");\n"
+            "        }") in loop
+    # A loop that is over is not told to end: Tauri would end the process on
+    # the spot, before the window's folder is taken away.
+    hook = main[main.index("*shell.exit_hook.lock()"):main.index("shell.start();")]
+    assert "if !*over {\n            handle.exit(code);\n        }" in hook and main.count("handle.exit(") == 1
+    tauri = registry_source("tauri", "src", "app.rs")
+    if tauri:
+        told = tauri[tauri.index("pub fn exit(&self, exit_code: i32) {"):]
+        told = told[:told.index("\n  }\n")]
+        assert "self.runtime_handle.request_exit(exit_code)" in told and "std::process::exit(exit_code);" in told
+    assert "app.run_return(|_, _| {})" not in main
+    # What it rests on: the window library ends the process right after
+    # that last word.  If a later version stops doing either, this says so.
+    tao = registry_source("tao", "src", "platform_impl", "windows", "event_loop.rs")
+    if tao:
+        at = tao.index("win32wm::WM_ENDSESSION => {")
+        handled = tao[at:tao.index("LRESULT(0)", at)]
+        assert handled.index("event_loop_runner.loop_destroyed();") < handled.index("std::process::exit(0);")
+    assert "what try_it.py sends" in app_crate("try_it.py") and "WM_ENDSESSION = 0x0016" in app_crate("try_it.py")
+
+
 def test_the_page_finds_what_it_asked_pywebview_for():
     """static/js/app.js was written for pywebview's window and is not changed.
     Everything it asks of `window.pywebview.api` is there in the shell's
@@ -387,8 +433,15 @@ def test_the_page_finds_what_it_asked_pywebview_for():
     assert ".pywebview-drag-region *:not(.pywebview-drag-region) { -webkit-app-region: no-drag; }" in shim
     assert "-webkit-app-region" not in repo("static", "css", "style.css"), "the page's own style does not do it"
     # It is given to the window's own page by the window, and never served.
-    assert ".initialization_script(page::shim(shell.token()))" in app_crate("src", "main.rs")
+    assert ".initialization_script(page::shim(shell.token(), &shell.settings.origin))" in app_crate("src", "main.rs")
     assert "SHIM" not in router and "shim" not in router
+    # The window runs it in every frame it ever shows: before it names the
+    # secret, the script looks whether it is the app's own page, at the top.
+    body = shim[shim.index("(function () {"):]
+    first = body.splitlines()[1].strip()
+    assert first == 'if (window.top !== window.self || location.origin !== "%ORIGIN%") { return; }', first
+    assert body.index(first) < body.index("%TOKEN%")
+    assert '.replace("%ORIGIN%", &origin)' in page
 
 
 def test_the_windows_page_cannot_reach_tauris_commands():
@@ -399,15 +452,145 @@ def test_the_windows_page_cannot_reach_tauris_commands():
     assert conf["app"]["security"]["capabilities"] == [] and conf["app"]["windows"] == []
     assert not conf["app"].get("withGlobalTauri") and conf["bundle"]["active"] is False
     assert not os.path.isdir(os.path.join(SHELL, "app", "capabilities"))
-    assert ".on_navigation(" in main and "NewWindowResponse::Deny" in main
-    # A link goes to the browser the way Explorer would start it, not as a
-    # child that inherits this program's handles (the listening socket).
-    assert "win::start_other(url.as_str(), \"\")" in main and 'matches!(url.scheme(), "http" | "https")' in main
+    assert "NewWindowResponse::Deny" in main
+    # The window stays on the app's own page, and "the app's own" is the
+    # whole of where a page is from: not the host name alone, under which
+    # another scheme or another port is another place.
+    assert main.count(".on_navigation(") == 1
+    assert ".on_navigation(move |url| page::is_the_apps_page(url.as_str(), &own_page))" in main
+    assert "let (own_page, for_links) = (shell.settings.origin.clone(), shell.clone());" in main
+    assert "host_str()" not in main and "url.scheme()" not in main
+    page, shell = rust("src", "page.rs"), rust("src", "shell.rs")
+    rule = page[page.index("pub fn is_the_apps_page("):page.index("const SHIM: &str")]
+    assert "match address.strip_prefix(origin) {" in rule and "rest.is_empty() || rest.starts_with(['/', '?', '#'])," in rule
+    assert 'origin: "http://vispora.localhost".to_string(),' in shell
+    # A link is handed to Explorer, which opens it in the person's browser
+    # without this program's rights; and Explorer is started without this
+    # program's handles (the listening socket among them).
+    win = rust("src", "win.rs")
+    assert "win::open_link(url.as_str())" in main
+    assert "start_other" not in main and "start_other" not in win
+    assert 'wide("open")' not in win, "the shell does not open things itself: it runs with administrator rights"
+    opened = win[win.index("pub fn open_link("):win.index("/// Windows' own folder")]
+    assert 'format!("{}\\\\explorer.exe", windows_folder()?)' in opened and "start_line_without_handles(&explorer, &line)" in opened
+    assert 'let line = line_for_a_link(&explorer, link).ok_or("not a web address")?;' in opened
+    assert 'link.starts_with("https://") || link.starts_with("http://")' in opened
+    assert "open_link(" not in win[win.index("#[cfg(test)]"):], "no test hands anything to Explorer"
+    started = win[win.index("fn start_line_without_handles("):win.index("/// Open a link in the person's browser")]
+    assert "let inherit_handles = 0;" in started and "std::ptr::null(), inherit_handles, 0," in started
     assert "std::process::Command" not in main, "the window starts nothing itself"
     # WebView2 is asked for before a window is made, and a missing one is said in a plain message.
     run = main[main.index("fn run("):]
     assert run.index("tauri::webview_version()?") < run.index("Shell::new(") < run.index("WebviewWindowBuilder::new(")
     assert "Microsoft Edge WebView2" in main and "win::tell(APP_NAME" in main
+
+
+def test_nothing_of_a_run_is_kept_in_the_windows_folder_and_nothing_found_there_is_used():
+    """WebView2 keeps a profile folder.  A fixed one in the person's AppData
+    can be read by any of their programs (the page keeps the run's secret in
+    its session storage) and written by them before the next start (what is
+    planted there runs in the app's page).  So: a private window, in a folder
+    that is new at every start, closed to programs without the app's rights,
+    and removed afterwards."""
+    main, win = app_crate("src", "main.rs"), rust("src", "win.rs")
+    made = main[main.index("WebviewWindowBuilder::new("):main.index(".build()?;", main.index("WebviewWindowBuilder::new("))]
+    assert ".incognito(true)" in made and ".data_directory(PathBuf::from(&window_folder))" in made
+    assert made.count(".data_directory(") == 1 and '"webview"' not in main
+    run = main[main.index("fn run("):]
+    assert "(win::administrators_folder()?, win::OpenTo::Administrators)" in run
+    assert "(folders.appdata_dir.clone(), win::OpenTo::ThisAccount)" in run
+    assert run.index("let window_folder = win::private_folder(&folder_in, open_to)?;") < run.index("WebviewWindowBuilder::new(")
+    # Removed when the run is over; and what a run that was ended from
+    # outside left behind, at the next start (by the one copy only).
+    assert run.index("let code = app.run_return(") < run.index("win::remove_private_folder(&window_folder)")
+    assert "if held.is_some() {\n        let left = win::remove_private_folders(&folder_in, None);" in run
+    # The folder: a name nobody can guess, never one that is there already,
+    # and nobody in it but the ones named and Windows itself.
+    folder = win[win.index("pub fn private_folder("):win.index("/// Remove the window's folder of a run that is over.")]
+    assert "Windows.random(&mut random)?;" in folder and "let made = CreateDirectoryW(path_w.as_ptr(), &attributes);" in folder
+    assert 'OpenTo::Administrators => "BA".to_string(),' in folder
+    assert 'closed_folder(&path, &format!("O:{who}{}", open_only_to(&who)))?;' in folder, "whose it is, and who gets in"
+    assert 'format!("D:P(A;OICI;FA;;;{who})(A;OICI;FA;;;SY)")' in folder
+    assert "std::fs::create_dir(&path)" not in folder, "every folder is made closed"
+    # Where that is, is not taken from the environment, which is the
+    # person's programs' to set: see the test after this one.
+    where = win[win.index("pub fn windows_folder("):win.index("// The window's own folder, one per run")]
+    assert "GetSystemWindowsDirectoryW(path.as_mut_ptr(), MAX_PATH as u32)" in where
+    assert 'let folder = format!("{}\\\\Temp", windows_folder()?);' in where
+    for word in ("std::env::var", "SHGetFolderPath", "SHGetKnownFolderPath", "GetTempPath", "temp_dir()"):
+        assert word not in where, word
+    for word in ("ProgramData", "temp_dir()", "TEMP"):
+        assert word not in main, word
+    # The trial looks into the folder for the secret, during a run and after it.
+    trial = app_crate("try_it.py")
+    assert "the run's secret is in no file of the window's folder" in trial and "the window's folder is gone after the run, and nothing of WebView2 is left anywhere else" in trial
+
+
+def test_where_the_shell_keeps_things_does_not_follow_the_environment():
+    """The app runs with administrator rights; the environment it is started
+    with can be set by a program that has none.  The two folders the shell
+    takes from Windows (Windows' own, for explorer.exe, and the one the
+    window's folder is made in) are asked for in a way that does not look
+    at it.  Tried for real: the trial tool is started with every variable
+    that names such a place pointing at a planted folder that has all of
+    them inside, and says where it would go."""
+    app()
+    if not TRY:
+        return
+    planted = os.path.join(m.ROOT, "planted")
+    for inside in ("ProgramData", "Temp", os.path.join("Windows", "Temp"), os.path.join("System32")):
+        os.makedirs(os.path.join(planted, inside), exist_ok=True)
+
+    def asked(env):
+        out = m.REAL_POPEN([TRY, "--where"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        said, complaint = out.communicate(timeout=30)
+        assert out.returncode == 0, complaint
+        return json.loads(said)
+
+    honest = asked(dict(os.environ))
+    assert os.path.isfile(os.path.join(honest["windows"], "explorer.exe")), honest
+    assert honest["administrators_folder"] == honest["windows"] + "\\Temp" and os.path.isdir(honest["administrators_folder"])
+    env = {name: value for name, value in os.environ.items()
+           if name.upper() not in ("SYSTEMDRIVE", "SYSTEMROOT", "WINDIR", "PROGRAMDATA", "ALLUSERSPROFILE", "TEMP", "TMP", "PUBLIC")}
+    env.update(SystemDrive=planted, SystemRoot=os.path.join(planted, "Windows"), windir=os.path.join(planted, "Windows"),
+               ProgramData=os.path.join(planted, "ProgramData"), ALLUSERSPROFILE=os.path.join(planted, "ProgramData"),
+               TEMP=os.path.join(planted, "Temp"), TMP=os.path.join(planted, "Temp"), PUBLIC=planted)
+    assert asked(env) == honest, "the environment decided where the shell keeps things"
+
+
+def test_webview2_takes_no_settings_from_the_environment():
+    """WebView2 reads settings from the environment: where to take the
+    browser's programs from, what to start them with, where the profile is.
+    A program without rights can set them for the person and wait for the
+    next start of the app, which has rights.  So they are removed first
+    thing, before anything of WebView2 is touched."""
+    main, win = app_crate("src", "main.rs"), rust("src", "win.rs")
+    body = main[main.index("fn main() {"):main.index("/// Open the window, start the backend")]
+    statements = [line.strip() for line in body.splitlines()[1:] if line.strip() and not line.strip().startswith("//")]
+    assert statements[0] == "let ignored = win::clear_webview2_variables();", statements[0]
+    assert main.count("tauri::") and body.index("win::clear_webview2_variables()") < body.index("instance::begin(")
+    assert "WEBVIEW2_" not in main, "the shell sets none of them: what it wants it says in the window's options"
+    cleared = win[win.index("pub fn clear_webview2_variables("):win.index("#[cfg(test)]")]
+    assert '.filter(|name| name.to_ascii_uppercase().starts_with("WEBVIEW2_"))' in cleared and "std::env::remove_var(name);" in cleared
+    assert "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS" in app_crate("try_it.py")
+
+
+def test_asking_for_rights_cannot_go_round_in_a_circle():
+    """Where Windows starts the new copy without rights all the same, each
+    copy would start the next and leave.  The copy that was started for
+    rights carries a mark; with the mark and without rights it says so and
+    stops.  The mark goes to that copy and nowhere else."""
+    main, instance = app_crate("src", "main.rs"), rust("src", "instance.rs")
+    assert 'pub const ASKED_FOR_RIGHTS: &str = "--asked-for-rights";' in instance
+    order = instance[instance.index("pub fn begin("):instance.index("#[cfg(test)]")]
+    stops = order.index("if arguments.iter().any(|argument| argument == ASKED_FOR_RIGHTS) {\n            return Begin::NotElevated(")
+    assert order.index("!session.has_administrator_rights()") < stops < order.index("marked.push(ASKED_FOR_RIGHTS.to_string());") \
+        < order.index("session.start_with_administrator_rights(&marked)")
+    # The backend is given two words of the shell's own choosing, and none of what the shell was started with.
+    given = [line.strip() for line in main.splitlines() if "backend.args.push(" in line]
+    assert given == ['backend.args.push("--backend".to_string());', 'backend.args.push("--from-autostart".to_string());'], given
+    assert "backend.args.extend" not in main and "args: arguments" not in main
+    assert "--asked-for-rights" in repo("shell_rs", "README.md")
 
 
 def test_a_first_copy_is_looked_for_before_anything_asks_for_rights():
@@ -458,7 +641,8 @@ def test_a_trial_of_the_window_never_meets_the_installed_app():
 
 def test_what_else_the_shell_starts_does_not_get_its_socket():
     """The shell's listening socket is inheritable on purpose: the backend
-    inherits it.  A browser the shell opens for a link must not."""
+    inherits it.  Nothing else the shell starts must (Explorer, which is
+    handed the links the page opens, is the one such program)."""
     app()
     if not TRY:
         return
@@ -479,8 +663,8 @@ def test_what_else_the_shell_starts_does_not_get_its_socket():
         script = os.path.join(m.ROOT, "looks_for_the_socket.py")
         with open(script, "w", encoding="utf-8") as f:
             f.write(looks)
-        started = t.ask(do="start_other", target=sys.executable.replace("python.exe", "pythonw.exe"),
-                        parameters=subprocess.list2cmdline([script, str(handle), str(port), out]))
+        started = t.ask(do="start_other", program=sys.executable.replace("python.exe", "pythonw.exe"),
+                        arguments=[script, str(handle), str(port), out])
         assert started["ok"] is True, started
         deadline = time.time() + 30
         while not os.path.isfile(out) and time.time() < deadline:

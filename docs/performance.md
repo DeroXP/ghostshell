@@ -466,12 +466,12 @@ real PC and which do not:
 | --- | --- | --- | --- |
 | The shell's process is up | (does not exist) | 12 ms | Real: it is the shell's own exe. Without the window, which will add to it |
 | The page can be handed to a window | after the unpacking (0.3 to 2.9 s) and Python and Flask (0.5 s and more) | **14 ms** after the shell's process started | Real for the shell. It does not wait for the backend: the page is compiled in |
-| A window on screen | 1 s (1 to 5) after the first log line, by hand, which itself comes after the unpacking | **35 ms** after the shell's process started | Real: the shell's own exe and window, drawn beyond the edge of the desktop. Not the build that asks for administrator rights, whose prompt comes first |
+| A window on screen | 1 s (1 to 5) after the first log line, by hand, which itself comes after the unpacking | **36 ms** after the shell's process started | Real: the shell's own exe and window, drawn beyond the edge of the desktop. Not the build that asks for administrator rights, whose prompt comes first |
 | The first screen has its data | 14 s (6 to 44) after the first log line, by hand | 0.9 s after the shell's process started | A trial's: it waits for the backend, which here is the app on the fake machine with no start-up work. The window and the page in it are the real ones |
 | The backend answers | (the same process) | 0.6 s after the shell started it | A trial's. Python 3.14 from source on the fake machine: no unpacking, no start-up work. A real backend does more |
 | A call the page makes | straight to Flask | 0.8 ms through the shell and back (1.0 ms for the slowest in twenty) | Real for the way through the shell; the route asked is the cheapest one |
 | A call the shell answers itself | (goes to Flask) | under 0.05 ms | Real |
-| Quit, until both processes are gone | not measured (see Quitting) | 0.1 s (the same with the window: 0.13 s from closing it) | A trial's: on the fake machine a quit has nothing to undo. What is real: the fixed half second before the old exit is not waited behind the shell |
+| Quit, until both processes are gone | not measured (see Quitting) | 0.1 s until the backend has ended. With the window: 0.24 s from closing it until the shell's process has ended too, because the shell takes its window's folder away first and WebView2 has to let go of it | A trial's: on the fake machine a quit has nothing to undo. What is real: the fixed half second before the old exit is not waited behind the shell |
 
 What the shell changes about waiting, whatever the numbers turn out to be:
 

@@ -162,7 +162,10 @@ pub struct Shell {
 /// on which opening the app again does not help either (old network filter
 /// software can keep a program from using a socket it inherits), so it
 /// says where the reason is written down.
-pub const NEVER_UP: &str = "Vispora's background program does not start. Close Vispora and open it again. \n                            If that does not help, the reason is in the file vispora.log in Vispora's data folder.";
+pub const NEVER_UP: &str = concat!(
+    "Vispora's background program does not start. Close Vispora and open it again. ",
+    "If that does not help, the reason is in the file vispora.log in Vispora's data folder."
+);
 
 /// How a backend that was being watched stopped being watched.
 enum Watched {

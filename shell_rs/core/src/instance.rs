@@ -38,6 +38,14 @@ pub trait Session {
     fn become_the_one(&self) -> Result<Option<Box<dyn Held>>, String>;
 }
 
+/// What a copy is started with when it was started to get administrator
+/// rights.  It is not passed on to anything else.  A copy that carries it
+/// and still has no rights does not ask again: where Windows starts the
+/// new copy without them all the same (its prompt switched off on an account
+/// that is no administrator's, say), each copy would start the next and
+/// leave, without an end and without a word.
+pub const ASKED_FOR_RIGHTS: &str = "--asked-for-rights";
+
 /// How a start goes on.
 pub enum Begin {
     /// This is the one copy.
@@ -61,7 +69,12 @@ pub fn begin(session: &dyn Session, needs_administrator: bool, arguments: &[Stri
         return Begin::Running;
     }
     if needs_administrator && !session.has_administrator_rights() {
-        return match session.start_with_administrator_rights(arguments) {
+        if arguments.iter().any(|argument| argument == ASKED_FOR_RIGHTS) {
+            return Begin::NotElevated("Windows started it again as asked, but still without administrator rights".to_string());
+        }
+        let mut marked = arguments.to_vec();
+        marked.push(ASKED_FOR_RIGHTS.to_string());
+        return match session.start_with_administrator_rights(&marked) {
             Ok(()) => Begin::Elevating,
             Err(why) => Begin::NotElevated(why),
         };
@@ -115,7 +128,7 @@ mod tests {
             self.administrator
         }
         fn start_with_administrator_rights(&self, arguments: &[String]) -> Result<(), String> {
-            assert_eq!(arguments, ["--from-autostart".to_string()]);
+            assert_eq!(arguments, ["--from-autostart".to_string(), ASKED_FOR_RIGHTS.to_string()], "marked, once");
             self.asked.borrow_mut().push("elevate");
             self.elevation.clone().expect("not expected to ask for rights")
         }
@@ -162,6 +175,20 @@ mod tests {
         // The prompt was answered with no.
         let refused = Told { elevation: Some(Err("The operation was canceled by the user.".into())), ..Told::default() };
         assert_eq!(start(&refused, true), ("not elevated", vec!["show", "running", "rights", "elevate"]));
+    }
+
+    #[test]
+    fn asking_for_rights_does_not_go_round_in_a_circle() {
+        // The copy that was started to get rights, and still has none: it
+        // says so and stops.  It does not start a third.
+        let again = Told::default();
+        let how = begin(&again, true, &["--from-autostart".to_string(), ASKED_FOR_RIGHTS.to_string()]);
+        let Begin::NotElevated(why) = how else { panic!("it went on") };
+        assert!(why.contains("still without administrator rights"), "{why}");
+        assert_eq!(*again.asked.borrow(), ["show", "running", "rights"], "nothing was started");
+        // With rights, the mark changes nothing.
+        let fine = Told { administrator: true, becomes: Some(Ok(true)), ..Told::default() };
+        assert!(matches!(begin(&fine, true, &[ASKED_FOR_RIGHTS.to_string()]), Begin::Run(Some(_))));
     }
 
     #[test]

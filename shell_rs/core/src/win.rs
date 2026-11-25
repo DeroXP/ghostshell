@@ -227,6 +227,7 @@ const TOKEN_QUERY: u32 = 8;
 const TOKEN_ELEVATION: u32 = 20;
 const INFINITE: u32 = 0xFFFF_FFFF;
 const SW_SHOWNORMAL: i32 = 1;
+const MAX_PATH: usize = 260;
 
 /// Who may do what with the "show your window" event: anybody signed in at
 /// this PC's screen may ring it and wait on it (a second start has no
@@ -234,6 +235,30 @@ const SW_SHOWNORMAL: i32 = 1;
 /// everything.  The last part says that a program without administrator
 /// rights may ring it although one with them made it.
 const WHO_MAY_RING: &str = "D:(A;;0x00100002;;;IU)(A;;GA;;;BA)(A;;GA;;;SY)S:(ML;;NW;;;ME)";
+
+/// What Windows is told about a program it is to start (nothing, here)
+/// and what it says back.
+#[repr(C)]
+struct StartupInfo {
+    size: u32,
+    reserved: *mut u16,
+    desktop: *mut u16,
+    title: *mut u16,
+    position_and_size: [u32; 7],
+    flags: u32,
+    show: u16,
+    reserved_size: u16,
+    reserved_bytes: *mut u8,
+    standard: [*mut c_void; 3],
+}
+
+#[repr(C)]
+struct ProcessInformation {
+    process: *mut c_void,
+    thread: *mut c_void,
+    pid: u32,
+    thread_id: u32,
+}
 
 #[repr(C)]
 struct SecurityAttributes {
@@ -253,6 +278,11 @@ extern "system" {
     fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> *mut c_void;
     fn SetEvent(event: *mut c_void) -> i32;
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+    fn CreateDirectoryW(path: *const u16, attributes: *const SecurityAttributes) -> i32;
+    fn GetSystemWindowsDirectoryW(path: *mut u16, length: u32) -> u32;
+    #[allow(clippy::too_many_arguments)]
+    fn CreateProcessW(program: *const u16, line: *mut u16, process: *const c_void, thread: *const c_void, inherit: i32, flags: u32,
+                      environment: *const c_void, folder: *const u16, startup: *const StartupInfo, started: *mut ProcessInformation) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -260,6 +290,7 @@ extern "system" {
     fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
     fn GetTokenInformation(token: *mut c_void, class: u32, information: *mut c_void, length: u32, needed: *mut u32) -> i32;
     fn ConvertStringSecurityDescriptorToSecurityDescriptorW(text: *const u16, revision: u32, descriptor: *mut *mut c_void, size: *mut u32) -> i32;
+    fn ConvertSidToStringSidW(account: *mut c_void, text: *mut *mut u16) -> i32;
 }
 
 #[link(name = "shell32")]
@@ -446,24 +477,256 @@ impl crate::instance::Session for ThisSession {
     }
 }
 
-/// Start another program, or open a link or a folder, the way Explorer
-/// would, and not as a child of this program.
+/// Start a program that is not the backend, with none of this program's
+/// handles.
 ///
 /// The shell's listening socket is inheritable on purpose: the backend
-/// inherits it.  Nothing else the shell ever starts is to get it, so nothing
-/// else is started the way the backend is.  What is started here inherits
-/// no handle of this program's.
-pub fn start_other(target: &str, parameters: &str) -> Result<(), String> {
-    let (verb, target_w, parameters_w) = (wide("open"), wide(target), wide(parameters));
-    let parameters_ptr = if parameters.is_empty() { std::ptr::null() } else { parameters_w.as_ptr() };
-    // SAFETY: strings that end in a NUL and outlive the call.
-    let started = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), target_w.as_ptr(), parameters_ptr, std::ptr::null(), SW_SHOWNORMAL) };
-    if started > 32 {
-        Ok(())
-    } else {
-        // SAFETY: reads the calling thread's last error.
-        Err(format!("{target}: Windows error {}", unsafe { GetLastError() }))
+/// inherits it.  Rust starts every program with inheritance on, so nothing
+/// but the backend is started Rust's way.  What is started here is started
+/// by Windows' own call with inheritance off.
+pub fn start_without_handles(program: &str, arguments: &[String]) -> Result<u32, String> {
+    let line = std::iter::once(quoted(program)).chain(arguments.iter().map(|a| quoted(a))).collect::<Vec<_>>().join(" ");
+    start_line_without_handles(program, &line)
+}
+
+fn start_line_without_handles(program: &str, line: &str) -> Result<u32, String> {
+    let (program_w, mut line_w) = (wide(program), wide(line));
+    // SAFETY: strings that end in a NUL; two structures of the sizes Windows
+    // expects, zeroed but for the first one's own size; handles closed again.
+    unsafe {
+        let mut startup: StartupInfo = std::mem::zeroed();
+        startup.size = std::mem::size_of::<StartupInfo>() as u32;
+        let mut started: ProcessInformation = std::mem::zeroed();
+        let inherit_handles = 0;
+        if CreateProcessW(program_w.as_ptr(), line_w.as_mut_ptr(), std::ptr::null(), std::ptr::null(), inherit_handles, 0,
+                          std::ptr::null(), std::ptr::null(), &startup, &mut started) == 0 {
+            return Err(format!("{program}: Windows error {}", GetLastError()));
+        }
+        CloseHandle(started.thread);
+        CloseHandle(started.process);
+        Ok(started.pid)
     }
+}
+
+/// Open a link in the person's browser, by way of Explorer.
+///
+/// The shell runs with administrator rights.  Asked to open a link itself,
+/// Windows would start the browser as a child of the shell, with those
+/// rights, and would look up which program opens links in the person's own
+/// part of the registry, which any program may change.  So the link is
+/// handed to Explorer (by its full path in Windows' folder, not looked up),
+/// and Explorer, which is the desktop the person is signed in to, opens it
+/// as it opens anything that is clicked there.
+///
+/// Only a web address is taken, and only one that is a single plain word.
+pub fn open_link(link: &str) -> Result<(), String> {
+    let explorer = format!("{}\\explorer.exe", windows_folder()?);
+    let line = line_for_a_link(&explorer, link).ok_or("not a web address")?;
+    start_line_without_handles(&explorer, &line).map(|_| ())
+}
+
+/// What Explorer is started with for `link`, or None for anything that is
+/// not a plain web address: no blank, no quotation mark, no backslash, no
+/// letter outside ASCII (the window hands links over written that way).
+/// The link is always put in quotation marks: Explorer reads commas and
+/// equals signs outside them as its own.
+fn line_for_a_link(explorer: &str, link: &str) -> Option<String> {
+    let web = link.starts_with("https://") || link.starts_with("http://");
+    let plain = link.len() <= 2000 && link.chars().all(|c| c.is_ascii_graphic() && c != '"' && c != '\\');
+    (web && plain).then(|| format!("{} \"{link}\"", quoted(explorer)))
+}
+
+/// Windows' own folder (`C:\Windows`), asked of Windows by the one call
+/// that does not look at the environment, which the person's programs can
+/// change.
+pub fn windows_folder() -> Result<String, String> {
+    let mut path = [0u16; MAX_PATH];
+    // SAFETY: a buffer and its length.
+    let length = unsafe { GetSystemWindowsDirectoryW(path.as_mut_ptr(), MAX_PATH as u32) } as usize;
+    if length == 0 || length >= MAX_PATH {
+        return Err("Windows did not say where it is installed".to_string());
+    }
+    Ok(String::from_utf16_lossy(&path[..length]))
+}
+
+/// Where the app, which runs with administrator rights, keeps what is its
+/// own for one run: Windows' folder for temporary files (`C:\Windows\Temp`).
+/// People without administrator rights can make files and folders in it,
+/// but can neither look into it nor rename or remove what somebody else
+/// made there.
+///
+/// Not the folder for all users' data (`C:\ProgramData`), although it would
+/// do as well: where that is, Windows works out from the SystemDrive
+/// variable of the program that asks.  Tried: with the variable pointing at
+/// a folder that has a ProgramData of its own, both of Windows' calls for it
+/// answer with that folder.  A variable is the person's programs' to set,
+/// and a folder of theirs is theirs to rename what is in it.
+pub fn administrators_folder() -> Result<String, String> {
+    let folder = format!("{}\\Temp", windows_folder()?);
+    if !std::path::Path::new(&folder).is_dir() {
+        return Err(format!("{folder} is missing"));
+    }
+    Ok(folder)
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// The window's own folder, one per run
+// ═════════════════════════════════════════════════════════════════════
+// WebView2 keeps a profile folder.  A fixed one in the person's AppData can
+// be read by any of their programs (and the page keeps the run's secret in
+// its session storage), and written by them before the next start (and what
+// is planted there runs inside the app's page).  So the window is private
+// (nothing of a run is written down for a later one), and its folder is new
+// at every start, under a name nobody can guess, made so that only
+// administrators can read or write it, and removed when the run is over.
+
+/// How the folders begin, so that what a run left behind is recognised.
+pub const WINDOW_FOLDER_PREFIX: &str = "Vispora-window-";
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+const TOKEN_USER: u32 = 1;
+
+/// Who may get into the window's folder.  Either way: everything, also in
+/// what is made inside, for the ones named and for Windows itself; nothing
+/// for anybody else; and nothing taken over from the folder above.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OpenTo {
+    /// The app as it ships, which runs with administrator rights: programs
+    /// the person runs without those rights are kept out.
+    Administrators,
+    /// A trial, which has no such rights: the account it runs under.  That
+    /// keeps out what the window's own helper programs run as, as the other
+    /// does, so a trial shows whether WebView2 works in a closed folder.
+    ThisAccount,
+}
+
+/// The account this program runs under, the way Windows writes it (S-1-5-...).
+fn own_account() -> Result<String, String> {
+    // (pointer-aligned: Windows writes a pointer and the account behind it)
+    let (mut token, mut found, mut length) = (std::ptr::null_mut(), [0u64; 32], 0u32);
+    // SAFETY: this process's own token, read into a buffer of the size
+    // given; the text Windows allocates is copied and freed.
+    unsafe {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(format!("Windows error {}", GetLastError()));
+        }
+        let read = GetTokenInformation(token, TOKEN_USER, found.as_mut_ptr() as *mut c_void, std::mem::size_of_val(&found) as u32, &mut length);
+        let error = GetLastError();
+        CloseHandle(token);
+        if read == 0 {
+            return Err(format!("Windows error {error}"));
+        }
+        let account = *(found.as_ptr() as *const *mut c_void);
+        let mut text: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(account, &mut text) == 0 {
+            return Err(format!("Windows error {}", GetLastError()));
+        }
+        let length = (0..).take_while(|at| *text.add(*at) != 0).count();
+        let written = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+        LocalFree(text as *mut c_void);
+        Ok(written)
+    }
+}
+
+/// Make a new folder for the window in `parent`.  It did not exist before:
+/// a folder that is already there is never taken.
+pub fn private_folder(parent: &str, open_to: OpenTo) -> Result<String, String> {
+    let mut random = [0u8; 16];
+    Windows.random(&mut random)?;
+    let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let path = format!("{parent}\\{WINDOW_FOLDER_PREFIX}{name}");
+    std::fs::create_dir_all(parent).map_err(|e| format!("{parent}: {e}"))?;
+    let who = match open_to {
+        OpenTo::Administrators => "BA".to_string(),
+        OpenTo::ThisAccount => own_account().map_err(|why| format!("the account this runs under could not be read ({why})"))?,
+    };
+    // Theirs, too: whoever owns a folder may change who gets into it.  So
+    // the owner is said here, and not left to what Windows would pick.  (A
+    // program without administrator rights cannot make a folder that is the
+    // administrators' own: Windows refuses.)
+    closed_folder(&path, &format!("O:{who}{}", open_only_to(&who)))?;
+    Ok(path)
+}
+
+/// Who gets into a folder that is open to `who` alone, the way Windows
+/// writes such a list: `who` and Windows itself, everything, also in what
+/// is made inside; nobody else; nothing taken over from the folder above.
+fn open_only_to(who: &str) -> String {
+    format!("D:P(A;OICI;FA;;;{who})(A;OICI;FA;;;SY)")
+}
+
+/// Make the folder `path`, which must not be there yet, with `described` as
+/// what Windows keeps about whose it is and who gets in.
+fn closed_folder(path: &str, described: &str) -> Result<(), String> {
+    let (path_w, described) = (wide(path), wide(described));
+    // SAFETY: strings that end in a NUL; a descriptor Windows allocates and
+    // that is freed here.
+    unsafe {
+        let mut descriptor = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(described.as_ptr(), 1, &mut descriptor, std::ptr::null_mut()) == 0 {
+            return Err(format!("the folder's access list could not be made (Windows error {})", GetLastError()));
+        }
+        let attributes = SecurityAttributes { length: std::mem::size_of::<SecurityAttributes>() as u32, descriptor, inherit: 0 };
+        let made = CreateDirectoryW(path_w.as_ptr(), &attributes);
+        let error = GetLastError();
+        LocalFree(descriptor);
+        if made == 0 {
+            return Err(format!("{path}: Windows error {error}"));
+        }
+    }
+    Ok(())
+}
+
+/// Remove the window's folder of a run that is over.  WebView2's own
+/// programs let go of their files a moment after the window is gone, so
+/// this tries for a few seconds.
+pub fn remove_private_folder(path: &str) -> bool {
+    for _ in 0..30 {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    false
+}
+
+/// Remove what earlier runs left behind in `parent` (a run that was ended
+/// from outside does not get to clean up).  Only real folders that begin as
+/// the window's folders begin; never `keep`; never anything that is a link
+/// to somewhere else.  How many were removed.
+pub fn remove_private_folders(parent: &str, keep: Option<&str>) -> usize {
+    use std::os::windows::fs::MetadataExt as _;
+    let Ok(entries) = std::fs::read_dir(parent) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let (name, path) = (entry.file_name().to_string_lossy().into_owned(), entry.path());
+        let Ok(found) = std::fs::symlink_metadata(&path) else { continue };
+        let real_folder = found.is_dir() && found.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0;
+        let kept = keep.is_some_and(|keep| keep.eq_ignore_ascii_case(&path.to_string_lossy()));
+        if name.starts_with(WINDOW_FOLDER_PREFIX) && real_folder && !kept && std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Take every setting for WebView2 out of this program's environment, and
+/// say which were there.
+///
+/// WebView2 reads them when it starts: one says where to take the browser's
+/// programs from, another what to start the browser with (a way in for a
+/// debugger among it), another where its profile is.  A program without
+/// administrator rights can set them for the person and wait for the next
+/// start of an app that has those rights.  The first thing the shell does.
+pub fn clear_webview2_variables() -> Vec<String> {
+    let found: Vec<String> = std::env::vars_os()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .filter(|name| name.to_ascii_uppercase().starts_with("WEBVIEW2_"))
+        .collect();
+    for name in &found {
+        std::env::remove_var(name);
+    }
+    found
 }
 
 /// Show `text` in a plain Windows message box and wait for its OK: for
@@ -516,6 +779,128 @@ mod tests {
         assert_eq!(asked.load(Ordering::SeqCst), 2);
         // (whether this test runs with administrator rights is not its business: only that the question has an answer)
         let _ = second.has_administrator_rights();
+    }
+
+    fn a_place(name: &str) -> String {
+        let place = std::env::temp_dir().join(format!("vispora-shell-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&place);
+        std::fs::create_dir_all(&place).unwrap();
+        place.to_string_lossy().into_owned()
+    }
+
+    /// Take a test's folder away again, whoever it was closed to.  (The
+    /// test made it, so it is the test's own, and its owner may open it.)
+    fn tidy(path: &str) {
+        let _ = std::process::Command::new("icacls.exe").args([path, "/reset", "/t", "/c", "/q"]).output();
+        let _ = std::fs::remove_dir_all(path);
+        assert!(!std::path::Path::new(path).exists(), "a test left {path} behind");
+    }
+
+    #[test]
+    fn the_windows_folder_is_new_at_every_run_and_gone_after_it() {
+        let parent = a_place("folders");
+        let (first, second) = (private_folder(&parent, OpenTo::ThisAccount).unwrap(), private_folder(&parent, OpenTo::ThisAccount).unwrap());
+        assert_ne!(first, second, "a folder is never used twice");
+        for path in [&first, &second] {
+            let name = std::path::Path::new(path).file_name().unwrap().to_string_lossy().into_owned();
+            assert!(name.starts_with(WINDOW_FOLDER_PREFIX) && name.len() == WINDOW_FOLDER_PREFIX.len() + 32, "{name}");
+            assert!(std::fs::read_dir(path).unwrap().next().is_none(), "it starts empty");
+        }
+        // What a run wrote goes with the folder.
+        std::fs::create_dir_all(format!("{first}\\EBWebView\\Default")).unwrap();
+        std::fs::write(format!("{first}\\EBWebView\\Default\\Session Storage"), b"the secret").unwrap();
+        assert!(remove_private_folder(&first) && !std::path::Path::new(&first).exists());
+        assert!(remove_private_folder(&first), "one that is gone already is no error");
+        // What earlier runs left behind is removed at the next start: but
+        // not this run's own, not anything else in the folder above, and
+        // never through a link to somewhere else.
+        let (third, other, elsewhere) = (private_folder(&parent, OpenTo::ThisAccount).unwrap(), format!("{parent}\\Something-else"), a_place("elsewhere"));
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(format!("{elsewhere}\\precious.txt"), b"keep me").unwrap();
+        let link = format!("{parent}\\{WINDOW_FOLDER_PREFIX}link");
+        let linked = std::process::Command::new("cmd.exe").args(["/d", "/c", "mklink", "/J", &link, &elsewhere]).output().unwrap();
+        assert!(linked.status.success(), "{}", String::from_utf8_lossy(&linked.stderr));
+        assert_eq!(remove_private_folders(&parent, Some(&second)), 1, "the one left behind, and only that");
+        assert!(!std::path::Path::new(&third).exists() && std::path::Path::new(&second).exists() && std::path::Path::new(&other).exists());
+        assert!(std::path::Path::new(&format!("{elsewhere}\\precious.txt")).exists(), "a link was followed and what it points to removed");
+        let _ = std::fs::remove_dir(&link);
+        tidy(&parent);
+        tidy(&elsewhere);
+    }
+
+    #[test]
+    fn a_program_without_administrator_rights_cannot_get_into_the_windows_folder() {
+        let parent = a_place("protected");
+        // This test is such a program, unless it is run from an elevated
+        // terminal, in which case it has nothing to show.
+        if !session(Names::for_a_trial("x")).has_administrator_rights() {
+            // It cannot make a folder that is the administrators' own
+            // (1307: "may not be assigned as the owner of this object") ...
+            let refused = private_folder(&parent, OpenTo::Administrators).unwrap_err();
+            assert!(refused.ends_with("Windows error 1307"), "{refused}");
+            assert!(std::fs::read_dir(&parent).unwrap().next().is_none(), "one was made all the same");
+            // ... and it cannot get into one that lets in whom the app's
+            // lets in.  (Made here as this test's own, to have one to try:
+            // it is the list of who gets in that keeps the test out.)
+            let folder = format!("{parent}\\who-gets-in");
+            closed_folder(&folder, &open_only_to("BA")).unwrap();
+            let planted = std::fs::write(format!("{folder}\\planted.js"), b"x");
+            assert_eq!(planted.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied, "something could be planted in it");
+            assert!(std::fs::read_dir(&folder).is_err(), "it could be read");
+            assert!(std::fs::create_dir(format!("{folder}\\EBWebView")).is_err());
+            tidy(&folder);
+            // A folder that is there already is never taken.
+            std::fs::create_dir(&folder).unwrap();
+            assert!(closed_folder(&folder, &open_only_to("BA")).unwrap_err().ends_with("Windows error 183"));
+        }
+        // The trial's kind is open to the account it runs under, and says so
+        // in what Windows keeps about it.
+        let account = own_account().unwrap();
+        assert!(account.starts_with("S-1-5-") && account.len() > 12, "{account}");
+        let mine = private_folder(&parent, OpenTo::ThisAccount).unwrap();
+        std::fs::write(format!("{mine}\\profile"), b"x").unwrap();
+        // (icacls writes the list down the way Windows writes it, which is
+        // the same in every language; the file is UTF-16)
+        let saved = format!("{parent}\\who-gets-in.txt");
+        let _ = std::process::Command::new("icacls.exe").args([&mine, "/save", &saved, "/q"]).output().unwrap();
+        let bytes = std::fs::read(&saved).unwrap();
+        let listed = String::from_utf16_lossy(&bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect::<Vec<_>>());
+        let wanted = format!("D:P(A;OICI;FA;;;{account})(A;OICI;FA;;;SY)");
+        assert!(listed.lines().any(|line| line.trim() == wanted), "this account and Windows itself, and nobody else; found: {listed}");
+        tidy(&parent);
+    }
+
+    #[test]
+    fn webview2s_settings_are_taken_out_of_the_environment() {
+        std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", "C:\\somewhere\\planted");
+        std::env::set_var("webview2_additional_browser_arguments", "--remote-debugging-port=9222");
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", "C:\\somewhere\\else");
+        std::env::set_var("NOT_WEBVIEW2_AT_ALL", "stays");
+        let mut cleared = clear_webview2_variables();
+        cleared.sort_by_key(|name| name.to_ascii_uppercase());
+        assert_eq!(cleared.iter().map(|n| n.to_ascii_uppercase()).collect::<Vec<_>>(),
+                   ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", "WEBVIEW2_USER_DATA_FOLDER"]);
+        assert!(std::env::vars_os().all(|(name, _)| !name.to_string_lossy().to_ascii_uppercase().starts_with("WEBVIEW2_")));
+        assert_eq!(std::env::var("NOT_WEBVIEW2_AT_ALL").as_deref(), Ok("stays"));
+        assert!(clear_webview2_variables().is_empty());
+        std::env::remove_var("NOT_WEBVIEW2_AT_ALL");
+    }
+
+    #[test]
+    fn only_a_plain_web_address_is_handed_to_explorer() {
+        // (nothing is opened here, and nothing could be: only what would be
+        // handed to Explorer is looked at, never the handing over itself)
+        for not_a_link in ["", "calc.exe", "C:\\Windows\\System32\\calc.exe", "file:///C:/Windows/win.ini", "ms-settings:", "javascript:alert(1)",
+                           "https://example.org/a b", "https://example.org/\" & calc.exe", "http://example.org/\r\nx", "vispora://localhost/",
+                           "HTTPS://EXAMPLE.ORG/", "https://example.org/x\\", "https://example.org/\u{e9}"] {
+            assert_eq!(line_for_a_link("C:\\Windows\\explorer.exe", not_a_link), None, "{not_a_link}");
+        }
+        // What Explorer is started with: itself, and the link in quotation marks.
+        assert_eq!(line_for_a_link("C:\\Windows\\explorer.exe", "https://example.org/a,b?c=d&e=f#g").as_deref(),
+                   Some("C:\\Windows\\explorer.exe \"https://example.org/a,b?c=d&e=f#g\""));
+        let windows = windows_folder().unwrap();
+        assert!(std::path::Path::new(&format!("{windows}\\explorer.exe")).is_file(), "{windows}");
+        assert_eq!(administrators_folder().unwrap(), format!("{windows}\\Temp"));
     }
 
     #[test]

@@ -125,8 +125,17 @@ bring (a test compares the two lock files). Plain `cargo build`, as there.
   lines make the parts of the page marked `pywebview-drag-region` move the
   window, and only those parts themselves, as pywebview did it.
 * **The page cannot reach Tauri's commands**: none are registered and it is
-  given no permission for the built-in ones. The window stays on the app's
-  own page; a link the page opens goes to the browser.
+  given no permission for the built-in ones.
+* **The window stays on the app's own page**, and "the app's own" is the
+  whole of where a page is from (`http://vispora.localhost`), not its host
+  name alone: another scheme or another port under that name is another
+  place (`core/src/page.rs`, `is_the_apps_page`).
+* **What the window gives its page, it gives to nothing else.** WebView2
+  runs the window's few lines of script in every frame the window ever
+  shows, so the script looks where it is before it does anything: anywhere
+  but in the app's own page, at the top of the window, it does nothing and
+  hands the run's secret to nobody. The page shows no frames today; this is
+  for the day it does, or something gets one in.
 * **Is a copy running already?** That is looked at first, before anything
   asks for administrator rights (`core/src/instance.rs`). A second start
   asks the first copy for its window and leaves. Today's exe carries a
@@ -136,15 +145,78 @@ bring (a test compares the two lock files). Plain `cargo build`, as there.
   Python app has always held (a mutex), so an old copy and a new one see
   each other; "show your window" is a second name (an event) that the
   running copy listens on. Windows' own calls for both.
+* **Asking for rights cannot go round in a circle.** The copy that is
+  started to get administrator rights is given a word of its own,
+  `--asked-for-rights`, which goes no further (the backend never sees it).
+  A copy that carries it and still has no rights does not start a third: it
+  says in a plain message that it did not get them, and stops. (Where
+  Windows' prompt is switched off for an account that is no
+  administrator's, the new copy is started without rights all the same.)
+* **WebView2 takes no settings from the environment.** It reads several from
+  variables named `WEBVIEW2_...`: where to take the browser's programs
+  from, what to start them with (a way in for a debugger among it), where
+  its profile is. A program without administrator rights can set those for
+  the person and wait for the next start of an app that has rights. The
+  first thing the shell does, before anything of WebView2 is touched, is to
+  take every such variable out of its own environment; the log names the
+  ones it found. The shell sets none itself. (As far as its documentation
+  goes, WebView2 reads the same settings from the policy part of the
+  registry as well, `Software\Policies\Microsoft\Edge\WebView2`. Only
+  administrators can write there, in the person's own half too: looked at
+  on one PC, not tried.)
+* **The window's folder is new at every start, closed, and gone
+  afterwards.** WebView2 keeps a profile folder. Today's window (pywebview)
+  is a private one with a throwaway folder, and so is this one: the window
+  is private (`.incognito(true)`), so nothing of a run is written down for a
+  later one, and what WebView2 does write goes into a folder made for this
+  run alone, under a name nobody can guess (`Vispora-window-` and 32 random
+  hex digits), never one that is already there, removed when the run is
+  over. The app as it ships makes it in Windows' own folder for temporary
+  files (`C:\Windows\Temp`), owned by administrators and open to them and
+  to Windows itself and to nobody else. Where that folder is, is asked of
+  Windows by the one call that does not look at the environment. (The
+  folder for all users' data, `C:\ProgramData`, was the first choice and is
+  not used: Windows works out where it is from the `SystemDrive` variable
+  of the program that asks. Tried here: with that variable pointing at a
+  folder with a `ProgramData` of its own, both of Windows' calls answer
+  with that folder; and a variable is for the person's programs to set.)
+  A fixed folder in the person's own AppData, which is what this window
+  had at first, would be readable by any of their programs, and an
+  ordinary window writes the run's secret into it twice (seen here, with
+  the private mode taken out: after 4.4 to 4.7 seconds in
+  `EBWebView\Default\Session Storage`, where the page keeps it, and after
+  9.4 seconds in `EBWebView\Default\History`, with the address the window
+  was opened at). It would also be writable by them before the next start,
+  and what is planted there (a service worker for the app's own address,
+  for one) runs inside the app's page. A run that is ended from
+  outside cannot tidy up; the next start removes what it left (only folders
+  that begin as the window's folders begin, never through a link to
+  somewhere else).
 * **WebView2 is asked for before a window is made**, and a missing one is
   said in a plain Windows message.
-* **Closing the window from outside** (Alt+F4, the taskbar, signing out)
-  quits the app: the process does not end before the backend has put the
-  system back and ended.
-* **What the shell starts besides its backend** (a browser for a link) is
-  started the way Explorer would start it, not as a child of the shell: it
-  inherits none of the shell's handles, and so not the listening socket,
-  which only the backend is meant to get.
+* **Closing the window from outside** (Alt+F4, the taskbar) quits the app:
+  the process does not end before the backend has put the system back and
+  ended.
+* **Signing out, shutting down, Windows replacing the app's files**: Windows
+  tells the window, and the window library ends the process as soon as that
+  call returns; nothing written after the window's loop is ever reached. The
+  quit is therefore done in the loop's own last word, which that call still
+  delivers: the backend is told, puts the system back and ends, and then the
+  process goes. Windows gives a program about five seconds for this. The
+  window's folder cannot be removed at that moment (WebView2 is still in
+  it); the next start removes it.
+* **A link the page opens is handed to Explorer.** The shell runs with
+  administrator rights. Opened by the shell itself, a browser that was not
+  running yet would start with those rights, and which program opens links
+  is looked up in the person's own part of the registry, which any of their
+  programs may change. So the link goes to `explorer.exe` (by its full path
+  in Windows' folder, asked of Windows), and Explorer, which is the desktop
+  the person is signed in to, opens it as it opens anything clicked there.
+  Only a web address is handed over (`http://` or `https://`, no blank, no
+  quotation mark), always in quotation marks.
+* **What the shell starts besides its backend** (Explorer, for a link) is
+  started with none of the shell's handles, and so not the listening
+  socket, which only the backend is meant to get.
 * **`--from-autostart`** starts the window out of sight and is passed on to
   the backend, as today.
 
@@ -156,7 +228,7 @@ trial, because the app itself is running on the PC the trials are made on.
 
 ```
 cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
-python shell_rs/app/try_it.py                  # 13 checks; the window is never shown
+python shell_rs/app/try_it.py                  # 34 checks; the window is never shown
 python shell_rs/app/try_it.py --time           # the times
 python shell_rs/app/try_it.py --picture x.png  # a picture of the window
 python shell_rs/app/try_it.py --show           # the window, to look at and click
@@ -175,6 +247,36 @@ cargo build --release --locked --manifest-path shell_rs/app/Cargo.toml
 
 It has nothing to start yet (the backend is packed in the one-file piece)
 and says that its files are incomplete.
+
+Besides the page, the calls, the second start and the quit, the checks look
+at what another program on the PC could get at, with the real window:
+
+* the window's folder must be closed to everybody but the account the
+  trial runs under and Windows itself; it is searched for the run's secret
+  twelve seconds after the page had it (a window that is not private has
+  written it down by then); and it must be gone after the run, with nothing
+  of WebView2 left anywhere else;
+* settings for WebView2 are planted in the trial's environment (a
+  debugger's port, a profile folder) and must not be used;
+* a folder made to look like one an earlier run left behind must be removed
+  and not used;
+* an empty frame, a frame that shows one of the app's own files, and a page
+  from somewhere else in a frame are put into the page and must find
+  nothing of what the window gives the app's page;
+* the page is sent to another port and another scheme under its own host
+  name and must stay where it is;
+* the windows of the program are told that the session ends, as Windows
+  tells them, and the backend must have put the system back and ended
+  before the shell's process is gone; the folder that run has to leave
+  behind is then searched for the secret as well.
+
+"Somewhere else" is this PC every time (127.0.0.1): nothing is asked of the
+internet, and no link is opened in a browser. A trial build takes scripts to
+run in its page from a folder the trial names; the build that ships has no
+such thing. The trial's folder for the window is closed to everybody but
+the account the trial runs under, which keeps WebView2's own helper programs
+out as the shipping build's folder does: that WebView2 works in a closed
+folder is tried, that it works in one for administrators only is not.
 
 ## What is where
 
@@ -264,6 +366,44 @@ it is told to start, and the only thing to tell it is the stand-in.
   administrator rights** have not been seen: the trials run without them.
   The event a second start rings is made so that a program without those
   rights may ring it; that part is untried.
+* **Nothing that needs administrator rights has been run**, and so three
+  things of the window are written and tested in their parts but not seen
+  whole: the window's folder in Windows' Temp folder, for administrators only
+  (the trial's is closed to its own account instead; a test makes the
+  administrators' kind and sees that a program without rights cannot get
+  in); a link opened from the app (nothing is handed to Explorer in any
+  test or trial: it would open the browser of whoever is at the PC, and
+  whether the browser then runs without the app's rights only shows from
+  an app that has them; what is tested is which addresses are handed over
+  and how the line for Explorer is written, and that what the shell starts
+  this way gets none of its handles); and the copy that is started for
+  rights. For the first real trial: open "Release notes" on the Drivers
+  page and look in Task Manager whether the browser runs elevated (it must
+  not), with a link that has a question mark and a comma in it.
+* **Handing a link to Explorer is the common way, not a documented one.**
+  It rests on Explorer passing what it is given to the desktop that is
+  already running. If a link ever opens a folder window instead of the
+  browser, the documented way is the desktop's own shell object
+  (`IShellDispatch2::ShellExecute`), which is a good deal more code.
+* **Five seconds at sign-out.** The quit begins at once and the stand-in
+  backend is gone in a tenth of a second. The real backend's undoing has
+  never been timed at sign-out. If it ever needs longer than Windows gives,
+  Windows ends both processes where they are, as it does with today's app;
+  what the backend had not yet put back is then put back at the next
+  start. Telling Windows to wait (`ShutdownBlockReasonCreate`) would be the
+  next step.
+* **Something else under the app's two names.** A program that makes an
+  object of another kind under the one-copy name (an event, say) before the
+  app starts makes every start run without the one-copy check, as the
+  Python app's would: "a second copy is a nuisance, an app that does not
+  start is worse". One that makes an event of its own under the show name
+  makes every start leave as if a first copy had been asked for its window,
+  so the app does not come up while that program runs. Both need a program
+  already running in the person's session; neither gives it anything.
+* **An address Tauri cannot read is let through.** The window's rule sees
+  every address the window is sent to after Tauri has read it; where Tauri
+  cannot read one at all, it lets the window go (`tauri-runtime-wry`,
+  `unwrap_or(true)`). No such address is known that WebView2 would go to.
 * **Old network filter software.** On a PC where such software (a layered
   service provider) sits between programs and Windows' sockets, a socket
   that a program inherits may not be usable in it. The backend then refuses
