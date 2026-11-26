@@ -412,6 +412,9 @@ impl Card {
             st.installs += 1;
             st.reader.take()
         };
+        // (counted off when this call is over, however it ends: also where
+        // passing it on panics, or a reader would never be started again)
+        let _counted_off_at_the_end = OnItsWay(self);
         match &reader {
             Some(reader) if reader.end() => self.say(&format!("a graphics driver's installer may be about to start: the graphics card's reader was ended first (pid {}), \
                                                                 and was seen to be gone", reader.pid())),
@@ -423,15 +426,13 @@ impl Card {
         // (the backend lets go of its own copy only once it knows that it
         // starts the installer, and says so with "ok")
         let started = answer.status == 200 && answer.to_json().get("ok").is_some_and(Json::truthy);
-        {
-            // (counted from the answer: the backend let go before it answered)
+        if started {
+            // (counted from the answer: the backend let go before it answered;
+            // set while this call still counts as on its way, so that no
+            // reader is started in between; later than the time of any
+            // installer that was started before)
             let until = self.steady() + HOLD_FOR_AN_INSTALL_S;
-            let mut st = self.state();
-            st.installs -= 1;
-            if started {
-                // (later than the time of any installer that was started before)
-                st.away_until = Some(until);
-            }
+            self.state().away_until = Some(until);
         }
         if started {
             self.say(&format!("a graphics driver's installer was started: no reader for the graphics card for {HOLD_FOR_AN_INSTALL_S:.0} s, the backend is asked meanwhile"));
@@ -477,6 +478,17 @@ impl Card {
         };
         Some(Live { core_mhz: whole("core_mhz"), mem_mhz: whole("mem_mhz"), temp_c: whole("temp_c"), power_w: number("power_w"),
                     gpu_util_pct: whole("gpu_util_pct"), mem_util_pct: whole("mem_util_pct"), fan_pct: whole("fan_pct") })
+    }
+}
+
+/// A call for a driver's install that is on its way: counted off when it
+/// goes out of scope.
+struct OnItsWay<'a>(&'a Card);
+
+impl Drop for OnItsWay<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.state();
+        st.installs = st.installs.saturating_sub(1);
     }
 }
 
@@ -997,6 +1009,20 @@ mod tests {
         rig.machine.at(1905.0);
         assert_eq!(rig.card.live(), of_the_reader(61));
         assert_eq!(rig.readers.started(), 2);
+    }
+
+    #[test]
+    fn a_call_for_an_install_that_breaks_on_its_way_is_counted_off_all_the_same() {
+        let rig = Rig::new();
+        assert_eq!(rig.card.live(), of_the_reader(61));
+        let broke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rig.card.around_a_driver_install(|| panic!("the call broke on its way"))));
+        assert!(broke.is_err());
+        assert!(rig.readers.running().is_empty(), "the reader was ended before the call");
+        // Nothing is on its way any more, and nothing said that an installer
+        // was started: the next reading starts a reader again.
+        rig.machine.at(1000.2);
+        assert_eq!(rig.card.live(), of_the_reader(61));
+        assert_eq!((rig.readers.started(), rig.backend.asked().len()), (2, 0));
     }
 
     #[test]

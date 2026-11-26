@@ -427,14 +427,16 @@ impl Monitor {
         // (a loop started after the quit ends before its first pass)
         if self.threads {
             let (monitor, card) = (self.clone(), card.clone());
-            let started = std::thread::Builder::new().name("hw-monitor".to_string()).spawn(move || monitor.run(&card, this));
-            if started.is_err() {
+            if let Err(why) = std::thread::Builder::new().name("hw-monitor".to_string()).spawn(move || monitor.run(&card, this)) {
                 // (no thread could be made: nothing reads, and that is said as "not running")
                 let mut st = self.state();
                 if st.thread == Some(this) {
                     st.thread = None;
                     st.running = false;
                 }
+                drop(st);
+                self.say(&format!("the hardware monitor could not be started: no thread could be made for it ({why})"));
+                return Json::object([("ok", true.into())]);
             }
         }
         self.say("the hardware monitor was started");
@@ -1528,6 +1530,47 @@ mod tests {
         // An answer that is neither a reading nor "it raised" is no answer.
         rig.backend.says_to("/api/monitor/part?name=ping&target=a-name", Some(Json::parse(r#"{"ok": false, "err": "Endpoint not found"}"#).unwrap()));
         assert_eq!((rig.pass(1002.0)["net_ping_ms"].clone(), rig.moved.hw.passes().kept), (Json::Null, 2));
+    }
+
+    #[test]
+    fn each_kind_of_part_that_raises_in_the_backend_drops_the_pass() {
+        const RAISED: &str = r#"{"ok": false, "raised": true, "err": "OSError: ..."}"#;
+        // Each part is asked where Python would start a program for it, and
+        // raises there; the parts before it in the pass answer.  (A place of
+        // the temperature, and LibreHardwareMonitor's sensors of the card,
+        // are asked of the backend where the helper has no answer for them.)
+        let cases: [(&str, fn(&Rig)); 7] = [
+            ("cpu", |rig| rig.machine.answers("cpu_clock", None)),
+            ("temp_lhm", |rig| rig.machine.answers_with("wmi", &[("namespace", LIBRE.into()), ("query", TEMPERATURE_SENSORS.into())], None)),
+            ("gpu_lhm", |rig| {
+                rig.readers.reads(FakeReading::Says(j(r#"{"temp_c": 61}"#)));
+                rig.machine.answers_with("wmi", &[("namespace", LIBRE.into()), ("query", ALL_SENSORS.into())], None);
+            }),
+            ("gpu", |rig| rig.readers.reads(FakeReading::HasNone)),
+            ("ram", |rig| rig.machine.answers("memory", Some(j(r#"{"load_pct": 43, "standby_pages": null, "page_size": 4096}"#)))),
+            ("dpc", |rig| {
+                rig.machine.answers("cpu_times", None);
+                rig.part("cpu", r#"{"ok": true, "reading": {"load": 5.0, "clock": 1, "temp": null}}"#);
+            }),
+            ("ping", |rig| {
+                rig.moved.hw.stop();
+                rig.moved.hw.start(&rig.moved.card, "a-name".into());
+            }),
+        ];
+        for (name, makes_it_asked) in cases {
+            let rig = a_machine();
+            let kept = rig.pass(1000.0);
+            makes_it_asked(&rig);
+            let call = if name == "ping" { "/api/monitor/part?name=ping&target=a-name".to_string() } else { format!("/api/monitor/part?name={name}") };
+            rig.backend.says_to(&call, Some(j(RAISED)));
+            assert_eq!(rig.pass(1001.0), kept, "{name}: nothing of the pass is kept");
+            assert_eq!((rig.moved.hw.passes().kept, rig.moved.hw.passes().dropped), (1, 1), "{name}");
+            assert_eq!(rig.backend.asked().last(), Some(&call), "{name}: the part that raised was the last thing asked");
+            // ... and where the part says that it has no reading, the pass is kept.
+            rig.backend.says_to(&call, Some(j(r#"{"ok": false, "err": "Endpoint not found"}"#)));
+            rig.pass(1002.0);
+            assert_eq!((rig.moved.hw.passes().kept, rig.moved.hw.passes().dropped), (2, 1), "{name}");
+        }
     }
 
     #[test]

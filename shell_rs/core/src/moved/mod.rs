@@ -325,13 +325,14 @@ impl Moved {
     /// The shell's own answer to a call of the page, or None: the call is
     /// the backend's, and is passed on as every call was before step 4.
     pub fn answer(&self, request: &Request) -> Option<Response> {
-        if request.path().starts_with("/api/perf/") {
-            return self.perf.answer(&self.card, request);
-        }
-        // (the monitor's calls are known however they are written: one that
-        // the backend would take for a start must not be passed on to it
-        // as something else, or its own monitor would run beside this one)
+        // Every call that has moved is known by its path as the backend
+        // reads it, however it is written: one that the backend would take
+        // for a start must not be passed on to it as something else, or its
+        // own copy of the module would run beside the shell's.
         let path = as_the_backend_reads_a_path(request.path());
+        if path.starts_with("/api/perf/") {
+            return self.perf.answer(&self.card, request, &path);
+        }
         if path.starts_with("/api/monitor/") {
             return self.hw.answer(&self.card, request, &path);
         }
@@ -641,6 +642,23 @@ mod tests {
             assert!(!is_it(method, target), "{method} {target}");
         }
         assert_eq!(as_the_backend_reads_a_path("/a%20b/%C3%A9/%41%zz%4"), "/a b/\u{e9}/A%zz%4");
+    }
+
+    #[test]
+    fn every_call_that_has_moved_is_known_however_its_path_is_written() {
+        let moved = Moved::new(Fake::new(), false);
+        let taken = |method: &str, target: &str, body: &str| moved.answer(&Request::new(method, target).with_body(body)).map(|answer| answer.status);
+        assert_eq!(taken("POST", "/api/%70erf/start", "{}"), Some(200));
+        let status = moved.answer(&Request::new("GET", "/api/perf/status")).unwrap().to_json();
+        assert_eq!(status["running"], Json::Bool(true), "the sampler's start written another way was taken: {status}");
+        for (method, target, body) in [("GET", "/api/perf/st%61tus", ""), ("GET", "/api%2Fperf%2Fscore?seconds=5", ""), ("POST", "/%61pi/perf/stop", "{}"),
+                                       ("POST", "/api/%6Donitor/start", "{}"), ("GET", "/api/monitor/sn%61pshot", "")] {
+            assert_eq!(taken(method, target, body), Some(200), "{method} {target}");
+        }
+        // (and what is no call of theirs stays the backend's, written either way)
+        for (method, target) in [("GET", "/api/%70erf"), ("GET", "/api/perf/Status"), ("GET", "/api/perfx/status"), ("GET", "/api/%2570erf/status")] {
+            assert_eq!(taken(method, target, ""), None, "{method} {target}");
+        }
     }
 
     #[test]

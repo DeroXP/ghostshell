@@ -2101,11 +2101,21 @@ mod tests {
         // program this process starts while it exists, which in the shell
         // is the backend alone and in a test run can be another test's
         // cmd.exe; the port is free when the last of them has ended.)
+        //
+        // The sign that the hold is gone is a sharing bind that succeeds:
+        // while the shell holds the port not even that does.  What the loop
+        // saw is kept, not asked again: the port is free for anybody now,
+        // and on a busy PC another socket may take its number in the
+        // ordinary, shareable way between two askings (it did once, in a
+        // test run), after which a plain bind fails and a sharing one still
+        // succeeds.
         let ends = std::time::Instant::now() + Duration::from_secs(20);
-        while can_be_joined(port) != (true, true) && std::time::Instant::now() < ends {
+        let mut seen = can_be_joined(port);
+        while !seen.1 && std::time::Instant::now() < ends {
             std::thread::sleep(Duration::from_millis(20));
+            seen = can_be_joined(port);
         }
-        assert_eq!(can_be_joined(port), (true, true));
+        assert!(seen.1, "the shell's port is still held 20 s after it was let go of: {seen:?}");
     }
 
     #[test]

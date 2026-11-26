@@ -362,6 +362,9 @@ def test_starting_and_stopping_give_the_same_answers():
     s += [stop({}), get("/api/perf/status"), start({"consumer": "a"}), start({"consumer": "a"}), start({"consumer": "b"}), STEP, now(50.2), STEP,
           get("/api/perf/status"), stop({"consumer": "a"}), stop({"consumer": "nobody"}), stop({"consumer": "b"}), get("/api/perf/status"),
           stop({"consumer": "b"}), STEP, get("/api/perf/status"), stop({"consumer": "b"}), stop({})]
+    # The calls written another way: the same calls, to Python and to the shell.
+    s += [post("/api/%70erf/start", {"consumer": "written"}), get("/api/perf/st%61tus"), get("/api%2Fperf%2Fscore?seconds=5"),
+          post("/%61pi/perf/stop", {"consumer": "written"}), get("/api/perf/status")]
     # Told to stop and started again before its thread has ended, and after.
     s += [now(60.0), start({}), STEP, stop({}), start({"consumer": "again"}), get("/api/perf/status"), now(60.2), STEP, STEP, get("/api/perf/status"),
           stop({"consumer": "again"}), STEP, now(70.0), start({"consumer": "later"}), get("/api/perf/status"), get("/api/perf/samples")]
@@ -1057,12 +1060,18 @@ def test_the_install_begins_in_one_place_and_both_sides_agree_on_it():
     around = sources["card.rs"]
     around = around[around.index("pub fn around_a_driver_install("):around.index("/// The shell quits: the reader is ended")]
     # Counted as on its way, the reader ended and seen to be gone, and only
-    # then passed on; counted off when it is answered, and a time to stay
-    # away only where the backend says that an installer was started.
-    assert around.index("st.installs += 1;") < around.index("st.reader.take()") < around.index("reader.end()") < around.index("let answer = pass_on();") \
+    # then passed on; a time to stay away only where the backend says that
+    # an installer was started, set while the call still counts as on its
+    # way; counted off when the call is over, however it ends (a guard that
+    # does it when it goes out of scope: also where passing it on panics).
+    assert around.index("st.installs += 1;") < around.index("st.reader.take()") < around.index("let _counted_off_at_the_end = OnItsWay(self);") \
+        < around.index("reader.end()") < around.index("let answer = pass_on();") \
         < around.index('let started = answer.status == 200 && answer.to_json().get("ok").is_some_and(Json::truthy);') \
-        < around.index("st.installs -= 1;") < around.index("if started {\n                // (later than the time of any installer that was started before)\n"
-                                                           "                st.away_until = Some(until);")
+        < around.index("self.state().away_until = Some(until);")
+    assert "st.installs" not in around[around.index("let _counted_off_at_the_end"):], "counted off anywhere but at the end"
+    off = sources["card.rs"][sources["card.rs"].index("impl Drop for OnItsWay<'_> {"):]
+    assert off.index("st.installs = st.installs.saturating_sub(1);") < off.index("impl State {")
+    assert sources["card.rs"].count("st.installs") == 4      # (counted on, looked at, counted off)
     assert "let away = st.installs > 0 || st.away_until.is_some_and(|until| now < until);" in sources["card.rs"]
     # The way the web framework reads a path, and so which calls are this
     # one: the app's own routing, asked with a few ways of writing it.

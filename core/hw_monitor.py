@@ -865,7 +865,7 @@ def _sample_ping(target: str = "1.1.1.1"):
 
 
 def _monitor_loop():
-    """Main monitoring loop — samples every 1 second, until it is stopped or
+    """The monitoring loop: a sample every second, until it is stopped or
     sleeps (nobody looked for IDLE_STOP_S)."""
     me = threading.current_thread()
     while _one_round(me):
