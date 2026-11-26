@@ -752,6 +752,27 @@ def test_it_sleeps_when_nobody_looks_and_wakes_when_somebody_does_as_python_does
     assert counted["no_pass"] == 4 + 1 + 2 + 1 + 4 + 6, counted["no_pass"]
 
 
+def test_a_pass_right_after_one_that_ran_past_its_second_starts_nothing_on_either_side():
+    """The first pass after a start or a wake waits half a second within
+    itself and may run past its second; the next then comes at once, and
+    reads the processor's times a moment after the last reading, the totals
+    not moved.  Both sides read the shares again a moment later: no
+    PowerShell in Python, no part asked by the shell.  The same where the
+    last reading is younger than a quarter of a second and the totals
+    moved; a quarter of a second old, it is compared with."""
+    if not tool():
+        return
+    s = a_whole_machine() + [start(), at(1000.0), PASS, PASS]          # (the second at the moment the first ended)
+    s += [at(1000.875), PASS, at(1001.375), PASS]                       # (0.125 s after the last reading; then 0.25 s)
+    for second in range(2, 36):                                         # nobody looks: it sleeps
+        s += [at(1000.0 + second), QUIET]
+    s += [SNAPSHOT, at(1040.0), PASS, PASS, at(1041.0), PASS]           # woken, and the same again
+    counted = both(s)
+    assert counted["no_pass"] > 0 and counted["passes"] >= 9, counted
+    assert counted["python_started"] == 0 and counted["shell_asked"] == 0, (counted["own_starts"], counted["parts"])
+    assert not any("name=dpc" in part for part in counted["parts"]) and "powershell dpc" not in counted["own_starts"]
+
+
 def a_minute_of_nothing(until=1060):
     """A machine with no source of the processor's temperature, and a card
     that says no load (so that LibreHardwareMonitor's sensors of the card

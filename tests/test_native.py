@@ -804,6 +804,46 @@ def test_dpc_falls_back_to_get_counter():
     assert HW._sample_dpc()["dpc_pct"] == 1.0 and left == []
 
 
+def test_a_pass_right_after_one_that_ran_past_its_second_reads_the_shares_again():
+    """A pass that ran past its second is followed by the next at once, and
+    that one reads the processor's times a few milliseconds after the last
+    reading: the totals have not moved, or by a little.  The shares take a
+    second reading a quarter of a second later, as with nothing to compare
+    with, and PowerShell is not started (it was, after the places in WMI
+    were left alone and a pass became that fast)."""
+    m.fresh()
+    HW._cpu_times_prev.update(totals=None, at=0.0)
+    clock = [1000.0]
+    saved = (HW.time, HW._CPU_TIMES_FIRST_WAIT_S)
+    HW.time = types.SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s))
+    HW._CPU_TIMES_FIRST_WAIT_S = 0.25
+    eighth = 24 * 10_000_000 // 8                               # an eighth of a second on 24 processors, in 100 ns units
+
+    def at(eighths, dpc_eighths=None):
+        """The times after so many eighths of a second: 0.1% of them in DPCs and 0.05% in interrupts
+        (counted up to `dpc_eighths`)."""
+        dpc_eighths = eighths if dpc_eighths is None else dpc_eighths
+        return _times(8000 * eighth + eighths * eighth, 5_000_000 + dpc_eighths * 30_000, 2_000_000 + dpc_eighths * 15_000)
+    try:
+        # The first pass (two readings a quarter of a second apart), then
+        # the next at once: the same totals.
+        left = cpu_times_answers([at(0), at(2), at(2), at(4)])
+        assert HW._sample_dpc()["dpc_pct"] == 0.1 and clock[0] == 1000.25
+        got = HW._sample_dpc()
+        assert (got["dpc_pct"], got["isr_pct"], got["perfmon_ok"]) == (0.1, 0.05, True), got
+        assert left == [] and m.PSC == [] and clock[0] == 1000.5, (left, m.PSC, clock)
+        # A reading younger than a quarter of a second, though the totals
+        # moved a little: the same (compared with, it would give no DPCs).
+        # A quarter of a second old: compared with.
+        clock[0] += 0.125
+        left = cpu_times_answers([at(5, 4), at(7, 6), at(9, 8)])
+        assert HW._sample_dpc()["dpc_pct"] == 0.1 and clock[0] == 1000.875 and len(left) == 1
+        clock[0] += 0.25
+        assert HW._sample_dpc()["dpc_pct"] == 0.1 and clock[0] == 1001.125 and left == [] and m.PSC == []
+    finally:
+        HW.time, HW._CPU_TIMES_FIRST_WAIT_S = saved
+
+
 def test_ping_from_the_helper_and_from_ping_exe():
     m.fresh()
     m.NATIVE["ping"] = {"ok": True, "ms": 12}
