@@ -584,7 +584,8 @@ with it:
 
 ```
 cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
-python shell_rs/app/try_it.py                  # 145 checks; the window is never shown
+python shell_rs/app/try_it.py                  # 153 checks; the window is never shown
+python shell_rs/app/try_it.py --monitor        # only the hardware monitor's (about two minutes)
 python shell_rs/app/try_it.py --time           # the times
 python shell_rs/app/try_it.py --time --pack P  # ... and what unpacking the pack P costs, both ways
 python shell_rs/app/try_it.py --time --pack P --carried-by E
@@ -692,9 +693,10 @@ So far: **the performance sampler** (`core/src/moved/perf.rs`, which is
 second while the Monitor page is open, for its live charts and its
 stability score; and **the hardware monitor** (`core/src/moved/hw.rs`,
 which is `core/hw_monitor.py`): the processor, the card, the memory, DPC
-time and a ping, once a second from the first visit to the Monitor page
-until its Stop button or the quit (the page does not stop it when it is
-left, as today), for its tiles. Its list of programs and its benchmark stay the backend's (they
+time and a ping, once a second while the Monitor page asks for its
+snapshot, for its tiles. The page does not stop it when it is left; it
+sleeps by itself half a minute after the last snapshot, in today's app as
+in the shell, and the next snapshot wakes it. Its list of programs and its benchmark stay the backend's (they
 start PowerShell, and the benchmark writes a file).
 
 The rules every module there keeps:
@@ -754,9 +756,9 @@ The rules every module there keeps:
     it beside it is not started (the backend is asked for the card).
 
   **What a person sees:** while the card is being read (today: while the
-  Monitor page is open, for the sampler; from the first visit to that
-  page until its Stop button or the quit, for the hardware monitor; and
-  for ten seconds after the last reading), Task Manager shows a second
+  Monitor page is open, for the sampler; while it is on screen and for
+  half a minute after, for the hardware monitor; and for ten seconds
+  after the last reading), Task Manager shows a second
   process of the app's, `VisporaGpuReader.exe`,
   with about 30 MB of memory, most of it NVIDIA's library. It is not
   there otherwise. On a PC without an NVIDIA card it is started, says that
@@ -765,7 +767,8 @@ The rules every module there keeps:
   it: the processor's times and clock and the memory through the helper
   (two questions were added to it for the memory and the DPC rate, which
   Python reads through ctypes), the temperature through WMI in Python's
-  four places, the card through its reader, the ping through the helper.
+  four places (a place that had nothing is left alone for half a minute,
+  as in Python), the card through its reader, the ping through the helper.
   Where Python would start a program (PowerShell, `nvidia-smi`,
   `ping.exe`), the shell starts none and asks its backend for that part
   of the pass (`GET /api/monitor/part?name=...`, there only behind the
@@ -776,12 +779,17 @@ The rules every module there keeps:
   cannot is refused, so that the backend's own monitor never runs beside
   the shell's.
 
-  **What a person sees:** the Monitor page as before. The shell's log
-  says when the monitor is started and stopped, and once, and again when
-  it changes, where the processor's temperature is read from, or that no
-  source has one. The card's reader runs while the monitor runs (it is
-  asked once a second): from the first visit to the Monitor page until
-  its Stop button or the quit.
+  **What a person sees:** the Monitor page as before, but for one thing:
+  coming back to it after more than half a minute away, the tiles show
+  dashes and the sparklines start again, for the first seconds, as after a
+  start (the old numbers are not shown as if they were current). The
+  shell's log says when the monitor is started and stopped, when it
+  sleeps and wakes, and once, and again when it changes, where the
+  processor's temperature is read from, or that no source has one. The
+  card's reader runs while the monitor reads (it is asked once a second),
+  and goes ten seconds after it sleeps. A LibreHardwareMonitor that is
+  started while the monitor runs shows its temperature within half a
+  minute.
 * **A real side and a made-up side.** `Real` asks the helper. `Fake`
   answers from a table and tells a time that is set by hand; `FakeReaders`
   are made-up readers for the card, and `FakeBackend` says what the
@@ -825,10 +833,13 @@ has to ask the backend), the reader is there 40 ms after it was started,
 and while the sampler runs the shell and its reader together use 0.18% of
 one core, about what the backend's own sampler takes. The chart's data
 takes the shell 0.13 ms where a call to the backend and back takes 1.1 ms.
-The hardware monitor costs the shell what it costs the backend (about 3%
-of a core while it runs, nearly all of it WMI asking for a
-processor temperature this PC does not have), and its snapshot takes the
-shell under 0.1 ms where the backend takes 0.95.
+The hardware monitor costs the shell what it costs the backend, and its
+snapshot takes the shell under 0.1 ms where the backend takes 0.95. Before
+the two fixes it cost this PC about a fifth of one core while it ran
+(about 3% in its own process, the rest in Windows' WMI service, asking for
+a processor temperature this PC does not have), from the first visit to
+the Monitor page until the quit; now about 3% while the page is on
+screen, and nothing half a minute after.
 
 ## What is where
 

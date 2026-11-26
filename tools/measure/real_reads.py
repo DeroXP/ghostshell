@@ -66,6 +66,8 @@ for _ in range(2):
         "seconds": round(time.perf_counter() - t, 2), "process_starts": len(calls),
         "by_program": {k: sum(1 for c in calls if c[0] == k) for k in sorted({c[0] for c in calls})},
         "slowest": sorted(((round(c[1], 2), c[3]) for c in calls), reverse=True)[:4]})
+# (a place in WMI that had nothing is left alone for half a minute: the
+# passes after the first ask it nothing, as the loop's passes do)
 for _ in range(5):
     time.sleep(1.0)                                     # (the loop's own pace: a second between passes)
     del calls[:]

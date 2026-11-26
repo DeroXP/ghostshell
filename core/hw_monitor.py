@@ -22,6 +22,30 @@
     don't run.  Renamed the field to DPC Load and surfaced the
     actual percentage from the counter; a healthy idle system
     legitimately sits near 0% (target <0.5%).
+
+The monitor sleeps when nobody looks.  Its only reader is the Monitor page,
+which asks for the snapshot every three seconds while it is on screen and
+the window is not hidden; the page starts the monitor when it opens and does
+not stop it when it is left.  Once nobody has asked for the snapshot (or
+started it) for IDLE_STOP_S, its loop ends by itself.  "running" in the
+snapshot stays what the person set, on from Start until Stop, also while
+the loop sleeps, so the page needs nothing new: the next snapshot finds the
+monitor on and its loop asleep, forgets what was read before the sleep (the
+tiles and the minute of history show what they show in the first second
+after a start), and wakes the loop.  A monitor that was stopped is never
+started by a snapshot.  Until then it cost the owner's PC about a fifth of
+one core for as long as the app ran after one visit to the page, most of it
+in Windows' WMI service (docs/performance.md).
+
+A place in WMI that had nothing is not asked again every second.  The four
+places of the processor's temperature and LibreHardwareMonitor's sensors of
+the graphics card are each a "place" (_from_a_place): one that had nothing
+(no namespace, no rows, no real reading) is not asked again for QUIET_S,
+unless it gave a reading within the last QUIET_S, so that one miss of a
+source that works does not blank a tile.  On a PC with no source the four
+are asked about twice a minute instead of sixty times, and a
+LibreHardwareMonitor that is started while the monitor runs is seen within
+half a minute.
 """
 import ctypes
 import json
@@ -61,12 +85,47 @@ _cpu_temp_source: str = ""
 _cpu_temp_hint_shown: bool = False
 
 _monitor_state = {
-    "running": False,
-    "thread": None,
+    "running": False,        # what the person set: on from Start until Stop
+    "thread": None,          # the loop that samples; None while it sleeps
     "latest": {},
     "alerts": [],
     "ping_target": "1.1.1.1",
+    "last_wanted": 0.0,      # when somebody last looked (time.monotonic())
 }
+_run_lock = threading.Lock()     # starting, waking, and the loop's going to sleep, one at a time
+
+# Nobody has asked for the snapshot (or started the monitor) for this long:
+# the loop sleeps.  The page asks every three seconds while it is on screen;
+# as the network monitor's (core/net_monitor.py, IDLE_STOP_S).
+IDLE_STOP_S = 30.0
+
+# A place in WMI that had nothing is not asked again for this long, unless
+# it gave a reading within the last QUIET_S (_from_a_place).
+QUIET_S = 30.0
+_places: dict = {}       # name -> {"quiet_until": monotonic, "had": monotonic of its last reading, or None}
+
+# The places, by name.
+CPU_LHM, CPU_OHM, CPU_ACPI, CPU_THERMAL = "cpu temperature: LibreHardwareMonitor", "cpu temperature: OpenHardwareMonitor", \
+    "cpu temperature: ACPI zone", "cpu temperature: thermal zone counter"
+GPU_LHM = "graphics card: LibreHardwareMonitor"
+
+
+def _from_a_place(name, read, has_reading=lambda value: value is not None, nothing=None):
+    """What the place `name` gives (`read()`), or `nothing` without asking
+    it while it is quiet.  A place that had nothing (not `has_reading`) is
+    quiet for QUIET_S, unless it gave a reading within the last QUIET_S.
+    The rule is the place's, however `read` asks it (the helper, or
+    PowerShell where there is none)."""
+    now = time.monotonic()
+    place = _places.setdefault(name, {"quiet_until": 0.0, "had": None})
+    if now < place["quiet_until"]:
+        return nothing
+    value = read()
+    if has_reading(value):
+        place["had"] = now
+    elif place["had"] is None or now - place["had"] > QUIET_S:
+        place["quiet_until"] = now + QUIET_S
+    return value
 
 # Alert thresholds
 THRESHOLDS = {
@@ -79,6 +138,57 @@ THRESHOLDS = {
 
 def _sample_cpu():
     """Sample CPU metrics."""
+    data = _cpu_load_and_clock()
+    t, source = _cpu_temp()
+    if t is not None:
+        data["temp"], data["temp_source"] = t, source
+
+    # Surface the source we landed on (or didn't) exactly once so
+    # vispora.log records which read path is paying off without
+    # noise on every poll.
+    global _cpu_temp_source
+    if data["temp"] is not None and data.get("temp_source") and data["temp_source"] != _cpu_temp_source:
+        log.info(f"CPU temp source: {data['temp_source']} ({data['temp']}°C)")
+        _cpu_temp_source = data["temp_source"]
+    elif data["temp"] is None and _cpu_temp_source != "<none>":
+        # 3.3.3: LibreHardwareMonitor is now auto-installed by the
+        # dependency manager + auto-launched on boot, so this warning
+        # should be rare.  When it does fire, the auto-install probably
+        # hit an error; check vispora.log for "lhm-winget" install
+        # output to see why.
+        log.warning(
+            "CPU temp unavailable: neither LibreHardwareMonitor (auto-installed) "
+            "nor any other WMI temp provider returned a sane reading.  "
+            "Check %APPDATA%/Vispora/install_logs/ for 'lhm-winget' output, "
+            "or open Settings > Dependencies and click 'Install' on the LHM row."
+        )
+        _cpu_temp_source = "<none>"
+
+    return data
+
+
+def _cpu_temp():
+    """The processor's temperature and where it was read, from the first of
+    four places that has a real one, each asked as its place allows
+    (_from_a_place); (None, "") where none has."""
+    # 1) LibreHardwareMonitor WMI (gold standard, requires LHM installed)
+    # 2) OpenHardwareMonitor WMI (older but still common)
+    # 3) MSAcpi_ThermalZoneTemperature (ACPI; only works on some laptops)
+    # 4) Win32_PerfFormattedData_Counters_ThermalZoneInformation (same
+    #    ACPI source surfaced through perfmon; sometimes works when the
+    #    direct WMI class doesn't)
+    for place, read, source in ((CPU_LHM, _read_cpu_temp_via_lhm, "LibreHardwareMonitor"),
+                                (CPU_OHM, _read_cpu_temp_via_ohm, "OpenHardwareMonitor"),
+                                (CPU_ACPI, _read_cpu_temp_via_msacpi, "MSAcpi_ThermalZone"),
+                                (CPU_THERMAL, _read_cpu_temp_via_perf_thermal, "PerfFormatted ThermalZone")):
+        t = _from_a_place(place, read)
+        if t is not None:
+            return t, source
+    return None, ""
+
+
+def _cpu_load_and_clock():
+    """The processor's load and clock: {"temp": None, "load", "clock"}."""
     data = {"temp": None, "load": None, "clock": None}
 
     # CPU load: try NT API first (works even with corrupt perflib),
@@ -121,47 +231,6 @@ def _sample_cpu():
                 data["clock"] = int(r2["out"].strip())
             except ValueError:
                 pass
-
-    # CPU temperature — try in order, log which one wins.
-    # 1) LibreHardwareMonitor WMI (gold standard, requires LHM installed)
-    # 2) OpenHardwareMonitor WMI (older but still common)
-    # 3) MSAcpi_ThermalZoneTemperature (ACPI; only works on some laptops)
-    # 4) Win32_PerfFormattedData_Counters_ThermalZoneInformation (same
-    #    ACPI source surfaced through perfmon; sometimes works when the
-    #    direct WMI class doesn't)
-    t = _read_cpu_temp_via_lhm()
-    if t is not None: data["temp"], data["temp_source"] = t, "LibreHardwareMonitor"
-    if data["temp"] is None:
-        t = _read_cpu_temp_via_ohm()
-        if t is not None: data["temp"], data["temp_source"] = t, "OpenHardwareMonitor"
-    if data["temp"] is None:
-        t = _read_cpu_temp_via_msacpi()
-        if t is not None: data["temp"], data["temp_source"] = t, "MSAcpi_ThermalZone"
-    if data["temp"] is None:
-        t = _read_cpu_temp_via_perf_thermal()
-        if t is not None: data["temp"], data["temp_source"] = t, "PerfFormatted ThermalZone"
-
-    # Surface the source we landed on (or didn't) exactly once so
-    # vispora.log records which read path is paying off without
-    # noise on every poll.
-    global _cpu_temp_source
-    if data["temp"] is not None and data.get("temp_source") and data["temp_source"] != _cpu_temp_source:
-        log.info(f"CPU temp source: {data['temp_source']} ({data['temp']}°C)")
-        _cpu_temp_source = data["temp_source"]
-    elif data["temp"] is None and _cpu_temp_source != "<none>":
-        # 3.3.3: LibreHardwareMonitor is now auto-installed by the
-        # dependency manager + auto-launched on boot, so this warning
-        # should be rare.  When it does fire, the auto-install probably
-        # hit an error; check vispora.log for "lhm-winget" install
-        # output to see why.
-        log.warning(
-            "CPU temp unavailable: neither LibreHardwareMonitor (auto-installed) "
-            "nor any other WMI temp provider returned a sane reading.  "
-            "Check %APPDATA%/Vispora/install_logs/ for 'lhm-winget' output, "
-            "or open Settings > Dependencies and click 'Install' on the LHM row."
-        )
-        _cpu_temp_source = "<none>"
-
     return data
 
 
@@ -354,11 +423,21 @@ def _gpu_from_nvidia_smi():
     return data
 
 
-def _sample_gpu():
-    """Sample GPU metrics: the native helper, else nvidia-smi."""
+def _gpu_from_the_card():
+    """The card's own numbers: the native helper, else nvidia-smi."""
     data = _gpu_from_native()
     if data is None:
         data = _gpu_from_nvidia_smi()
+    return data
+
+
+_NOTHING_FROM_LHM = {"temp": None, "load": None, "clock": None}
+
+
+def _sample_gpu():
+    """Sample GPU metrics: the native helper, else nvidia-smi; then
+    LibreHardwareMonitor for what the card does not say."""
+    data = _gpu_from_the_card()
 
     # Fallback: WMI
     # 3.4.0 — LHM GPU fallback broadened for AMD + Intel.  nvidia-smi
@@ -369,7 +448,8 @@ def _sample_gpu():
     # Temperature".  Pull load too (SensorType=Load, Name~"GPU Core")
     # so the live tile isn't blank on non-NVIDIA hardware.
     if data["temp"] is None or data["load"] is None:
-        lhm = _read_gpu_via_lhm()
+        lhm = _from_a_place(GPU_LHM, _read_gpu_via_lhm, has_reading=lambda read: any(v is not None for v in read.values()),
+                            nothing=dict(_NOTHING_FROM_LHM))
         if data["temp"] is None and lhm.get("temp") is not None:
             data["temp"] = lhm["temp"]
         if data["load"] is None and lhm.get("load") is not None:
@@ -785,106 +865,154 @@ def _sample_ping(target: str = "1.1.1.1"):
 
 
 def _monitor_loop():
-    """Main monitoring loop — samples every 1 second."""
+    """Main monitoring loop — samples every 1 second, until it is stopped or
+    sleeps (nobody looked for IDLE_STOP_S)."""
     me = threading.current_thread()
+    while _one_round(me):
+        pass
+
+
+def _one_round(me) -> bool:
+    """One round of the loop: a pass, the rest of the second, and whether
+    anybody still looks.  Does the loop go on?"""
     # Stop then Start within one pass used to leave this loop running beside
     # the new one (and another per toggle); it ends once it is not the current one.
-    while _monitor_state["running"] and _monitor_state["thread"] is me:
-        try:
-            ts = time.time()
+    if not (_monitor_state["running"] and _monitor_state["thread"] is me):
+        return False
+    try:
+        ts = time.time()
 
-            cpu = _sample_cpu()
-            gpu = _sample_gpu()
-            ram = _sample_ram()
-            dpc = _sample_dpc()
-            ping = _sample_ping(_monitor_state["ping_target"])
+        cpu = _sample_cpu()
+        gpu = _sample_gpu()
+        ram = _sample_ram()
+        dpc = _sample_dpc()
+        ping = _sample_ping(_monitor_state["ping_target"])
 
-            # Store in rolling buffers
-            if cpu["temp"] is not None:
-                _metrics["cpu_temp"].append(cpu["temp"])
-            if cpu["load"] is not None:
-                _metrics["cpu_load"].append(cpu["load"])
-            if cpu["clock"] is not None:
-                _metrics["cpu_clock"].append(cpu["clock"])
-            if gpu["temp"] is not None:
-                _metrics["gpu_temp"].append(gpu["temp"])
-            if gpu["load"] is not None:
-                _metrics["gpu_load"].append(gpu["load"])
-            if gpu["clock"] is not None:
-                _metrics["gpu_clock"].append(gpu["clock"])
-            if gpu["vram_pct"] is not None:
-                _metrics["gpu_vram_pct"].append(gpu["vram_pct"])
-            _metrics["ram_pct"].append(ram.get("used_pct", 0))
-            _metrics["ram_standby_mb"].append(ram.get("standby_mb", 0))
-            # New DPC shape: store percentages.  Keep dpc_latency_us in
-            # the history dict so any external graph code that grabs
-            # by that key doesn't crash; it just trails None now.
-            dpc_pct = dpc.get("dpc_pct") if isinstance(dpc, dict) else None
-            isr_pct = dpc.get("isr_pct") if isinstance(dpc, dict) else None
-            if dpc_pct is not None: _metrics["dpc_pct"].append(dpc_pct)
-            if isr_pct is not None: _metrics["isr_pct"].append(isr_pct)
-            if ping is not None:
-                _metrics["net_ping_ms"].append(ping)
+        # Store in rolling buffers
+        if cpu["temp"] is not None:
+            _metrics["cpu_temp"].append(cpu["temp"])
+        if cpu["load"] is not None:
+            _metrics["cpu_load"].append(cpu["load"])
+        if cpu["clock"] is not None:
+            _metrics["cpu_clock"].append(cpu["clock"])
+        if gpu["temp"] is not None:
+            _metrics["gpu_temp"].append(gpu["temp"])
+        if gpu["load"] is not None:
+            _metrics["gpu_load"].append(gpu["load"])
+        if gpu["clock"] is not None:
+            _metrics["gpu_clock"].append(gpu["clock"])
+        if gpu["vram_pct"] is not None:
+            _metrics["gpu_vram_pct"].append(gpu["vram_pct"])
+        _metrics["ram_pct"].append(ram.get("used_pct", 0))
+        _metrics["ram_standby_mb"].append(ram.get("standby_mb", 0))
+        # New DPC shape: store percentages.  Keep dpc_latency_us in
+        # the history dict so any external graph code that grabs
+        # by that key doesn't crash; it just trails None now.
+        dpc_pct = dpc.get("dpc_pct") if isinstance(dpc, dict) else None
+        isr_pct = dpc.get("isr_pct") if isinstance(dpc, dict) else None
+        if dpc_pct is not None: _metrics["dpc_pct"].append(dpc_pct)
+        if isr_pct is not None: _metrics["isr_pct"].append(isr_pct)
+        if ping is not None:
+            _metrics["net_ping_ms"].append(ping)
 
-            # Update latest snapshot
-            _monitor_state["latest"] = {
-                "ts": ts,
-                "cpu_temp": cpu["temp"],
-                "cpu_temp_source": cpu.get("temp_source") or "",
-                "cpu_load": cpu["load"],
-                "cpu_clock": cpu["clock"],
-                "gpu_temp": gpu["temp"],
-                "gpu_load": gpu["load"],
-                "gpu_clock": gpu["clock"],
-                "gpu_vram_pct": gpu["vram_pct"],
-                "ram_pct": ram.get("used_pct"),
-                "ram_standby_mb": ram.get("standby_mb"),
-                # New DPC fields.  When the user's perflib is healthy
-                # we publish dpc_pct + isr_pct + dpc_rate.  When it's
-                # corrupt (lodctr /R territory) only dpc_rate is
-                # populated via the NT API fallback.  UI prefers
-                # dpc_rate as the primary display since it's the more
-                # useful metric and the more available one.
-                "dpc_pct":         dpc_pct,
-                "isr_pct":         isr_pct,
-                "dpc_rate":        dpc.get("dpc_rate") if isinstance(dpc, dict) else None,
-                "dpc_ok":          bool(isinstance(dpc, dict) and dpc.get("ok")),
-                "dpc_perfmon_ok":  bool(isinstance(dpc, dict) and dpc.get("perfmon_ok")),
-                "dpc_latency_us":  None,
-                "net_ping_ms":     ping,
-            }
+        # Update latest snapshot
+        _monitor_state["latest"] = {
+            "ts": ts,
+            "cpu_temp": cpu["temp"],
+            "cpu_temp_source": cpu.get("temp_source") or "",
+            "cpu_load": cpu["load"],
+            "cpu_clock": cpu["clock"],
+            "gpu_temp": gpu["temp"],
+            "gpu_load": gpu["load"],
+            "gpu_clock": gpu["clock"],
+            "gpu_vram_pct": gpu["vram_pct"],
+            "ram_pct": ram.get("used_pct"),
+            "ram_standby_mb": ram.get("standby_mb"),
+            # New DPC fields.  When the user's perflib is healthy
+            # we publish dpc_pct + isr_pct + dpc_rate.  When it's
+            # corrupt (lodctr /R territory) only dpc_rate is
+            # populated via the NT API fallback.  UI prefers
+            # dpc_rate as the primary display since it's the more
+            # useful metric and the more available one.
+            "dpc_pct":         dpc_pct,
+            "isr_pct":         isr_pct,
+            "dpc_rate":        dpc.get("dpc_rate") if isinstance(dpc, dict) else None,
+            "dpc_ok":          bool(isinstance(dpc, dict) and dpc.get("ok")),
+            "dpc_perfmon_ok":  bool(isinstance(dpc, dict) and dpc.get("perfmon_ok")),
+            "dpc_latency_us":  None,
+            "net_ping_ms":     ping,
+        }
 
-            # Check alerts
-            alerts = []
-            if cpu["temp"] and cpu["temp"] > THRESHOLDS["cpu_temp"]:
-                alerts.append(f"CPU temp: {cpu['temp']}°C")
-            if gpu["temp"] and gpu["temp"] > THRESHOLDS["gpu_temp"]:
-                alerts.append(f"GPU temp: {gpu['temp']}°C")
-            if ram.get("used_pct", 0) > THRESHOLDS["ram_pct"]:
-                alerts.append(f"RAM: {ram['used_pct']}%")
-            if gpu["vram_pct"] and gpu["vram_pct"] > THRESHOLDS["gpu_vram_pct"]:
-                alerts.append(f"VRAM: {gpu['vram_pct']}%")
-            _monitor_state["alerts"] = alerts
+        # Check alerts
+        alerts = []
+        if cpu["temp"] and cpu["temp"] > THRESHOLDS["cpu_temp"]:
+            alerts.append(f"CPU temp: {cpu['temp']}°C")
+        if gpu["temp"] and gpu["temp"] > THRESHOLDS["gpu_temp"]:
+            alerts.append(f"GPU temp: {gpu['temp']}°C")
+        if ram.get("used_pct", 0) > THRESHOLDS["ram_pct"]:
+            alerts.append(f"RAM: {ram['used_pct']}%")
+        if gpu["vram_pct"] and gpu["vram_pct"] > THRESHOLDS["gpu_vram_pct"]:
+            alerts.append(f"VRAM: {gpu['vram_pct']}%")
+        _monitor_state["alerts"] = alerts
 
-            # Sleep remainder of 1 second
-            elapsed = time.time() - ts
-            if elapsed < 1.0:
-                time.sleep(1.0 - elapsed)
+        # Sleep remainder of 1 second
+        elapsed = time.time() - ts
+        if elapsed < 1.0:
+            time.sleep(1.0 - elapsed)
 
-        except Exception as e:
-            log.warning(f"hw_monitor sample failed: {e}")
-            time.sleep(1)
+    except Exception as e:
+        log.warning(f"hw_monitor sample failed: {e}")
+        time.sleep(1)
+    with _run_lock:
+        # (decided with the lock held: somebody who looks now either got in
+        # first, and it goes on, or wakes a new loop)
+        if _monitor_state["thread"] is me and time.monotonic() - _monitor_state["last_wanted"] > IDLE_STOP_S:
+            _monitor_state["thread"] = None
+            log.info(f"Hardware monitor sleeps: nobody has looked for {IDLE_STOP_S:.0f} s")
+            return False
+    return True
 
 
-def start_monitor(ping_target: str = "1.1.1.1") -> dict:
-    """Start the hardware monitor."""
-    if _monitor_state["running"]:
-        return {"ok": True, "msg": "Already running"}
-    _monitor_state["running"] = True
-    _monitor_state["ping_target"] = ping_target
+def _forget_readings() -> None:
+    """Drop what was read before a sleep: the tiles and the minute of
+    history are as in the first second after a start, and the first pass
+    after it compares with nothing older than the sleep."""
+    global _cpu_prev_sample
+    _monitor_state["latest"] = {}
+    _monitor_state["alerts"] = []
+    for kept in _metrics.values():
+        kept.clear()
+    _cpu_prev_sample = {"ts": 0.0, "idle": 0, "kernel": 0, "user": 0}
+    _cpu_times_prev.update(totals=None, at=0.0)
+
+
+def _start_the_loop() -> None:
+    """(with _run_lock held)"""
     t = threading.Thread(target=_monitor_loop, daemon=True)
     _monitor_state["thread"] = t        # before start(): the loop checks it
     t.start()
+
+
+def _wake() -> None:
+    """The monitor is on and its loop sleeps: forget, and wake it.  (With
+    _run_lock held.)"""
+    _forget_readings()
+    _start_the_loop()
+    log.info("Hardware monitor wakes: somebody looks again")
+
+
+def start_monitor(ping_target: str = "1.1.1.1") -> dict:
+    """Start the hardware monitor.  (A start while it sleeps wakes it, and
+    answers as a start while it runs.)"""
+    with _run_lock:
+        _monitor_state["last_wanted"] = time.monotonic()
+        if _monitor_state["running"]:
+            if _monitor_state["thread"] is None:
+                _wake()
+            return {"ok": True, "msg": "Already running"}
+        _monitor_state["running"] = True
+        _monitor_state["ping_target"] = ping_target
+        _start_the_loop()
     log.info("Hardware monitor started")
     return {"ok": True}
 
@@ -896,7 +1024,12 @@ def stop_monitor() -> dict:
 
 
 def get_monitor_snapshot() -> dict:
-    """Get latest readings + rolling history for sparklines."""
+    """Get latest readings + rolling history for sparklines.  Asking is
+    looking: a monitor that is on and asleep wakes (and forgets first)."""
+    with _run_lock:
+        _monitor_state["last_wanted"] = time.monotonic()
+        if _monitor_state["running"] and _monitor_state["thread"] is None:
+            _wake()
     return {
         "running": _monitor_state["running"],
         "latest": _monitor_state["latest"],

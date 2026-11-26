@@ -328,7 +328,9 @@ def moved(program, appdata):
 # The backend's own hardware monitor, for a minute, in a Python process of
 # its own: core/hw_monitor.py with the app's native helper (as a source
 # checkout has it built), its data folder redirected, its echo requests to
-# 127.0.0.1.  It only reads.  It says how many programs it started.
+# 127.0.0.1.  It only reads.  It says how many programs it started.  It is
+# asked for the snapshot every three seconds, as the page asks while it is
+# on screen: a monitor nobody looks at sleeps after half a minute.
 THE_BACKENDS_MONITOR = r"""
 import atexit, json, os, shutil, statistics, sys, tempfile, time
 root = tempfile.mkdtemp(prefix="vispora_measure_")
@@ -358,7 +360,10 @@ from core import hw_monitor
 print(json.dumps({"ready": True}), flush=True)
 sys.stdin.readline()
 hw_monitor.start_monitor("127.0.0.1")
-time.sleep(float(sys.argv[2]))
+end = time.monotonic() + float(sys.argv[2])
+while time.monotonic() < end:
+    time.sleep(min(3.0, max(0.0, end - time.monotonic())))
+    hw_monitor.get_monitor_snapshot()
 hw_monitor.stop_monitor()
 time.sleep(1.5)
 passes = len(hw_monitor._metrics["cpu_load"])
@@ -393,7 +398,10 @@ def monitor(program, appdata, seconds=60, timed=20):
       * the backend's own monitor: core/hw_monitor.py in a Python process of
         its own, with the native helper as a source checkout has it built.
 
-    Then each takes 20 more passes, one a second, each of them timed."""
+    The page's call for the snapshot is made of each every three seconds,
+    as the page makes it while it is on screen (a monitor that nobody looks
+    at sleeps after half a minute).  Then each takes 20 more passes, one a
+    second, each of them timed."""
     reader = reader_beside(program)
     if not os.path.isfile(reader):
         sys.exit("Not started: %s has not been built (it is built with the trial tool)." % reader)
@@ -438,7 +446,10 @@ def monitor(program, appdata, seconds=60, timed=20):
         began = time.perf_counter()
         counted = {"shell": processor_seconds(shell.pid), "backend": processor_seconds(backend), "python": processor_seconds(python.pid)}
         print("Both monitors run, the shell's and the backend's own; a minute ...")
-        time.sleep(seconds)
+        while time.perf_counter() - began < seconds:
+            time.sleep(max(0.0, min(3.0, seconds - (time.perf_counter() - began))))
+            for asks in (ask, ask_passing):         # (the page on screen; the shell that passes it on, too)
+                asks(do="call", method="GET", target="/api/monitor/snapshot", token=True)
         wall = time.perf_counter() - began
         used = {"shell": processor_seconds(shell.pid) - counted["shell"], "backend": processor_seconds(backend) - counted["backend"],
                 "python": processor_seconds(python.pid) - counted["python"]}

@@ -428,6 +428,116 @@ def test_stop_then_start_leaves_one_monitor_loop():
             setattr(HW, n, f)
 
 
+class _AMonitorThatSleepsSoon:
+    """The hardware monitor with readings that take no time, that sleeps
+    when nobody has looked for a moment instead of half a minute, and that
+    counts the loops it starts and the passes they take."""
+    NAMES = ("_sample_cpu", "_sample_gpu", "_sample_ram", "_sample_dpc", "_sample_ping", "_start_the_loop", "IDLE_STOP_S")
+
+    def __enter__(self):
+        self.saved = {n: getattr(HW, n) for n in self.NAMES}
+        self.passes, self.starts = [0], [0]
+        start_the_loop = HW._start_the_loop
+
+        def sample_cpu():
+            self.passes[0] += 1                     # (the load is the pass's number: old and new can be told apart)
+            return {"temp": None, "load": float(self.passes[0]), "clock": None}
+
+        def counted_start():
+            self.starts[0] += 1
+            start_the_loop()
+        HW._sample_cpu, HW._start_the_loop = sample_cpu, counted_start
+        HW._sample_gpu = lambda: {"temp": None, "load": None, "clock": None, "vram_pct": None}
+        HW._sample_ram = lambda: {"used_pct": 10, "standby_mb": 0}
+        HW._sample_dpc = lambda: {"dpc_pct": None, "isr_pct": None, "dpc_rate": None, "ok": False, "perfmon_ok": False}
+        HW._sample_ping = lambda target="1.1.1.1": None
+        HW.IDLE_STOP_S = 0.3
+        HW._monitor_state.update(latest={}, alerts=[], thread=None, running=False)
+        return self
+
+    def asleep(self):
+        return HW._monitor_state["thread"] is None
+
+    def __exit__(self, *exc):
+        loop = HW._monitor_state["thread"]
+        HW.stop_monitor()
+        if loop is not None:
+            m.wait(lambda: not loop.is_alive(), 4)
+        for n, f in self.saved.items():
+            setattr(HW, n, f)
+        return False
+
+
+def test_the_monitor_sleeps_when_nobody_looks_and_a_look_wakes_it():
+    """Nobody asks for the snapshot: the loop ends by itself, and "running"
+    stays what the person set.  The next snapshot wakes it, without what
+    was read before the sleep.  A start while it sleeps wakes it too, and
+    answers as a start while it runs."""
+    m.fresh()
+    with _AMonitorThatSleepsSoon() as monitor:
+        assert HW.start_monitor() == {"ok": True}
+        first = HW._monitor_state["thread"]
+        assert m.wait(lambda: HW._monitor_state["latest"]), "the loop never sampled"
+        assert m.wait(monitor.asleep, 4) and m.wait(lambda: not first.is_alive(), 2), "nobody looked: it sleeps"
+        taken = monitor.passes[0]
+        time.sleep(1.5)
+        assert monitor.passes[0] == taken, "a loop that sleeps takes no pass"
+        woken = HW.get_monitor_snapshot()
+        # (nothing of the first pass: the woken loop's own first pass at most)
+        assert woken["running"] is True and woken["latest"].get("cpu_load") in (None, 2.0) and woken["history"]["cpu_load"] in ([], [2.0]), woken
+        assert monitor.starts[0] == 2 and not monitor.asleep()
+        assert m.wait(lambda: HW._monitor_state["latest"]) and HW.get_monitor_snapshot()["history"]["cpu_load"] == [2.0]
+        # Looked at, it does not sleep.
+        for _ in range(12):
+            HW.get_monitor_snapshot()
+            time.sleep(0.15)
+        assert not monitor.asleep() and monitor.starts[0] == 2
+        # A start while it sleeps.
+        assert m.wait(monitor.asleep, 4)
+        assert HW.start_monitor("9.9.9.9") == {"ok": True, "msg": "Already running"}
+        assert not monitor.asleep() and monitor.starts[0] == 3 and HW._monitor_state["ping_target"] == "1.1.1.1"
+
+
+def test_a_monitor_stopped_while_it_sleeps_stays_stopped():
+    m.fresh()
+    with _AMonitorThatSleepsSoon() as monitor:
+        HW.start_monitor()
+        assert m.wait(lambda: HW._monitor_state["latest"]) and m.wait(monitor.asleep, 4)
+        HW.stop_monitor()
+        said = HW.get_monitor_snapshot()
+        assert said["running"] is False and said["latest"], "a look does not wake it, and what it read is kept, as after a stop"
+        time.sleep(1.2)
+        assert monitor.asleep() and monitor.starts[0] == 1
+        assert HW.start_monitor() == {"ok": True} and monitor.starts[0] == 2, "an ordinary start after it"
+
+
+def test_eight_looks_at_once_wake_one_loop():
+    """One of each, through a sleep and a wake: eight who look at the same
+    moment wake one loop, which takes a pass a second, not eight."""
+    m.fresh()
+    with _AMonitorThatSleepsSoon() as monitor:
+        HW.start_monitor()
+        assert m.wait(lambda: HW._monitor_state["latest"]) and m.wait(monitor.asleep, 4)
+        go = threading.Barrier(8)
+
+        def look():
+            go.wait()
+            HW.get_monitor_snapshot()
+        looks = [threading.Thread(target=look) for _ in range(8)]
+        for t in looks:
+            t.start()
+        for t in looks:
+            t.join()
+        assert monitor.starts[0] == 2, monitor.starts
+        taken = monitor.passes[0]
+        for _ in range(15):                         # looked at for 2.25 s
+            HW.get_monitor_snapshot()
+            time.sleep(0.15)
+        assert 2 <= monitor.passes[0] - taken <= 4, monitor.passes[0] - taken
+        loops = [t for t in threading.enumerate() if getattr(t, "_target", None) is HW._monitor_loop]
+        assert len(loops) == 1, loops
+
+
 # ── GPU tab ───────────────────────────────────────────────────────────
 def test_clean_install_script_removes_only_nvidia_driver_packages():
     m.fresh()

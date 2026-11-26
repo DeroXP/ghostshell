@@ -364,6 +364,8 @@ step("quit at idle", lambda: A._restore_system_before_exit("measurement"))
 settle(3.0, 1.0)
 
 # ── 6. the Monitor page: passes of the hardware monitor ───────────────
+# (a place in WMI that had nothing is left alone for half a minute: the
+# passes after the first ask it nothing, as the loop's passes do)
 PHASE[0] = "7 Monitor page open, per pass of its loop"
 samples = []
 hw_monitor._read_cpu_load_via_ntapi()          # (the loop's first pass has run: there is a previous reading)

@@ -358,7 +358,7 @@ request, in this order:
 | --- | --- | --- | --- | --- |
 | 1 | The performance sampler (`core/perf_monitor.py`) | the graphics card, five times a second, while the Monitor page is open | nothing | **moved**: `shell_rs/core/src/moved/perf.rs` |
 | | The graphics card's own reader (not a module of the backend: what pieces 1, 2 and 5 read the card with) | the card, while something in the shell wants its readings | nothing | **written**: `VisporaGpuReader`, a small program the shell starts and ends (below). The backend's reading where it is away or has none |
-| 2 | The hardware monitor (`core/hw_monitor.py`) | processor, card, memory, DPC time, ping: once a second from the first visit to the Monitor page until its Stop button or the quit | nothing | **moved**: its loop and its start, stop and snapshot, `shell_rs/core/src/moved/hw.rs`. Its benchmark (it writes a file) and its list of programs (PowerShell) stay the backend's (below) |
+| 2 | The hardware monitor (`core/hw_monitor.py`) | processor, card, memory, DPC time, ping: once a second while the Monitor page asks for its snapshot (it sleeps half a minute after the last one) | nothing | **moved**: its loop and its start, stop and snapshot, `shell_rs/core/src/moved/hw.rs`. Its benchmark (it writes a file) and its list of programs (PowerShell) stay the backend's (below) |
 | 3 | The network monitor (`core/net_monitor.py`) | bytes per program and per network card, once a second while the Network page is open | nothing in its loop | pausing a program is process tuning (item 3 of the plan) and stays; which game is running is the game monitor's to say, and is asked of the backend until piece 7 |
 | 4 | The popup watchdog (`core/popup_killer.py`) | every visible window, once a second, always | closes Windows' own "get an app to open this link" windows | the first piece that changes something: looking and closing are kept apart, and the closing is never run against a PC by a test or a trial |
 | 5 | The temperature ceiling (`core/temp_ceiling.py`) | the card's temperature, once a second, always | when it trips: resets the overclock | the reset is GPU overclock's and stays in Python: the shell watches and decides, and asks the backend to carry it out |
@@ -369,7 +369,11 @@ After piece 7 nothing in the backend runs while the app idles with no page
 open, and item 1's last step can be taken: the backend is started only when
 a page needs it. One thing stands before that step, found with the first
 piece: the graphics card's reading while a driver is being installed
-(below).
+(below). The hardware monitor does not: it reads only while somebody looks
+at it (it sleeps half a minute after the Monitor page's last snapshot,
+piece 2), so the parts of a pass it asks of the backend (on a PC whose card
+the reader cannot read, the card's, once a second) are asked while that
+page is on screen and for half a minute after, and then no more.
 
 Why the sampler first, though it is the coldest of the seven: it is the
 smallest module that has everything a move needs (a loop of its own, state,
@@ -558,12 +562,15 @@ processor (temperature, load, clock), the graphics card (temperature,
 load, clock, memory), the memory (in use, the standby list), the time
 spent in DPCs and interrupts and DPCs a second, and a ping, once a
 second, a minute of each kept. In the shell:
-`shell_rs/core/src/moved/hw.rs`. It runs from the first visit to the
-Monitor page until the page's Stop button or the quit: the page starts it
-when it opens and does not stop it when it is left (`static/js/app.js`,
-"Hardware Monitor auto-runs"), in today's app as behind the shell. Behind
-the shell that keeps the card's reader running too (it is asked once a
-second), until the monitor is stopped.
+`shell_rs/core/src/moved/hw.rs`. The page starts it when it opens and
+does not stop it when it is left (`static/js/app.js`, "Hardware Monitor
+auto-runs"), and asks for its snapshot every three seconds while it is on
+screen and the window is not hidden. Since the owner's yes of 2026-11-25
+(below, "What was fixed after this piece") the monitor sleeps half a minute
+after the last snapshot, in today's app as behind the shell, and the card's
+reader goes ten seconds after its last reading. Until then it ran from the
+first visit to the page until its Stop button or the quit, and kept the
+reader running for as long.
 
 * **What moves, and what stays.** The loop and the three calls that
   belong to it move: `POST /api/monitor/start`, `POST /api/monitor/stop`,
@@ -587,7 +594,8 @@ second), until the monitor is stopped.
   * Its temperature: WMI through the helper, the four places Python asks
     in Python's order (LibreHardwareMonitor, OpenHardwareMonitor, the
     ACPI zone, the thermal zone's counter), the same questions word for
-    word.
+    word, each asked as the place allows (a place that had nothing is
+    left alone for half a minute: below).
   * The memory in use and the standby list, and DPCs a second: two new
     questions of the helper's, `memory` and `dpc_rate` (`native/src/
     memory.rs`), which make the calls Python makes itself through ctypes
@@ -597,7 +605,7 @@ second), until the monitor is stopped.
   * The graphics card: its own reader (`Card::from_the_reader`, all of
     the helper's answer, the card's memory included), never the shell's
     own door; then LibreHardwareMonitor for what the card does not say,
-    as Python does.
+    as Python does (a place too, left alone as the four are).
   * The ping: one echo request through the helper (below).
 * **Where Python would start a program, the backend is asked for that
   part.** The shell starts none: not PowerShell, not `nvidia-smi`, not
@@ -607,12 +615,17 @@ second), until the monitor is stopped.
   counters when those give nothing; `nvidia-smi` for a card the helper
   cannot read; `ping.exe` for a name or an address written another way.
   In each of those places the shell asks its backend for that part of
-  the pass, `GET /api/monitor/part?name=cpu|gpu|ram|dpc|ping` (and
-  `&target=` for the ping), a call that is there only behind the shell.
-  The backend takes the part with the very function its own loop would
-  have used (`_sample_cpu()`, `_sample_gpu()`, ...), so the page is shown
-  Python's answer, and the program is the backend's to start, as it is
-  today. The same where Python would read a value in a way of its own
+  the pass, `GET /api/monitor/part?name=...` (and `&target=` for the
+  ping), a call that is there only behind the shell. The parts: `cpu`
+  (the load and the clock), `temp_lhm`, `temp_ohm`, `temp_acpi`,
+  `temp_thermal` (one place of the temperature each), `gpu` (the card's
+  own numbers), `gpu_lhm` (LibreHardwareMonitor's sensors of the card),
+  `ram`, `dpc`, `ping`. The backend takes the part with the very function
+  its own loop would have used (`_cpu_load_and_clock()`,
+  `_read_cpu_temp_via_lhm()`, `_gpu_from_the_card()`, ...), so the page is
+  shown Python's answer, and the program is the backend's to start, as it
+  is today. A place is read as it is: which places are quiet is the
+  shell's to keep track of, as it is the loop's in Python. The same where Python would read a value in a way of its own
   that the shell does not copy (a sensor's value written as text, a name
   that is a list). The card's part is asked where the reader is away (a
   driver's install) or has no reading (no NVIDIA card, a card that
@@ -660,9 +673,14 @@ second), until the monitor is stopped.
   run a round at a time) and the shell's (in the trial tool) the same
   things on the same made-up machine, and compares every answer, the
   snapshot after every pass included, a whole number where Python has one
-  and a fraction where Python has that: 441 answers, among them the
-  snapshot after each of 286 passes, and 31 calls passed on and 7
-  refused. The machine is the processor's times counting up, its clock,
+  and a fraction where Python has that: 568 answers, among them 509
+  snapshots, over 787 passes (and 20 rounds in which a monitor that slept
+  took none), and 31 calls passed on and 7 refused. The loop is taken a
+  round at a time on both sides (a pass, the rest of its second, and
+  whether anybody still looks), and a pass may be taken without a look
+  after it, so that the monitor can be left alone; how often each place
+  was asked, and how often PowerShell was started for one, is counted on
+  both sides and compared. The machine is the processor's times counting up, its clock,
   the memory, the DPC rate, WMI's rows for each of the four questions,
   the echo requests, the card, and what PowerShell, `nvidia-smi` and
   `ping.exe` print; Python's own calls to Windows read the same machine.
@@ -673,7 +691,12 @@ second), until the monitor is stopped.
   (LibreHardwareMonitor's sensors of an AMD card), no card at all, a
   reader that is silent, that garbles, that is away for an install, a
   pass that raises in Python, the PC's clock set back and forward, and
-  eighteen kinds of ping target. In every pass in which Python's own
+  eighteen kinds of ping target; and since the fixes below: a sleep and a
+  wake, a Stop during a sleep, a start during one, a pass at the very
+  edge of the half minute, the PC's clock far ahead while it sleeps,
+  places that had nothing for a minute, a place that comes, one that
+  misses once and one that goes, and the same where the helper cannot ask
+  WMI and PowerShell is started instead. In every pass in which Python's own
   loop started a program, the shell asked its backend, and the page got
   Python's answer.
 * **Tried for real, and measured.** `python shell_rs/app/try_it.py
@@ -688,16 +711,68 @@ second), until the monitor is stopped.
   own monitor runs and no part is asked. `python shell_rs/try_it.py
   --monitor`: the numbers, in [performance.md](performance.md).
 
+What was fixed after this piece, on the owner's yes of 2026-11-25 ("Yes,
+fix both"), in `core/hw_monitor.py` and `moved/hw.rs` together:
+
+* **What it cost.** On this PC no source has a processor temperature, and
+  the four questions for one were asked at every pass, by Python and by
+  the shell alike: about half of a pass, and nearly all of the 3% of a
+  core the monitor's own process used while it ran. Most of the work is
+  not in that process: WMI's own process (`WmiPrvSE.exe`) answers the
+  questions, and used about 17% of one core more while the monitor ran
+  (measured from Windows' own list of every process's processor time).
+  And it ran from the first visit to the Monitor page until its Stop
+  button or the quit: about a fifth of a core for as long as the app ran
+  after one look at that page.
+* **It sleeps when nobody looks.** Its only reader is the Monitor page:
+  of the module's five routes three are the loop's (start, stop,
+  snapshot), and the page is all that calls them (when it opens, and every
+  three seconds while it is on screen and the window is not hidden). The
+  measuring tool that runs the loop for a minute (`shell_rs/try_it.py
+  --monitor`) now asks as the page does; the two in `tools/measure/` take
+  their passes by hand, without the loop. A snapshot, and a start, are
+  somebody looking. When nobody has looked for 30 seconds (`IDLE_STOP_S`,
+  the network monitor's), the loop ends by itself after its pass, by the
+  clock that does not jump
+  (`time.monotonic`, `steady`). "running" in the snapshot stays what the
+  person set, on from Start until Stop, also while the loop sleeps, so
+  the page needs nothing new. A snapshot that finds the monitor on and
+  its loop asleep forgets what was read before the sleep (the tiles, the
+  alerts and the minute of history are as in the first second after a
+  start, and the first pass compares with nothing older than the sleep)
+  and wakes the loop. A monitor that was stopped is never started by a
+  snapshot. A start while it sleeps wakes it, and answers "Already
+  running" as a start while it runs does. One of each holds through a
+  sleep and a wake: the wake is decided with the monitor's state held
+  (Python's `_run_lock`), so that eight who look at the same moment wake
+  one loop (a test with real threads on each side). Behind the shell the
+  card's reader then goes ten seconds after the monitor's last reading,
+  by the rule it already had, and comes back with the next snapshot
+  (tried in the window).
+* **A place that had nothing is not asked again every second.** The four
+  places of the processor's temperature and LibreHardwareMonitor's
+  sensors of the card are each a place: one that had nothing (no
+  namespace, no rows, no real temperature) is left alone for 30 seconds
+  (`QUIET_S`), unless it gave a reading within the last 30 seconds, so
+  that one miss of a source that works does not blank a tile for half a
+  minute. The rule is the place's however it is asked: through the
+  helper, or through PowerShell where Python has none. While a place is
+  quiet the pass is what it would have been had the place been asked and
+  had nothing, and the order of the places is as before. On a PC with no
+  source the four are asked twice a minute instead of sixty times. A
+  LibreHardwareMonitor that is started while the monitor runs is seen
+  within half a minute instead of within a second.
+* **What it costs now**, measured on this PC with WMI's process and
+  service counted (the numbers in [performance.md](performance.md)):
+  about 23% of one core before, in today's app and behind the shell
+  alike; about 2 to 3% while the page is on screen; nothing half a minute
+  after it is left. Of the places, the thermal zone's counter was nearly
+  all of it: 242 ms a question, and about a sixth of a core of WMI's work
+  when asked every second. The other four take 6 to 14 ms and no work of
+  WMI's that can be told from the PC's own.
+
 What is left open by this piece:
 
-* **Four questions for a temperature on a PC that has none.** On this PC
-  no source has one, and the four questions are asked at every pass, by
-  Python and by the shell alike: they take about half of a pass (the
-  thermal zone's counter alone about 300 ms) and nearly all of the 3% of
-  a core the monitor uses while it runs (which is, once the page was
-  visited, until the Stop button or the quit). Asking a source that
-  gave nothing less often would change when a LibreHardwareMonitor that
-  is installed while the app runs is seen. Not changed here.
 * **The backend's part keeps a previous reading of its own.** For the
   processor's load and the two shares, the backend's functions compare
   with their own reading before. The shell asks for those parts only
@@ -716,9 +791,13 @@ What is left open by this piece:
   127.0.0.1 (the app's own target, 1.1.1.1, was pinged only by the
   measuring of Python's helper before this piece); a PC where WMI's
   LibreHardwareMonitor namespace is there (this PC has none, so the
-  temperature was never read for real by either); and the two new
-  questions of the helper's in the released app (they are not asked by
-  Python).
+  temperature was never read for real by either, and a LibreHardwareMonitor
+  that is started while the monitor runs was seen within half a minute
+  only on the made-up machine); the sleep and the wake beside the real
+  backend, or in the released app (today's app ran them in its tests on
+  the fake machine, and the shell in the window against the stand-in);
+  and the two new questions of the helper's in the released app (they are
+  not asked by Python).
 
 ## What goes last
 
