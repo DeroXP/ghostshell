@@ -589,7 +589,9 @@ reader running for as long.
     to the same Windows function, and the two shares through the helper).
     The first pass, with nothing to compare with, reads twice a quarter
     of a second apart, as Python does; so does a pass after more than ten
-    seconds without one (for the shares, as in Python).
+    seconds without one, or one whose last reading is younger than a
+    quarter of a second or that the totals have not moved since (for the
+    shares, as in Python).
   * Its clock: the helper's `cpu_clock`.
   * Its temperature: WMI through the helper, the four places Python asks
     in Python's order (LibreHardwareMonitor, OpenHardwareMonitor, the
@@ -772,6 +774,16 @@ fix both"), in `core/hw_monitor.py` and `moved/hw.rs` together:
   all of it: 242 ms a question, and about a sixth of a core of WMI's work
   when asked every second. The other four take 6 to 14 ms and no work of
   WMI's that can be told from the PC's own.
+* **One program it started that it did not before, now gone.** A quiet
+  pass is fast, so when the first pass after a start or a wake ran past
+  its second (two monitors asking WMI at once), the next came at once and
+  read the processor's times about 2 ms after the last reading: the
+  totals had not moved, Python started `Get-Counter` for the DPC and
+  interrupt shares, and the shell asked its backend for them. A reading
+  younger than a quarter of a second, or one the totals have not moved
+  since, is now not compared with: a second reading is taken a moment
+  later, on both sides (found in the parent session's `--monitor` run,
+  and once in the window's trial).
 
 What is left open by this piece:
 

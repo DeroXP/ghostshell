@@ -748,8 +748,8 @@ while the page is on screen, and nothing once the monitor sleeps. The other four
 not there or have no rows on this PC, and WMI says so in a few
 milliseconds.
 
-**One program now and then, in the second pass after a start or a wake.**
-In the parent session's run of `python shell_rs/try_it.py --monitor` after
+**One program now and then, in the second pass after a start or a wake:
+fixed.** In the parent session's run of `python shell_rs/try_it.py --monitor` after
 the fixes, the backend's own monitor started one program in its minute
 and the shell asked its backend for one part, where both were none
 before. Two runs here started the same program each time: PowerShell's
@@ -768,10 +768,17 @@ half a second at least. Shown on this PC by making only the first pass
 `Get-Counter` started. The window's trial saw it too, once in three runs
 of the hardware monitor's checks: the shell asked the stand-in for the
 shares' part beside the card's, and "the card is the backend's part of
-each pass" failed. Not changed: it is today's app's behaviour, and
-changing it (a second reading a moment later, as when there is nothing
-to compare with, instead of PowerShell) would be done on both sides
-together, with the same-answers test.
+each pass" failed. Fixed on both sides together, with the same-answers
+test: a reading of the times that is younger than a quarter of a second,
+or that the totals have not moved since, is not one to compare with; a
+second reading is taken a quarter of a second later, as where there is
+nothing to compare with, and PowerShell is started only where the helper
+has no answer at all. A first pass after a start or a wake, and the next
+at the moment it ends, now start nothing and ask nothing of the backend
+(tests on both sides, which fail without the change). The load cannot
+miss this way: it is read first in every pass, so its two readings are a
+whole pass apart (at least three quarters of a second), and where it has
+none it already reads again a moment later.
 
 How it was measured: a scratch script that starts the module of each
 checkout in a process of its own, as `python shell_rs/try_it.py

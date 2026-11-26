@@ -760,12 +760,22 @@ _CPU_TIMES_FIRST_WAIT_S = 0.25  # with nothing to compare with, how long the fir
 def _dpc_shares_from_native():
     """(% DPC time, % interrupt time) over all processors since the previous
     pass, rounded like Get-Counter's were, from the native helper.  None when
-    the helper is not there or the totals did not move."""
+    the helper is not there or the totals did not move.
+
+    A previous reading that is younger than a quarter of a second, or that
+    the totals have not moved since, is not one to compare with either: a
+    pass that ran past its second is followed by the next at once, and that
+    one reads the times a few milliseconds after the last reading (since the
+    places in WMI are left alone, a pass can be that fast).  A second reading
+    is then taken a moment later, as with nothing to compare with, so that
+    PowerShell is started only where the helper has no answer at all."""
     now = native.cpu_times()
     if now is None:
         return None
     prev, at = _cpu_times_prev["totals"], _cpu_times_prev["at"]
-    if prev is None or time.monotonic() - at > _CPU_TIMES_STALE_S or prev["processors"] != now["processors"]:
+    age = time.monotonic() - at
+    if prev is None or age > _CPU_TIMES_STALE_S or prev["processors"] != now["processors"] \
+            or age < _CPU_TIMES_FIRST_WAIT_S or now["total"] - prev["total"] <= 0:
         # Nothing recent to compare with: take a second reading a moment later
         # (Get-Counter measures over a second of its own for the same reason).
         prev = now

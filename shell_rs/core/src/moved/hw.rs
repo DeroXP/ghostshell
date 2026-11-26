@@ -998,7 +998,14 @@ impl Monitor {
     /// times cannot be read or did not move.
     fn shares(&self, before: &mut Before) -> Option<(f64, f64)> {
         let mut now = self.times()?;
-        let recent = before.shares.filter(|(was, at)| self.door.steady() - at <= STALE_S && was.processors == now.processors);
+        // (a reading younger than a quarter of a second, or one the totals
+        // have not moved since, is not one to compare with either: a pass
+        // that ran past its second is followed by the next at once, which
+        // reads the times a few milliseconds later; as in Python)
+        let recent = before.shares.filter(|(was, at)| {
+            let age = self.door.steady() - at;
+            age <= STALE_S && was.processors == now.processors && age >= FIRST_WAIT_S && now.total - was.total > 0
+        });
         let was = match recent {
             Some((was, _)) => was,
             None => {
@@ -1640,14 +1647,42 @@ mod tests {
         rig.machine.answers("cpu_times", Some(Json::parse(r#"{"total": 20000000000, "idle": 15000000000, "dpc": 400000000, "interrupt": 200000000, "processors": 16}"#).unwrap()));
         rig.pass(1066.0);
         assert_eq!(rig.machine.waited(), 1.0);
-        // Times that did not move give nothing: the backend's.  (The
-        // first pass after they stopped still sees the last of them move.)
+        // Times that did not move give nothing: the backend's, after a
+        // second reading of each a moment later.  (The first pass after
+        // they stopped still sees the last of them move.)
         rig.machine.grows("cpu_times", None);
         rig.part("cpu", r#"{"ok": true, "reading": {"load": 7.5}}"#);
         rig.part("dpc", r#"{"ok": true, "reading": {"dpc_pct": 0.75, "isr_pct": 0.5, "perfmon_ok": true}}"#);
         rig.pass(1067.0);
         let latest = rig.pass(1068.0);
-        assert_eq!((&latest["cpu_load"], &latest["dpc_pct"], rig.machine.waited()), (&Json::Float(7.5), &Json::Float(0.75), 1.25));
+        // (the shares read again in both passes, the load in the second)
+        assert_eq!((&latest["cpu_load"], &latest["dpc_pct"], rig.machine.waited()), (&Json::Float(7.5), &Json::Float(0.75), 1.75));
+    }
+
+    #[test]
+    fn a_pass_right_after_one_that_ran_past_its_second_reads_the_shares_again_a_moment_later() {
+        // A pass that ran past its second is followed by the next at once
+        // (here: the first pass, which waits half a second within itself,
+        // and the next at the moment it ends).  That one reads the times a
+        // few milliseconds after the last reading, and the totals have not
+        // moved: the shell asked its backend for the shares there, as
+        // Python started PowerShell.  Now both read again a moment later.
+        let rig = a_machine();
+        rig.pass(1000.0);
+        let waited = rig.machine.waited();
+        let latest = rig.pass(rig.machine.steady());
+        assert_eq!(rig.machine.waited() - waited, FIRST_WAIT_S, "a second reading of the shares, a quarter of a second later");
+        assert_eq!((&latest["dpc_pct"], &latest["isr_pct"]), (&Json::Float(0.5), &Json::Float(0.1)));
+        assert_eq!(rig.backend.asked(), Vec::<String>::new());
+        // A reading younger than a quarter of a second, though the totals
+        // moved: the same.  A quarter of a second old: compared with.
+        let waited = rig.machine.waited();
+        rig.pass(rig.machine.steady() + 0.125);
+        assert_eq!(rig.machine.waited() - waited, FIRST_WAIT_S);
+        let waited = rig.machine.waited();
+        let latest = rig.pass(rig.machine.steady() + 0.25);
+        assert_eq!((rig.machine.waited() - waited, &latest["dpc_pct"]), (0.0, &Json::Float(0.5)));
+        assert_eq!(rig.backend.asked(), Vec::<String>::new());
     }
 
     #[test]
@@ -1657,21 +1692,24 @@ mod tests {
         let rig = a_machine_with(true);
         rig.moved.hw.start(&rig.moved.card, THE_USUAL_TARGET.into());
         // (the first pass waits half a made-up second, which the loop
-        // counts as gone: the second comes after half a real one, every
-        // later one a second after the one before)
+        // counts as gone: the second comes after half a real one.  On this
+        // clock, which stands still, the last reading of the shares is
+        // never older than a moment, so every later pass reads them again a
+        // made-up quarter of a second later: each comes three quarters of a
+        // real second after the one before)
         let began = std::time::Instant::now();
         while rig.moved.hw.passes().kept < 3 && began.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(20));
         }
         let took = began.elapsed();
-        assert!(rig.moved.hw.passes().kept == 3 && took > Duration::from_millis(1300) && took < Duration::from_secs(6), "{took:?}");
-        // Stopped and started again at once: one loop, not two (two would
-        // take six passes in the time one takes three).
+        assert!(rig.moved.hw.passes().kept == 3 && took > Duration::from_millis(1150) && took < Duration::from_secs(6), "{took:?}");
+        // Stopped and started again at once: one loop, not two (in 2.5 s
+        // one takes four passes, two would take eight).
         rig.moved.hw.stop();
         rig.moved.hw.start(&rig.moved.card, THE_USUAL_TARGET.into());
         std::thread::sleep(Duration::from_millis(2500));
         let kept = rig.moved.hw.passes().kept;
-        assert!((5..=7).contains(&kept), "{kept} passes");
+        assert!((5..=8).contains(&kept), "{kept} passes");
         // Closed, as at a quit: the loop ends, and no start begins one.
         rig.moved.close();
         std::thread::sleep(Duration::from_millis(300));
