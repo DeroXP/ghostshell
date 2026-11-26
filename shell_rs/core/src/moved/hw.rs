@@ -1375,6 +1375,15 @@ mod tests {
         assert!(!rig.asleep(), "30 seconds is not more than 30");
         rig.round(1140.5);
         assert!(rig.asleep());
+        // The PC's own clock set far ahead, or back, changes nothing of it:
+        // the half minute is the monitor's own clock's.
+        rig.machine.at(1200.0);
+        rig.look();
+        for (second, the_pcs_clock) in [(1201.0, 9_000_000_000.0), (1202.0, 10.0), (1203.0, 9_000_000_000.0)] {
+            rig.machine.at(second);
+            rig.machine.the_pcs_clock_is_set_to(the_pcs_clock);
+            assert!(rig.moved.hw.round(&rig.moved.card) && !rig.asleep(), "the PC's clock at {the_pcs_clock}");
+        }
     }
 
     #[test]

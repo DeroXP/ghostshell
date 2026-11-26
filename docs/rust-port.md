@@ -692,7 +692,9 @@ reader running for as long.
   reader that is silent, that garbles, that is away for an install, a
   pass that raises in Python, the PC's clock set back and forward, and
   eighteen kinds of ping target; and since the fixes below: a sleep and a
-  wake, a Stop during a sleep, a start during one, a pass at the very
+  wake (the PC busier while it sleeps, so that a first pass after the wake
+  that compared with a reading from before the sleep would show), a Stop
+  during a sleep, a start during one, a pass at the very
   edge of the half minute, the PC's clock far ahead while it sleeps,
   places that had nothing for a minute, a place that comes, one that
   misses once and one that goes, and the same where the helper cannot ask
