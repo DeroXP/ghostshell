@@ -27,7 +27,7 @@ process or the graphics card.
 | `gpu_release` | Lets go of the NVIDIA library for `hold_s` seconds (for a driver install) | not needed: `nvidia-smi` never stayed loaded |
 | `cpu_clock` | The processor's current clock in MHz | `Get-CimInstance Win32_Processor` in PowerShell |
 | `cpu_times` | Processor time in total, idle, in DPCs and in interrupts | `Get-Counter` in PowerShell |
-| `memory` | How much of the memory is in use, and how many pages are on the standby list (read, never emptied) | not asked by the app: its hardware monitor reads both itself, and the Rust shell's asks here |
+| `memory` | How much of the memory is in use (and the totals it is worked out from), and how many pages are on the standby list (read, never emptied) | not asked by the app: its hardware monitor reads both itself, and the Rust shell's asks here |
 | `dpc_rate` | Deferred procedure calls a second, over all processors | the same |
 | `ping` | One echo to an IPv4 address: answered or not, and how fast | `ping.exe` |
 | `gpu_identity` | The NVIDIA card's name, the driver's version and the card's memory | `nvidia-smi`, at every start |

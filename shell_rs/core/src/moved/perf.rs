@@ -167,8 +167,9 @@ impl Sampler {
 
     /// The shell's answer to one of the sampler's calls, or None: the call
     /// is the backend's (see the top of this file).
-    pub fn answer(self: &Arc<Self>, card: &Arc<Card>, request: &Request) -> Option<Response> {
-        let (method, path, target) = (request.method.as_str(), request.path(), request.target.as_str());
+    /// `path` is the call's path as the backend's web framework reads it.
+    pub fn answer(self: &Arc<Self>, card: &Arc<Card>, request: &Request, path: &str) -> Option<Response> {
+        let (method, target) = (request.method.as_str(), request.target.as_str());
         let answer = match (method, path) {
             ("GET", "/api/perf/status") => self.status(),
             ("GET", "/api/perf/samples") => self.chart(card.now(), query_int(target, "seconds", 60)?),
@@ -463,7 +464,8 @@ mod tests {
     }
 
     fn call(sampler: &Arc<Sampler>, card: &Arc<Card>, method: &str, target: &str, body: &str) -> Option<Json> {
-        let answer = sampler.answer(card, &Request::new(method, target).with_body(body))?;
+        let request = Request::new(method, target).with_body(body);
+        let answer = sampler.answer(card, &request, &super::super::as_the_backend_reads_a_path(request.path()))?;
         assert_eq!((answer.status, answer.header("Content-Type")), (200, Some("application/json")));
         Some(answer.to_json())
     }
@@ -749,7 +751,7 @@ mod tests {
     #[test]
     fn with_threads_it_samples_by_itself_until_it_is_told_to_stop() {
         let (_, backend, card, sampler) = a_machine_with(true);
-        assert!(sampler.answer(&card, &Request::new("POST", "/api/perf/start").with_body("{}")).is_some());
+        assert!(sampler.answer(&card, &Request::new("POST", "/api/perf/start").with_body("{}"), "/api/perf/start").is_some());
         let waited = std::time::Instant::now();
         while sampler.status()["sample_count"].as_int() < Some(3) && waited.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(20));

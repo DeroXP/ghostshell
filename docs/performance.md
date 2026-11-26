@@ -748,6 +748,31 @@ while the page is on screen, and nothing once the monitor sleeps. The other four
 not there or have no rows on this PC, and WMI says so in a few
 milliseconds.
 
+**One program now and then, in the second pass after a start or a wake.**
+In the parent session's run of `python shell_rs/try_it.py --monitor` after
+the fixes, the backend's own monitor started one program in its minute
+and the shell asked its backend for one part, where both were none
+before. Two runs here started the same program each time: PowerShell's
+`Get-Counter` for the DPC and interrupt shares, in the second pass. The
+first pass after a start or a wake asks all four places and waits twice a
+quarter of a second; with two monitors asking WMI at the same moment, as
+in that trial (the thermal zone's counter then takes up to half a second),
+it runs past one second. The loop then starts the next pass at once, and
+that pass, its places quiet now, reads the processor's times 2 ms after
+the first pass's last reading. The totals have not moved, which Python
+takes for "no reading", so it asks `Get-Counter`; the shell asks its
+backend's part for the shares, as it must to give Python's answer.
+Before the fixes every pass asked the four places before the shares,
+half a second at least. Shown on this PC by making only the first pass
+0.3 s slower: the second pass's two readings 2 ms apart, the same totals,
+`Get-Counter` started. The window's trial saw it too, once in three runs
+of the hardware monitor's checks: the shell asked the stand-in for the
+shares' part beside the card's, and "the card is the backend's part of
+each pass" failed. Not changed: it is today's app's behaviour, and
+changing it (a second reading a moment later, as when there is nothing
+to compare with, instead of PowerShell) would be done on both sides
+together, with the same-answers test.
+
 How it was measured: a scratch script that starts the module of each
 checkout in a process of its own, as `python shell_rs/try_it.py
 --monitor` does, and reads the list before and after each minute. Not
