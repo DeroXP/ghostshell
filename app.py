@@ -3126,9 +3126,18 @@ def api_monitor_benchmark():
 #
 # It only reads, as the loop does.  Started as it always was, the app has
 # no such call: it answers as a path that does not exist.
+#
+# The places in WMI the monitor leaves alone for a while when they had
+# nothing (hw_monitor._from_a_place) are the shell's to keep track of, as
+# they are the loop's here: their parts are read as they are, without it.
 _MONITOR_PARTS = {
-    "cpu": lambda target: hw_monitor._sample_cpu(),
-    "gpu": lambda target: hw_monitor._sample_gpu(),
+    "cpu": lambda target: hw_monitor._cpu_load_and_clock(),
+    "temp_lhm": lambda target: {"degrees": hw_monitor._read_cpu_temp_via_lhm()},
+    "temp_ohm": lambda target: {"degrees": hw_monitor._read_cpu_temp_via_ohm()},
+    "temp_acpi": lambda target: {"degrees": hw_monitor._read_cpu_temp_via_msacpi()},
+    "temp_thermal": lambda target: {"degrees": hw_monitor._read_cpu_temp_via_perf_thermal()},
+    "gpu": lambda target: hw_monitor._gpu_from_the_card(),
+    "gpu_lhm": lambda target: hw_monitor._read_gpu_via_lhm(),
     "ram": lambda target: hw_monitor._sample_ram(),
     "dpc": lambda target: hw_monitor._sample_dpc(),
     "ping": lambda target: {"ms": hw_monitor._sample_ping(target)},
@@ -3138,7 +3147,8 @@ _MONITOR_PARTS = {
 @app.route("/api/monitor/part")
 def api_monitor_part():
     """One part of one pass of the hardware monitor, for the shell:
-    ?name=cpu | gpu | ram | dpc | ping (and &target=... for the ping)."""
+    ?name=cpu | temp_lhm | temp_ohm | temp_acpi | temp_thermal | gpu |
+    gpu_lhm | ram | dpc | ping (and &target=... for the ping)."""
     if _behind_shell is None:
         abort(404)
     take = _MONITOR_PARTS.get(request.args.get("name"))

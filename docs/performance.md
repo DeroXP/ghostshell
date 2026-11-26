@@ -639,11 +639,17 @@ on a person's PC.
 ### The hardware monitor (the second module)
 
 The Monitor page's tiles: the processor, the card, the memory, DPC time
-and a ping, once a second from the first visit to that page until its Stop
-button or the quit: the page does not stop it when it is left (`core/hw_monitor.py`,
-now also `shell_rs/core/src/moved/hw.rs`). Before step 1 one pass started
-nine programs and took 3.3 s ("The Monitor page", above); since 3.8.1 the
-helper takes every reading on this PC, and no program is started.
+and a ping, once a second (`core/hw_monitor.py`, now also
+`shell_rs/core/src/moved/hw.rs`). Until the two fixes below it ran from
+the first visit to that page until its Stop button or the quit: the page
+does not stop it when it is left. Now it sleeps half a minute after the
+page's last snapshot. Before step 1 one pass started nine programs and
+took 3.3 s ("The Monitor page", above); since 3.8.1 the helper takes every
+reading on this PC, and no program is started.
+
+The numbers in the table just below were taken before the fixes, and count
+only the monitors' own processes; "Before and after the two fixes" counts
+Windows' WMI service too.
 
 Measured with `python shell_rs/try_it.py --monitor`, on this PC, both at
 the same time for a minute, each with its echo requests to 127.0.0.1
@@ -668,17 +674,86 @@ The readings themselves agree: the same clock, card temperature and clock,
 memory of the card, standby list (to the megabyte), ping; the load and
 the DPC shares a few tenths apart (each pass covers its own second).
 
-What it comes to: on this PC the monitor costs the shell what it costs
-the backend. Nearly all of a pass is WMI: no source on this PC has a
-processor temperature, and the four questions for one take about 75, 75,
-110 and 300 ms (the last is the thermal zone's counter), asked at every
+What it came to: on this PC the monitor costs the shell what it costs
+the backend. Nearly all of a pass was WMI: no source on this PC has a
+processor temperature, and the four questions for one were asked at every
 pass by both, as Python asks them. Most of that work is done in WMI's own
 process, which neither number counts. The page's call every three seconds
 is answered in under a twentieth of the time, and the monitor no longer needs
-the backend, which is what item 1's last step needs. Making it cheaper
-means asking for a temperature less often where none was found, which
-changes when a newly installed LibreHardwareMonitor is seen
-([rust-port.md](rust-port.md), piece 2).
+the backend, which is what item 1's last step needs.
+
+#### Before and after the two fixes, Windows' WMI service counted
+
+The owner said yes on 2026-11-25 to two fixes, made in the Python module
+and the shell together ([rust-port.md](rust-port.md), piece 2): the
+monitor sleeps when nobody has asked for its snapshot for half a minute,
+and a place in WMI that had nothing is left alone for half a minute.
+
+Measured on this PC from Windows' own list of every process's processor
+time (no rights needed): the monitor's own process, every `WmiPrvSE.exe`
+(WMI's process that answers the questions), and the `svchost.exe` that
+holds Windows' WMI service (Winmgmt). A minute each, in this order, with
+the echo requests to 127.0.0.1. The PC was not idle (Roblox Studio used
+more than a core, and the installed app a fifth of one), so a difference
+of a point or so is noise: with nothing of the measuring running,
+`WmiPrvSE.exe` used 25.1% and 24.6% of one core, the WMI service 6.7% and
+7.7%.
+
+The Python module, as today's app runs it (in a process of its own, its
+data folder redirected, the native helper of the checkout):
+
+| | Before (main, 42213fc) | After, the page on screen (a snapshot every 3 s) | After, nobody looks (from 35 s after the start) |
+| --- | --- | --- | --- |
+| The monitor's own process, of one core | 3.46% | 0.29% | 0.00% |
+| `WmiPrvSE.exe` | 42.5% (+17.6) | 26.3% (+1.4) | 23.5% (-1.4) |
+| The WMI service | 9.0% (+1.7) | 7.7% (+0.4) | 8.1% (+0.8) |
+| In all, about | **23% of one core** | **2%** | **nothing** |
+| Passes in the minute | 60 | 60 | none (30, then it slept) |
+| Questions to WMI in the minute | 63 of each of the four | 3 of each | none (1 of each before it slept) |
+
+The shell's monitor (the trial tool, with the card's reader beside it,
+reading this PC through its own door; its backend the stand-in), measured
+the same way, each build after a minute with nothing running of its own
+(`WmiPrvSE.exe` 22.8% and 24.4%, the WMI service 6.8% and 7.2%):
+
+| | Before (main, 42213fc) | After, the page on screen (a snapshot every 3 s) | After, nobody looks (from 45 s after the start) |
+| --- | --- | --- | --- |
+| The shell's own process, of one core | 2.86% | 0.26% | 0.00% |
+| Its card's reader, its backend | 0.08%, 0.03% | 0.03%, 0.05% | none (the reader was ended), 0.03% |
+| `WmiPrvSE.exe` | 40.3% (+17.5) | 26.3% (+2.0) | 24.3% (0.0) |
+| The WMI service | 9.1% (+2.3) | 7.9% (+0.7) | 6.9% (-0.4) |
+| In all, about | **23% of one core** | **3%** | **nothing** |
+
+Before the fixes nobody looking changed nothing: the shell's monitor used
+3.36% of a core itself and `WmiPrvSE.exe` 40.8% in the minute from 45
+seconds on, the reader still running and a full minute of readings kept.
+
+Which place costs: each question asked by itself through the helper, once
+a second for 30 seconds, as a pass asks it on this PC (where none of them
+has anything):
+
+| The place | One question (the slowest) | `WmiPrvSE.exe` and the WMI service, beside nothing running |
+| --- | --- | --- |
+| LibreHardwareMonitor, the processor's temperature | 6.6 ms (7.3) | no more |
+| OpenHardwareMonitor | 6.7 ms (7.7) | no more |
+| The ACPI zone | 13.5 ms (27.0) | no more |
+| **The thermal zone's counter** (`Win32_PerfFormattedData_Counters_ThermalZoneInformation`) | **242 ms (543)** | **+12.8 and +3.5: about 16% of one core** |
+| LibreHardwareMonitor, the card's sensors (asked only where the card does not say its temperature and load: not on this PC) | 6.9 ms (7.5) | no more |
+
+So the cost was the thermal zone's counter, a performance counter that WMI
+works out afresh for every question: asked once a second it kept about a
+sixth of a core busy in WMI (about 0.16 s of a core for each question).
+Asked twice a minute, as now, that is about 20 seconds of a core an hour
+while the page is on screen, and nothing once the monitor sleeps. The other four namespaces and classes are
+not there or have no rows on this PC, and WMI says so in a few
+milliseconds.
+
+How it was measured: a scratch script that starts the module of each
+checkout in a process of its own, as `python shell_rs/try_it.py
+--monitor` does, and reads the list before and after each minute. Not
+measured: with administrator rights (with them the ACPI zone may
+answer); on a PC where a source has a temperature (then the first place
+that has one is asked every pass, and the others not at all, as before).
 
 Not measured: with administrator rights; on a PC where
 LibreHardwareMonitor answers (one question instead of four); the parts the

@@ -21,6 +21,7 @@ import re
 import sys
 import tempfile
 import types
+from collections import Counter
 
 from core import native as N
 
@@ -670,6 +671,90 @@ def test_gpu_sensors_from_librehardwaremonitor_are_the_same_either_way():
     assert HW._read_gpu_via_lhm() == old and m.PSC == []
     wmi_answers({"root\\librehardwaremonitor": SENSORS[:3]})    # no GPU sensor at all
     assert HW._read_gpu_via_lhm() == {"temp": None, "load": None, "clock": None} and m.PSC == []
+
+
+class _TheMonitorsClock:
+    """The monitor's own clock (time.monotonic), made up, for the length of
+    a `with` block; the PC's clock stands at a time of its own, which the
+    places never read.  The places start with nothing on record."""
+
+    def __init__(self, at=1000.0):
+        self.at = at
+
+    def __enter__(self):
+        self.saved = HW.time
+        HW.time = types.SimpleNamespace(time=lambda: 5_000_000.0, monotonic=lambda: self.at, sleep=lambda seconds: None)
+        HW._places.clear()
+        return self
+
+    def __exit__(self, *exc):
+        HW.time = self.saved
+        HW._places.clear()
+        return False
+
+
+def _asked_where():
+    return Counter(namespace for namespace, _ in ASKED)
+
+
+def test_a_place_in_wmi_that_had_nothing_is_asked_twice_a_minute():
+    """No source of the processor's temperature: each of the four places is
+    asked twice in a minute, not sixty times.  LibreHardwareMonitor started
+    while the monitor runs is seen within half a minute; one miss of it is
+    asked again at the next pass; gone, it is asked every pass for half a
+    minute after its last reading, then left alone."""
+    m.fresh()
+    wmi_answers({})                                             # no namespace has a temperature
+    with _TheMonitorsClock() as clock:
+        for second in range(60):
+            clock.at = 1000.0 + second
+            assert HW._cpu_temp() == (None, "")
+        assert _asked_where() == {"root\\LibreHardwareMonitor": 2, "root\\OpenHardwareMonitor": 2, "root\\WMI": 2, "root\\cimv2": 2}
+        # (asked at 1000 and 1030; at 1060 again, quiet until 1090)
+        seen = {}
+        for second in range(60, 95):
+            clock.at = 1000.0 + second
+            if second == 65:
+                wmi_answers({"root\\librehardwaremonitor": SENSORS})      # LibreHardwareMonitor is started
+            seen[second] = HW._cpu_temp()
+        assert seen[89] == (None, "") and seen[90] == (52.4, "LibreHardwareMonitor") and seen[94] == seen[90]
+        wmi_answers({})
+        clock.at = 1095.0
+        assert HW._cpu_temp() == (None, "")                     # it misses once ...
+        wmi_answers({"root\\librehardwaremonitor": SENSORS})
+        clock.at = 1096.0
+        assert HW._cpu_temp() == (52.4, "LibreHardwareMonitor"), "... and is asked again at the next pass"
+        wmi_answers({})                                         # gone: its last reading at 1096
+        for second in range(97, 140):
+            clock.at = 1000.0 + second
+            HW._cpu_temp()
+        assert _asked_where()["root\\LibreHardwareMonitor"] == 31, "every pass from 1097 to 1127, then not until 1157"
+    # Without the helper each place is a PowerShell call: left alone the same way.
+    m.fresh()
+    with _TheMonitorsClock() as clock:
+        for second in range(60):
+            clock.at = 1000.0 + second
+            assert HW._cpu_temp() == (None, "")
+        for source in ("LibreHardwareMonitor", "OpenHardwareMonitor", "MSAcpi_ThermalZoneTemperature", "ThermalZoneInformation"):
+            assert len(m.ps_ran(source)) == 2, (source, m.PSC)
+
+
+def test_librehardwaremonitors_sensors_of_the_card_are_a_place_too():
+    """The card says no load: LibreHardwareMonitor's sensors of the card are
+    asked, and while they have nothing, twice a minute."""
+    m.fresh()
+    m.NATIVE["gpu_live"] = dict(LIVE, gpu_util_pct=None)
+    wmi_answers({"root\\librehardwaremonitor": SENSORS[:3]})  # no sensor of the card
+    with _TheMonitorsClock() as clock:
+        for second in range(60):
+            clock.at = 1000.0 + second
+            assert HW._sample_gpu()["load"] is None
+        assert _asked_where() == {"root\\LibreHardwareMonitor": 2}
+        wmi_answers({"root\\librehardwaremonitor": SENSORS})
+        clock.at = 1060.0
+        assert HW._sample_gpu()["load"] == 64.0
+        clock.at = 1061.0
+        assert HW._sample_gpu()["load"] == 64.0 and len(ASKED) == 2, "a place that has a reading is asked every pass"
 
 
 def _times(total, dpc, interrupt, processors=24):

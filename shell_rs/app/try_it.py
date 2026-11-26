@@ -8,6 +8,7 @@
                                                    the same, for a trial build that was made with
                                                    --features unpack-at-every-start
     python shell_rs/app/try_it.py --moved          only the checks of what has moved from the backend into the shell
+    python shell_rs/app/try_it.py --monitor        only the checks of the hardware monitor (about two minutes)
     python shell_rs/app/try_it.py --time           the times, five runs
     python shell_rs/app/try_it.py --time --pack P  ... and what unpacking the pack P costs, both ways
     python shell_rs/app/try_it.py --time --pack P --carried-by E
@@ -1111,6 +1112,81 @@ def the_hardware_monitor(root, check):
         run.end()
 
 
+THE_SLEEP = "the hardware monitor sleeps: nobody has looked for 30 s"
+THE_WAKE = "the hardware monitor wakes: somebody looks again"
+
+
+def the_hardware_monitor_sleeps(root, check):
+    """The hardware monitor sleeps when nobody looks: half a minute after
+    the last snapshot its loop ends, and the graphics card's reader goes ten
+    seconds after the monitor's last reading of the card, by the reader's
+    own rule.  The next snapshot wakes both, and shows nothing of before the
+    sleep.  A monitor that was stopped while it slept stays stopped.
+
+    The reader reads this PC's graphics card, and only reads (as in
+    the_cards_reader).  The echo requests go to 127.0.0.1."""
+    pack, says, _ = made_up_backend(root, "monitor-with-reader", reader=True)
+    its_card = {"temp_c": 66, "gpu_util_pct": 50, "mem_util_pct": 20, "core_mhz": 1800, "mem_mhz": 7000, "power_mw": 123450, "fan_pct": 60}
+
+    def parts(run):
+        return len([c for c in run.calls() if c[3].startswith("/api/monitor/part")])
+
+    def looks(run, times):
+        """The page on screen: a snapshot every three seconds."""
+        said = None
+        for _ in range(times):
+            time.sleep(3.0)
+            said = the_page_calls(run, "GET", "/api/monitor/snapshot", tell=THE_SNAPSHOT)
+        return said, time.time()
+
+    run = Run(root, "hidden", pack=pack, keep=False)
+    try:
+        up = first_screen(run)
+        the_page_calls(run, "POST", "/api/stand-in/card", its_card)
+        started = the_page_calls(run, "POST", "/api/monitor/start", {"ping_target": "127.0.0.1"})
+        reader = run.wait_for(lambda: readers_of(run)[-1:], 10)
+        reads = bool(reader) and "gave no reading" not in run.log()
+        said, last_look = looks(run, 3)
+        check("the monitor runs, looked at every three seconds (%s readings kept); %s" % (said and said[8], "the card's reader runs" if reads else
+              "this PC's card gives a reader no reading: the card is the backend's part"),
+              up and started == ["true"] and said and said[0] == "true" and int(said[8]) >= 8 and THE_SLEEP not in run.log())
+        slept = run.wait_for(lambda: THE_SLEEP in run.log(), 40)
+        took = time.time() - last_look
+        at_the_sleep = parts(run)
+        check("nobody looks: half a minute after the last snapshot the monitor sleeps (%.1f s), and the log says so" % took,
+              slept and 29.0 <= took <= 33.5)
+        if reads:
+            gone = run.wait_for(lambda: not running(reader[0]), 14)
+            took = time.time() - last_look
+            check("... and the card's reader is ended ten seconds after the monitor's last reading (%.1f s after the last snapshot)" % took,
+                  gone and 38.5 <= took <= 45.0 and ("the graphics card's reader was ended (pid %d): nobody asked for a reading for 10 s" % reader[0]) in run.log())
+        else:
+            time.sleep(4.0)
+        check("a monitor that sleeps takes no pass: the backend was asked for no part since (%d in all)" % at_the_sleep, parts(run) == at_the_sleep)
+        # The page is shown again: the next snapshot wakes it.
+        woken = the_page_calls(run, "GET", "/api/monitor/snapshot", tell=THE_SNAPSHOT)
+        check("the next snapshot wakes it: running, and nothing of before the sleep (%r readings kept)" % (woken and woken[8],),
+              woken and woken[0] == "true" and int(woken[8]) <= 1 and THE_WAKE in run.log())
+        again = run.wait_for(lambda: [pid for pid in readers_of(run) if pid not in reader][-1:], 10) if reads else None
+        said, last_look = looks(run, 1)
+        check("... and it reads again (%r readings kept)%s" % (said and said[8], ", with another reader of the card" if reads else ""),
+              said and said[0] == "true" and int(said[8]) >= 2 and (not reads or (again and running(again[0]))))
+        # Asleep again, and stopped while it sleeps: a snapshot does not wake it.
+        slept = run.wait_for(lambda: run.log().count(THE_SLEEP) == 2, 40)
+        stopped = the_page_calls(run, "POST", "/api/monitor/stop")
+        said = the_page_calls(run, "GET", "/api/monitor/snapshot", tell=THE_SNAPSHOT)
+        at_the_stop = parts(run)
+        time.sleep(12.0)
+        later = the_page_calls(run, "GET", "/api/monitor/snapshot", tell=THE_SNAPSHOT)
+        check("asleep again and stopped: the snapshots say it is not running, it is not woken, nothing is asked%s" %
+              (", and the reader is gone" if reads else ""),
+              slept and stopped == ["true"] and said and said[0] == "false" and later and later[0] == "false" and run.log().count(THE_WAKE) == 1
+              and parts(run) == at_the_stop and (not reads or not any(running(pid) for pid in readers_of(run))))
+        check("the shell quits as ever (exit code %r)" % (quit_by_its_window(run),), run.process.returncode == 0)
+    finally:
+        run.end()
+
+
 def moved(root, check):
     """What has moved from the backend into the shell: the performance
     sampler's calls are answered by the shell and do not reach the backend.
@@ -1208,7 +1284,14 @@ def moved(root, check):
         run.end()
 
     the_hardware_monitor(root, check)
+    the_hardware_monitor_sleeps(root, check)
     the_cards_reader(root, check)
+
+
+def the_monitor(root, check):
+    """--monitor: only the hardware monitor's checks."""
+    the_hardware_monitor(root, check)
+    the_hardware_monitor_sleeps(root, check)
 
 
 def first_screen(run):
@@ -1966,7 +2049,7 @@ def main(argv):
         BUILT_FOR_EVERY_START = True
         argv = [word for word in argv if word != "--built-for-every-start"]
     # (the checks of the one file, and its times, make and read packs)
-    needs_the_tool = not argv or argv in (["--one-file"], ["--moved"]) or argv[:2] == ["--time", "--pack"]
+    needs_the_tool = not argv or argv in (["--one-file"], ["--moved"], ["--monitor"]) or argv[:2] == ["--time", "--pack"]
     if needs_the_tool and not os.path.isfile(PACK_TOOL):
         refuse("%s is missing: build it first (cargo build --release --manifest-path shell_rs/core/Cargo.toml). "
                "It makes the packs that the exe is given to unpack." % PACK_TOOL)
@@ -1982,6 +2065,8 @@ def main(argv):
             ok = checks(root, one_file)
         elif argv == ["--moved"]:
             ok = checks(root, moved)
+        elif argv == ["--monitor"]:
+            ok = checks(root, the_monitor)
         elif argv == ["--time"]:
             ok = times(root)
         elif argv[:2] == ["--time", "--pack"] and len(argv) == 3:

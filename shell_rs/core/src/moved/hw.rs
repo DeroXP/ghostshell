@@ -51,8 +51,19 @@
 //!
 //! It only reads.  Starting and stopping it starts and stops a thread of
 //! the shell's own.  The standby list is read, never emptied.
+//!
+//! **It sleeps when nobody looks**, as Python's (core/hw_monitor.py): once
+//! nobody has asked for the snapshot or started it for `IDLE_STOP_S`, its
+//! loop ends; "running" stays what the person set; the next snapshot (or
+//! start) forgets what was read before the sleep and wakes it.  A monitor
+//! that was stopped is never woken by a snapshot.  **A place in WMI that
+//! had nothing is not asked again for `QUIET_S`**, unless it gave a reading
+//! within the last `QUIET_S` (`Before::quiet`, `Before::noted`), the same
+//! rule as Python's `_from_a_place`.  Where the shell asks its backend for
+//! a place's answer (one only Python reads), the place is still the
+//! shell's to keep track of: the backend reads it as it is.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -62,6 +73,18 @@ use crate::json::Json;
 
 /// One pass every this many seconds.
 pub const EVERY_S: f64 = 1.0;
+/// Nobody has looked for this long: the loop sleeps (core/hw_monitor.py,
+/// IDLE_STOP_S).
+pub const IDLE_STOP_S: f64 = 30.0;
+/// A place that had nothing is not asked again for this long, unless it
+/// gave a reading within the last as long (core/hw_monitor.py, QUIET_S).
+pub const QUIET_S: f64 = 30.0;
+/// The places, by the names Python gives them.
+pub const CPU_LHM: &str = "cpu temperature: LibreHardwareMonitor";
+pub const CPU_OHM: &str = "cpu temperature: OpenHardwareMonitor";
+pub const CPU_ACPI: &str = "cpu temperature: ACPI zone";
+pub const CPU_THERMAL: &str = "cpu temperature: thermal zone counter";
+pub const GPU_LHM: &str = "graphics card: LibreHardwareMonitor";
 /// How many readings of each kind are kept: a minute of them.
 pub const KEPT: usize = 60;
 /// A reading that is the difference between two readings, with nothing to
@@ -102,6 +125,9 @@ const KEPT_OF: [&str; 15] = ["cpu_temp", "cpu_load", "cpu_clock", "gpu_temp", "g
 /// This reading is not the shell's to take: Python would start a program
 /// for it, or read a value in a way of its own.  The backend is asked.
 struct NotMine;
+
+/// A part raised in the backend: the pass is not kept.
+struct Raised;
 
 /// What the backend says of a part of a pass.
 enum Part {
@@ -157,10 +183,15 @@ pub struct Passes {
 }
 
 struct State {
-    /// As the Python module keeps it: true from a start to a stop.
+    /// As the Python module keeps it: true from a start to a stop, also
+    /// while the loop sleeps.
     running: bool,
-    /// Which start the loop that runs now belongs to.
+    /// Which start (or wake) the loop that runs now belongs to; None while
+    /// it sleeps.
     thread: Option<u64>,
+    /// When somebody last looked (a snapshot, a start), on the clock that
+    /// does not jump.
+    last_wanted: f64,
     starts: u64,
     latest: Option<Json>,
     alerts: Vec<String>,
@@ -186,6 +217,26 @@ struct Before {
     shares: Option<(Times, f64)>,
     /// Which source of the processor's temperature was said in the log last.
     said_source: Option<String>,
+    /// The places in WMI, by name: until when one is quiet, and when it last
+    /// gave a reading.
+    places: HashMap<&'static str, (f64, Option<f64>)>,
+}
+
+impl Before {
+    /// Is the place quiet at `now`?
+    fn quiet(&self, place: &str, now: f64) -> bool {
+        self.places.get(place).is_some_and(|(until, _)| now < *until)
+    }
+
+    /// What the place gave, asked at `now`: a reading, or nothing.
+    fn noted(&mut self, place: &'static str, now: f64, a_reading: bool) {
+        let (until, had) = self.places.entry(place).or_insert((0.0, None));
+        if a_reading {
+            *had = Some(now);
+        } else if had.is_none_or(|had| now - had > QUIET_S) {
+            *until = now + QUIET_S;
+        }
+    }
 }
 
 /// The monitor.
@@ -292,7 +343,7 @@ fn or_nothing(value: Option<&Json>) -> Json {
 
 impl Monitor {
     pub fn new(door: Arc<dyn Readings>, threads: bool) -> Arc<Monitor> {
-        let state = State { running: false, thread: None, starts: 0, latest: None, alerts: Vec::new(), target: THE_USUAL_TARGET.into(),
+        let state = State { running: false, thread: None, last_wanted: 0.0, starts: 0, latest: None, alerts: Vec::new(), target: THE_USUAL_TARGET.into(),
                             kept: KEPT_OF.iter().map(|_| VecDeque::with_capacity(KEPT)).collect(), passes: Passes::default(), backend: None, say: None,
                             closed: false };
         Arc::new(Monitor { door, threads, state: Mutex::new(state), before: Mutex::new(Before::default()), told: Condvar::new() })
@@ -348,16 +399,23 @@ impl Monitor {
             },
             // (the route reads nothing of a stop's body)
             ("POST", "/api/monitor/stop") => self.stop(),
-            ("GET", "/api/monitor/snapshot") => self.snapshot(),
+            ("GET", "/api/monitor/snapshot") => self.look(card),
             _ => return None,
         };
         Some(Response::json(200, &answer))
     }
 
     /// Start the monitor, with the ping going to `target`.
+    /// (A start while it sleeps wakes it, and answers as a start while it
+    /// runs.)
     pub fn start(self: &Arc<Self>, card: &Arc<Card>, target: Json) -> Json {
         let mut st = self.state();
+        st.last_wanted = self.door.steady();
         if st.running {
+            if let Some(this) = self.claim_a_wake(&mut st) {
+                drop(st);
+                self.wake(card, this);
+            }
             return Json::object([("ok", true.into()), ("msg", "Already running".into())]);
         }
         st.running = true;
@@ -403,6 +461,79 @@ impl Monitor {
         self.told.notify_all();
     }
 
+    /// The snapshot, asked for by the page: asking is looking, and a monitor
+    /// that is on and asleep is woken (and forgets first).
+    pub fn look(self: &Arc<Self>, card: &Arc<Card>) -> Json {
+        let wake = {
+            let mut st = self.state();
+            st.last_wanted = self.door.steady();
+            if st.running { self.claim_a_wake(&mut st) } else { None }
+        };
+        if let Some(this) = wake {
+            self.wake(card, this);
+        }
+        self.snapshot()
+    }
+
+    /// A monitor that is on and whose loop sleeps: the wake is this caller's
+    /// (decided with the state held, so that two who look at once wake one
+    /// loop), and what was read before the sleep is forgotten at once, so
+    /// that nobody who looks in the meantime sees it: the tiles and the
+    /// minute of history are as in the first second after a start.
+    fn claim_a_wake(&self, st: &mut State) -> Option<u64> {
+        if st.thread.is_some() || st.closed {
+            return None;
+        }
+        st.starts += 1;
+        st.thread = Some(st.starts);
+        st.latest = None;
+        st.alerts.clear();
+        for kept in &mut st.kept {
+            kept.clear();
+        }
+        st.thread
+    }
+
+    /// Start the loop of `this`, whose first pass compares with nothing
+    /// older than the sleep.  (No pass of it has begun yet: its thread is
+    /// made below.)
+    fn wake(self: &Arc<Self>, card: &Arc<Card>, this: u64) {
+        {
+            let mut before = self.before.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            (before.load, before.shares) = (None, None);
+        }
+        if self.threads {
+            let (monitor, card) = (self.clone(), card.clone());
+            if let Err(why) = std::thread::Builder::new().name("hw-monitor".to_string()).spawn(move || monitor.run(&card, this)) {
+                let mut st = self.state();
+                if st.thread == Some(this) {
+                    st.thread = None;
+                }
+                drop(st);
+                self.say(&format!("the hardware monitor could not be woken: no thread could be made for it ({why})"));
+                return;
+            }
+        }
+        self.say("the hardware monitor wakes: somebody looks again");
+    }
+
+    /// After a pass (and the rest of its second): nobody has looked for
+    /// longer than `IDLE_STOP_S`, and the loop of `this` sleeps?
+    fn falls_asleep(&self, this: u64) -> bool {
+        let asleep = {
+            let mut st = self.state();
+            let asleep = st.thread == Some(this) && self.door.steady() - st.last_wanted > IDLE_STOP_S;
+            if asleep {
+                st.thread = None;
+            }
+            asleep
+        };
+        if asleep {
+            self.say(&format!("the hardware monitor sleeps: nobody has looked for {IDLE_STOP_S:.0} s"));
+        }
+        asleep
+    }
+
     /// The latest readings, and the minute before them.
     pub fn snapshot(&self) -> Json {
         let st = self.state();
@@ -416,7 +547,8 @@ impl Monitor {
     }
 
     /// What the loop of the start that counts does in one round: a pass,
-    /// if it still runs.  (For a test that takes every round by hand.)
+    /// if it still runs, and whether anybody still looks.  Did it take a
+    /// pass?  (For a test that takes every round by hand.)
     pub fn round(&self, card: &Card) -> bool {
         let this = {
             let st = self.state();
@@ -425,7 +557,11 @@ impl Monitor {
                 _ => return false,
             }
         };
-        self.round_of(card, this)
+        if !self.round_of(card, this) {
+            return false;
+        }
+        self.falls_asleep(this);
+        true
     }
 
     /// A pass, if the loop of start `this` still runs.
@@ -453,6 +589,9 @@ impl Monitor {
                 let st = self.state();
                 let _ = self.told.wait_timeout_while(st, Duration::from_secs_f64(left), |st| st.running && st.thread == Some(this) && !st.closed);
             }
+            if self.falls_asleep(this) {
+                break;
+            }
         }
     }
 
@@ -463,7 +602,7 @@ impl Monitor {
         let ts = self.door.now();
         let read = (|| {
             let cpu = self.cpu(&mut before)?;
-            let gpu = self.gpu(card)?;
+            let gpu = self.gpu(card, &mut before)?;
             let (used, standby) = self.ram()?;
             let dpc = self.dpc(&mut before)?;
             let target = self.state().target.clone();
@@ -600,36 +739,68 @@ impl Monitor {
         }
     }
 
-    /// The processor's temperature and where it was read, from the first
-    /// of Python's four sources that has a real one.
-    fn temp(&self) -> Result<Option<(f64, &'static str)>, NotMine> {
-        let rows = self.rows(LIBRE, TEMPERATURE_SENSORS)?;
-        if let Some(degrees) = a_temperature(first_named(&rows, &["package", "ccd1", "tctl"])?)? {
-            return Ok(Some((degrees, "LibreHardwareMonitor")));
-        }
-        let rows = self.rows(OPEN, TEMPERATURE_SENSORS)?;
-        if let Some(degrees) = a_temperature(first_named(&rows, &["package", "ccd1"])?)? {
-            return Ok(Some((degrees, "OpenHardwareMonitor")));
-        }
-        // (the first zone)
-        let rows = self.rows(ACPI, ACPI_ZONES)?;
-        if let Some(degrees) = rows.first().and_then(|zone| tenths_of_kelvin(zone.get("CurrentTemperature"))) {
-            return Ok(Some((degrees, "MSAcpi_ThermalZone")));
-        }
-        // (the warmest zone: Python's `max`, which keeps the first of equals)
-        let rows = self.rows(CIMV2, THERMAL_ZONES)?;
-        let mut warmest: Option<&Json> = None;
-        for reading in rows.iter().filter_map(|zone| zone.get("HighPrecisionTemperature")).filter(|reading| matches!(reading, Json::Int(_) | Json::Float(_))) {
-            let number = |value: &Json| match value {
-                Json::Int(whole) => *whole as f64,
-                Json::Float(number) => *number,
-                _ => 0.0,
-            };
-            if warmest.map_or(true, |so_far| number(reading) > number(so_far)) {
-                warmest = Some(reading);
+    /// The temperature one place gives, read as Python reads it.
+    fn temp_at(&self, place: &str) -> Result<Option<f64>, NotMine> {
+        match place {
+            CPU_LHM => {
+                let rows = self.rows(LIBRE, TEMPERATURE_SENSORS)?;
+                a_temperature(first_named(&rows, &["package", "ccd1", "tctl"])?)
+            }
+            CPU_OHM => {
+                let rows = self.rows(OPEN, TEMPERATURE_SENSORS)?;
+                a_temperature(first_named(&rows, &["package", "ccd1"])?)
+            }
+            // (the first zone)
+            CPU_ACPI => Ok(self.rows(ACPI, ACPI_ZONES)?.first().and_then(|zone| tenths_of_kelvin(zone.get("CurrentTemperature")))),
+            // (the warmest zone: Python's `max`, which keeps the first of equals)
+            _ => {
+                let rows = self.rows(CIMV2, THERMAL_ZONES)?;
+                let mut warmest: Option<&Json> = None;
+                for reading in rows.iter().filter_map(|zone| zone.get("HighPrecisionTemperature")).filter(|reading| matches!(reading, Json::Int(_) | Json::Float(_))) {
+                    let number = |value: &Json| match value {
+                        Json::Int(whole) => *whole as f64,
+                        Json::Float(number) => *number,
+                        _ => 0.0,
+                    };
+                    if warmest.map_or(true, |so_far| number(reading) > number(so_far)) {
+                        warmest = Some(reading);
+                    }
+                }
+                Ok(warmest.and_then(|reading| tenths_of_kelvin(Some(reading))))
             }
         }
-        Ok(warmest.and_then(|reading| tenths_of_kelvin(Some(reading))).map(|degrees| (degrees, "PerfFormatted ThermalZone")))
+    }
+
+    /// The processor's temperature and where it was read, from the first of
+    /// Python's four places that has a real one, each asked as the place
+    /// allows.  Where a place's answer is one only Python reads, the backend
+    /// reads that place (as it is: the place is the shell's to keep track of).
+    fn temp(&self, before: &mut Before) -> Result<Option<(f64, &'static str)>, Raised> {
+        let places = [(CPU_LHM, "temp_lhm", "LibreHardwareMonitor"), (CPU_OHM, "temp_ohm", "OpenHardwareMonitor"),
+                      (CPU_ACPI, "temp_acpi", "MSAcpi_ThermalZone"), (CPU_THERMAL, "temp_thermal", "PerfFormatted ThermalZone")];
+        for (place, part, source) in places {
+            let now = self.door.steady();
+            if before.quiet(place, now) {
+                continue;
+            }
+            let degrees = match self.temp_at(place) {
+                Ok(degrees) => degrees,
+                Err(NotMine) => match self.the_backends(part, None) {
+                    Part::Raised => return Err(Raised),
+                    Part::Says(said) => match said.get("degrees") {
+                        Some(Json::Float(degrees)) => Some(*degrees),
+                        Some(Json::Int(degrees)) => Some(*degrees as f64),
+                        _ => None,
+                    },
+                    Part::HasNone => None,
+                },
+            };
+            before.noted(place, now, degrees.is_some());
+            if let Some(degrees) = degrees {
+                return Ok(Some((degrees, source)));
+            }
+        }
+        Ok(None)
     }
 
     fn cpu(&self, before: &mut Before) -> Option<Cpu> {
@@ -641,15 +812,11 @@ impl Monitor {
             load = self.load(before);
         }
         let clock = self.clock();
-        let temp = self.temp();
         let mut cpu = Cpu { temp: Json::Null, source: String::new(), load: load.map_or(Json::Null, Json::Float), clock: clock.map_or(Json::Null, Json::Int) };
-        if let Ok(Some((degrees, source))) = &temp {
-            (cpu.temp, cpu.source) = (Json::Float(*degrees), source.to_string());
-        }
         // Where Python would start PowerShell (the times or the clock gave
-        // nothing), or read a sensor's value in a way of its own: the
-        // backend's reading of the processor, for what is missing here.
-        if load.is_none() || clock.is_none() || temp.is_err() {
+        // nothing): the backend's reading of the load and the clock, for
+        // what is missing here.
+        if load.is_none() || clock.is_none() {
             match self.the_backends("cpu", None) {
                 Part::Raised => return None,
                 Part::HasNone => {}
@@ -660,12 +827,13 @@ impl Monitor {
                     if clock.is_none() {
                         cpu.clock = or_nothing(said.get("clock"));
                     }
-                    if temp.is_err() {
-                        cpu.temp = or_nothing(said.get("temp"));
-                        cpu.source = said.get("temp_source").map(Json::py_str_or_empty).unwrap_or_default();
-                    }
                 }
             }
+        }
+        match self.temp(before) {
+            Err(Raised) => return None,
+            Ok(Some((degrees, source))) => (cpu.temp, cpu.source) = (Json::Float(degrees), source.to_string()),
+            Ok(None) => {}
         }
         // Said once, and again when it changes: which source pays off on
         // this PC, or that none does.
@@ -754,35 +922,41 @@ impl Monitor {
         Ok(read)
     }
 
-    fn gpu(&self, card: &Card) -> Option<Gpu> {
-        let of_the_backend = |said: &Json| Gpu { temp: or_nothing(said.get("temp")), load: or_nothing(said.get("load")), clock: or_nothing(said.get("clock")),
-                                                 vram: or_nothing(said.get("vram_pct")) };
+    fn gpu(&self, card: &Card, before: &mut Before) -> Option<Gpu> {
         let mut gpu = match card.from_the_reader() {
             Some(said) => Gpu { temp: said.value("temp_c").map_or(Json::Null, Json::Int), load: said.value("gpu_util_pct").map_or(Json::Null, Json::Int),
                                 clock: said.value("core_mhz").map_or(Json::Null, Json::Int), vram: vram_of(said.value("mem_used_bytes"), said.value("mem_total_bytes")) },
             // The reader is away or has no reading: Python would start
-            // nvidia-smi.  The backend's reading of the card, all of it
-            // (LibreHardwareMonitor included, where it needs it).
+            // nvidia-smi.  The backend's reading of the card itself.
             None => match self.the_backends("gpu", None) {
                 Part::Raised => return None,
-                Part::Says(said) => return Some(of_the_backend(&said)),
+                Part::Says(said) => Gpu { temp: or_nothing(said.get("temp")), load: or_nothing(said.get("load")), clock: or_nothing(said.get("clock")),
+                                          vram: or_nothing(said.get("vram_pct")) },
                 Part::HasNone => Gpu { temp: Json::Null, load: Json::Null, clock: Json::Null, vram: Json::Null },
             },
         };
         if gpu.temp == Json::Null || gpu.load == Json::Null {
-            match self.gpu_from_lhm() {
-                Ok((temp, load, clock)) => {
-                    for (mine, theirs) in [(&mut gpu.temp, temp), (&mut gpu.load, load), (&mut gpu.clock, clock)] {
-                        if *mine == Json::Null {
-                            *mine = theirs;
-                        }
-                    }
+            // LibreHardwareMonitor's sensors, as the place allows; where its
+            // answer is one only Python reads, the backend reads the place.
+            let now = self.door.steady();
+            let (temp, load, clock) = if before.quiet(GPU_LHM, now) {
+                (Json::Null, Json::Null, Json::Null)
+            } else {
+                let read = match self.gpu_from_lhm() {
+                    Ok(read) => read,
+                    Err(NotMine) => match self.the_backends("gpu_lhm", None) {
+                        Part::Raised => return None,
+                        Part::Says(said) => (or_nothing(said.get("temp")), or_nothing(said.get("load")), or_nothing(said.get("clock"))),
+                        Part::HasNone => (Json::Null, Json::Null, Json::Null),
+                    },
+                };
+                before.noted(GPU_LHM, now, read.0 != Json::Null || read.1 != Json::Null || read.2 != Json::Null);
+                read
+            };
+            for (mine, theirs) in [(&mut gpu.temp, temp), (&mut gpu.load, load), (&mut gpu.clock, clock)] {
+                if *mine == Json::Null {
+                    *mine = theirs;
                 }
-                Err(NotMine) => match self.the_backends("gpu", None) {
-                    Part::Raised => return None,
-                    Part::Says(said) => return Some(of_the_backend(&said)),
-                    Part::HasNone => {}
-                },
             }
         }
         Some(gpu)
@@ -1094,7 +1268,7 @@ mod tests {
         // A sensor's value that is a text: Python reads a number out of it.
         let rig = a_machine();
         wmi(&rig.machine, LIBRE, TEMPERATURE_SENSORS, r#"[{"Name": "CPU Package", "Value": "52.4"}]"#);
-        rig.part("cpu", r#"{"ok": true, "reading": {"temp": 52.4, "temp_source": "LibreHardwareMonitor", "load": 1.0, "clock": 1}}"#);
+        rig.part("temp_lhm", r#"{"ok": true, "reading": {"degrees": 52.4}}"#);
         let latest = rig.pass(1000.0);
         assert_eq!((&latest["cpu_temp"], latest["cpu_temp_source"].as_str(), &latest["cpu_load"], &latest["cpu_clock"]),
                    (&Json::Float(52.4), Some("LibreHardwareMonitor"), &Json::Float(25.0), &Json::Int(3700)));
@@ -1133,6 +1307,167 @@ mod tests {
         assert!(rig.machine.asked().iter().all(|question| !question.starts_with("gpu_")));
         assert_eq!(vram_of(Some(5_000_000_000), Some(12_000_000_000)), Json::Float(41.7));
         assert_eq!((vram_of(Some(1), Some(0)), vram_of(None, Some(1)), vram_of(Some(1), None)), (Json::Int(0), Json::Null, Json::Null));
+    }
+
+    impl Rig {
+        /// A round of the loop at `at`: did it take a pass?
+        fn round(&self, at: f64) -> bool {
+            self.machine.at(at);
+            self.moved.hw.round(&self.moved.card)
+        }
+
+        fn look(&self) -> Json {
+            self.call("GET", "/api/monitor/snapshot", "").unwrap().1
+        }
+
+        fn asleep(&self) -> bool {
+            self.moved.hw.state().thread.is_none()
+        }
+
+        /// How often each place of the processor's temperature was asked so far.
+        fn asked_of_wmi(&self, query: &str, namespace: &str) -> usize {
+            let kept = format!("wmi {}", Json::Object(vec![("namespace".to_string(), namespace.into()), ("query".to_string(), query.into())]));
+            self.machine.asked().iter().filter(|asked| **asked == kept).count()
+        }
+    }
+
+    #[test]
+    fn it_sleeps_when_nobody_looks_and_a_look_wakes_it_without_the_old_numbers() {
+        let rig = a_machine();
+        rig.machine.at(1000.0);
+        assert_eq!(rig.call("POST", "/api/monitor/start", "{}").unwrap().1, j(r#"{"ok": true}"#));
+        for second in 0..=30 {
+            assert!(rig.round(1000.0 + second as f64), "{second}");
+            assert!(!rig.asleep(), "{second} seconds after the start: nobody looked for no longer than 30 s");
+        }
+        // 30.25 seconds after the start nobody has looked for more than 30 s.
+        assert!(rig.round(1030.25));
+        assert!(rig.asleep());
+        assert!(!rig.round(1031.0), "a loop that sleeps takes no pass");
+        assert_eq!(rig.moved.hw.passes().kept, 32);
+        assert_eq!(rig.moved.hw.snapshot()["running"], Json::Bool(true), "running is what the person set");
+        // A look wakes it, and the old numbers are gone.
+        rig.machine.at(1040.0);
+        let woken = rig.look();
+        assert_eq!((&woken["running"], &woken["latest"], &woken["alerts"], &woken["history"]["cpu_load"]), (&Json::Bool(true), &j("{}"), &j("[]"), &j("[]")));
+        assert!(!rig.asleep());
+        // The first pass after it compares with nothing older than the sleep:
+        // it waits for its second reading, as a first pass does.
+        let waited = rig.machine.waited();
+        assert!(rig.round(1040.0));
+        assert_eq!(rig.machine.waited() - waited, 0.5);
+        assert_eq!(rig.moved.hw.snapshot()["history"]["cpu_load"], j("[25.0]"));
+        // Looked at every three seconds, it does not sleep.
+        for second in 1..40 {
+            if second % 3 == 0 {
+                rig.look();
+            }
+            rig.round(1040.0 + second as f64);
+        }
+        assert!(!rig.asleep());
+        // At the edge: 30 seconds after a look it is awake, a little later
+        // it sleeps (a pass every second, so that none waits within itself).
+        rig.machine.at(1110.0);
+        rig.look();
+        for second in 1111..=1140 {
+            rig.round(second as f64);
+        }
+        assert!(!rig.asleep(), "30 seconds is not more than 30");
+        rig.round(1140.5);
+        assert!(rig.asleep());
+    }
+
+    #[test]
+    fn a_stopped_monitor_is_never_woken_and_a_start_while_it_sleeps_wakes_it() {
+        let rig = a_machine();
+        rig.machine.at(1000.0);
+        rig.call("POST", "/api/monitor/start", "{}");
+        rig.round(1000.0);
+        rig.round(1031.0);
+        assert!(rig.asleep());
+        // Stopped while it sleeps: a look neither wakes it nor forgets.
+        rig.call("POST", "/api/monitor/stop", "");
+        let stopped = rig.look();
+        assert_eq!(stopped["running"], Json::Bool(false));
+        assert!(matches!(stopped["latest"]["ts"], Json::Float(_)), "what it read before is kept, as after a stop today");
+        assert!(rig.asleep() && !rig.round(1040.0));
+        // Started again: an ordinary start, which forgets nothing either.
+        assert_eq!(rig.call("POST", "/api/monitor/start", "{}").unwrap().1, j(r#"{"ok": true}"#));
+        assert!(rig.round(1041.0));
+        assert_eq!(rig.moved.hw.snapshot()["history"]["cpu_load"].as_array().unwrap().len(), 3);
+        // A start while it sleeps wakes it, and answers as a start while it runs.
+        rig.round(1072.0);
+        assert!(rig.asleep());
+        assert_eq!(rig.call("POST", "/api/monitor/start", r#"{"ping_target": "9.9.9.9"}"#).unwrap().1, j(r#"{"ok": true, "msg": "Already running"}"#));
+        assert!(!rig.asleep());
+        assert_eq!(rig.moved.hw.state().target, Json::from(THE_USUAL_TARGET), "the target is the one it was started with");
+        assert_eq!(rig.moved.hw.snapshot()["history"]["cpu_load"], j("[]"));
+        // Two looks at once wake one loop.
+        rig.round(1080.0);
+        rig.round(1111.0);
+        let starts = rig.moved.hw.state().starts;
+        rig.look();
+        rig.look();
+        assert_eq!(rig.moved.hw.state().starts, starts + 1);
+    }
+
+    #[test]
+    fn a_place_that_had_nothing_is_asked_about_twice_a_minute_and_one_that_works_every_pass() {
+        // No source of the processor's temperature at all.
+        let rig = a_machine();
+        wmi(&rig.machine, LIBRE, TEMPERATURE_SENSORS, "[]");
+        for second in 0..=60 {
+            rig.pass(1000.0 + second as f64);
+        }
+        // (asked in the first pass at 1000.25, after its two waits: quiet until
+        // 1030.25, so asked again at 1031, and quiet until 1061)
+        for (namespace, query) in [(LIBRE, TEMPERATURE_SENSORS), (OPEN, TEMPERATURE_SENSORS), (ACPI, ACPI_ZONES), (CIMV2, THERMAL_ZONES)] {
+            assert_eq!(rig.asked_of_wmi(query, namespace), 2, "{namespace}: twice in a minute");
+        }
+        // A source that works is asked every pass; one miss does not quiet it.
+        let rig = a_machine();
+        for second in 0..5 {
+            rig.pass(1000.0 + second as f64);
+        }
+        wmi(&rig.machine, LIBRE, TEMPERATURE_SENSORS, "[]");
+        assert_eq!(rig.pass(1005.0)["cpu_temp"], Json::Null);
+        wmi(&rig.machine, LIBRE, TEMPERATURE_SENSORS, r#"[{"Name": "CPU Package", "Value": 50.0}]"#);
+        assert_eq!(rig.pass(1006.0)["cpu_temp"], Json::Float(50.0), "asked again at once: it gave a reading within 30 s");
+        assert_eq!(rig.asked_of_wmi(TEMPERATURE_SENSORS, LIBRE), 7);
+        // Gone for longer than 30 s since its last reading: quiet.
+        wmi(&rig.machine, LIBRE, TEMPERATURE_SENSORS, "[]");
+        for second in 7..=37 {
+            rig.pass(1000.0 + second as f64);
+        }
+        let asked = rig.asked_of_wmi(TEMPERATURE_SENSORS, LIBRE);
+        rig.pass(1038.0);
+        rig.pass(1039.0);
+        assert_eq!(rig.asked_of_wmi(TEMPERATURE_SENSORS, LIBRE), asked, "quiet now");
+        // A source that comes (LibreHardwareMonitor started) is seen within 30 s.
+        let rig = a_machine();
+        wmi(&rig.machine, LIBRE, TEMPERATURE_SENSORS, "[]");
+        rig.pass(1000.0);
+        wmi(&rig.machine, LIBRE, TEMPERATURE_SENSORS, r#"[{"Name": "CPU Package", "Value": 51.0}]"#);
+        // (asked at 1000.25, after the first pass's waits: quiet until 1030.25)
+        assert_eq!(rig.pass(1005.0)["cpu_temp"], Json::Null);
+        assert_eq!(rig.pass(1030.0)["cpu_temp"], Json::Null);
+        assert_eq!(rig.pass(1030.5)["cpu_temp"], Json::Float(51.0));
+        // The PC's own clock set back or forward changes nothing of it.
+        let rig = a_machine();
+        wmi(&rig.machine, LIBRE, TEMPERATURE_SENSORS, "[]");
+        rig.pass(1000.0);
+        rig.machine.the_pcs_clock_is_set_to(5_000_000.0);
+        rig.moved.hw.step(&rig.moved.card);
+        rig.machine.the_pcs_clock_is_set_to(10.0);
+        rig.moved.hw.step(&rig.moved.card);
+        assert_eq!(rig.asked_of_wmi(TEMPERATURE_SENSORS, LIBRE), 1);
+        // The card's sensors in LibreHardwareMonitor are a place too.
+        let rig = a_machine();
+        rig.readers.reads(FakeReading::Says(j(r#"{"temp_c": 61}"#)));
+        for second in 0..=60 {
+            rig.pass(1000.0 + second as f64);
+        }
+        assert_eq!(rig.asked_of_wmi(ALL_SENSORS, LIBRE), 2);
     }
 
     #[test]
@@ -1292,5 +1627,51 @@ mod tests {
         rig.moved.hw.start(&rig.moved.card, THE_USUAL_TARGET.into());
         std::thread::sleep(Duration::from_millis(1300));
         assert_eq!(rig.moved.hw.passes().kept, at_the_close);
+    }
+
+    #[test]
+    fn started_for_real_it_sleeps_and_eight_looks_at_once_wake_one_loop() {
+        let rig = a_machine_with(true);
+        let hw = &rig.moved.hw;
+        let until = |what: &dyn Fn() -> bool| {
+            let began = std::time::Instant::now();
+            while !what() && began.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            what()
+        };
+        hw.start(&rig.moved.card, THE_USUAL_TARGET.into());
+        assert!(until(&|| hw.passes().kept >= 1));
+        // Nobody has looked for longer than 30 s, by the monitor's own
+        // clock: it sleeps after the pass it is in, and takes no more.
+        rig.machine.at(1031.0);
+        assert!(until(&|| hw.state().thread.is_none()));
+        let asleep = hw.passes().kept;
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(hw.passes().kept, asleep, "a loop that sleeps takes no pass");
+        assert_eq!(hw.snapshot()["running"], Json::Bool(true));
+        // Eight look at once: one loop is woken (two would take twice the
+        // passes in the same time).
+        let starts = hw.state().starts;
+        let looks: Vec<_> = (0..8).map(|_| {
+            let (hw, card) = (hw.clone(), rig.moved.card.clone());
+            std::thread::spawn(move || hw.look(&card))
+        }).collect();
+        for look in looks {
+            look.join().unwrap();
+        }
+        assert_eq!(hw.state().starts, starts + 1);
+        std::thread::sleep(Duration::from_millis(2600));
+        let woken = hw.passes().kept - asleep;
+        assert!((2..=5).contains(&woken), "{woken} passes in 2.6 s");
+        // Asleep again, and stopped while it sleeps: a look does not wake it.
+        rig.machine.at(1070.0);
+        assert!(until(&|| hw.state().thread.is_none()));
+        hw.stop();
+        hw.look(&rig.moved.card);
+        let kept = hw.passes().kept;
+        std::thread::sleep(Duration::from_millis(1300));
+        assert!(hw.state().thread.is_none() && hw.passes().kept == kept && hw.snapshot()["running"] == Json::Bool(false));
+        rig.moved.close();
     }
 }
