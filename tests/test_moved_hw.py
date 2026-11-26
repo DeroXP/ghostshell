@@ -534,6 +534,7 @@ def ps(name, says):
 PASS, STOP = {"do": "pass"}, call("POST", "/api/monitor/stop")
 TIMES = {"total": 8_000_000_000, "idle": 6_000_000_000, "dpc": 4_000_000, "interrupt": 2_000_000, "processors": 8}
 A_QUARTER_BUSY = {"total": 80_000_000, "idle": 60_000_000, "dpc": 400_000, "interrupt": 80_000}
+THREE_QUARTERS_BUSY = {"total": 80_000_000, "idle": 20_000_000, "dpc": 2_400_000, "interrupt": 800_000}
 A_CARD = dict(temp_c=61, gpu_util_pct=97, mem_util_pct=40, core_mhz=2100, mem_mhz=9501, core_max_mhz=2200, mem_max_mhz=9800, core_app_mhz=2100,
               mem_app_mhz=9501, power_mw=215437, power_limit_mw=320000, fan_pct=55, mem_used_bytes=5_000_000_000, mem_total_bytes=12_000_000_000)
 LHM_TEMPS = [{"Name": "Core #1", "SensorType": "Temperature", "Value": 48.0}, {"Name": "CPU Package", "SensorType": "Temperature", "Value": 52.44}]
@@ -708,9 +709,14 @@ def test_it_sleeps_when_nobody_looks_and_wakes_when_somebody_does_as_python_does
     s = a_whole_machine() + [start()]
     for second in range(12):                        # looked at every three seconds
         s += [at(1000.0 + second), QUIET] + ([SNAPSHOT] if second % 3 == 0 else [])
-    for second in range(12, 45):                    # ... the last look at 1009: asleep after the pass at 1040
+    for second in range(12, 41):                    # ... the last look at 1009: asleep after the pass at 1040
         s += [at(1000.0 + second), QUIET]
-    s += [SNAPSHOT]                                 # (index 4 of the looks: woken, nothing old)
+    # While it sleeps the PC is busier, and then not: a first pass after the
+    # wake that compared with the last one before the sleep would show it.
+    s += [{"do": "times_grow", "each_second": THREE_QUARTERS_BUSY}]
+    for second in range(41, 45):
+        s += [at(1000.0 + second), QUIET]
+    s += [{"do": "times_grow", "each_second": A_QUARTER_BUSY}, SNAPSHOT]   # (index 4 of the looks: woken, nothing old)
     s += [at(1046.0), QUIET, SNAPSHOT, at(1047.0), QUIET, SNAPSHOT]
     for second in range(48, 78):                    # the pass at 1077, exactly 30 s after the look at 1047: awake
         s += [at(1000.0 + second), QUIET]
