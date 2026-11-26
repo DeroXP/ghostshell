@@ -8,6 +8,10 @@
                                          reader costs (about a minute and a half; it reads this PC's card)
     python shell_rs/try_it.py --monitor  the same for the hardware monitor (about a minute and a half; it
                                          reads this PC, and its echo requests go to 127.0.0.1 only)
+    python shell_rs/try_it.py --network [--python EXE]
+                                         the same for the network monitor, and the work it causes in
+                                         other processes (about three and a half minutes; it reads this
+                                         PC; EXE: a Python with psutil, for the backend's own)
 
 This starts the shell's trial tool (vispora-shell-try: the shell without a
 window), which starts a backend, and takes the times that matter to somebody
@@ -495,7 +499,236 @@ def monitor(program, appdata, seconds=60, timed=20):
                 p.kill()
 
 
+def everyones_time():
+    """{program name: processor seconds so far} of every process, summed by
+    name, from Windows' own list of processes (it only reads; the times are
+    the ones Windows charges at its clock's ticks)."""
+    import ctypes
+    ntdll = ctypes.WinDLL("ntdll")
+    size = 1 << 20
+    while True:
+        buffer = ctypes.create_string_buffer(size)
+        needed = ctypes.c_ulong(0)
+        status = ntdll.NtQuerySystemInformation(5, buffer, size, ctypes.byref(needed)) & 0xFFFFFFFF
+        if status == 0xC0000004:
+            size = max(size * 2, needed.value + (1 << 16))
+            continue
+        if status != 0:
+            raise OSError("NtQuerySystemInformation failed: %#x" % status)
+        break
+    raw, at, times = buffer.raw, 0, {}
+    while True:
+        following = int.from_bytes(raw[at:at + 4], "little")
+        user, kernel = int.from_bytes(raw[at + 40:at + 48], "little", signed=True), int.from_bytes(raw[at + 48:at + 56], "little", signed=True)
+        length, pointer = int.from_bytes(raw[at + 56:at + 58], "little"), int.from_bytes(raw[at + 64:at + 72], "little")
+        name = ctypes.wstring_at(pointer, length // 2) if pointer and length else "(system idle)"
+        times[name.lower()] = times.get(name.lower(), 0.0) + (user + kernel) / 1e7
+        if not following:
+            return times
+        at += following
+
+
+# The backend's own network monitor, in a Python process of its own:
+# core/net_monitor.py with the app's native helper (as a source checkout has
+# it built) and psutil, its data folder redirected, read as the Network page
+# reads it (the live figures and the history every two seconds).  It only
+# reads.
+THE_BACKENDS_NETWORK = r"""
+import atexit, json, os, shutil, sys, tempfile, time
+root = tempfile.mkdtemp(prefix="vispora_measure_")
+atexit.register(shutil.rmtree, root, True)
+for var, sub in (("APPDATA", "Roaming"), ("LOCALAPPDATA", "Local")):
+    os.environ[var] = os.path.join(root, sub)
+    os.makedirs(os.environ[var], exist_ok=True)
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+import config
+assert config.APPDATA_DIR.startswith(root), config.APPDATA_DIR
+from core import native
+if not native.available():
+    print(json.dumps({"error": "the native helper is not built: " + native.status()["why"]}))
+    sys.exit(0)
+import psutil
+from core import net_monitor
+print(json.dumps({"ready": True}), flush=True)
+sys.stdin.readline()
+began = time.monotonic()
+while time.monotonic() - began < float(sys.argv[2]):
+    net_monitor.get_live()
+    net_monitor.get_history(60)
+    time.sleep(2.0)
+print(json.dumps({"live": net_monitor.get_live()}, default=str), flush=True)
+"""
+
+
+# The readings of one pass of the network monitor, fifty times a second:
+# the helper's two questions (what the shell asks), or what Python reads
+# (psutil's totals of the cards, and the helper's list of programs).  For
+# seeing whether they make other processes work.  It only reads.
+FIFTY_TIMES_A_SECOND = r"""
+import json, os, sys, time
+sys.path.insert(0, sys.argv[1])
+os.environ["APPDATA"] = os.environ["LOCALAPPDATA"] = sys.argv[4]
+from core import native
+assert native.available(), native.status()
+if sys.argv[2] == "psutil":
+    import psutil
+    def one():
+        psutil.net_io_counters()
+        native.process_io()
+else:
+    def one():
+        native.call("network_cards")
+        native.call("process_io")
+print("ready", flush=True)
+sys.stdin.readline()
+began, done = time.perf_counter(), 0
+while time.perf_counter() - began < float(sys.argv[3]):
+    one()
+    done += 1
+    time.sleep(max(0.0, began + done / 50.0 - time.perf_counter()))
+print(json.dumps({"done": done}), flush=True)
+"""
+
+
+def other_processes(python, appdata, rounds=3, window=15.0):
+    """Do the readings make other processes work?  Windows' own count of
+    every other process's processor time, in windows of `window` seconds:
+    nothing, then the shell's readings fifty times a second, nothing, then
+    Python's fifty times a second; `rounds` times.  What each reading window
+    used above the two windows of nothing around it, per program: at fifty
+    times the monitor's pace, so that a fiftieth of it is what the monitor
+    causes, and what does not stand out from the noise of the PC is below
+    a fiftieth of the noise."""
+    ours = {"python.exe", "pythonw.exe", "vispora-shell-try.exe", "visporagpureader.exe"}
+
+    def window_of(load=None):
+        child = None
+        if load:
+            child = subprocess.Popen([python if load == "psutil" else sys.executable, "-u", "-c", FIFTY_TIMES_A_SECOND, REPO, load, str(window), appdata],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=REPO, creationflags=NO_WINDOW)
+            assert child.stdout.readline().strip() == "ready", child.stderr.read()
+        before, began = everyones_time(), time.perf_counter()
+        if child:
+            child.stdin.write("go\n")
+            child.stdin.flush()
+            done = json.loads(child.stdout.readline())["done"]
+            child.wait(10)
+            assert done >= window * 45, done
+        else:
+            time.sleep(window)
+        after, took = everyones_time(), time.perf_counter() - began
+        return {name: (after.get(name, 0.0) - before.get(name, 0.0)) / took for name in after if name not in ours}
+
+    print("Other processes' work: %d rounds of four windows of %.0f s (nothing, the shell's readings, nothing, Python's), "
+          "the readings fifty times a second ..." % (rounds, window))
+    above = {"helper": [], "psutil": []}
+    quiet = window_of()
+    for _ in range(rounds):
+        for load in ("helper", "psutil"):
+            loaded = window_of(load)
+            after = window_of()
+            above[load].append({name: loaded.get(name, 0.0) - (quiet.get(name, 0.0) + after.get(name, 0.0)) / 2 for name in set(loaded) | set(quiet) | set(after)})
+            quiet = after
+    return above
+
+
+def network(program, appdata, python, seconds=60):
+    """The network monitor, the third module that moved into the shell
+    (shell_rs/core/src/moved/net.rs), beside the same module in the backend,
+    each read as the Network page reads it for a minute, one after the
+    other; and whether the readings make other processes work
+    (`other_processes`).
+
+    Both read this PC and only read: its network cards and every program's
+    bytes.  The shell's backend is the stand-in, which it asks which game
+    runs once a pass."""
+    has_psutil = subprocess.run([python, "-c", "import psutil"], capture_output=True).returncode == 0
+    if not has_psutil:
+        sys.exit("Not started: %s has no psutil, which the backend's own monitor needs (pass --python with one that has)." % python)
+
+    # The shell's, read as the page reads it.
+    shell = subprocess.Popen([program, "--backend", sys.executable, "--arg", "-u", "--arg", STAND_IN, "--arg", "--backend", "--appdata", appdata,
+                              "--readings", "real"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=REPO, text=True, encoding="utf-8", creationflags=NO_WINDOW)
+
+    def ask(**what):
+        shell.stdin.write(json.dumps(what) + "\n")
+        shell.stdin.flush()
+        line = shell.stdout.readline()
+        if not line:
+            sys.exit("The trial tool ended: " + shell.stderr.read())
+        return json.loads(line)
+    try:
+        json.loads(shell.stdout.readline())
+        assert ask(do="wait", **{"for": "ready"}, within=90)["phase"] == "ready"
+        backend = ask(do="state")["backend_pid"]
+        print("The shell's network monitor, read every two seconds for a minute ...")
+        mine, its_backend, began = processor_seconds(shell.pid), processor_seconds(backend), time.perf_counter()
+        answers = []
+        while time.perf_counter() - began < seconds:
+            said = ask(do="call", method="GET", target="/api/network/live", token=True)
+            answers.append(said["ms"])
+            assert said["status"] == 200, said
+            ask(do="call", method="GET", target="/api/network/history?seconds=60", token=True)
+            time.sleep(2.0)
+        minute = time.perf_counter() - began
+        shells = {"the shell": (processor_seconds(shell.pid) - mine) / minute, "its backend": (processor_seconds(backend) - its_backend) / minute}
+        live = json.loads(ask(do="call", method="GET", target="/api/network/live", token=True)["body"])
+        took = sorted(ask(do="call", method="GET", target="/api/network/live", token=True)["ms"] for _ in range(300))
+    finally:
+        try:
+            shell.stdin.write(json.dumps({"do": "quit"}) + "\n")
+            shell.stdin.flush()
+            shell.wait(30)
+        except (OSError, subprocess.TimeoutExpired):
+            shell.kill()
+
+    # The backend's own, read as the page reads it.
+    child = subprocess.Popen([python, "-u", "-c", THE_BACKENDS_NETWORK, REPO, str(seconds)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, cwd=REPO, text=True, encoding="utf-8", creationflags=NO_WINDOW)
+    try:
+        ready = json.loads(child.stdout.readline() or "{}")
+        if not ready.get("ready"):
+            sys.exit("The backend's network monitor could not be measured: %r %s" % (ready, child.stderr.read()[-2000:]))
+        print("The backend's own network monitor, read every two seconds for a minute ...")
+        its_own, began = processor_seconds(child.pid), time.perf_counter()
+        child.stdin.write("go\n")
+        child.stdin.flush()
+        theirs = json.loads(child.stdout.readline() or "{}")
+        minute = time.perf_counter() - began
+        own = (processor_seconds(child.pid) - its_own) / minute
+    finally:
+        child.wait(30)
+    above = other_processes(python, appdata)
+
+    print("\nProcessor time used, as a share of one core (the shell and Python counted in the processor's cycles):\n")
+    print("  %-40s %.2f%%" % ("the shell's network monitor:", 100 * shells["the shell"]))
+    print("  %-40s %.2f%%" % ("  its backend (asked which game runs):", 100 * shells["its backend"]))
+    print("  %-40s %.2f%%" % ("the backend's own (Python, psutil):", 100 * own))
+    print("\nOther processes, the readings fifty times a second: what each program used above the windows of nothing around it,\n"
+          "as a share of one core, in each round (Windows' own count), for the programs with the most in all:\n")
+    for label, load in (("the shell's readings", "helper"), ("Python's readings", "psutil")):
+        rounds = above[load]
+        total = [sum(each.values()) for each in rounds]
+        names = sorted({name for each in rounds for name in each}, key=lambda name: -abs(sum(each.get(name, 0.0) for each in rounds)))[:6]
+        print("  %-22s in all: %s" % (label, ", ".join("%+.2f%%" % (100 * value) for value in total)))
+        for name in names:
+            print("  %-22s %-26s %s" % ("", name, ", ".join("%+.2f%%" % (100 * each.get(name, 0.0)) for each in rounds)))
+    print("\nThe page's call for the live figures, through the shell, 300 times: %.3f ms (the slowest in twenty %.3f)"
+          % (statistics.median(took), took[int(len(took) * 0.95)]))
+    print("\nThe last live figures of each:")
+    for name, said in (("the shell", live), ("the backend's own", theirs.get("live", {}))):
+        print("  %-18s received %s B/s, sent %s B/s, %d programs moving, sampler %s" % (name, said.get("total_rx_per_sec"), said.get("total_tx_per_sec"),
+                                                                                       len(said.get("top") or []), "running" if said.get("running") else "stopped"))
+    return 0
+
+
 def main(argv):
+    if argv[:1] == ["--network"]:
+        python = argv[argv.index("--python") + 1] if "--python" in argv else sys.executable
+        with tempfile.TemporaryDirectory(prefix="vispora-shell-trial-") as appdata:
+            return network(tool(), appdata, python)
     if argv == ["--monitor"]:
         with tempfile.TemporaryDirectory(prefix="vispora-shell-trial-") as appdata:
             return monitor(tool(), appdata)

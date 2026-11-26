@@ -126,6 +126,21 @@ if psutil and procs:
     check("process list: each counter lies between psutil's reading before and after", compared and between == compared,
           f"{between} of {compared}")
 
+# ── the network cards' byte counts (psutil.net_io_counters' own calls) ─
+cards = ask("network_cards")
+check("network cards: answered", isinstance(cards, list) and len(cards) > 0, f"{len(cards or [])} adapters")
+if psutil and cards:
+    from psutil import _psplatform
+    before = _psplatform.cext.net_io_counters()            # {friendly name: (sent, received, ...)}, as Windows says them
+    cards = ask("network_cards")
+    after = _psplatform.cext.net_io_counters()
+    check("network cards: the adapters psutil lists, by name, in its order",
+          list(dict.fromkeys(c["name"] for c in cards)) == list(before) == list(after), f"{[c['name'] for c in cards]} / {list(before)}")
+    between = [c["name"] for c in cards if c["name"] in before and c["name"] in after
+               and before[c["name"]][0] <= c["sent"] <= after[c["name"]][0] and before[c["name"]][1] <= c["recv"] <= after[c["name"]][1]]
+    check("network cards: each count lies between psutil's reading before and after", len(between) == len(cards),
+          f"{len(between)} of {len(cards)}")
+
 # ── the graphics card ─────────────────────────────────────────────────
 FIELDS = ("temperature.gpu,utilization.gpu,utilization.memory,clocks.current.graphics,clocks.current.memory,"
           "clocks.max.graphics,clocks.max.memory,power.draw,power.limit,fan.speed,memory.used,memory.total")

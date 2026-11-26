@@ -359,7 +359,7 @@ request, in this order:
 | 1 | The performance sampler (`core/perf_monitor.py`) | the graphics card, five times a second, while the Monitor page is open | nothing | **moved**: `shell_rs/core/src/moved/perf.rs` |
 | | The graphics card's own reader (not a module of the backend: what pieces 1, 2 and 5 read the card with) | the card, while something in the shell wants its readings | nothing | **written**: `VisporaGpuReader`, a small program the shell starts and ends (below). The backend's reading where it is away or has none |
 | 2 | The hardware monitor (`core/hw_monitor.py`) | processor, card, memory, DPC time, ping: once a second while the Monitor page asks for its snapshot (it sleeps half a minute after the last one) | nothing | **moved**: its loop and its start, stop and snapshot, `shell_rs/core/src/moved/hw.rs`. Its benchmark (it writes a file) and its list of programs (PowerShell) stay the backend's (below) |
-| 3 | The network monitor (`core/net_monitor.py`) | bytes per program and per network card, once a second while the Network page is open | nothing in its loop | pausing a program is process tuning (item 3 of the plan) and stays; which game is running is the game monitor's to say, and is asked of the backend until piece 7 |
+| 3 | The network monitor (`core/net_monitor.py`) | bytes per program and per network card, once a second while the Network page reads it | nothing in its loop | **moved**: its sampler and live, history and top, `shell_rs/core/src/moved/net.rs`. Pausing and resuming a program stay the backend's (process tuning, item 3); which game runs is asked of the backend until piece 7 (below) |
 | 4 | The popup watchdog (`core/popup_killer.py`) | every visible window, once a second, always | closes Windows' own "get an app to open this link" windows | the first piece that changes something: looking and closing are kept apart, and the closing is never run against a PC by a test or a trial |
 | 5 | The temperature ceiling (`core/temp_ceiling.py`) | the card's temperature, once a second, always | when it trips: resets the overclock | the reset is GPU overclock's and stays in Python: the shell watches and decides, and asks the backend to carry it out |
 | 6 | Idle Mode (`core/idle_mode.py`) | whether a game runs, every twenty seconds, when switched on | the power plan, and the overclock | the power plan moves; the overclock is GPU overclock's and stays |
@@ -800,6 +800,117 @@ What is left open by this piece:
   the fake machine, and the shell in the window against the stand-in);
   and the two new questions of the helper's in the released app (they are
   not asked by Python).
+
+### Piece 3: the network monitor
+
+`core/net_monitor.py`, the Network page's live figures: the bytes a second
+the network cards receive and send, the programs that move the most, a
+minute of totals for the sparkline, and a warning when a program other
+than the game moves 5 MB a second or more for three seconds in a row while
+a game runs. In the shell: `shell_rs/core/src/moved/net.rs`.
+
+* **What moves, and what stays.** The sampler and the three calls that
+  read it move: `GET /api/network/live`, `/history`, `/top` (and HEAD of
+  them: the backend's web framework answers HEAD by running the route,
+  which would start the backend's own sampler). Pausing and resuming a
+  program (`POST /api/network/pause-process`, `/resume-process`) change
+  the PC: they stay the backend's, and no test or trial ever makes them.
+  The other calls under `/api/network/` are the network optimizer's, no
+  part of this module, and are passed on as they were.
+* **It runs while something reads it, and stops by itself**, as Python's:
+  a read starts it (and is answered with noughts until the second sample
+  is in), it samples once a second, and it stops once nobody has read it
+  for 30 seconds, counted on the clock that does not jump. A start forgets
+  the programs and the cards' last counts, and keeps the minute of totals
+  and the time of the last sample, as Python does. The rates are worked
+  out over the time between two samples on the PC's own clock, as
+  Python's are (a clock set back in between gives a rate over a
+  thousandth of a second, in both).
+* **Where each reading comes from: where Python reads it.**
+  * The network cards' totals: a new question of the helper's,
+    `network_cards` (`native/src/nics.rs`), which makes the calls psutil's
+    `net_io_counters()` makes (`GetAdaptersAddresses`, then `GetIfEntry2`
+    for each adapter) and fails where psutil would raise. It asks for the
+    list without the addresses and DNS details psutil has Windows add to
+    each adapter: with them, every call made Windows' DNS Client service
+    work (measured below), and the list, its order and its names are the
+    same either way (a test holds that). What psutil then
+    does in Python is done in the shell the same way: two adapters of one
+    name, the last counts; a count that goes back is taken to have started
+    again, and the old count is added on from then on (psutil's
+    `_WrapNumbers`, kept for the process's life as psutil keeps it). Held
+    three ways: a made-up row with a number of its own at every place;
+    this PC's rows against Windows' older call, which lays the row out
+    another way; and side by side with psutil on this PC (same adapters,
+    same order, each count between psutil's reading before and after;
+    also in `native/check_parity.py`).
+  * Every program's bytes: the helper's `process_io`, read as Python reads
+    it. Where it has no answer Python reads them with psutil, one program
+    at a time, in the backend; the shell asks its backend for that part
+    (`GET /api/network/part?name=processes`, behind the shell only), which
+    takes it with the module's own `_process_io_rows`. If that raises (or
+    there is no backend), the pass is dropped after the cards were read,
+    as a pass of Python's whose list of programs raised.
+  * **Whether a game runs, and which**: the game monitor knows, and it is
+    the backend's until piece 7. The shell asks once a pass, as Python
+    reads it once a pass (`GET /api/network/part?name=game`, the module's
+    own `_get_active_game_exe()`). That is one call to the backend a
+    second while the Network page reads the monitor, and none otherwise.
+    Where there is no backend to ask, no game is known for that pass: no
+    program is taken for the game, and the page is told of none.
+* **One of each.** The backend's sampler is started by a read of it and
+  by nothing else, and behind the shell every read is the shell's: GET
+  and HEAD of the three paths, written in whatever way the backend's web
+  framework reads as them. A number of seconds or programs that Python
+  may read and the shell cannot is refused (400), not passed on. Told to
+  leave everything to the backend (`--all-to-backend`), the shell takes
+  none of them, and the backend's sampler runs as today (tried in the
+  window). What the sampler keeps is the shell's.
+* **It only reads, and starts no program.** Both questions to the helper
+  take no words; nothing of a call's text reaches the helper.
+* **The same answers**, proven before anything is removed:
+  `tests/test_moved_net.py` asks the Python module (its routes, its loop
+  a round at a time) and the shell's (in the trial tool) the same things
+  on the same made-up machine: 130 answers and 113 rounds compared, 9
+  calls passed on, 2 refused. Python's psutil there is a made-up one that
+  reads that machine; what psutil does with the counts in Python is
+  psutil's own code where psutil is installed (the Python releases are
+  built with) and the test's copy of it elsewhere, held against psutil's
+  own. Among the scripts: the Network page for 75 seconds while a game
+  starts and a download wakes up, programs that come and go, the page
+  left and opened again; the helper without a list of programs (psutil's:
+  a program it cannot read, one with no name, a listing that raises),
+  cards that cannot be read, none, two of one name, a count that goes
+  back, a card that goes and comes back; a program's count that goes
+  back, an id given to another program; a burst with and without a game,
+  one at exactly the line; the PC's clock set back and forward.
+* **Tried for real, and measured**: `python shell_rs/app/try_it.py
+  --moved` (the real window against the stand-in backend: the shell reads
+  this PC's cards and programs, asks the backend once a pass which game
+  runs, takes HEAD, passes another method on, stops by itself half a
+  minute after the last read, and starts again on the next); `python
+  shell_rs/try_it.py --network` (the numbers, in
+  [performance.md](performance.md)).
+
+What is left open by this piece:
+
+* **The backend is asked which game runs once a second** while the
+  Network page reads the monitor. That ends with piece 7, when the game
+  monitor's looking moves into the shell.
+* **A rate across a clock that was set**: worked out on the PC's own
+  clock, as Python works it out, so a clock set back between two samples
+  gives one enormous rate. Not changed: both sides would change together.
+* **Behind the shell, the app's own programs are not all on the list of
+  programs never taken for a burst**: it names `Vispora.exe`, the updater
+  and `python.exe`, and not the backend behind the shell
+  (`VisporaBackend.exe`) or the card's reader. Neither moves bytes to
+  speak of. Not changed: the list is Python's, and the same in both.
+* **What was never run by anybody**: the monitor with administrator
+  rights, or beside the real backend (its part call has answered only the
+  stand-in); the programs' part answered by a real backend with psutil;
+  a real game during a real burst; the new question of the helper's in
+  the released app (Python does not ask it); pausing or resuming a
+  program, by anybody, from this piece.
 
 ## What goes last
 

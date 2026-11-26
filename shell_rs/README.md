@@ -584,7 +584,7 @@ with it:
 
 ```
 cargo build --release --locked --no-default-features --manifest-path shell_rs/app/Cargo.toml
-python shell_rs/app/try_it.py                  # 153 checks; the window is never shown
+python shell_rs/app/try_it.py                  # 162 checks; the window is never shown
 python shell_rs/app/try_it.py --monitor        # only the hardware monitor's (about two minutes)
 python shell_rs/app/try_it.py --time           # the times
 python shell_rs/app/try_it.py --time --pack P  # ... and what unpacking the pack P costs, both ways
@@ -697,7 +697,11 @@ time and a ping, once a second while the Monitor page asks for its
 snapshot, for its tiles. The page does not stop it when it is left; it
 sleeps by itself half a minute after the last snapshot, in today's app as
 in the shell, and the next snapshot wakes it. Its list of programs and its benchmark stay the backend's (they
-start PowerShell, and the benchmark writes a file).
+start PowerShell, and the benchmark writes a file); and **the network
+monitor** (`core/src/moved/net.rs`, which is `core/net_monitor.py`): the
+network cards' bytes a second, the programs that move the most, and the
+warning of a burst while a game runs, sampled once a second while the
+Network page reads it. Pausing and resuming a program stay the backend's.
 
 The rules every module there keeps:
 
@@ -790,6 +794,17 @@ The rules every module there keeps:
   and goes ten seconds after it sleeps. A LibreHardwareMonitor that is
   started while the monitor runs shows its temperature within half a
   minute.
+* **The network monitor** reads the network cards through a new question
+  of the helper's (`network_cards`, the calls psutil makes, with what
+  psutil does with them in Python done the same way in the shell) and
+  every program's bytes through the helper as Python does; where the
+  helper has no list of programs, the backend's psutil gives it. It asks
+  its backend which game runs once a pass (the game monitor is there
+  until it moves too); with no backend, no game is known for that pass.
+
+  **What a person sees:** the Network page as before. The shell's log
+  says when the sampler starts and when it stops by itself, half a minute
+  after the page stopped reading it.
 * **A real side and a made-up side.** `Real` asks the helper. `Fake`
   answers from a table and tells a time that is set by hand; `FakeReaders`
   are made-up readers for the card, and `FakeBackend` says what the
@@ -820,6 +835,8 @@ python shell_rs/app/try_it.py --moved   # the real window: the page's calls, the
                                         # the hardware monitor reading this PC (its pings to 127.0.0.1 only)
 python shell_rs/try_it.py --moved       # what the sampler costs, beside the backend's own (a minute and a half)
 python shell_rs/try_it.py --monitor     # what the hardware monitor costs, beside the backend's own (a minute and a half)
+python shell_rs/try_it.py --network     # what the network monitor costs, beside the backend's own, other processes' work counted too
+                                        # (three and a half minutes; the backend's own needs a Python with psutil: --python EXE)
 python tools/measure/nvml_release.py    # that NVIDIA's library stays in a process that let go of it
 ```
 
@@ -839,7 +856,11 @@ the two fixes it cost this PC about a fifth of one core while it ran
 (about 3% in its own process, the rest in Windows' WMI service, asking for
 a processor temperature this PC does not have), from the first visit to
 the Monitor page until the quit; now about 3% while the page is on
-screen, and nothing half a minute after.
+screen, and nothing half a minute after. The network monitor costs
+the shell what it costs the backend (about 1.1% of a core while the page
+reads it, and 0.2% in the backend for the question which game runs), and
+spares Windows' DNS Client service the third of a percent that psutil's
+reading of the cards costs it today.
 
 ## What is where
 
@@ -855,6 +876,7 @@ screen, and nothing half a minute after.
 | `core/src/gpu_reader.rs`, `core/src/bin/gpu_reader.rs` | The reader from the shell's side (started with two pipe ends, asked with a limit, ended), and the reader's own program, `VisporaGpuReader.exe` |
 | `core/src/moved/perf.rs` | The performance sampler, moved from `core/perf_monitor.py` |
 | `core/src/moved/hw.rs` | The hardware monitor, moved from `core/hw_monitor.py` |
+| `core/src/moved/net.rs` | The network monitor, moved from `core/net_monitor.py` |
 | `../backend.spec` | The app built as a folder for the shell to carry (PyInstaller) |
 | `app/try_it.py` | Runs the real window exe against a stand-in backend, out of the way |
 | `core/src/instance.rs` | Is this the one copy, and does it have the rights it needs: the order of a start |
@@ -955,9 +977,9 @@ it is told to start, and the only thing to tell it is the stand-in.
   shell's own account of them, and a test compares the three pictures'
   files with what the app draws.
 * **What has moved has not run with administrator rights, or beside the
-  real backend.** The sampler and the hardware monitor were tried in the
+  real backend.** The sampler and the two monitors were tried in the
   real window against the stand-in, the reader reading this PC's card
-  and the monitor this PC. That their answers are the Python modules' is
+  and the monitors this PC. That their answers are the Python modules' is
   proven on a made-up machine. Beside the real backend the fallbacks are
   the real `read_live_state()` and the monitor's part call, which the
   shell has never asked of a real backend; no part was ever answered by

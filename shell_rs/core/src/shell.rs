@@ -251,7 +251,8 @@ impl Shell {
             }
         });
         moved.card.says_with(say.clone());
-        moved.hw.says_with(say);
+        moved.hw.says_with(say.clone());
+        moved.net.says_with(say);
         *self.moved.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(moved.clone());
         moved
     }
