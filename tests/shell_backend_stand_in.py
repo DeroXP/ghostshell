@@ -30,8 +30,13 @@ each time it puts the (fake) system back, with the reason: that is how a test
 sees that a backend restored before it went.  With VISPORA_STAND_IN_CALLS=<file>
 it writes a line for every call it answers (the time, the status, the
 method and the path): that is how a trial sees what the window's page asked.
-(For the call a shell makes for a part of the hardware monitor's pass, the
-path is written with its query: which part, and for the ping, to whom.)
+(For the calls a shell makes for a part of the hardware monitor's or the
+network monitor's pass, the path is written with its query: which part,
+and for the ping, to whom.)
+
+POST /api/stand-in/network-game with {"exe": "..."} makes the game monitor
+say to the network monitor that this game runs ({"exe": null}: none), as it
+says it on a PC while a game is played.
 With VISPORA_STAND_IN_SECRET=<file> it writes the run's secret there, as it
 was handed over: that is how a trial knows what to look for when it checks
 that the secret is nowhere it should not be.  (The file is the trial's own,
@@ -93,7 +98,7 @@ def main():
     calls = os.environ.get("VISPORA_STAND_IN_CALLS")
     if calls:
         def note(answer):
-            path = A.request.full_path.rstrip("?") if A.request.path == "/api/monitor/part" else A.request.path
+            path = A.request.full_path.rstrip("?") if A.request.path in ("/api/monitor/part", "/api/network/part") else A.request.path
             with open(calls, "a", encoding="utf-8") as f:
                 f.write(f"{time.time():.3f} {answer.status_code} {A.request.method} {path}\n")
             return answer
@@ -106,6 +111,13 @@ def main():
         game_profiles._engine["active_game"] = name
         game_profiles._engine["active_pid"] = 4242 if name else None
         return A.jsonify({"ok": True, "active_game": name})
+
+    @A.app.route("/api/stand-in/network-game", methods=["POST"])
+    def the_network_monitors_game():
+        from core import game_profiles
+        exe = (A.request.get_json(silent=True) or {}).get("exe") or None
+        game_profiles.get_active_game_info = (lambda: {"exe": exe, "display": exe, "pid": 4242, "oc_core": 0, "oc_mem": 0}) if exe else (lambda: None)
+        return A.jsonify({"ok": True, "exe": exe})
 
     @A.app.route("/api/stand-in/card", methods=["POST"])
     def the_card_says():

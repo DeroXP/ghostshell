@@ -1050,6 +1050,82 @@ def a_number(text):
         return None
 
 
+# A HEAD call of the page's, and its status said in a call of its own.
+A_HEAD = """(function () {
+    window.pywebview.api.get_api_token().then(function (token) {
+        fetch(%(path)s, { method: 'HEAD', headers: { 'X-Vispora-Token': token } })
+            .then(function (answer) { return fetch('/api/trial/' + %(name)s + '/' + answer.status, { headers: { 'X-Vispora-Token': token } }); });
+    });
+})();"""
+
+
+# What the page shows of the network monitor, in words without a blank.
+THE_NETWORK = ("said.running, said.history_len, said.total_rx_per_sec, said.total_tx_per_sec, (said.top || []).length, "
+               "said.active_game === undefined ? 'nothing' : (said.active_game || 'none')")
+
+
+def the_network_monitor(root, check):
+    """The network monitor: its three calls that read it are answered by
+    the shell, which reads this PC's network cards and programs through its
+    own door, and asks its backend which game runs (the stand-in's fake
+    machine, where the trial says one runs).  It runs while the page reads
+    it, and stops by itself when nobody has for half a minute.
+
+    It only reads.  Pausing and resuming a program are the backend's, and
+    are never asked for here."""
+
+    def theirs(run):
+        return [c for c in run.calls() if c[3].startswith("/api/network/")]
+
+    def games_asked(run):
+        return len([c for c in run.calls() if c[3] == "/api/network/part?name=game"])
+
+    run = Run(root, "hidden")
+    try:
+        up = first_screen(run)
+        pid = run.process.pid
+        first = the_page_calls(run, "GET", "/api/network/live", tell=THE_NETWORK)
+        time.sleep(2.4)
+        live = the_page_calls(run, "GET", "/api/network/live", tell=THE_NETWORK)
+        history = the_page_calls(run, "GET", "/api/network/history?seconds=60", tell="said.history.length")
+        top = the_page_calls(run, "GET", "/api/network/top?limit=3", tell="said.top.length")
+        reached = [c[3] for c in theirs(run) if not c[3].startswith("/api/network/part")]
+        check("the network monitor's calls are answered by the shell, which reads this PC's cards and programs: first %r, then %r, history %r, top %r"
+              % (first, live, history, top), up and first and first[0] == "true" and first[1] in ("0", "1") and first[5] in ("nothing", "none")
+              and live and live[0] == "true" and int(live[1]) >= 2 and int(live[2]) >= 0 and int(live[3]) >= 0 and live[5] == "none"
+              and history and int(history[0]) >= 2 and top and int(top[0]) <= 3 and reached == [])
+        parts = sorted({c[3] for c in theirs(run) if c[3].startswith("/api/network/part")})
+        check("the backend is asked which game runs, once a pass, and for nothing else (the helper reads the programs here): %r, %d times"
+              % (parts, games_asked(run)), parts == ["/api/network/part?name=game"] and int(live[1]) <= games_asked(run) <= int(live[1]) + 2)
+        the_page_calls(run, "POST", "/api/stand-in/network-game", {"exe": "cs2.exe"})
+        time.sleep(1.3)
+        game = the_page_calls(run, "GET", "/api/network/live", tell=THE_NETWORK)
+        check("where the backend's game monitor says a game runs, the page is told: %r" % (game,), game and game[5] == "cs2.exe")
+        the_page_calls.made += 1
+        run.in_the_page(A_HEAD % {"path": json.dumps("/api/network/live"), "name": json.dumps("head-%d" % the_page_calls.made)})
+        head = run.wait_for(lambda: [c[3].split("/")[4:] for c in run.calls() if c[3].startswith("/api/trial/head-%d/" % the_page_calls.made)], 20)
+        head = head[-1] if head else None
+        passed = the_page_calls(run, "POST", "/api/network/live", {}, tell="said.ok === false")
+        reached = [(c[2], c[3]) for c in theirs(run) if not c[3].startswith("/api/network/part")]
+        check("HEAD is the shell's too (the backend would start its own sampler for it); another method is the backend's to refuse: %r" % (reached,),
+              head == ["200"] and passed == ["true"] and reached == [("POST", "/api/network/live")])
+        # Nobody reads it: it stops by itself, half a minute after the last read.
+        asked = games_asked(run)
+        time.sleep(33)
+        stopped = "the network monitor's sampler stopped: nobody has read it for 30 s" in run.log()
+        later = games_asked(run)
+        time.sleep(2.2)
+        check("half a minute after the last read the sampler stopped by itself, and asks nothing more (%d parts before, %d after)" % (asked, later),
+              stopped and later >= asked and games_asked(run) == later)
+        again = the_page_calls(run, "GET", "/api/network/live", tell=THE_NETWORK)
+        check("read again, it starts again and has forgotten the last run but the minute of totals: %r" % (again,),
+              again and again[0] == "true" and again[2] == "0" and again[3] == "0" and again[4] == "0" and int(again[1]) >= 30)
+        check("the shell's process never held the graphics driver's library", not holds(pid, THE_DRIVERS_LIBRARY) and holds(pid, "kernel32.dll"))
+        check("the shell quits as ever with a network monitor that ran (exit code %r)" % (quit_by_its_window(run),), run.process.returncode == 0)
+    finally:
+        run.end()
+
+
 def the_hardware_monitor(root, check):
     """The hardware monitor: its start, stop and snapshot are answered by the
     shell, which reads this PC through its own door (the processor's times
@@ -1279,12 +1355,17 @@ def moved(root, check):
         check("... and the hardware monitor's too: the backend's own monitor runs, and the shell asks it for no part: %r" % (reached,),
               started == ["true"] and snap == ["true"] and stopped == ["true"]
               and reached == ["/api/monitor/start", "/api/monitor/snapshot", "/api/monitor/stop"])
+        live = the_page_calls(run, "GET", "/api/network/live", tell="said.running")
+        reached = [c[3] for c in run.calls() if c[3].startswith("/api/network/")]
+        check("... and the network monitor's: the backend's own sampler runs, and the shell asks it for no part: %r" % (reached,),
+              live == ["true"] and reached == ["/api/network/live"])
         quit_by_its_window(run)
     finally:
         run.end()
 
     the_hardware_monitor(root, check)
     the_hardware_monitor_sleeps(root, check)
+    the_network_monitor(root, check)
     the_cards_reader(root, check)
 
 

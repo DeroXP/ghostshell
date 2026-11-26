@@ -41,11 +41,12 @@
 //!   Python modules take themselves, so a module that lives on it gives
 //!   Python's answers at all times, also while a driver is installed.
 //!
-//! What has moved so far: the performance sampler (perf.rs) and the
-//! hardware monitor (hw.rs).
+//! What has moved so far: the performance sampler (perf.rs), the
+//! hardware monitor (hw.rs) and the network monitor (net.rs).
 
 pub mod card;
 pub mod hw;
+pub mod net;
 pub mod perf;
 
 use std::collections::HashMap;
@@ -283,6 +284,7 @@ pub struct Moved {
     pub card: Arc<Card>,
     pub perf: Arc<perf::Sampler>,
     pub hw: Arc<hw::Monitor>,
+    pub net: Arc<net::NetMonitor>,
 }
 
 impl Moved {
@@ -291,7 +293,8 @@ impl Moved {
     /// where a test moves the clock by hand and does every round itself
     /// (`perf::Sampler::step`, `hw::Monitor::step`, `Card::tend`).
     pub fn new(door: Arc<dyn Readings>, threads: bool) -> Arc<Moved> {
-        Arc::new(Moved { card: Arc::new(Card::new(door.clone(), threads)), perf: perf::Sampler::new(threads), hw: hw::Monitor::new(door, threads) })
+        Arc::new(Moved { card: Arc::new(Card::new(door.clone(), threads)), perf: perf::Sampler::new(threads), hw: hw::Monitor::new(door.clone(), threads),
+                         net: net::NetMonitor::new(door, threads) })
     }
 
     /// How the backend is asked: for the graphics card's reading, where the
@@ -300,11 +303,13 @@ impl Moved {
     /// take it.
     pub fn asks_the_backend_with(&self, ask: AskBackend) {
         self.card.asks_the_backend_with(ask.clone());
-        self.hw.asks_the_backend_with(ask);
+        self.hw.asks_the_backend_with(ask.clone());
+        self.net.asks_the_backend_with(ask);
     }
 
     /// The shell quits: what has moved stops, and reads nothing any more.
     pub fn close(&self) {
+        self.net.close();
         self.hw.close();
         self.card.close();
     }
@@ -335,6 +340,11 @@ impl Moved {
         }
         if path.starts_with("/api/monitor/") {
             return self.hw.answer(&self.card, request, &path);
+        }
+        // (of the calls under /api/network/ only the network monitor's three
+        // that read it; the rest are the network optimizer's, and stay)
+        if path.starts_with("/api/network/") {
+            return self.net.answer(request, &path);
         }
         None
     }

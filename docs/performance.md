@@ -786,6 +786,64 @@ shell asks of a real backend (what a part costs there is the function's
 own cost and a call's, 1.9 to 2.7 ms of the backend's processor time:
 "The performance sampler", above).
 
+### The network monitor (the third module)
+
+The Network page's live figures: the network cards' bytes a second, the
+programs that move the most and the warning of a burst, sampled once a
+second while the page reads it and for half a minute after
+(`core/net_monitor.py`, now also `shell_rs/core/src/moved/net.rs`). Before
+step 2 it ran from every start until the quit, at 26 to 28% of a core
+(above); since then it runs only while its page is read, and since step 1
+the list of programs is the helper's.
+
+Measured with `python shell_rs/try_it.py --network --python <a Python
+with psutil>` on this PC, three runs. Each side is read as the page reads
+it (the live figures and the minute of totals every two seconds) for a
+minute, one after the other:
+
+* **the shell**: the trial tool, its monitor reading this PC through its
+  own door; its backend is the stand-in, which it asks which game runs
+  once a pass;
+* **the backend's own**: `core/net_monitor.py` in a Python process of its
+  own, with the app's native helper and psutil, as the app runs it.
+
+| | The backend's own | The shell |
+| --- | --- | --- |
+| Processor time while it runs, of one core | 1.13% to 1.20% | 1.12% to 1.15%, and its backend 0.20% to 0.21% (asked which game runs) |
+| What it makes other processes do, at its pace (below) | about 0.3% of a core in Windows' DNS Client service | nothing that stands out; under 0.1% of a core |
+| The page's call for the live figures, 300 times (the slowest in twenty) | about 1 ms through the shell to the backend (a call's way and back, as for the other modules) | **0.009 ms** (0.011 to 0.014) |
+| While nobody reads it | nothing (it stops half a minute after the last read) | the same |
+
+**Other processes' work.** The readings of a pass were made fifty times a
+second in windows of 15 seconds, between windows in which nothing was
+read, three rounds each (the same script), and every other process's
+processor time was taken from Windows' own list. At fifty times the pace
+the effect stands out of the PC's own noise; a fiftieth of it is what the
+monitor causes.
+
+* Python's readings (psutil's `net_io_counters()` and the helper's list of
+  programs): the DNS Client service (`Dnscache`, in a `svchost.exe` of its
+  own) used 14 to 18% of a core more. psutil asks Windows for the list of
+  adapters with every detail, and Windows asks that service for each
+  adapter's DNS servers and suffix at every call. At the monitor's pace
+  that is about 0.3% of a core, in today's app, on top of the 1.2%.
+* The shell's readings (the helper's `network_cards` and `process_io`):
+  the list of adapters is asked for without those details (the adapters,
+  their order and their names are the same: a test holds that), and the
+  service did not work for it (its `svchost.exe` used 0 to 7% less than in
+  the windows around). What remained was WMI's provider host, 1 to 4% at
+  fifty times (under a tenth of a percent at the monitor's pace), and the
+  kernel's own work for the list of programs.
+
+What it comes to: the shell's monitor costs what the backend's own does
+in its own process, plus a fifth of a percent in the backend for the
+question which game runs (until the game monitor moves, piece 7), and it
+spares the DNS Client service the third of a percent that today's app
+costs it. The page's call is answered in a hundredth of a millisecond.
+
+Not measured: with administrator rights; beside the real backend; on a PC
+where psutil's call costs more (many adapters, slow DNS settings).
+
 ## Measuring again
 
 After each piece of the port, run the same scripts and put the new numbers
@@ -804,6 +862,7 @@ python tools/measure/live_sample.py 120         (with the app running)
 python native/check_parity.py                   (needs the helper built)
 python shell_rs/try_it.py --moved               (what has moved into the shell; needs the shell's core built)
 python shell_rs/try_it.py --monitor             (the hardware monitor, the shell's beside the backend's own)
+python shell_rs/try_it.py --network --python EXE   (the network monitor, and other processes' work; EXE: a Python with psutil)
 ```
 
 None of them changes a setting on the PC, and none needs the app to be

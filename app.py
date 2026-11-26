@@ -2536,6 +2536,46 @@ def api_network_resume_process():
     return jsonify(net_monitor.resume_process(pid))
 
 
+# ── The network monitor, behind the shell ────────────────────────────
+# Behind the shell the network monitor's sampler is the shell's (shell_rs/
+# core/src/moved/net.rs): live, history and top above do not reach this
+# process, and its own sampler is never started.  For a pass the shell
+# asks two things of this process with the call below: which game runs
+# (the game monitor is here until it moves too), and, only where the native
+# helper has no list of programs, the list as the sampler takes it (with
+# psutil).  Each with the sampler's own function.
+#
+# It only reads.  Started as it always was, the app has no such call: it
+# answers as a path that does not exist.
+def _network_programs():
+    import psutil
+    return {"rows": [[pid, name, other] for pid, name, other in net_monitor._process_io_rows(psutil)]}
+
+
+_NETWORK_PARTS = {
+    "game": lambda: {"exe": net_monitor._get_active_game_exe()},
+    "processes": _network_programs,
+}
+
+
+@app.route("/api/network/part")
+def api_network_part():
+    """One part of one pass of the network monitor, for the shell:
+    ?name=game | processes."""
+    if _behind_shell is None:
+        abort(404)
+    take = _NETWORK_PARTS.get(request.args.get("name"))
+    if take is None:
+        abort(404)
+    try:
+        return jsonify({"ok": True, "reading": take()})
+    except Exception as e:
+        # The sampler keeps nothing of a pass in which reading the programs
+        # raised.  The shell is told, and does the same.
+        log.warning(f"net_monitor sample failed: {e}")
+        return jsonify({"ok": False, "raised": True, "err": f"{type(e).__name__}: {e}"})
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Privacy API
 # ═══════════════════════════════════════════════════════════════════════════

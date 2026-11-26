@@ -33,6 +33,7 @@ mod cpu;
 mod gpu;
 pub mod json;
 mod memory;
+mod nics;
 mod ping;
 mod power;
 mod procs;
@@ -102,6 +103,7 @@ fn dispatch(request: &str) -> Result<Reply, String> {
         "cpu_times" => cpu::times().map(Into::into),
         "memory" => memory::memory().map(Into::into),
         "dpc_rate" => memory::dpc_rate().map(Into::into),
+        "network_cards" => nics::network_cards().map(Into::into),
         "ping" => {
             let target = req["target"].as_str().ok_or("ping needs a \"target\"")?;
             let timeout = req["timeout_ms"].as_u64().unwrap_or(500).min(10_000);

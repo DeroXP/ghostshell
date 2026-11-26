@@ -309,6 +309,7 @@ fn main() {
     //     {"do": "tend"}                  what the thread that looks after the reader does in one round
     //     {"do": "step"}                  what the sampling thread does in one round
     //     {"do": "pass"}                  what the hardware monitor's thread does in one round
+    //     {"do": "net_round"}             what the network monitor's sampler does in one round
     //     {"do": "asked"}                 what the library, the reader and the backend were asked so far
     //     {"do": "call", "method": "GET", "target": "/api/perf/score", "body": "..."}   ("body_hex": "..." for bytes)
     //         the shell's own answer ({"status", "body"}), or {"passed_on": true}
@@ -431,6 +432,8 @@ fn main() {
                             ("waited", machine.waited().into()),
                             ("passes_kept", moved.hw.passes().kept.into()),
                             ("passes_dropped", moved.hw.passes().dropped.into()),
+                            ("net_kept", moved.net.passes().kept.into()),
+                            ("net_dropped", moved.net.passes().dropped.into()),
                             ("backend", Json::Array(backend.asked().into_iter().map(Into::into).collect())),
                             ("reader", reader.into()),
                             ("reader_gave", gave.into()),
@@ -443,6 +446,7 @@ fn main() {
                         Json::object([("ok", true.into())])
                     }
                     Some("pass") => Json::object([("took_one", moved.hw.round(&moved.card).into())]),
+                    Some("net_round") => Json::object([("took_one", moved.net.round().into())]),
                     Some("call") => {
                         // (a body that is no text is given as hexadecimal digits)
                         let body = match asked.get("body_hex").and_then(Json::as_str) {

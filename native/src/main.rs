@@ -23,7 +23,7 @@ fn main() {
         eprintln!(
             "usage: vispora-native-ask <question> [name=value ...]\n\
              questions: abi, windowed_processes, process_io, gpu_live, gpu_identity, gpu_release, cpu_clock, \
-             cpu_times, memory, dpc_rate, ping, wmi, service_state, power_scheme, power_setting"
+             cpu_times, memory, dpc_rate, network_cards, ping, wmi, service_state, power_scheme, power_setting"
         );
         std::process::exit(2);
     };

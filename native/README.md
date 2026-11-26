@@ -29,6 +29,7 @@ process or the graphics card.
 | `cpu_times` | Processor time in total, idle, in DPCs and in interrupts | `Get-Counter` in PowerShell |
 | `memory` | How much of the memory is in use (and the totals it is worked out from), and how many pages are on the standby list (read, never emptied) | not asked by the app: its hardware monitor reads both itself, and the Rust shell's asks here |
 | `dpc_rate` | Deferred procedure calls a second, over all processors | the same |
+| `network_cards` | Every network adapter's friendly name and the bytes it has sent and received (the calls psutil's `net_io_counters()` makes) | `psutil.net_io_counters()`, which the app reads itself; the Rust shell's network monitor asks here |
 | `ping` | One echo to an IPv4 address: answered or not, and how fast | `ping.exe` |
 | `gpu_identity` | The NVIDIA card's name, the driver's version and the card's memory | `nvidia-smi`, at every start |
 | `wmi` | The rows of one WMI `SELECT` query | `Get-CimInstance` in PowerShell (seven of them for the first screen) |
